@@ -86,6 +86,11 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.alias_op.probability, src.alias_op.probability);
     mergeOpt(dst.alias_op.iterations, src.alias_op.iterations);
     mergeOpt(dst.alias_op.max_blocks, src.alias_op.max_blocks);
+    // External/volatile-derived opaque predicates
+    mergeOpt(dst.external_op.enabled, src.external_op.enabled);
+    mergeOpt(dst.external_op.probability, src.external_op.probability);
+    mergeOpt(dst.external_op.max_blocks, src.external_op.max_blocks);
+    mergeOpt(dst.external_op.decoy_stores, src.external_op.decoy_stores);
     // Coherent decoy dead paths
     mergeOpt(dst.coherent_decoy.enabled, src.coherent_decoy.enabled);
     mergeOpt(dst.coherent_decoy.probability, src.coherent_decoy.probability);

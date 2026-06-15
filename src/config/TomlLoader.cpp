@@ -105,6 +105,13 @@ void parseAliasOp(const toml::table &t, AliasOpConfig &c) {
     c.max_blocks = readU32(t["max_blocks"]);
 }
 
+void parseExternalOp(const toml::table &t, ExternalOpConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.probability = readU32(t["probability"]);
+    c.max_blocks = readU32(t["max_blocks"]);
+    c.decoy_stores = readU32(t["decoy_stores"]);
+}
+
 void parseCoherentDecoy(const toml::table &t, CoherentDecoyConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.probability = readU32(t["probability"]);
@@ -305,6 +312,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parsePhiTangle(*t, pc.phi_tangle);
     if (auto *t = p["alias_opaque_predicates"].as_table())
         parseAliasOp(*t, pc.alias_op);
+    if (auto *t = p["external_opaque_predicates"].as_table())
+        parseExternalOp(*t, pc.external_op);
     if (auto *t = p["coherent_decoys"].as_table())
         parseCoherentDecoy(*t, pc.coherent_decoy);
     if (auto *t = p["data_entangled_flattening"].as_table())

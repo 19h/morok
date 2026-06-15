@@ -65,6 +65,11 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     probability = 73
     iterations = 2
     max_blocks = 7
+    [passes.external_opaque_predicates]
+    enabled = true
+    probability = 47
+    max_blocks = 6
+    decoy_stores = 3
     [passes.coherent_decoys]
     enabled = true
     probability = 62
@@ -191,6 +196,10 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.alias_op.probability == 73u);
     CHECK(r.config.passes.alias_op.iterations == 2u);
     CHECK(r.config.passes.alias_op.max_blocks == 7u);
+    CHECK(r.config.passes.external_op.enabled == true);
+    CHECK(r.config.passes.external_op.probability == 47u);
+    CHECK(r.config.passes.external_op.max_blocks == 6u);
+    CHECK(r.config.passes.external_op.decoy_stores == 3u);
     CHECK(r.config.passes.coherent_decoy.enabled == true);
     CHECK(r.config.passes.coherent_decoy.probability == 62u);
     CHECK(r.config.passes.coherent_decoy.max_blocks == 5u);

@@ -21,6 +21,7 @@
 #include "morok/passes/DataEntangledFlattening.hpp"
 #include "morok/passes/DataFlowIntegrity.hpp"
 #include "morok/passes/DispatcherlessRouting.hpp"
+#include "morok/passes/ExternalOpaquePredicates.hpp"
 #include "morok/passes/Flattening.hpp"
 #include "morok/passes/FunctionCallObfuscate.hpp"
 #include "morok/passes/FunctionWrapper.hpp"
@@ -190,6 +191,17 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
             p.iterations = eff.alias_op.iterations.value_or(1);
             p.max_blocks = eff.alias_op.max_blocks.value_or(16);
             changed |= passes::aliasOpaquePredicatesFunction(F, p, rng);
+        }
+
+        // Context-derived opaque predicates add side-effecting guard calls
+        // before decoys and flattening absorb the widened CFG.
+        if (ir::shouldObfuscate(F, "extop",
+                                eff.external_op.enabled.value_or(false))) {
+            passes::ExternalOpaqueParams p;
+            p.probability = eff.external_op.probability.value_or(35);
+            p.max_blocks = eff.external_op.max_blocks.value_or(8);
+            p.decoy_stores = eff.external_op.decoy_stores.value_or(2);
+            changed |= passes::externalOpaquePredicatesFunction(F, p, rng);
         }
 
         // Coherent dead paths use opaque-true guards but return plausible

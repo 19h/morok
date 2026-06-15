@@ -117,6 +117,7 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 | Path explosion | `morok-pathexplode` | opaque-guarded input-derived decoy loops |
 | Execution-trace keying | `morok-tracekey` | rolling trace accumulator guards and neutral data/control poisoning |
 | Alias opaque predicates | `morok-aliasop` | pointer/alias invariant guarded decoy edges |
+| External opaque predicates | `morok-extop` | IPO-blocked volatile context guards with scratch decoy arms |
 | Coherent decoys | `morok-decoy` | opaque-dead alternate return implementations |
 | Bogus control flow | `morok-bcf` | opaque-true (volatile-load) guarded junk edges |
 | Optimizer amplification | `morok-optamp` | early input-selected equivalent forms for optimizer/backend lowering |

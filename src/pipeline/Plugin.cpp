@@ -26,6 +26,7 @@
 #include "morok/passes/DataEntangledFlattening.hpp"
 #include "morok/passes/DataFlowIntegrity.hpp"
 #include "morok/passes/DispatcherlessRouting.hpp"
+#include "morok/passes/ExternalOpaquePredicates.hpp"
 #include "morok/passes/Flattening.hpp"
 #include "morok/passes/FunctionCallObfuscate.hpp"
 #include "morok/passes/FunctionWrapper.hpp"
@@ -276,6 +277,11 @@ PassPluginLibraryInfo getPluginInfo() {
                         }
                         if (name == "morok-aliasop") {
                             FPM.addPass(passes::AliasOpaquePredicatesPass());
+                            return true;
+                        }
+                        if (name == "morok-extop") {
+                            FPM.addPass(
+                                passes::ExternalOpaquePredicatesPass());
                             return true;
                         }
                         if (name == "morok-decoy") {

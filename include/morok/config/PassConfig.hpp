@@ -86,6 +86,13 @@ struct AliasOpConfig {
     Opt<std::uint32_t> max_blocks;
 };
 
+struct ExternalOpConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> max_blocks;
+    Opt<std::uint32_t> decoy_stores;
+};
+
 struct CoherentDecoyConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
@@ -266,6 +273,7 @@ struct PassConfig {
     TypePunConfig type_pun;
     PhiTangleConfig phi_tangle;
     AliasOpConfig alias_op;
+    ExternalOpConfig external_op;
     CoherentDecoyConfig coherent_decoy;
     DataEntangledFlattenConfig data_entangled_flatten;
     NonInvertibleStateConfig non_invertible_state;

@@ -226,6 +226,28 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   the CFG before dispatcher construction, but its own pointer/int scaffolding is
   not amplified by value-level rewrites.
 
+## External/volatile-derived opaque predicates — IR structure
+- Each selected block is split before its first non-PHI/non-alloca instruction
+  and guarded by two calls to an internal `morok.extop.context` helper.  The
+  helper is `noinline`/`optnone`, has unknown memory effects, and volatile-loads
+  a private mutable `morok.extop.seed` global before mixing the call-site
+  function pointer and a per-build tag.
+- The two helper calls use identical arguments, so their xor is zero at runtime
+  and the guard is always true.  The predicate is nevertheless not a pure
+  algebraic identity: simplifying it requires proving through side-effecting
+  calls, volatile memory, and IPO-blocked helper semantics.
+- The false edge enters a `morok.extop.decoy` block that performs configurable
+  volatile loads/stores against `morok.extop.scratch` before rejoining the real
+  body.  This gives the dead arm memory/context behavior instead of obvious
+  junk, while keeping PHI repair unnecessary because the split preserves the
+  original predecessor relation.
+- The pass skips generated `morok.*` functions, EH pads, landing pads, and
+  generated `morok.extop.*` blocks.  `max_blocks` caps transformed blocks per
+  function; `decoy_stores` controls scratch-store density.
+- Scheduler placement is after AliasOpaquePredicates and before CoherentDecoys
+  and flattening.  That layers a volatile/context hardness class on top of
+  alias-invariant predicates before later CFG passes absorb the extra edges.
+
 ## Coherent decoy dead paths — IR structure
 - The pass selects integer-return blocks, splits the return into a real return
   block and a `morok.decoy.alt` false arm, then guards the real path with an
@@ -552,6 +574,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - TypePunning: volatile union-buffer scalar↔vector/integer reinterpretation chains.
 - PhiTangling: redundant edge-copy/direct PHI webs; zero cross-terms rewrite uses.
 - AliasOpaquePredicates: maintained pointer/alias memory invariant guards with decoy edges.
+- ExternalOpaquePredicates: IPO-blocked volatile context helper guards with scratch decoy edges.
 - CoherentDecoys: opaque-dead alternate return computations, not junk blocks.
 - DataFlowIntegrity: byte-op tables decoded by runtime integrity hashes.
 - OptimizerAmplification: early branchless select lattice over equivalent forms.
@@ -573,5 +596,5 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Scheduler order (to preserve semantics)
 AntiHook → AntiClassDump → FCO(fn) → AntiDebug → StringEnc → Virtualization → HashSelfDecrypt → per-fn{ Split, BCF, OptAmp, Sub,
-MBA, AliasOp, CoherentDecoys, NiState/EntFla/CSM/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, TraceKeying, Dispatcherless, SelfChecksum, MutualGuardGraph } → ConstEnc → IndirectBranch → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
+MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, TraceKeying, Dispatcherless, SelfChecksum, MutualGuardGraph } → ConstEnc → IndirectBranch → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 FeatureElimination (strip debug/names) → cleanup marker decls.

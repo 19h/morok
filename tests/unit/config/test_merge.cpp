@@ -85,6 +85,10 @@ TEST_CASE("merge handles every pass family") {
     src.alias_op.probability = 72u;
     src.alias_op.iterations = 2u;
     src.alias_op.max_blocks = 9u;
+    src.external_op.enabled = true;
+    src.external_op.probability = 59u;
+    src.external_op.max_blocks = 6u;
+    src.external_op.decoy_stores = 2u;
     src.coherent_decoy.enabled = true;
     src.coherent_decoy.probability = 62u;
     src.coherent_decoy.max_blocks = 5u;
@@ -188,6 +192,10 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.alias_op.probability == 72u);
     CHECK(dst.alias_op.iterations == 2u);
     CHECK(dst.alias_op.max_blocks == 9u);
+    CHECK(dst.external_op.enabled == true);
+    CHECK(dst.external_op.probability == 59u);
+    CHECK(dst.external_op.max_blocks == 6u);
+    CHECK(dst.external_op.decoy_stores == 2u);
     CHECK(dst.coherent_decoy.enabled == true);
     CHECK(dst.coherent_decoy.probability == 62u);
     CHECK(dst.coherent_decoy.max_blocks == 5u);

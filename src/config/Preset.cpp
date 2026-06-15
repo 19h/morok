@@ -99,6 +99,11 @@ PassConfig makeLow() {
     c.alias_op.iterations = 0;
     c.alias_op.max_blocks = 0;
 
+    c.external_op.enabled = false;
+    c.external_op.probability = 0;
+    c.external_op.max_blocks = 0;
+    c.external_op.decoy_stores = 0;
+
     c.coherent_decoy.enabled = false;
     c.coherent_decoy.probability = 0;
     c.coherent_decoy.max_blocks = 0;
@@ -262,6 +267,11 @@ PassConfig makeMid() {
     c.alias_op.probability = 35;
     c.alias_op.iterations = 1;
     c.alias_op.max_blocks = 6;
+
+    c.external_op.enabled = true;
+    c.external_op.probability = 20;
+    c.external_op.max_blocks = 4;
+    c.external_op.decoy_stores = 1;
 
     c.coherent_decoy.enabled = true;
     c.coherent_decoy.probability = 35;
@@ -432,6 +442,11 @@ PassConfig makeHigh() {
     c.alias_op.probability = 65;
     c.alias_op.iterations = 2;
     c.alias_op.max_blocks = 10;
+
+    c.external_op.enabled = true;
+    c.external_op.probability = 50;
+    c.external_op.max_blocks = 12;
+    c.external_op.decoy_stores = 2;
 
     c.coherent_decoy.enabled = true;
     c.coherent_decoy.probability = 70;

@@ -17,6 +17,7 @@ add_library(morok_passes STATIC
   TypePunning.cpp
   PhiTangling.cpp
   AliasOpaquePredicates.cpp
+  ExternalOpaquePredicates.cpp
   CoherentDecoys.cpp
   DataFlowIntegrity.cpp
   BogusControlFlow.cpp

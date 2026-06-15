@@ -20,6 +20,7 @@
 #include "morok/passes/DataEntangledFlattening.hpp"
 #include "morok/passes/DataFlowIntegrity.hpp"
 #include "morok/passes/DispatcherlessRouting.hpp"
+#include "morok/passes/ExternalOpaquePredicates.hpp"
 #include "morok/passes/Flattening.hpp"
 #include "morok/passes/FunctionCallObfuscate.hpp"
 #include "morok/passes/FunctionWrapper.hpp"
@@ -980,6 +981,103 @@ TEST_CASE("aliasOpaquePredicatesFunction honors zero probability") {
         *F, {/*probability=*/0, /*iterations=*/1}, rng));
     CHECK(F->size() == beforeBlocks);
     CHECK(countNamedAllocas(*F, "morok.aliasop.cell") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE(
+    "externalOpaquePredicatesFunction builds IPO-blocked volatile guards") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @extop_target(i32 %x) {
+entry:
+  %c = icmp sgt i32 %x, 4
+  br i1 %c, label %left, label %right
+left:
+  %l = add i32 %x, 7
+  br label %merge
+right:
+  %r = sub i32 %x, 3
+  br label %merge
+merge:
+  %p = phi i32 [ %l, %left ], [ %r, %right ]
+  ret i32 %p
+}
+)ir");
+    Function *F = M->getFunction("extop_target");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(98);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::externalOpaquePredicatesFunction(
+        *F, {/*probability=*/100, /*max_blocks=*/3, /*decoy_stores=*/2}, rng));
+
+    Function *Context = M->getFunction("morok.extop.context");
+    REQUIRE(Context);
+    CHECK(Context->hasFnAttribute(Attribute::NoInline));
+    CHECK(Context->hasFnAttribute(Attribute::OptimizeNone));
+    CHECK(countGlobals(*M, "morok.extop.seed") == 1u);
+    CHECK(countGlobals(*M, "morok.extop.scratch") == 1u);
+
+    unsigned contextCalls = 0;
+    unsigned decoyBlocks = 0;
+    bool hasPredicate = false;
+    bool branchesToDecoy = false;
+    bool decoyHasVolatileStore = false;
+    for (BasicBlock &BB : *F) {
+        const bool isDecoy = BB.getName().starts_with("morok.extop.decoy");
+        if (isDecoy)
+            ++decoyBlocks;
+        for (Instruction &I : BB) {
+            hasPredicate |= I.getName().starts_with("morok.extop.pred");
+            if (auto *CI = dyn_cast<CallInst>(&I))
+                if (CI->getCalledFunction() == Context)
+                    ++contextCalls;
+            if (auto *BI = dyn_cast<BranchInst>(&I))
+                if (BI->isConditional())
+                    for (unsigned Succ = 0; Succ != BI->getNumSuccessors();
+                         ++Succ)
+                        branchesToDecoy |= BI->getSuccessor(Succ)
+                                               ->getName()
+                                               .starts_with(
+                                                   "morok.extop.decoy");
+            if (isDecoy)
+                if (auto *SI = dyn_cast<StoreInst>(&I))
+                    decoyHasVolatileStore |= SI->isVolatile();
+        }
+    }
+
+    bool helperHasVolatileLoad = false;
+    for (Instruction &I : instructions(*Context))
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+            helperHasVolatileLoad |= LI->isVolatile();
+
+    CHECK(contextCalls >= 2u);
+    CHECK(decoyBlocks >= 1u);
+    CHECK(hasPredicate);
+    CHECK(branchesToDecoy);
+    CHECK(decoyHasVolatileStore);
+    CHECK(helperHasVolatileLoad);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("externalOpaquePredicatesFunction honors zero probability") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @extop_off(i32 %x) {
+entry:
+  %y = add i32 %x, 1
+  ret i32 %y
+}
+)ir");
+    Function *F = M->getFunction("extop_off");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(99);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::externalOpaquePredicatesFunction(
+        *F, {/*probability=*/0, /*max_blocks=*/3, /*decoy_stores=*/2}, rng));
+    CHECK(M->getFunction("morok.extop.context") == nullptr);
+    CHECK(countGlobals(*M, "morok.extop.") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

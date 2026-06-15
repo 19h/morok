@@ -43,6 +43,7 @@ TEST_CASE("low preset matches the documented table") {
     CHECK(c.type_pun.enabled == false);
     CHECK(c.phi_tangle.enabled == false);
     CHECK(c.alias_op.enabled == false);
+    CHECK(c.external_op.enabled == false);
     CHECK(c.coherent_decoy.enabled == false);
     CHECK(c.data_entangled_flatten.enabled == false);
     CHECK(c.non_invertible_state.enabled == false);
@@ -89,6 +90,10 @@ TEST_CASE("mid preset matches the documented table") {
     CHECK(c.alias_op.probability == 35u);
     CHECK(c.alias_op.iterations == 1u);
     CHECK(c.alias_op.max_blocks == 6u);
+    CHECK(c.external_op.enabled == true);
+    CHECK(c.external_op.probability == 20u);
+    CHECK(c.external_op.max_blocks == 4u);
+    CHECK(c.external_op.decoy_stores == 1u);
     CHECK(c.coherent_decoy.enabled == true);
     CHECK(c.coherent_decoy.probability == 35u);
     CHECK(c.coherent_decoy.max_blocks == 4u);
@@ -174,6 +179,10 @@ TEST_CASE("high preset matches the documented table") {
     CHECK(c.alias_op.probability == 65u);
     CHECK(c.alias_op.iterations == 2u);
     CHECK(c.alias_op.max_blocks == 10u);
+    CHECK(c.external_op.enabled == true);
+    CHECK(c.external_op.probability == 50u);
+    CHECK(c.external_op.max_blocks == 12u);
+    CHECK(c.external_op.decoy_stores == 2u);
     CHECK(c.coherent_decoy.enabled == true);
     CHECK(c.coherent_decoy.probability == 70u);
     CHECK(c.coherent_decoy.max_blocks == 8u);
