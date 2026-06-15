@@ -51,6 +51,10 @@ bool bogusControlFlowFunction(Function &F, const BcfParams &params,
     Module &M = *F.getParent();
     auto *i32 = Type::getInt32Ty(F.getContext());
     bool changed = false;
+    // Resolve the shared opaque global once; the first use lazily creates it
+    // (consuming one rng draw, exactly as before), and later guarded blocks
+    // reuse the pointer instead of re-running a module-wide symbol lookup.
+    GlobalVariable *gv = nullptr;
 
     for (std::uint32_t it = 0; it < iterations; ++it) {
         std::vector<BasicBlock *> blocks;
@@ -69,7 +73,8 @@ bool bogusControlFlowFunction(Function &F, const BcfParams &params,
 
             // head = [PHIs] + (unconditional br to body); body = the rest.
             BasicBlock *body = SplitBlock(head, splitPt);
-            GlobalVariable *gv = opaqueGlobal(M, rng);
+            if (!gv)
+                gv = opaqueGlobal(M, rng);
 
             // Build the opaque-true predicate at the end of head, replacing the
             // unconditional branch SplitBlock inserted.

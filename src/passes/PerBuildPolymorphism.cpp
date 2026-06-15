@@ -235,12 +235,12 @@ bool perBuildPolymorphismModule(Module &M,
     if (Params.function_order)
         Changed |= shuffleFunctionOrder(M, Rng);
     if (Params.block_order) {
-        std::vector<Function *> Functions;
+        // shuffleBlockOrder only permutes blocks within a function and never
+        // adds or removes functions, so iterate the module directly instead of
+        // materializing a function-pointer worklist.
         for (Function &F : M)
             if (!F.isDeclaration())
-                Functions.push_back(&F);
-        for (Function *F : Functions)
-            Changed |= shuffleBlockOrder(*F, Rng);
+                Changed |= shuffleBlockOrder(F, Rng);
     }
     Changed |= addAnchors(M, Params, Rng);
     return Changed;

@@ -48,15 +48,20 @@ bool splitBlocksFunction(Function &F, const SplitParams &params,
             BasicBlock::iterator firstNonPhi = cur->getFirstNonPHIIt();
             if (firstNonPhi == cur->end())
                 break;
-            std::vector<BasicBlock::iterator> points;
+            // Count candidate cut points without materializing them, then walk
+            // back to the selected one.  The rng draw and the chosen iterator
+            // are identical to collecting into a vector first.
+            std::uint32_t count = 0;
             for (BasicBlock::iterator it = std::next(firstNonPhi);
                  it != cur->end() && !it->isTerminator(); ++it)
-                points.push_back(it);
-            if (points.empty())
+                ++count;
+            if (count == 0)
                 break;
 
-            BasicBlock::iterator cut =
-                points[rng.range(static_cast<std::uint32_t>(points.size()))];
+            std::uint32_t pick = rng.range(count);
+            BasicBlock::iterator cut = std::next(firstNonPhi);
+            for (std::uint32_t k = 0; k < pick; ++k)
+                ++cut;
             BasicBlock *tail = SplitBlock(cur, cut);
             changed = true;
             cur = tail; // keep splitting the remaining tail

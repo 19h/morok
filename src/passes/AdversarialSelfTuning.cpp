@@ -33,7 +33,6 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
 #include <algorithm>
@@ -419,7 +418,9 @@ std::vector<Candidate> makeCandidates(std::uint32_t MaxCandidates,
     return Out;
 }
 
-bool verified(const Module &M) { return !verifyModule(M, &errs()); }
+// Candidate rejection is an expected, normal outcome here, so do not spill the
+// verifier's diagnostics to stderr — only the boolean result is consumed.
+bool verified(const Module &M) { return !verifyModule(M); }
 
 CandidateResult evaluateCandidate(const Module &Original, Candidate Candidate,
                                   std::uint32_t MaxCandidatePasses) {
