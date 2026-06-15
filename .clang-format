@@ -1,0 +1,8 @@
+# Morok C++ formatting policy: LLVM style with 4-space indentation.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 80
