@@ -27,7 +27,9 @@ add_library(morok_passes STATIC
   OptimizerAmplification.cpp
   ArithmeticTables.cpp
   UniformPrimitiveLowering.cpp
+  Virtualization.cpp
   PathExplosion.cpp
+  TraceKeying.cpp
   DispatcherlessRouting.cpp
   StringEncryption.cpp
   FunctionWrapper.cpp

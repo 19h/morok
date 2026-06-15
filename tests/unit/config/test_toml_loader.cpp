@@ -105,11 +105,21 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     branch_probability = 67
     max_tables = 5
     max_branches = 7
+    [passes.virtualization]
+    enabled = true
+    probability = 31
+    max_functions = 2
+    max_instructions = 44
+    max_registers = 52
     [passes.path_explosion]
     enabled = true
     probability = 51
     max_blocks = 4
     max_iterations = 10
+    [passes.execution_trace_keying]
+    enabled = true
+    probability = 43
+    max_blocks = 6
     [passes.dispatcherless_routing]
     enabled = true
     probability = 63
@@ -179,10 +189,18 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.uniform_lower.branch_probability == 67u);
     CHECK(r.config.passes.uniform_lower.max_tables == 5u);
     CHECK(r.config.passes.uniform_lower.max_branches == 7u);
+    CHECK(r.config.passes.virtualization.enabled == true);
+    CHECK(r.config.passes.virtualization.probability == 31u);
+    CHECK(r.config.passes.virtualization.max_functions == 2u);
+    CHECK(r.config.passes.virtualization.max_instructions == 44u);
+    CHECK(r.config.passes.virtualization.max_registers == 52u);
     CHECK(r.config.passes.path_explosion.enabled == true);
     CHECK(r.config.passes.path_explosion.probability == 51u);
     CHECK(r.config.passes.path_explosion.max_blocks == 4u);
     CHECK(r.config.passes.path_explosion.max_iterations == 10u);
+    CHECK(r.config.passes.trace_keying.enabled == true);
+    CHECK(r.config.passes.trace_keying.probability == 43u);
+    CHECK(r.config.passes.trace_keying.max_blocks == 6u);
     CHECK(r.config.passes.dispatcherless.enabled == true);
     CHECK(r.config.passes.dispatcherless.probability == 63u);
     CHECK(r.config.passes.dispatcherless.max_routes == 9u);

@@ -166,11 +166,25 @@ void parseUniformLower(const toml::table &t, UniformLowerConfig &c) {
     c.max_branches = readU32(t["max_branches"]);
 }
 
+void parseVirtualization(const toml::table &t, VirtualizationConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.probability = readU32(t["probability"]);
+    c.max_functions = readU32(t["max_functions"]);
+    c.max_instructions = readU32(t["max_instructions"]);
+    c.max_registers = readU32(t["max_registers"]);
+}
+
 void parsePathExplosion(const toml::table &t, PathExplosionConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.probability = readU32(t["probability"]);
     c.max_blocks = readU32(t["max_blocks"]);
     c.max_iterations = readU32(t["max_iterations"]);
+}
+
+void parseTraceKeying(const toml::table &t, TraceKeyConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.probability = readU32(t["probability"]);
+    c.max_blocks = readU32(t["max_blocks"]);
 }
 
 void parseDispatcherless(const toml::table &t, DispatcherlessConfig &c) {
@@ -261,8 +275,12 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseSubThreshold(*t, pc.sub_threshold);
     if (auto *t = p["uniform_primitive_lowering"].as_table())
         parseUniformLower(*t, pc.uniform_lower);
+    if (auto *t = p["virtualization"].as_table())
+        parseVirtualization(*t, pc.virtualization);
     if (auto *t = p["path_explosion"].as_table())
         parsePathExplosion(*t, pc.path_explosion);
+    if (auto *t = p["execution_trace_keying"].as_table())
+        parseTraceKeying(*t, pc.trace_keying);
     if (auto *t = p["dispatcherless_routing"].as_table())
         parseDispatcherless(*t, pc.dispatcherless);
     if (auto *t = p["string_encryption"].as_table())

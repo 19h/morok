@@ -36,8 +36,10 @@
 #include "morok/passes/StringEncryption.hpp"
 #include "morok/passes/SubThresholdPersistence.hpp"
 #include "morok/passes/Substitution.hpp"
+#include "morok/passes/TraceKeying.hpp"
 #include "morok/passes/TypePunning.hpp"
 #include "morok/passes/UniformPrimitiveLowering.hpp"
+#include "morok/passes/Virtualization.hpp"
 #include "morok/passes/VectorObfuscation.hpp"
 
 #include "llvm/Demangle/Demangle.h"
@@ -87,6 +89,20 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         passes::StrEncParams sp;
         sp.probability = config_.passes.str_enc.probability.value_or(100);
         changed |= passes::stringEncryptModule(M, sp, rng);
+    }
+
+    // VM lifting must run before block splitting / flattening make straight-line
+    // functions ineligible.  The generated morok.* helpers are skipped below.
+    if (config_.passes.virtualization.enabled.value_or(false)) {
+        passes::VirtualizationParams p;
+        p.probability = config_.passes.virtualization.probability.value_or(20);
+        p.max_functions =
+            config_.passes.virtualization.max_functions.value_or(1);
+        p.max_instructions =
+            config_.passes.virtualization.max_instructions.value_or(64);
+        p.max_registers =
+            config_.passes.virtualization.max_registers.value_or(96);
+        changed |= passes::virtualizeModule(M, p, rng);
     }
 
     for (Function &F : M) {
@@ -309,6 +325,16 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
             p.max_blocks = eff.path_explosion.max_blocks.value_or(4);
             p.max_iterations = eff.path_explosion.max_iterations.value_or(16);
             changed |= passes::pathExplosionFunction(F, p, rng);
+        }
+
+        // Fold the observed CFG order into a rolling accumulator, then guard
+        // selected blocks and poison data/control only if the trace diverges.
+        if (ir::shouldObfuscate(F, "tracekey",
+                                eff.trace_keying.enabled.value_or(false))) {
+            passes::TraceKeyParams p;
+            p.probability = eff.trace_keying.probability.value_or(20);
+            p.max_blocks = eff.trace_keying.max_blocks.value_or(8);
+            changed |= passes::traceKeyFunction(F, p, rng);
         }
 
         // Dispatcherless routing converts remaining direct branches/switches to

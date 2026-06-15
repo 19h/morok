@@ -35,8 +35,10 @@
 #include "morok/passes/StringEncryption.hpp"
 #include "morok/passes/SubThresholdPersistence.hpp"
 #include "morok/passes/Substitution.hpp"
+#include "morok/passes/TraceKeying.hpp"
 #include "morok/passes/TypePunning.hpp"
 #include "morok/passes/UniformPrimitiveLowering.hpp"
+#include "morok/passes/Virtualization.hpp"
 #include "morok/passes/VectorObfuscation.hpp"
 
 #include "llvm/AsmParser/Parser.h"
@@ -1616,6 +1618,102 @@ right:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("virtualizeModule lifts simple arithmetic to encrypted threaded VM") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @vm_arith(i32 %a, i32 %b) {
+entry:
+  %x = add i32 %a, %b
+  %y = xor i32 %x, 1515870810
+  %z = mul i32 %y, %a
+  ret i32 %z
+}
+)ir");
+    Function *F = M->getFunction("vm_arith");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(151);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::virtualizeModule(
+        *M,
+        {/*probability=*/100, /*max_functions=*/1,
+         /*max_instructions=*/16, /*max_registers=*/32},
+        rng));
+
+    Function *Helper = M->getFunction("morok.vm.vm_arith.exec");
+    REQUIRE(Helper);
+    CHECK(countGlobals(*M, "morok.vm.bytecode") == 1u);
+    CHECK(countGlobals(*M, "morok.vm.targets") == 1u);
+
+    GlobalVariable *Bytecode = nullptr;
+    for (GlobalVariable &GV : M->globals())
+        if (GV.getName().starts_with("morok.vm.bytecode"))
+            Bytecode = &GV;
+    REQUIRE(Bytecode);
+    REQUIRE(Bytecode->isConstant());
+    auto *Data = dyn_cast<ConstantDataArray>(Bytecode->getInitializer());
+    REQUIRE(Data);
+    bool controlBytesAreEncrypted = false;
+    for (unsigned I = 0; I < 4 && I < Data->getNumElements(); ++I)
+        controlBytesAreEncrypted |= Data->getElementAsInteger(I) > 63u;
+    CHECK(controlBytesAreEncrypted);
+
+    std::size_t wrapperCalls = 0;
+    std::size_t wrapperBinops = 0;
+    for (Instruction &I : instructions(*F)) {
+        wrapperCalls += isa<CallInst>(&I) ? 1u : 0u;
+        wrapperBinops += isa<BinaryOperator>(&I) ? 1u : 0u;
+    }
+    CHECK(wrapperCalls == 1u);
+    CHECK(wrapperBinops == 0u);
+
+    std::size_t indirects = 0;
+    std::size_t switches = 0;
+    std::size_t addHandlers = 0;
+    std::size_t xorHandlers = 0;
+    bool hasBytecodeDecrypt = false;
+    for (BasicBlock &BB : *Helper) {
+        addHandlers += BB.getName().starts_with("morok.vm.h.add") ? 1u : 0u;
+        xorHandlers += BB.getName().starts_with("morok.vm.h.xor") ? 1u : 0u;
+        for (Instruction &I : BB) {
+            indirects += isa<IndirectBrInst>(&I) ? 1u : 0u;
+            switches += isa<SwitchInst>(&I) ? 1u : 0u;
+            hasBytecodeDecrypt |= I.getName().starts_with("morok.vm.bc.dec");
+        }
+    }
+    CHECK(indirects == 1u);
+    CHECK(switches == 0u);
+    CHECK(addHandlers >= 2u);
+    CHECK(xorHandlers >= 2u);
+    CHECK(hasBytecodeDecrypt);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("virtualizeModule skips unsupported control flow") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @branchy(i32 %a, i32 %b, i1 %c) {
+entry:
+  br i1 %c, label %left, label %right
+left:
+  ret i32 %a
+right:
+  ret i32 %b
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(152);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::virtualizeModule(
+        *M,
+        {/*probability=*/100, /*max_functions=*/1,
+         /*max_instructions=*/16, /*max_registers=*/32},
+        rng));
+    CHECK(countGlobals(*M, "morok.vm.bytecode") == 0u);
+    CHECK(M->getFunction("morok.vm.branchy.exec") == nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("pathExplosionFunction injects input-driven decoy loops") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -1677,6 +1775,111 @@ TEST_CASE("pathExplosionFunction honors zero probability") {
         *F, {/*probability=*/0, /*max_blocks=*/4, /*max_iterations=*/16}, rng));
     CHECK(F->size() == beforeBlocks);
     CHECK(countNamedAllocas(*F, "morok.path.scratch") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("traceKeyFunction builds rolling accumulator guards") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @trace(i32 %a, i32 %b) {
+entry:
+  %c = icmp slt i32 %a, %b
+  br i1 %c, label %left, label %right
+left:
+  %l = add i32 %a, 7
+  br label %join
+right:
+  %r = sub i32 %b, 3
+  br label %join
+join:
+  %p = phi i32 [ %l, %left ], [ %r, %right ]
+  %d = icmp eq i32 %p, %a
+  br i1 %d, label %yes, label %no
+yes:
+  ret i32 %p
+no:
+  %x = xor i32 %p, %b
+  ret i32 %x
+}
+)ir");
+    Function *F = M->getFunction("trace");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(161);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::traceKeyFunction(
+        *F, {/*probability=*/100, /*max_blocks=*/8}, rng));
+
+    CHECK(countNamedAllocas(*F, "morok.trace.state") == 1u);
+    CHECK(M->getGlobalVariable("morok.trace.seed", true) != nullptr);
+    CHECK(M->getFunction("llvm.trap") != nullptr);
+
+    std::size_t guards = 0;
+    std::size_t expectedPhis = 0;
+    std::size_t volatileLoads = 0;
+    std::size_t volatileStores = 0;
+    std::size_t failBlocks = 0;
+    std::size_t branchKeys = 0;
+    std::size_t returnKeys = 0;
+    std::size_t edgeMixes = 0;
+    for (BasicBlock &BB : *F) {
+        failBlocks += BB.getName().starts_with("morok.trace.fail") ? 1u : 0u;
+        for (Instruction &I : BB) {
+            if (I.getName().starts_with("morok.trace.guard"))
+                ++guards;
+            if (I.getName().starts_with("morok.trace.expected"))
+                ++expectedPhis;
+            if (I.getName().starts_with("morok.trace.edge.mix"))
+                ++edgeMixes;
+            if (auto *LI = dyn_cast<LoadInst>(&I))
+                volatileLoads += LI->isVolatile() ? 1u : 0u;
+            if (auto *SI = dyn_cast<StoreInst>(&I))
+                volatileStores += SI->isVolatile() ? 1u : 0u;
+            if (auto *BI = dyn_cast<BranchInst>(&I))
+                if (BI->isConditional() &&
+                    BI->getCondition()->getName().starts_with(
+                        "morok.trace.branch.cond"))
+                    ++branchKeys;
+            if (auto *RI = dyn_cast<ReturnInst>(&I))
+                if (RI->getReturnValue() &&
+                    RI->getReturnValue()->getName().starts_with(
+                        "morok.trace.ret"))
+                    ++returnKeys;
+        }
+    }
+    CHECK(guards >= 4u);
+    CHECK(expectedPhis >= 4u);
+    CHECK(volatileLoads >= 4u);
+    CHECK(volatileStores >= 4u);
+    CHECK(failBlocks >= 4u);
+    CHECK(branchKeys >= 1u);
+    CHECK(returnKeys >= 1u);
+    CHECK(edgeMixes >= 3u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("traceKeyFunction honors zero probability") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @trace_zero(i32 %a, i32 %b) {
+entry:
+  %c = icmp slt i32 %a, %b
+  br i1 %c, label %left, label %right
+left:
+  ret i32 %a
+right:
+  ret i32 %b
+}
+)ir");
+    Function *F = M->getFunction("trace_zero");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(162);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::traceKeyFunction(
+        *F, {/*probability=*/0, /*max_blocks=*/8}, rng));
+    CHECK(countNamedAllocas(*F, "morok.trace.state") == 0u);
+    CHECK(M->getGlobalVariable("morok.trace.seed", true) == nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

@@ -108,7 +108,9 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 | PHI tangling | `morok-phitangle` | redundant cross-block PHI webs |
 | Table arithmetic | `morok-tablearith` | byte arithmetic lowered to encrypted lookup tables |
 | Uniform primitive lowering | `morok-uniform` | byte ops and direct branches lowered to table/memory dispatch |
+| Virtualization | `morok-vm` | selected straight-line integer functions lifted to encrypted threaded bytecode VMs |
 | Path explosion | `morok-pathexplode` | opaque-guarded input-derived decoy loops |
+| Execution-trace keying | `morok-tracekey` | rolling trace accumulator guards and neutral data/control poisoning |
 | Alias opaque predicates | `morok-aliasop` | pointer/alias invariant guarded decoy edges |
 | Coherent decoys | `morok-decoy` | opaque-dead alternate return implementations |
 | Bogus control flow | `morok-bcf` | opaque-true (volatile-load) guarded junk edges |

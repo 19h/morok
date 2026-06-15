@@ -319,6 +319,32 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Scheduler placement is after TableArithmetic and before SIMD/path/dispatcher
   passes.  Standalone `morok-uniform` composes both halves for targeted use.
 
+## Virtualization — threaded bytecode VM
+- Selected functions are lifted only when the pass can prove a strict
+  straight-line integer subset: same-width integer arguments/return, one basic
+  block, no calls or memory, and unflagged modular arithmetic/bitwise/constant
+  shifts.  Unsupported IR is left untouched rather than approximated.
+- The lifted function becomes a native wrapper that calls an internal
+  `morok.vm.<function>.exec` helper.  The original computation is encoded as a
+  private `morok.vm.bytecode.*` byte array; bytecode fields are first randomized
+  by operand/immediate encoding and then encrypted byte-by-byte with a stream
+  key derived from the VM PC.
+- The helper keeps a bounded `i64` virtual-register file, masks results back to
+  the original integer width after each operation, and decodes one instruction
+  at a time.  Constants, operands, and opcodes are decrypted from the current PC
+  rather than materializing a plaintext program image.
+- Dispatch is threaded computed-goto: the decoded opcode indexes a private
+  `morok.vm.targets.*` blockaddress table, loads the target pointer, and reaches
+  handlers through `indirectbr`.  There is no central `switch` decode anchor.
+- Arithmetic handlers are duplicated and shuffled per build.  Alternate
+  variants use equivalent formulas for add/sub/xor/and/or and PC-neutralized
+  polymorphic forms for the remaining operations, so one opcode does not map to
+  one stable handler shape.
+- Scheduler placement is before per-function splitting/flattening; otherwise
+  the structural passes would make the straight-line source functions
+  ineligible.  The generated `morok.*` helpers are skipped by the later
+  per-function pipeline.
+
 ## Vector obfuscation — IR structure
 - Eligible scalar integer binary ops are lifted to `<N x iM>` operations, where
   `N = width / M` for configured widths 128, 256, or 512 bits.  Lane `realLane`
@@ -349,6 +375,31 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   The pass runs after flattening/vectorization because its `indirectbr` regions
   intentionally defeat later CFG structuring.
 
+## Execution-trace keying — IR structure
+- The pass creates one private volatile `i64` accumulator in the function entry
+  and seeds it from a private `morok.trace.seed` global plus a per-build salt.
+  This makes the key stream a property of the execution context and build, not
+  an input-only expression.
+- Selected non-entry direct-CFG blocks receive a `morok.trace.expected` PHI.  For
+  every predecessor branch or switch edge into selected blocks, the pass loads
+  the current accumulator, selects an edge tag based on the actual successor,
+  applies an avalanche-style rolling hash, stores it back volatile, and feeds
+  the new value into the successor's expected PHI.
+- At the selected block entry, a volatile accumulator load is compared with the
+  expected edge value.  The normal body is reached only through
+  `morok.trace.guard`; the mismatch edge calls `llvm.trap`, so replay or
+  instrumentation that perturbs the order has no single separable check to
+  remove.
+- The accumulator mismatch is also folded into outgoing control/data: selected
+  conditional branch conditions are XORed with `diff != 0`, switch conditions
+  are XORed with the truncated diff, and integer returns are XORed with a
+  width-matched diff.  On the valid trace the diff is zero; on a wrong trace,
+  bypassing the guard still corrupts routing or output.
+- EH pads, generated `morok.*` blocks, entry blocks, and blocks with unsupported
+  indirect predecessor terminators are skipped.  Scheduler placement is after
+  path explosion and before dispatcherless routing, so trace points are frozen
+  late and later routing can still hide the guard branches.
+
 ## Indirect branch — `core/KnuthHash`
 - Per-function key: random `delta`, odd `mult`, `xork`. `encode = ((raw+delta)*mult)^xork`,
   `decode = ((enc^xork)*multInv) - delta`, `multInv = modInverse64(mult)` (5 Newton steps).
@@ -377,13 +428,15 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - SubThresholdPersistence: volatile local-seed opaque-zero terms under a small cap.
 - TableArithmetic: encrypted lazy byte-op lookup tables.
 - UniformPrimitiveLowering: byte-op tables plus memory-loaded indirectbr dispatch.
+- Virtualization: encrypted per-function bytecode plus threaded computed-goto VM helpers.
 - PathExplosion: opaque-guarded input-derived loops with volatile symbolic stores and indirectbr dispatch.
+- TraceKeying: edge-carried rolling trace accumulator with guards and neutral poisoning.
 - VectorObfuscation: scalar→SIMD lifting; width 128/256/512, shuffle, lift_comparisons.
 - FunctionWrapper: polymorphic proxies; prob/times.
 - FunctionCallObfuscate: dlopen/dlsym indirection; uses a JSON symbol DB (`json.hpp`).
 - AntiClassDump / AntiDebugging / AntiHooking: platform anti-analysis (module passes).
 
 ## Scheduler order (to preserve semantics)
-AntiHook → AntiClassDump → FCO(fn) → AntiDebug → StringEnc → per-fn{ Split, BCF, OptAmp, Sub,
-MBA, AliasOp, CoherentDecoys, NiState/EntFla/CSM/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, PointerLaunder, TableArith, Uniform, Vec, PathExplosion, Dispatcherless } → ConstEnc → IndirectBranch → FunctionWrapper →
+AntiHook → AntiClassDump → FCO(fn) → AntiDebug → StringEnc → Virtualization → per-fn{ Split, BCF, OptAmp, Sub,
+MBA, AliasOp, CoherentDecoys, NiState/EntFla/CSM/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, PointerLaunder, TableArith, Uniform, Vec, PathExplosion, TraceKeying, Dispatcherless } → ConstEnc → IndirectBranch → FunctionWrapper →
 FeatureElimination (strip debug/names) → cleanup marker decls.

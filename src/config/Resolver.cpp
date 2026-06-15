@@ -136,12 +136,25 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.uniform_lower.branch_probability);
     mergeOpt(dst.uniform_lower.max_tables, src.uniform_lower.max_tables);
     mergeOpt(dst.uniform_lower.max_branches, src.uniform_lower.max_branches);
+    // Virtualization
+    mergeOpt(dst.virtualization.enabled, src.virtualization.enabled);
+    mergeOpt(dst.virtualization.probability, src.virtualization.probability);
+    mergeOpt(dst.virtualization.max_functions,
+             src.virtualization.max_functions);
+    mergeOpt(dst.virtualization.max_instructions,
+             src.virtualization.max_instructions);
+    mergeOpt(dst.virtualization.max_registers,
+             src.virtualization.max_registers);
     // Path explosion
     mergeOpt(dst.path_explosion.enabled, src.path_explosion.enabled);
     mergeOpt(dst.path_explosion.probability, src.path_explosion.probability);
     mergeOpt(dst.path_explosion.max_blocks, src.path_explosion.max_blocks);
     mergeOpt(dst.path_explosion.max_iterations,
              src.path_explosion.max_iterations);
+    // Execution-trace keying
+    mergeOpt(dst.trace_keying.enabled, src.trace_keying.enabled);
+    mergeOpt(dst.trace_keying.probability, src.trace_keying.probability);
+    mergeOpt(dst.trace_keying.max_blocks, src.trace_keying.max_blocks);
     // Dispatcherless routing
     mergeOpt(dst.dispatcherless.enabled, src.dispatcherless.enabled);
     mergeOpt(dst.dispatcherless.probability, src.dispatcherless.probability);

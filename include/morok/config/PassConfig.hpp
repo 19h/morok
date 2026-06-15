@@ -144,11 +144,25 @@ struct UniformLowerConfig {
     Opt<std::uint32_t> max_branches;
 };
 
+struct VirtualizationConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> max_functions;
+    Opt<std::uint32_t> max_instructions;
+    Opt<std::uint32_t> max_registers;
+};
+
 struct PathExplosionConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
     Opt<std::uint32_t> max_blocks;
     Opt<std::uint32_t> max_iterations;
+};
+
+struct TraceKeyConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> max_blocks;
 };
 
 struct DispatcherlessConfig {
@@ -216,7 +230,9 @@ struct PassConfig {
     TableArithConfig table_arith;
     SubThresholdConfig sub_threshold;
     UniformLowerConfig uniform_lower;
+    VirtualizationConfig virtualization;
     PathExplosionConfig path_explosion;
+    TraceKeyConfig trace_keying;
     DispatcherlessConfig dispatcherless;
     StrEncConfig str_enc;
     ConstEncConfig const_enc;

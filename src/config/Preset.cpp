@@ -139,10 +139,20 @@ PassConfig makeLow() {
     c.uniform_lower.max_tables = 0;
     c.uniform_lower.max_branches = 0;
 
+    c.virtualization.enabled = false;
+    c.virtualization.probability = 0;
+    c.virtualization.max_functions = 0;
+    c.virtualization.max_instructions = 0;
+    c.virtualization.max_registers = 0;
+
     c.path_explosion.enabled = false;
     c.path_explosion.probability = 0;
     c.path_explosion.max_blocks = 0;
     c.path_explosion.max_iterations = 0;
+
+    c.trace_keying.enabled = false;
+    c.trace_keying.probability = 0;
+    c.trace_keying.max_blocks = 0;
 
     c.dispatcherless.enabled = false;
     c.dispatcherless.probability = 0;
@@ -260,10 +270,20 @@ PassConfig makeMid() {
     c.uniform_lower.max_tables = 2;
     c.uniform_lower.max_branches = 2;
 
+    c.virtualization.enabled = false;
+    c.virtualization.probability = 0;
+    c.virtualization.max_functions = 0;
+    c.virtualization.max_instructions = 0;
+    c.virtualization.max_registers = 0;
+
     c.path_explosion.enabled = true;
     c.path_explosion.probability = 15;
     c.path_explosion.max_blocks = 2;
     c.path_explosion.max_iterations = 8;
+
+    c.trace_keying.enabled = true;
+    c.trace_keying.probability = 10;
+    c.trace_keying.max_blocks = 2;
 
     c.dispatcherless.enabled = true;
     c.dispatcherless.probability = 35;
@@ -387,10 +407,20 @@ PassConfig makeHigh() {
     c.uniform_lower.max_tables = 2;
     c.uniform_lower.max_branches = 1;
 
+    c.virtualization.enabled = true;
+    c.virtualization.probability = 25;
+    c.virtualization.max_functions = 1;
+    c.virtualization.max_instructions = 48;
+    c.virtualization.max_registers = 64;
+
     c.path_explosion.enabled = true;
     c.path_explosion.probability = 35;
     c.path_explosion.max_blocks = 4;
     c.path_explosion.max_iterations = 16;
+
+    c.trace_keying.enabled = true;
+    c.trace_keying.probability = 25;
+    c.trace_keying.max_blocks = 4;
 
     c.dispatcherless.enabled = true;
     c.dispatcherless.probability = 75;

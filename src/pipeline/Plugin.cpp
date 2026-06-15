@@ -41,8 +41,10 @@
 #include "morok/passes/StringEncryption.hpp"
 #include "morok/passes/SubThresholdPersistence.hpp"
 #include "morok/passes/Substitution.hpp"
+#include "morok/passes/TraceKeying.hpp"
 #include "morok/passes/TypePunning.hpp"
 #include "morok/passes/UniformPrimitiveLowering.hpp"
+#include "morok/passes/Virtualization.hpp"
 #include "morok/passes/VectorObfuscation.hpp"
 #include "morok/pipeline/Scheduler.hpp"
 
@@ -182,6 +184,10 @@ PassPluginLibraryInfo getPluginInfo() {
                             MPM.addPass(passes::InterproceduralFsmPass());
                             return true;
                         }
+                        if (name == "morok-vm") {
+                            MPM.addPass(passes::VirtualizationPass());
+                            return true;
+                        }
                         if (name == "morok-antidbg") {
                             MPM.addPass(passes::AntiDebuggingPass());
                             return true;
@@ -287,6 +293,10 @@ PassPluginLibraryInfo getPluginInfo() {
                         }
                         if (name == "morok-pathexplode") {
                             FPM.addPass(passes::PathExplosionPass());
+                            return true;
+                        }
+                        if (name == "morok-tracekey") {
+                            FPM.addPass(passes::TraceKeyingPass());
                             return true;
                         }
                         if (name == "morok-dispatchless") {
