@@ -20,6 +20,8 @@
 #include "llvm/IR/Module.h"
 #include "llvm/TargetParser/Triple.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <vector>
 
 using namespace llvm;
@@ -27,6 +29,8 @@ using namespace llvm;
 namespace morok::passes {
 
 namespace {
+
+constexpr std::uint32_t kMaxCallsPerModule = 256;
 
 bool eligible(CallInst *ci) {
     if (ci->isInlineAsm() || ci->hasOperandBundles() || ci->isMustTailCall())
@@ -44,6 +48,30 @@ bool eligible(CallInst *ci) {
 
 bool functionCallObfuscateModule(Module &M, const FcoParams &params,
                                  ir::IRRandom &rng) {
+    if (params.probability == 0 || params.max_calls == 0)
+        return false;
+
+    const std::uint32_t Limit = std::min(params.max_calls, kMaxCallsPerModule);
+
+    std::vector<CallInst *> targets;
+    targets.reserve(Limit);
+    for (Function &F : M) {
+        if (targets.size() >= Limit)
+            break;
+        if (F.isDeclaration() || F.getName().starts_with("morok."))
+            continue;
+        for (Instruction &inst : instructions(F)) {
+            if (targets.size() >= Limit)
+                break;
+            if (auto *ci = dyn_cast<CallInst>(&inst))
+                if (eligible(ci))
+                    if (rng.chance(params.probability))
+                        targets.push_back(ci);
+        }
+    }
+    if (targets.empty())
+        return false;
+
     LLVMContext &ctx = M.getContext();
     auto *i64 = Type::getInt64Ty(ctx);
     auto *ptr = PointerType::getUnqual(ctx);
@@ -53,20 +81,8 @@ bool functionCallObfuscateModule(Module &M, const FcoParams &params,
     FunctionCallee dlsym = M.getOrInsertFunction(
         "dlsym", FunctionType::get(ptr, {ptr, ptr}, false));
 
-    std::vector<CallInst *> targets;
-    for (Function &F : M) {
-        if (F.isDeclaration() || F.getName().starts_with("morok."))
-            continue;
-        for (Instruction &inst : instructions(F))
-            if (auto *ci = dyn_cast<CallInst>(&inst))
-                if (eligible(ci))
-                    targets.push_back(ci);
-    }
-
     bool changed = false;
     for (CallInst *ci : targets) {
-        if (!rng.chance(params.probability))
-            continue;
         Function *callee = ci->getCalledFunction();
 
         IRBuilder<> B(ci);

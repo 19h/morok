@@ -79,6 +79,15 @@ with `[global]`, `[passes.*]`, and ordered `[[policy]]` rules; see
 Per-function `__attribute__((annotate("sub")))` / `annotate("nosub")` overrides
 are honoured.
 
+The scheduler has hard instruction/block/module budgets and skips growth passes
+once a function or module is too large.  The `high` preset is memory-first by
+default: VM lifting, hash self-decrypt, late integrity graphs/tables, MQ,
+microcode stress, adversarial clone/merge tuning, and call-site wrappers are
+explicit opt-ins rather than preset defaults.
+String encryption also has direct byte caps so large global literals do not
+expand into unbounded constructor IR.  Standalone growth-heavy passes also have
+fixed local caps for table, CFG-route, and call-site collection.
+
 ## Testing strategy
 
 Coverage is layered to match the architecture:
@@ -103,17 +112,19 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 |------|----------------|--------------|
 | Split basic blocks | `morok-split` | cuts blocks into more dispatch targets |
 | Stack coalescing | `morok-stackcoalesce` | locals → one opaque byte buffer |
+| Stack delta games | `morok-stackdelta` | dynamic stack-pointer deltas with odd overlapping volatile slots |
 | Pointer laundering | `morok-ptrlaunder` | pointer/int round trips and byte-vector value views |
 | Type punning | `morok-typepun` | union-buffer scalar reinterpretation chains |
 | PHI tangling | `morok-phitangle` | redundant cross-block PHI webs |
 | Adversarial merge/outline | `morok-afm` | unrelated functions fused behind selector dispatchers and shared helpers |
+| Adversarial self-tuning | `morok-selftune` | cloned-candidate hardness search with selected bundle replay |
 | Per-build polymorphism | `morok-polymorph` | seed-driven function/block layout and neutral return anchors |
 | Data-flow integrity | `morok-dfi` | byte lookup tables decoded from runtime integrity hashes |
 | Mutual guard graph | `morok-mutualguard` | overlapping checksum nodes whose aggregate diff poisons returns |
 | Table arithmetic | `morok-tablearith` | byte arithmetic lowered to encrypted lookup tables |
 | Uniform primitive lowering | `morok-uniform` | byte ops and direct branches lowered to table/memory dispatch |
 | Virtualization | `morok-vm` | selected straight-line integer functions lifted to encrypted threaded bytecode VMs |
-| Hash-gated self-decrypt | `morok-selfdecrypt` | VM bytecode payloads hash-gated and lazily decrypted |
+| Hash-gated self-decrypt | `morok-selfdecrypt` | VM bytecode payloads hash/context-gated and lazily decrypted |
 | Path explosion | `morok-pathexplode` | opaque-guarded input-derived decoy loops |
 | Execution-trace keying | `morok-tracekey` | rolling trace accumulator guards and neutral data/control poisoning |
 | Alias opaque predicates | `morok-aliasop` | pointer/alias invariant guarded decoy edges |
@@ -129,10 +140,14 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 | Non-invertible state | `morok-nistate` | flattened next states hashed into encoded dispatcher IDs |
 | Stateful opaque predicates | `morok-stateop` | MBA opaque guards over flattened dispatcher state |
 | Interprocedural FSM | `morok-ifsm` | flattened state updates routed through recursive helper functions |
-| Chaos state machine | `morok-csm` | flattening driven by the logistic map |
+| Chaos state machine | `morok-csm` | flattening driven by logistic or T-function state maps |
+| T-function flattening | `morok-tfa` | single-cycle nonlinear dispatcher-state generator |
 | Dispatcherless routing | `morok-dispatchless` | branch/switch edges → state-entangled `indirectbr` DAG |
+| Microcode stress | `morok-microstress` | oversized computed blockaddress tables with aliased decoy destinations |
 | Vector obfuscation | `morok-vec` | scalar integer ops/comparisons lifted to configurable SIMD |
 | Self-checksum constants | `morok-selfcheck` | constants fused with runtime checksum diff so tamper corrupts data |
+| Shamir threshold sharing | `morok-shamir` | selected integer literals reconstructed from GF(2^8) threshold shares |
+| MQ opaque gate | `morok-mq` | planted GF(2) quadratic systems guarding input-derived branch sites |
 | Constant encryption | `morok-constenc` | literals split into XOR shares |
 | String encryption | `morok-strenc` | literals stored GF(2⁸)-encrypted, decrypted in a ctor |
 | Indirect branch | `morok-indbr` | conditional edges → keyed `indirectbr` table |
@@ -144,8 +159,9 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 
 Every pass is exercised by an IR-validity test, and the value/control-flow
 passes are additionally proven semantics-preserving by the end-to-end
-differential tests across the `low`/`mid`/`high` presets — the `high` preset
-stacks the full pipeline and still reproduces the reference output byte-for-byte.
+differential tests across the `low`/`mid`/`high` presets.  The `high` preset
+stacks the bounded default pipeline, skips the heavyweight opt-in passes above,
+and still reproduces the reference output byte-for-byte.
 
 Faithfulness note for the current LLVM: indirect-branch keys the table index
 rather than multiplicatively encrypting the loaded pointer (modern LLVM forbids

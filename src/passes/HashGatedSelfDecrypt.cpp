@@ -5,10 +5,11 @@
 // morok/passes/HashGatedSelfDecrypt.cpp
 //
 // IR-safe hash-gated self-decrypting blocks.  Native block encryption requires
-// post-link addresses and W^X cooperation, so this pass implements the roadmap's
-// bytecode route: selected VM bytecode globals receive an outer encrypted layer,
-// a mutable payload, and a lazy decryptor gated by a runtime hash of the still-
-// encrypted payload.  The VM helper calls the decryptor before reading bytecode.
+// post-link addresses and W^X cooperation, so this pass implements the
+// roadmap's bytecode route: selected VM bytecode globals receive an outer
+// encrypted layer, a mutable payload, and a lazy decryptor gated by a runtime
+// hash of the still- encrypted payload.  The VM helper calls the decryptor
+// before reading bytecode.
 
 #include "morok/passes/HashGatedSelfDecrypt.hpp"
 
@@ -107,17 +108,18 @@ Value *emitHashStep(Builder &B, Value *H, Value *Byte) {
 }
 
 Value *emitKeyByte(Builder &B, Value *Index, Value *ComputedHash,
-                   const StreamSchedule &S) {
+                   Value *ContextZero, const StreamSchedule &S) {
     auto *I64 = B.getInt64Ty();
     auto *I8 = B.getInt8Ty();
     Value *Idx64 = B.CreateZExt(Index, I64, "morok.sdb.key.idx");
     Value *Key = B.CreateXor(ComputedHash, ConstantInt::get(I64, S.key_mask),
                              "morok.sdb.key.gate");
-    Value *X = B.CreateAdd(Key, ConstantInt::get(I64, S.add),
-                           "morok.sdb.key.mix");
+    Key = B.CreateXor(Key, ContextZero, "morok.sdb.key.context");
+    Value *X =
+        B.CreateAdd(Key, ConstantInt::get(I64, S.add), "morok.sdb.key.mix");
     X = B.CreateAdd(
-        X, B.CreateMul(Idx64, ConstantInt::get(I64, S.mul),
-                       "morok.sdb.key.mul"),
+        X,
+        B.CreateMul(Idx64, ConstantInt::get(I64, S.mul), "morok.sdb.key.mul"),
         "morok.sdb.key.mix");
     X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I64, 11)),
                     "morok.sdb.key.mix");
@@ -156,7 +158,8 @@ std::vector<std::uint8_t> readBytes(GlobalVariable &GV) {
         return Bytes;
     Bytes.reserve(Data->getNumElements());
     for (unsigned I = 0; I < Data->getNumElements(); ++I)
-        Bytes.push_back(static_cast<std::uint8_t>(Data->getElementAsInteger(I)));
+        Bytes.push_back(
+            static_cast<std::uint8_t>(Data->getElementAsInteger(I)));
     return Bytes;
 }
 
@@ -196,9 +199,8 @@ void shufflePayloads(std::vector<Payload> &Payloads, ir::IRRandom &Rng) {
 
 void makeMutablePayload(GlobalVariable &GV, ArrayRef<std::uint8_t> Outer) {
     auto &Ctx = GV.getContext();
-    auto *Init =
-        ConstantDataArray::get(Ctx, ArrayRef<std::uint8_t>(Outer.data(),
-                                                           Outer.size()));
+    auto *Init = ConstantDataArray::get(
+        Ctx, ArrayRef<std::uint8_t>(Outer.data(), Outer.size()));
     GV.setInitializer(Init);
     GV.setConstant(false);
     GV.setUnnamedAddr(GlobalValue::UnnamedAddr::None);
@@ -217,24 +219,64 @@ GlobalVariable *createReady(Module &M, StringRef Suffix) {
 Value *payloadPtr(Builder &B, GlobalVariable *Payload, Value *Idx) {
     auto *I32 = B.getInt32Ty();
     auto *ArrTy = cast<ArrayType>(Payload->getValueType());
-    return B.CreateInBoundsGEP(
-        ArrTy, Payload, {ConstantInt::get(I32, 0), Idx},
-        "morok.sdb.payload.ptr");
+    return B.CreateInBoundsGEP(ArrTy, Payload, {ConstantInt::get(I32, 0), Idx},
+                               "morok.sdb.payload.ptr");
+}
+
+Value *asI64(Builder &B, Value *V) {
+    auto *I64 = B.getInt64Ty();
+    Type *Ty = V->getType();
+    if (Ty->isIntegerTy()) {
+        auto *IT = cast<IntegerType>(Ty);
+        if (IT->getBitWidth() == 64)
+            return V;
+        if (IT->getBitWidth() < 64)
+            return B.CreateZExt(V, I64, "morok.sdb.context.arg");
+        return B.CreateTrunc(V, I64, "morok.sdb.context.arg");
+    }
+    if (Ty->isPointerTy())
+        return B.CreatePtrToInt(V, I64, "morok.sdb.context.ptr");
+    return ConstantInt::get(I64, 0);
+}
+
+Value *emitContextZero(Builder &B, Function *Fn) {
+    auto *I64 = B.getInt64Ty();
+    Value *Acc = ConstantInt::get(I64, 0);
+    for (Argument &Arg : Fn->args()) {
+        Value *Wide = asI64(B, &Arg);
+        auto *Slot = B.CreateAlloca(I64, nullptr, "morok.sdb.context.slot");
+        Slot->setAlignment(Align(8));
+        auto *Store = B.CreateStore(Wide, Slot);
+        Store->setVolatile(true);
+        Store->setAlignment(Align(8));
+        auto *A = B.CreateLoad(I64, Slot, "morok.sdb.context.load");
+        A->setVolatile(true);
+        A->setAlignment(Align(8));
+        auto *C = B.CreateLoad(I64, Slot, "morok.sdb.context.load");
+        C->setVolatile(true);
+        C->setAlignment(Align(8));
+        Value *Zero = B.CreateXor(A, C, "morok.sdb.context.zero");
+        Acc = B.CreateXor(Acc, Zero, "morok.sdb.context.mix");
+    }
+    return Acc;
 }
 
 Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
-                       const StreamSchedule &S) {
+                       const StreamSchedule &S, bool ContextKeying) {
     LLVMContext &Ctx = M.getContext();
     auto *VoidTy = Type::getVoidTy(Ctx);
     auto *I1 = Type::getInt1Ty(Ctx);
     auto *I8 = Type::getInt8Ty(Ctx);
     auto *I32 = Type::getInt32Ty(Ctx);
     auto *I64 = Type::getInt64Ty(Ctx);
-    const std::uint32_t Size =
-        static_cast<std::uint32_t>(P.original.size());
+    const std::uint32_t Size = static_cast<std::uint32_t>(P.original.size());
 
     const std::string EnsureName = "morok.sdb.ensure." + P.suffix;
-    auto *Fn = Function::Create(FunctionType::get(VoidTy, false),
+    SmallVector<Type *, 8> Params;
+    for (Type *Ty : P.helper->getFunctionType()->params())
+        Params.push_back(Ty);
+
+    auto *Fn = Function::Create(FunctionType::get(VoidTy, Params, false),
                                 GlobalValue::InternalLinkage, EnsureName, &M);
     addRuntimeAttrs(Fn);
 
@@ -247,6 +289,8 @@ Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
     BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
 
     Builder EB(Entry);
+    Value *ContextZero =
+        ContextKeying ? emitContextZero(EB, Fn) : ConstantInt::get(I64, 0);
     auto *ReadyLoad = EB.CreateLoad(I1, Ready, "morok.sdb.ready.load");
     ReadyLoad->setVolatile(true);
     ReadyLoad->setAlignment(Align(1));
@@ -266,15 +310,13 @@ Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
         HB.CreateAdd(HashI, ConstantInt::get(I32, 1), "morok.sdb.hash.next");
     HashI->addIncoming(NextHashI, HashLoop);
     Hash->addIncoming(NextHash, HashLoop);
-    Value *HashDone =
-        HB.CreateICmpEQ(NextHashI, ConstantInt::get(I32, Size),
-                        "morok.sdb.hash.done");
+    Value *HashDone = HB.CreateICmpEQ(NextHashI, ConstantInt::get(I32, Size),
+                                      "morok.sdb.hash.done");
     HB.CreateCondBr(HashDone, Gate, HashLoop);
 
     Builder GB(Gate);
-    Value *GateOk =
-        GB.CreateICmpEQ(NextHash, ConstantInt::get(I64, S.expected_hash),
-                        "morok.sdb.gate");
+    Value *GateOk = GB.CreateICmpEQ(
+        NextHash, ConstantInt::get(I64, S.expected_hash), "morok.sdb.gate");
     GB.CreateCondBr(GateOk, DecryptLoop, Fail);
 
     Builder FB(Fail);
@@ -289,7 +331,7 @@ Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
     auto *Outer = DB.CreateLoad(I8, DecPtr, "morok.sdb.outer");
     Outer->setVolatile(true);
     Outer->setAlignment(Align(1));
-    Value *Key = emitKeyByte(DB, DecI, NextHash, S);
+    Value *Key = emitKeyByte(DB, DecI, NextHash, ContextZero, S);
     Value *Inner = DB.CreateXor(Outer, Key, "morok.sdb.inner");
     auto *Store = DB.CreateStore(Inner, DecPtr);
     Store->setVolatile(true);
@@ -297,9 +339,8 @@ Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
     Value *NextDecI =
         DB.CreateAdd(DecI, ConstantInt::get(I32, 1), "morok.sdb.dec.next");
     DecI->addIncoming(NextDecI, DecryptLoop);
-    Value *DecryptDone =
-        DB.CreateICmpEQ(NextDecI, ConstantInt::get(I32, Size),
-                        "morok.sdb.dec.done");
+    Value *DecryptDone = DB.CreateICmpEQ(NextDecI, ConstantInt::get(I32, Size),
+                                         "morok.sdb.dec.done");
     DB.CreateCondBr(DecryptDone, MarkReady, DecryptLoop);
 
     Builder RB(MarkReady);
@@ -326,20 +367,22 @@ void insertEnsureCall(Function *Helper, Function *Ensure) {
         return;
     Instruction *Term = Helper->getEntryBlock().getTerminator();
     Builder B(Term);
-    B.CreateCall(Ensure->getFunctionType(), Ensure, {});
+    SmallVector<Value *, 8> Args;
+    for (Argument &Arg : Helper->args())
+        Args.push_back(&Arg);
+    B.CreateCall(Ensure->getFunctionType(), Ensure, Args);
     Helper->setMemoryEffects(MemoryEffects::unknown());
     Helper->removeFnAttr(Attribute::NoSync);
 }
 
-bool wrapPayload(Module &M, Payload &P, ir::IRRandom &Rng) {
+bool wrapPayload(Module &M, Payload &P,
+                 const HashGatedSelfDecryptParams &Params, ir::IRRandom &Rng) {
     StreamSchedule S = makeSchedule(Rng);
-    std::vector<std::uint8_t> Outer =
-        outerEncrypt(ArrayRef<std::uint8_t>(P.original.data(),
-                                            P.original.size()),
-                     S);
+    std::vector<std::uint8_t> Outer = outerEncrypt(
+        ArrayRef<std::uint8_t>(P.original.data(), P.original.size()), S);
     makeMutablePayload(*P.bytecode, Outer);
     GlobalVariable *Ready = createReady(M, P.suffix);
-    Function *Ensure = createEnsure(M, P, Ready, S);
+    Function *Ensure = createEnsure(M, P, Ready, S, Params.context_keying);
     insertEnsureCall(P.helper, Ensure);
     return true;
 }
@@ -364,7 +407,7 @@ bool hashGatedSelfDecryptModule(Module &M,
             break;
         if (!Rng.chance(Params.probability))
             continue;
-        Changed |= wrapPayload(M, P, Rng);
+        Changed |= wrapPayload(M, P, Params, Rng);
         ++Wrapped;
     }
     return Changed;

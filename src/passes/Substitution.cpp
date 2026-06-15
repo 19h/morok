@@ -25,6 +25,8 @@ namespace morok::passes {
 
 namespace {
 
+constexpr std::size_t kMaxSubstitutionTargetsPerIteration = 256;
+
 using Builder = IRBuilder<NoFolder>;
 
 // Emit an equivalent expression for `bo`, or nullptr if this opcode/operand
@@ -130,11 +132,17 @@ bool substituteFunction(Function &F, const SubstitutionParams &params,
 
     for (std::uint32_t it = 0; it < iterations; ++it) {
         std::vector<BinaryOperator *> targets;
-        for (BasicBlock &bb : F)
-            for (Instruction &inst : bb)
+        for (BasicBlock &bb : F) {
+            for (Instruction &inst : bb) {
+                if (targets.size() >= kMaxSubstitutionTargetsPerIteration)
+                    break;
                 if (auto *bo = dyn_cast<BinaryOperator>(&inst))
                     if (bo->getType()->isIntegerTy())
                         targets.push_back(bo);
+            }
+            if (targets.size() >= kMaxSubstitutionTargetsPerIteration)
+                break;
+        }
 
         for (BinaryOperator *bo : targets) {
             if (!rng.chance(params.probability))

@@ -65,6 +65,13 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.stack_coalesce.probability, src.stack_coalesce.probability);
     mergeOpt(dst.stack_coalesce.opaque_offsets,
              src.stack_coalesce.opaque_offsets);
+    // Stack pointer delta games
+    mergeOpt(dst.stack_delta.enabled, src.stack_delta.enabled);
+    mergeOpt(dst.stack_delta.probability, src.stack_delta.probability);
+    mergeOpt(dst.stack_delta.max_blocks, src.stack_delta.max_blocks);
+    mergeOpt(dst.stack_delta.min_bytes, src.stack_delta.min_bytes);
+    mergeOpt(dst.stack_delta.max_extra_bytes, src.stack_delta.max_extra_bytes);
+    mergeOpt(dst.stack_delta.touches, src.stack_delta.touches);
     // Pointer laundering
     mergeOpt(dst.pointer_launder.enabled, src.pointer_launder.enabled);
     mergeOpt(dst.pointer_launder.pointer_probability,
@@ -113,8 +120,7 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.state_opaque.max_blocks, src.state_opaque.max_blocks);
     mergeOpt(dst.state_opaque.max_terms, src.state_opaque.max_terms);
     // Interprocedural FSM splitting
-    mergeOpt(dst.interprocedural_fsm.enabled,
-             src.interprocedural_fsm.enabled);
+    mergeOpt(dst.interprocedural_fsm.enabled, src.interprocedural_fsm.enabled);
     mergeOpt(dst.interprocedural_fsm.probability,
              src.interprocedural_fsm.probability);
     mergeOpt(dst.interprocedural_fsm.max_sites,
@@ -156,15 +162,15 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.hash_self_decrypt.probability);
     mergeOpt(dst.hash_self_decrypt.max_payloads,
              src.hash_self_decrypt.max_payloads);
+    mergeOpt(dst.hash_self_decrypt.context_keying,
+             src.hash_self_decrypt.context_keying);
     // Self-checksum-fused constants
     mergeOpt(dst.self_checksum.enabled, src.self_checksum.enabled);
     mergeOpt(dst.self_checksum.probability, src.self_checksum.probability);
-    mergeOpt(dst.self_checksum.max_constants,
-             src.self_checksum.max_constants);
+    mergeOpt(dst.self_checksum.max_constants, src.self_checksum.max_constants);
     mergeOpt(dst.self_checksum.region_bytes, src.self_checksum.region_bytes);
     // Data-flow-entangled integrity
-    mergeOpt(dst.data_flow_integrity.enabled,
-             src.data_flow_integrity.enabled);
+    mergeOpt(dst.data_flow_integrity.enabled, src.data_flow_integrity.enabled);
     mergeOpt(dst.data_flow_integrity.probability,
              src.data_flow_integrity.probability);
     mergeOpt(dst.data_flow_integrity.max_tables,
@@ -177,6 +183,20 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.mutual_guard.nodes, src.mutual_guard.nodes);
     mergeOpt(dst.mutual_guard.region_bytes, src.mutual_guard.region_bytes);
     mergeOpt(dst.mutual_guard.max_returns, src.mutual_guard.max_returns);
+    // Shamir threshold sharing
+    mergeOpt(dst.shamir_share.enabled, src.shamir_share.enabled);
+    mergeOpt(dst.shamir_share.probability, src.shamir_share.probability);
+    mergeOpt(dst.shamir_share.threshold, src.shamir_share.threshold);
+    mergeOpt(dst.shamir_share.shares, src.shamir_share.shares);
+    mergeOpt(dst.shamir_share.max_secrets, src.shamir_share.max_secrets);
+    // Multivariate-quadratic gate
+    mergeOpt(dst.mq_gate.enabled, src.mq_gate.enabled);
+    mergeOpt(dst.mq_gate.probability, src.mq_gate.probability);
+    mergeOpt(dst.mq_gate.vars, src.mq_gate.vars);
+    mergeOpt(dst.mq_gate.eqs, src.mq_gate.eqs);
+    mergeOpt(dst.mq_gate.density, src.mq_gate.density);
+    mergeOpt(dst.mq_gate.max_gates, src.mq_gate.max_gates);
+    mergeOpt(dst.mq_gate.fold_diff, src.mq_gate.fold_diff);
     // Adversarial function merging + outlining
     mergeOpt(dst.adversarial_merge.enabled, src.adversarial_merge.enabled);
     mergeOpt(dst.adversarial_merge.probability,
@@ -189,6 +209,16 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.adversarial_merge.outline_probability);
     mergeOpt(dst.adversarial_merge.max_outlines,
              src.adversarial_merge.max_outlines);
+    // Adversarial self-tuning
+    mergeOpt(dst.adversarial_tuning.enabled, src.adversarial_tuning.enabled);
+    mergeOpt(dst.adversarial_tuning.max_candidates,
+             src.adversarial_tuning.max_candidates);
+    mergeOpt(dst.adversarial_tuning.max_candidate_passes,
+             src.adversarial_tuning.max_candidate_passes);
+    mergeOpt(dst.adversarial_tuning.score_floor,
+             src.adversarial_tuning.score_floor);
+    mergeOpt(dst.adversarial_tuning.emit_marker,
+             src.adversarial_tuning.emit_marker);
     // Per-build polymorphism
     mergeOpt(dst.per_build_polymorphism.enabled,
              src.per_build_polymorphism.enabled);
@@ -215,6 +245,17 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.dispatcherless.probability, src.dispatcherless.probability);
     mergeOpt(dst.dispatcherless.max_routes, src.dispatcherless.max_routes);
     mergeOpt(dst.dispatcherless.max_terms, src.dispatcherless.max_terms);
+    // Microcode optimizer stress
+    mergeOpt(dst.microcode_stress.enabled, src.microcode_stress.enabled);
+    mergeOpt(dst.microcode_stress.probability,
+             src.microcode_stress.probability);
+    mergeOpt(dst.microcode_stress.max_sites, src.microcode_stress.max_sites);
+    mergeOpt(dst.microcode_stress.table_entries,
+             src.microcode_stress.table_entries);
+    mergeOpt(dst.microcode_stress.decoy_blocks,
+             src.microcode_stress.decoy_blocks);
+    mergeOpt(dst.microcode_stress.alias_stores,
+             src.microcode_stress.alias_stores);
     // StrEnc
     mergeOpt(dst.str_enc.enabled, src.str_enc.enabled);
     mergeOpt(dst.str_enc.probability, src.str_enc.probability);
@@ -240,6 +281,8 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.vec.lift_comparisons, src.vec.lift_comparisons);
     // CSM
     mergeOpt(dst.csm.enabled, src.csm.enabled);
+    mergeOpt(dst.csm.generator, src.csm.generator);
+    mergeOpt(dst.csm.tf_const, src.csm.tf_const);
     mergeOpt(dst.csm.nested_dispatch, src.csm.nested_dispatch);
     mergeOpt(dst.csm.warmup, src.csm.warmup);
     // Toggles

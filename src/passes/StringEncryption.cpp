@@ -26,6 +26,10 @@ namespace gf8 = core::gf8;
 
 namespace {
 
+constexpr std::uint64_t kMaxEncryptedStrings = 64;
+constexpr std::uint64_t kMaxEncryptedStringBytes = 1024;
+constexpr std::uint64_t kMaxEncryptedTotalBytes = 4096;
+
 // Emit (once) an internal GF(2^8) multiply mirroring morok::core::gf8::mul:
 // shift-and-add over xtime with the AES reduction polynomial, unrolled 8×.
 Function *getOrCreateGf8Mul(Module &M) {
@@ -84,18 +88,34 @@ struct Encrypted {
 
 bool stringEncryptModule(Module &M, const StrEncParams &params,
                          ir::IRRandom &rng) {
+    if (params.probability == 0)
+        return false;
+
     LLVMContext &ctx = M.getContext();
     auto *i8 = Type::getInt8Ty(ctx);
 
     std::vector<GlobalVariable *> targets;
-    for (GlobalVariable &gv : M.globals())
-        if (eligible(gv))
+    targets.reserve(kMaxEncryptedStrings);
+    std::uint64_t selectedBytes = 0;
+    for (GlobalVariable &gv : M.globals()) {
+        if (targets.size() >= kMaxEncryptedStrings ||
+            selectedBytes >= kMaxEncryptedTotalBytes)
+            break;
+        if (!eligible(gv))
+            continue;
+        const auto *cda = cast<ConstantDataArray>(gv.getInitializer());
+        const std::uint64_t n = cda->getNumElements();
+        if (n > kMaxEncryptedStringBytes ||
+            selectedBytes + n > kMaxEncryptedTotalBytes)
+            continue;
+        if (rng.chance(params.probability)) {
             targets.push_back(&gv);
+            selectedBytes += n;
+        }
+    }
 
     std::vector<Encrypted> encrypted;
     for (GlobalVariable *gv : targets) {
-        if (!rng.chance(params.probability))
-            continue;
         const auto *cda = cast<ConstantDataArray>(gv->getInitializer());
         StringRef raw = cda->getRawDataValues();
         const std::uint64_t n = cda->getNumElements();

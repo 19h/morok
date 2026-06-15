@@ -39,6 +39,9 @@ namespace morok::passes {
 
 namespace {
 
+constexpr std::uint64_t kCloneInstLimit = 1500;
+constexpr std::uint64_t kCloneBlockLimit = 160;
+
 using Builder = IRBuilder<NoFolder>;
 
 struct SignatureGroup {
@@ -117,6 +120,18 @@ bool hasBlockAddressUser(const Function &F) {
     return false;
 }
 
+std::uint64_t instructionCount(const Function &F) {
+    std::uint64_t Count = 0;
+    for (const BasicBlock &BB : F)
+        Count += BB.size();
+    return Count;
+}
+
+bool withinCloneBudget(const Function &F) {
+    return instructionCount(F) <= kCloneInstLimit &&
+           F.size() <= kCloneBlockLimit;
+}
+
 bool eligibleFunction(Function &F) {
     if (F.isDeclaration() || F.isIntrinsic() || F.isVarArg())
         return false;
@@ -125,6 +140,8 @@ bool eligibleFunction(Function &F) {
     if (hasBlockAddressUser(F))
         return false;
     if (F.hasAvailableExternallyLinkage() || F.hasFnAttribute(Attribute::Naked))
+        return false;
+    if (!withinCloneBudget(F))
         return false;
     if (F.hasFnAttribute(Attribute::NoReturn) || F.hasPersonalityFn())
         return false;
@@ -220,9 +237,9 @@ std::vector<SignatureGroup> collectGroups(Module &M) {
 }
 
 Function *cloneToImpl(Function &F, Module &M) {
-    auto *Impl = Function::Create(
-        F.getFunctionType(), GlobalValue::InternalLinkage,
-        (Twine("morok.afm.impl.") + F.getName()).str(), &M);
+    auto *Impl =
+        Function::Create(F.getFunctionType(), GlobalValue::InternalLinkage,
+                         (Twine("morok.afm.impl.") + F.getName()).str(), &M);
     Impl->copyAttributesFrom(&F);
     Impl->setLinkage(GlobalValue::InternalLinkage);
     Impl->setVisibility(GlobalValue::DefaultVisibility);
@@ -311,17 +328,16 @@ Function *createDispatcher(Module &M, const SignatureGroup &Group,
     BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Dispatch);
     BasicBlock *Default = BasicBlock::Create(Ctx, "invalid", Dispatch);
     Builder B(Entry);
-    auto *Switch = B.CreateSwitch(Selector, Default,
-                                  static_cast<unsigned>(Merged.size()));
+    auto *Switch =
+        B.CreateSwitch(Selector, Default, static_cast<unsigned>(Merged.size()));
 
     for (const MergedFunction &MF : Merged) {
         BasicBlock *Case = BasicBlock::Create(
             Ctx, (Twine("case.") + MF.original->getName()).str(), Dispatch);
         Switch->addCase(ConstantInt::get(I32, MF.selector), Case);
         B.SetInsertPoint(Case);
-        CallInst *Call =
-            B.CreateCall(MF.impl->getFunctionType(), MF.impl, Args,
-                         "morok.afm.impl.call");
+        CallInst *Call = B.CreateCall(MF.impl->getFunctionType(), MF.impl, Args,
+                                      "morok.afm.impl.call");
         Call->setCallingConv(MF.impl->getCallingConv());
         if (Group.type->getReturnType()->isVoidTy())
             B.CreateRetVoid();
@@ -334,8 +350,8 @@ Function *createDispatcher(Module &M, const SignatureGroup &Group,
     return Dispatch;
 }
 
-void rewriteOriginalAsWrapper(MergedFunction &MF, Function *Dispatch,
-                              Module &M, ir::IRRandom &Rng) {
+void rewriteOriginalAsWrapper(MergedFunction &MF, Function *Dispatch, Module &M,
+                              ir::IRRandom &Rng) {
     Function &F = *MF.original;
     F.deleteBody();
     addNoInlineBarrier(&F);
@@ -387,12 +403,12 @@ Function *createOutlineHelper(Module &M, const OutlineKey &Key,
     auto *Ty = IntegerType::get(Ctx, Key.bits);
     auto *I64 = Type::getInt64Ty(Ctx);
     auto *FT = FunctionType::get(Ty, {Ty, Ty}, false);
-    auto *Fn = Function::Create(
-        FT, GlobalValue::InternalLinkage,
-        (Twine("morok.afm.outline.") + opcodeName(Key.opcode) + ".i" +
-         Twine(Key.bits))
-            .str(),
-        &M);
+    auto *Fn =
+        Function::Create(FT, GlobalValue::InternalLinkage,
+                         (Twine("morok.afm.outline.") + opcodeName(Key.opcode) +
+                          ".i" + Twine(Key.bits))
+                             .str(),
+                         &M);
     Fn->setDSOLocal(true);
     addGeneratedAttrs(Fn);
 
@@ -430,8 +446,7 @@ Function *getOutlineHelper(Module &M, std::vector<OutlineHelper> &Helpers,
 }
 
 bool outlineFragments(Module &M, ArrayRef<Function *> ImplFunctions,
-                      const AdversarialMergeParams &Params,
-                      ir::IRRandom &Rng) {
+                      const AdversarialMergeParams &Params, ir::IRRandom &Rng) {
     if (Params.outline_probability == 0 || Params.max_outlines == 0)
         return false;
 
@@ -503,8 +518,8 @@ bool mergeGroup(Module &M, SignatureGroup &Group,
     SmallVector<Function *, 8> ImplFunctions = impls(Merged);
     outlineFragments(M, ArrayRef<Function *>(ImplFunctions), Params, Rng);
 
-    Function *Dispatch =
-        createDispatcher(M, Group, ArrayRef<MergedFunction>(Merged), GroupIndex);
+    Function *Dispatch = createDispatcher(
+        M, Group, ArrayRef<MergedFunction>(Merged), GroupIndex);
     for (MergedFunction &MF : Merged)
         rewriteOriginalAsWrapper(MF, Dispatch, M, Rng);
     return true;
@@ -537,8 +552,8 @@ bool adversarialFunctionMergingModule(Module &M,
     return Changed;
 }
 
-PreservedAnalyses
-AdversarialFunctionMergingPass::run(Module &M, ModuleAnalysisManager &) {
+PreservedAnalyses AdversarialFunctionMergingPass::run(Module &M,
+                                                      ModuleAnalysisManager &) {
     ir::IRRandom Rng(engine_);
     return adversarialFunctionMergingModule(M, params_, Rng)
                ? PreservedAnalyses::none()

@@ -59,6 +59,15 @@ struct StackCoalesceConfig {
     Opt<bool> opaque_offsets;
 };
 
+struct StackDeltaConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> max_blocks;
+    Opt<std::uint32_t> min_bytes;
+    Opt<std::uint32_t> max_extra_bytes;
+    Opt<std::uint32_t> touches;
+};
+
 struct PointerLaunderConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> pointer_probability;
@@ -163,6 +172,7 @@ struct HashSelfDecryptConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
     Opt<std::uint32_t> max_payloads;
+    Opt<bool> context_keying;
 };
 
 struct SelfChecksumConfig {
@@ -187,6 +197,24 @@ struct MutualGuardConfig {
     Opt<std::uint32_t> max_returns;
 };
 
+struct ShamirShareConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> threshold;
+    Opt<std::uint32_t> shares;
+    Opt<std::uint32_t> max_secrets;
+};
+
+struct MqGateConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> vars;
+    Opt<std::uint32_t> eqs;
+    Opt<std::uint32_t> density;
+    Opt<std::uint32_t> max_gates;
+    Opt<bool> fold_diff;
+};
+
 struct AdversarialMergeConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
@@ -194,6 +222,14 @@ struct AdversarialMergeConfig {
     Opt<std::uint32_t> max_functions;
     Opt<std::uint32_t> outline_probability;
     Opt<std::uint32_t> max_outlines;
+};
+
+struct AdversarialTuningConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> max_candidates;
+    Opt<std::uint32_t> max_candidate_passes;
+    Opt<std::uint32_t> score_floor;
+    Opt<bool> emit_marker;
 };
 
 struct PerBuildPolymorphismConfig {
@@ -224,6 +260,15 @@ struct DispatcherlessConfig {
     Opt<std::uint32_t> max_terms;
 };
 
+struct MicrocodeStressConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> max_sites;
+    Opt<std::uint32_t> table_entries;
+    Opt<std::uint32_t> decoy_blocks;
+    Opt<std::uint32_t> alias_stores;
+};
+
 struct StrEncConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
@@ -252,8 +297,15 @@ struct VecConfig {
     Opt<bool> lift_comparisons;
 };
 
+enum class CsmGenerator {
+    Logistic,
+    TFunction,
+};
+
 struct CsmConfig {
     Opt<bool> enabled;
+    Opt<CsmGenerator> generator;
+    Opt<std::uint64_t> tf_const;
     Opt<bool> nested_dispatch;
     Opt<std::uint32_t> warmup;
 };
@@ -269,6 +321,7 @@ struct PassConfig {
     MbaConfig mba;
     SplitConfig split;
     StackCoalesceConfig stack_coalesce;
+    StackDeltaConfig stack_delta;
     PointerLaunderConfig pointer_launder;
     TypePunConfig type_pun;
     PhiTangleConfig phi_tangle;
@@ -288,11 +341,15 @@ struct PassConfig {
     SelfChecksumConfig self_checksum;
     DataFlowIntegrityConfig data_flow_integrity;
     MutualGuardConfig mutual_guard;
+    ShamirShareConfig shamir_share;
+    MqGateConfig mq_gate;
     AdversarialMergeConfig adversarial_merge;
+    AdversarialTuningConfig adversarial_tuning;
     PerBuildPolymorphismConfig per_build_polymorphism;
     PathExplosionConfig path_explosion;
     TraceKeyConfig trace_keying;
     DispatcherlessConfig dispatcherless;
+    MicrocodeStressConfig microcode_stress;
     StrEncConfig str_enc;
     ConstEncConfig const_enc;
     VecConfig vec;

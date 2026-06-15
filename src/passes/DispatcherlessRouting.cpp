@@ -47,6 +47,10 @@ struct RoutingState {
     std::unordered_map<BasicBlock *, std::uint32_t> idOf;
 };
 
+constexpr std::uint32_t kMaxRoutesPerInvocation = 32;
+constexpr std::uint32_t kMaxTermsPerSite = 8;
+constexpr std::uint32_t kMaxSuccessorsPerSite = 32;
+
 bool isGeneratedBlock(const BasicBlock &BB) {
     return BB.getName().starts_with("morok.");
 }
@@ -90,17 +94,13 @@ bool eligibleTerminator(Instruction &Term, BasicBlock *Entry) {
     if (!Parent || Parent->isEHPad() || Parent->isLandingPad() ||
         isGeneratedBlock(*Parent))
         return false;
-    for (BasicBlock *Succ : terminatorSuccessors(Term))
+    std::vector<BasicBlock *> Succs = terminatorSuccessors(Term);
+    if (Succs.empty() || Succs.size() > kMaxSuccessorsPerSite)
+        return false;
+    for (BasicBlock *Succ : Succs)
         if (!validSuccessor(Succ, Entry))
             return false;
     return true;
-}
-
-void shuffleSites(std::vector<RouteSite> &Sites, ir::IRRandom &rng) {
-    for (std::size_t I = Sites.size(); I > 1; --I) {
-        const std::size_t J = rng.range(static_cast<std::uint32_t>(I));
-        std::swap(Sites[I - 1], Sites[J]);
-    }
 }
 
 AllocaInst *createState(Function &F) {
@@ -149,30 +149,37 @@ Value *asI32(IRBuilder<NoFolder> &B, Value *V) {
 }
 
 void addTerm(Value *V, SmallPtrSetImpl<Value *> &Seen,
-             std::vector<Value *> &Terms) {
+             std::vector<Value *> &Terms, std::uint32_t Limit) {
+    if (Terms.size() >= Limit)
+        return;
     if (!V || !V->getType()->isIntegerTy())
         return;
     if (Seen.insert(V).second)
         Terms.push_back(V);
 }
 
-std::vector<Value *> collectTerms(Instruction &Term) {
+std::vector<Value *> collectTerms(Instruction &Term, std::uint32_t MaxTerms) {
     std::vector<Value *> Terms;
+    const std::uint32_t Limit = std::min(MaxTerms, kMaxTermsPerSite);
+    if (Limit == 0)
+        return Terms;
     SmallPtrSet<Value *, 32> Seen;
 
     if (auto *Br = dyn_cast<BranchInst>(&Term)) {
         if (Br->isConditional())
-            addTerm(Br->getCondition(), Seen, Terms);
+            addTerm(Br->getCondition(), Seen, Terms, Limit);
     } else if (auto *Sw = dyn_cast<SwitchInst>(&Term)) {
-        addTerm(Sw->getCondition(), Seen, Terms);
+        addTerm(Sw->getCondition(), Seen, Terms, Limit);
     }
 
     for (Instruction &I : *Term.getParent()) {
+        if (Terms.size() >= Limit)
+            break;
         if (&I == &Term)
             break;
         if (isa<AllocaInst>(&I))
             continue;
-        addTerm(&I, Seen, Terms);
+        addTerm(&I, Seen, Terms, Limit);
     }
     return Terms;
 }
@@ -227,7 +234,7 @@ Value *tokenFor(IRBuilder<NoFolder> &B, RoutingState &State, Instruction &Term,
         Cur, ConstantInt::get(I32, static_cast<std::uint32_t>(rng.next())),
         "morok.dlf.token.seed");
 
-    std::vector<Value *> Terms = collectTerms(Term);
+    std::vector<Value *> Terms = collectTerms(Term, Params.max_terms);
     shuffleTerms(Terms, rng);
     const std::uint32_t Limit = std::min<std::uint32_t>(
         Params.max_terms, static_cast<std::uint32_t>(Terms.size()));
@@ -310,24 +317,19 @@ bool dispatcherlessRoutingFunction(Function &F,
         params.probability == 0 || params.max_routes == 0)
         return false;
 
+    const std::uint32_t RouteLimit =
+        std::min(params.max_routes, kMaxRoutesPerInvocation);
     BasicBlock *Entry = &F.getEntryBlock();
-    std::vector<RouteSite> Candidates;
+    std::vector<RouteSite> Selected;
+    Selected.reserve(RouteLimit);
     for (BasicBlock &BB : F) {
+        if (Selected.size() >= RouteLimit)
+            break;
         Instruction *Term = BB.getTerminator();
         if (!Term || !eligibleTerminator(*Term, Entry))
             continue;
-        Candidates.push_back({Term, terminatorSuccessors(*Term)});
-    }
-    shuffleSites(Candidates, rng);
-
-    std::vector<RouteSite> Selected;
-    Selected.reserve(
-        std::min<std::size_t>(Candidates.size(), params.max_routes));
-    for (RouteSite &Site : Candidates) {
-        if (Selected.size() >= params.max_routes)
-            break;
         if (rng.chance(params.probability))
-            Selected.push_back(std::move(Site));
+            Selected.push_back({Term, terminatorSuccessors(*Term)});
     }
     if (Selected.empty())
         return false;

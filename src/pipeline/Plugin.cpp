@@ -16,6 +16,7 @@
 #include "morok/config/Resolver.hpp"
 #include "morok/config/TomlLoader.hpp"
 #include "morok/passes/AdversarialFunctionMerging.hpp"
+#include "morok/passes/AdversarialSelfTuning.hpp"
 #include "morok/passes/AliasOpaquePredicates.hpp"
 #include "morok/passes/AntiAnalysis.hpp"
 #include "morok/passes/ArithmeticTables.hpp"
@@ -34,6 +35,8 @@
 #include "morok/passes/IndirectBranch.hpp"
 #include "morok/passes/InterproceduralFsm.hpp"
 #include "morok/passes/Mba.hpp"
+#include "morok/passes/MicrocodeStress.hpp"
+#include "morok/passes/MqGate.hpp"
 #include "morok/passes/MutualGuardGraph.hpp"
 #include "morok/passes/NonInvertibleState.hpp"
 #include "morok/passes/OptimizerAmplification.hpp"
@@ -42,8 +45,10 @@
 #include "morok/passes/PhiTangling.hpp"
 #include "morok/passes/PointerLaundering.hpp"
 #include "morok/passes/SelfChecksumConstants.hpp"
+#include "morok/passes/ShamirShare.hpp"
 #include "morok/passes/SplitBasicBlocks.hpp"
 #include "morok/passes/StackCoalescing.hpp"
+#include "morok/passes/StackDeltaGames.hpp"
 #include "morok/passes/StateOpaquePredicates.hpp"
 #include "morok/passes/StringEncryption.hpp"
 #include "morok/passes/SubThresholdPersistence.hpp"
@@ -192,6 +197,10 @@ PassPluginLibraryInfo getPluginInfo() {
                                 passes::AdversarialFunctionMergingPass());
                             return true;
                         }
+                        if (name == "morok-selftune") {
+                            MPM.addPass(passes::AdversarialSelfTuningPass());
+                            return true;
+                        }
                         if (name == "morok-polymorph") {
                             MPM.addPass(passes::PerBuildPolymorphismPass());
                             return true;
@@ -255,12 +264,20 @@ PassPluginLibraryInfo getPluginInfo() {
                             FPM.addPass(passes::MutualGuardGraphPass());
                             return true;
                         }
+                        if (name == "morok-shamir") {
+                            FPM.addPass(passes::ShamirSharePass());
+                            return true;
+                        }
                         if (name == "morok-split") {
                             FPM.addPass(passes::SplitBasicBlocksPass());
                             return true;
                         }
                         if (name == "morok-stackcoalesce") {
                             FPM.addPass(passes::StackCoalescingPass());
+                            return true;
+                        }
+                        if (name == "morok-stackdelta") {
+                            FPM.addPass(passes::StackDeltaGamesPass());
                             return true;
                         }
                         if (name == "morok-ptrlaunder") {
@@ -312,6 +329,12 @@ PassPluginLibraryInfo getPluginInfo() {
                             FPM.addPass(passes::ChaosStateMachinePass());
                             return true;
                         }
+                        if (name == "morok-tfa") {
+                            passes::CsmParams p;
+                            p.generator = passes::CsmGenerator::TFunction;
+                            FPM.addPass(passes::ChaosStateMachinePass(p));
+                            return true;
+                        }
                         if (name == "morok-vec") {
                             FPM.addPass(passes::VectorObfuscationPass());
                             return true;
@@ -332,8 +355,16 @@ PassPluginLibraryInfo getPluginInfo() {
                             FPM.addPass(passes::PathExplosionPass());
                             return true;
                         }
+                        if (name == "morok-mq") {
+                            FPM.addPass(passes::MqGatePass());
+                            return true;
+                        }
                         if (name == "morok-tracekey") {
                             FPM.addPass(passes::TraceKeyingPass());
+                            return true;
+                        }
+                        if (name == "morok-microstress") {
+                            FPM.addPass(passes::MicrocodeStressPass());
                             return true;
                         }
                         if (name == "morok-dispatchless") {

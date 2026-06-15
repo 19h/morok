@@ -22,12 +22,16 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Variant counts: Add 13, Sub 10, And 10, Or 10, Xor 12, Mul 7, Shl/LShr/AShr 2.
 - Shifts only substituted when shift amount is a `ConstantInt`; LShr/AShr skip k==0;
   all skip k>=width. AShr identity = "XOR distributes over arithmetic shift".
-- Max-target throttle: if `eligible*prob/100 > 10000`, scale prob down.
+- Direct memory cap: each sweep collects at most 256 target binary operators.
+  Larger functions are partially transformed rather than expanding every
+  eligible operation in one pass invocation.
 
 ## Mixed Boolean-Arithmetic — `core/MbaIdentities`
 - Variant counts: Add 8, Sub 7, Xor 7, And 8, Or 7, Mul 5. `mba_prob` (default 60),
   `mba_layers` (default 2, clamp 1..3), `mba_heuristic` (default true).
-- Layers compound: layer L+1 sees layer L output. Per-layer max-target throttle 10000.
+- Layers compound: layer L+1 sees layer L output. Each layer collects at most
+  256 target binary operators, so MBA cannot compound across an unbounded
+  eligible set in one pass invocation.
 - Heuristic noise = `zeroTerm` (k terms) added/subtracted; always nets to 0.
 - Carry lemma `x+r == (x^r)+2*(x&r)` underpins the random-constant variants.
 
@@ -40,6 +44,10 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Wider types (i16/i32/i64): plain XOR cipher (`enc = K^V`), not GF8.
 - `strcry_prob` default 100; per-element coin `get_range(100) >= prob` ⇒ left clear.
   Content regex `skip_content`/`force_content` over raw bytes.
+- Direct memory caps: the pass encrypts at most 64 string globals, skips any
+  single string above 1024 bytes, and emits at most 4096 bytes of decryptor
+  payload per module.  Larger literals remain clear rather than expanding into
+  one decryptor instruction sequence per byte.
 
 ## Constant encryption — `core/XorShare`, `core/Feistel`
 - Pipeline: `origC ─[Feistel if feistel && bits>=16]→ workC ─[k-share XOR or single XOR]→ shares`.
@@ -51,6 +59,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Flags: `constenc_times` 1, `constenc_kshare` 2, `constenc_feistel` off,
   `constenc_subxor` off / `_prob` 40, `constenc_togv` off / `_prob` 50.
   Max-mode forces kshare=4, feistel=true. `skip_value`/`force_value` regex on hex.
+- Direct memory cap: each constant-encryption sweep rewrites at most 128
+  literal operands.  With the default two-share mode that bounds new share
+  globals to 256 per function per sweep.
 
 ## Data-entangled flattening — IR structure
 - The pass reuses the standard switch dispatcher, but replaces direct
@@ -135,21 +146,36 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   storing the same token to `morok.dlf.shadow[0/1]`; the token is mixed from the
   previous `morok.dlf.state` and up to `max_terms` live integer values from the
   source block.
+- Route selection has hard standalone ceilings of 32 route sites, 8 mixed live
+  terms per site, and 32 successors per site.  Larger functions are partially
+  routed, and very large switches are left direct.
 - PHI correctness is preserved because each original predecessor still
   terminates to the same possible successors, only via `indirectbr`.  The pass
   skips EH pads, generated `morok.*` blocks, and entry-block targets.
 - The scheduler runs this late, after flattening and path-explosion, so it
   removes remaining direct CFG edges without blocking earlier CFG transforms.
 
-## Chaos state machine — `core/LogisticMap`
-- Q16 logistic map `step(x)`: `r·x·(1−x)` with r encoded 65533, `>>30`, guards
-  0x1337 (input 0) / 0xC0DE (output 0). Default seed 0x4B1D, `csm_warmup` 64.
-- Dispatcher state held XOR-masked by per-function `feistelK`. Transition realised as
-  `next = step(current) ^ correction(i,j)`, `correction(i,j)=step(case_i)^case_j`.
-- `csm_nested` (default off): when numBBs>=4, relay blocks add an inner switch on the
-  low nibble (`&0xF`) — CFG multiplier, semantic no-op. `csm_maxblocks` 10000 size guard.
-- Sequence build uses unique-state collection + anti-stuck XOR perturbation (impure;
-  the pure `step` alone cycles after a few hundred states — by design).
+## Chaos state machine — `core/LogisticMap` / `core/TFunction`
+- The CSM flattening slot now has a generator selector.  `generator=logistic`
+  emits the original Q16 logistic step `r*x*(1-x)` with r encoded as 65533,
+  `>>30`, and zero guards.  `generator=tfunction` emits the Klimov-Shamir
+  quadratic T-function `step(x) = x + (x*x | C) mod 2^32`.
+- T-function constants are valid when `C mod 8` is 5 or 7.  `tf_const=0` means
+  the pass draws a per-build valid constant from the shared PRNG; an invalid
+  configured constant also falls back to a random valid one.  The first
+  `numBlocks` states are guaranteed distinct within the 32-bit dispatcher
+  domain because this family is a single 2^n-cycle permutation.
+- Transitions keep the existing telescoping form:
+  `next = step(current) ^ correction(i,j)`, where
+  `correction(i,j)=step(case_i)^case_j`.  The runtime step is nonlinear
+  (`mul`/`or`/`add`) and the compile-time correction lands exactly on the target
+  dispatcher id, so the switch skeleton and downstream StateOpaque/IFSM passes
+  compose unchanged.
+- Standalone `morok-csm` uses the default logistic generator for compatibility.
+  Standalone `morok-tfa` runs the same flattener with `generator=tfunction`.
+  In the scheduler, mid/high presets select the T-function generator; the CSM
+  slot still participates in the same precedence cascade:
+  NonInvertibleState → DataEntangledFlattening → CSM → plain Flattening.
 
 ## Stack coalescing — IR structure
 - Eligible locals are static entry-block allocas in address space 0 with fixed,
@@ -166,6 +192,27 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Lifetime markers naming coalesced allocas are removed, because LLVM lifetime
   intrinsics may only name an alloca or poison after opaque pointers.
 
+## Stack-pointer-delta games — IR-forced backend structure
+- This is the target-independent IR form of the roadmap's MIR stack-delta item.
+  Selected blocks are split and prefixed with `llvm.stacksave`, a bounded
+  variable-sized `alloca i8, morok.stackdelta.size`, odd-offset volatile stack
+  writes, and `llvm.stackrestore`.
+- The dynamic size is derived from a volatile private `morok.stackdelta.seed`
+  load, integer arguments/live terms visible at the split point, a per-build
+  salt, an odd minimum byte count, and a bounded `max_extra_bytes` mask.  The
+  allocation is therefore not a static frame object the decompiler can fold
+  into ordinary typed locals.
+- The volatile stores deliberately overlap: an unaligned i64 write at byte
+  offset 1 is followed by configurable i8 writes at offsets inside that word.
+  Runtime program data is unchanged, but the backend must materialize irregular
+  stack memory and stack-pointer movement.
+- `stackrestore` runs before the original body, so loops do not accumulate
+  unbounded dynamic allocations.  The pass skips generated `morok.*` functions,
+  EH pads, landing pads, naked functions, and generated stack-delta blocks.
+- Scheduler placement is after StackCoalescing and before PointerLaundering:
+  static locals are first folded into the opaque frame, then stack deltas are
+  added, then later pointer laundering can further obscure stack accesses.
+
 ## Pointer/integer laundering — IR structure
 - Pointer operands of loads, stores, GEPs, atomics, and memory intrinsics are
   laundered when their address space is integral and target rules allow both
@@ -176,6 +223,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Integer SSA values with byte-sized scalar widths are laundered as
   `iN -> <N/8 x i8> -> shufflevector identity -> iN`, giving decompilers a
   conflicting byte-vector view of scalar values without changing bits.
+- Direct memory caps: each invocation launders at most 128 pointer operands and
+  at most 128 integer SSA values.
 
 ## Type punning — IR structure
 - Eligible scalar-producing instructions (`iN`, `half`, `bfloat`, `float`,
@@ -318,8 +367,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   readiness flag.  Function bodies call the decoder, compute the byte-pair
   index, and load the result, so decompilers see array indexing instead of the
   original arithmetic.
-- `max_tables` caps per-function table growth.  The scheduler skips generated
-  `morok.*` helper functions so decoders are not recursively obfuscated.
+- `max_tables` caps per-function table growth, and standalone invocation has a
+  hard ceiling of 16 selected tables.  The scheduler skips generated `morok.*`
+  helper functions so decoders are not recursively obfuscated.
 
 ## Uniform primitive lowering — IR structure
 - This is the IR-level half of the roadmap's IR/MIR item.  It deliberately
@@ -329,11 +379,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   lazy table materialization from TableArithmetic, governed by `op_probability`
   and `max_tables`.  This removes opcode intent from the function body while
   keeping plaintext truth tables out of static initializers.
-- Selected direct branches and switches are collected up to `max_branches` and
-  lowered to a private per-function `morok.uniform.table` of `blockaddress`
-  entries.  Conditional branches become `select cond, true_id, false_id`;
-  switches become chained `icmp`/`select`; the resulting index GEPs into the
-  table, loads a target pointer, and dispatches through `indirectbr`.
+- Selected direct branches and switches are collected up to `max_branches` with
+  a hard ceiling of 16 branch sites and 32 successors per site, then lowered to
+  a private per-function `morok.uniform.table` of `blockaddress` entries.
+  Conditional branches become `select cond, true_id, false_id`; switches become
+  chained `icmp`/`select`; the resulting index GEPs into the table, loads a
+  target pointer, and dispatches through `indirectbr`.
 - PHI correctness is preserved because each transformed predecessor still has
   the same possible successor set, only reached through memory-loaded dispatch.
   EH pads, landing pads, entry-block backedges, and generated `morok.*` blocks
@@ -376,10 +427,17 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   original per-PC bytecode encryption remains inside that layer.
 - For each wrapped payload the pass emits an internal
   `morok.sdb.ensure.*` helper and private `morok.sdb.ready.*` flag.  The VM
-  helper calls the ensure function before its dispatch loop reads bytecode.
+  helper calls the ensure function before its dispatch loop reads bytecode,
+  passing through the helper's original arguments.
 - The ensure function first hashes the still-encrypted payload through volatile
   byte loads.  A `morok.sdb.gate` compare must match the embedded expected hash;
   mismatch calls `llvm.trap`.
+- With `context_keying=true`, the ensure helper also folds VM call context into
+  the stream key: each argument is volatile-stored to a local context slot,
+  loaded twice, xored to a runtime zero, and mixed as `morok.sdb.key.context`.
+  The correct path still decrypts exactly, but the IR key now carries
+  argument-derived, volatile memory-dependent provenance instead of being a
+  purely static payload-hash expression.
 - Only after the hash gate passes does the helper derive the stream key from
   the hash, decrypt each payload byte with volatile stores, set the ready flag
   volatile, and return.  Later calls observe the ready flag and skip the hash
@@ -404,6 +462,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   region and expected loads, `noinline`, and `optnone`.  Per-constant masks live
   in private mutable `morok.sc.mask.*` globals and are volatile-loaded at each
   use site.
+- The pass also emits a retained `morok.postlink.sc.*` manifest and places it
+  in `llvm.compiler.used`.  The manifest records magic/version, pointers to the
+  `morok.sc.region.*` and `morok.sc.expected.*` globals, the region byte count,
+  the hash seed, and the current expected hash.  A post-link rewriter can use
+  that manifest to replace the placeholder region with final code bytes and
+  patch the expected-hash global without reverse-engineering the IR shape.
 - Scheduler placement is after trace keying/dispatcherless routing and before
   constant encryption, so the integrity fusion is late while ordinary constant
   encryption can still hide the encoded constants introduced by this pass.
@@ -423,6 +487,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - The table stays encoded at rest; unlike generic TableArithmetic, there is no
   lazy plaintext materialization pass.  There is also no trap or integrity
   branch, only data poisoning.
+- `max_tables` is further bounded by a hard ceiling of 8 selected DFI tables per
+  function, so standalone runs cannot emit one integrity table per eligible
+  byte op in a huge function.
 - Scheduler placement is before generic TableArithmetic, so this pass claims a
   configurable subset of byte operations for integrity-bound tables and leaves
   the remaining byte ops to ordinary encrypted table lowering.
@@ -440,12 +507,40 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - The internal `morok.mg.diff.*` aggregator calls every node and xors/mixes the
   node diffs.  Valid graphs contribute zero.  Tampering with one region or
   expected hash makes that node and its neighbors contribute nonzero data.
+- The pass also emits a retained `morok.postlink.mg.*` manifest in
+  `llvm.compiler.used`.  The manifest records magic/version, node count, region
+  byte count, and per-node records containing the region pointer, expected-hash
+  pointer, hash seed, and current expected hash.  A post-link rewriter can patch
+  every node region and expected global from that single graph record.
 - Selected integer returns are rewritten as `ret_value ^ graph_diff` (truncated
   to the return width as needed).  There is no trap and no check branch; the
   integrity graph affects program data directly.
 - Scheduler placement is after self-checksum constants and before constant
   encryption, so it sees late control/data shape while ordinary literal
   encryption can still obscure constants introduced in the user function.
+
+## Shamir threshold sharing — `core/ShamirGf256` / `core/Galois8`
+- The pure core implements GF(2^8) polynomial evaluation, `(k,n)` splitting,
+  and Lagrange reconstruction at zero.  Tests cover a fixed reference vector,
+  every 3-of-5 subset for all 256 byte secrets, invalid-parameter clamps, and
+  constexpr reconstruction.
+- The pass targets safe `i8`/`i16`/`i32`/`i64` constant operands of integer
+  binary ops and `icmp`, then caps selected secrets by `max_secrets` after the
+  per-operand probability gate.  Wider literals are split bytewise and
+  recomposed little-endian.
+- Current IR is dominator-deposited fixed-quorum reconstruction: each byte
+  secret is split into `n` build-time shares, the first `k` shares are loaded
+  volatilely from private mutable `morok.shamir.share.*` globals in the entry
+  block and stored volatilely into private `morok.shamir.cell.*` globals.  The
+  use site reloads those cells, multiplies them by build-time Lagrange basis
+  constants through `morok.gf8mul`, XOR-folds the terms, and reassembles the
+  original integer type.  No runtime inverse table or loop is emitted.
+- Scheduler placement is after `SelfChecksum`/`MutualGuardGraph` and before
+  `ConstEnc`, so the late integrity passes still see original constants while
+  Shamir claims selected remaining operands before generic XOR sharing.  This
+  implementation guarantees deposits dominate uses but does not yet distribute
+  shares across genuinely distinct path-specific deposit blocks; that is a
+  stronger future mode rather than a property of the current pass.
 
 ## Adversarial function merging + outlining — IR structure
 - This is the IR half of the roadmap's IR/MIR item.  It groups unrelated
@@ -468,10 +563,47 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   referenced by `blockaddress` constants.  The last guard avoids cloning
   post-dispatcher jump tables whose entries are tied to the original function's
   basic blocks.
+- It also skips functions above the clone budget.  AFM copies selected bodies,
+  so large functions are not eligible even when the pass is invoked directly.
 - Scheduler placement is a late module step after the per-function
   transformations and before FunctionWrapper.  That lets the pass perturb final
   function boundaries while FunctionWrapper can still proxy ordinary call sites
   afterwards; generated `morok.afm.*` helpers are skipped by later wrappers.
+
+## Adversarial self-tuning — score-guided IR search harness
+- This is the IR+harness item from the roadmap.  The pass treats the current
+  module as the ground-truth specimen, clones it for each candidate bundle, runs
+  existing semantics-preserving Morok transforms on the clone, verifies the
+  clone, scores the resulting IR, and replays only the highest-scoring verified
+  candidate on the original module.
+- The built-in oracle scores the recovery stages the roadmap targets:
+  CFG-recovery pressure (`indirectbr`, switches, PHIs, blockaddress tables),
+  lvar/stack pressure (single byte buffers, dynamic allocas, volatile memory),
+  type-recovery pressure (`ptrtoint`/`inttoptr`, bitcasts, vectors/shuffles),
+  symbolic-pressure (volatile loads/stores, table dispatch, path structure),
+  and diff-resistance (generated helpers, private globals, large tables).  The
+  total score weights CFG and lvar failures highest because those are the
+  dominant decompiler collapse points.
+- Candidate bundles deliberately cover different adversary surfaces:
+  StackCoalescing/PointerLaundering/PhiTangling/TypePunning for value recovery,
+  TypePunning/PointerLaundering/StackCoalescing for alias/type recovery,
+  PathExplosion/TraceKeying/PhiTangling for anti-DSE pressure,
+  DispatcherlessRouting/MicrocodeStress/StackDeltaGames for microcode CFG/stack
+  pressure, and TableArithmetic/UniformPrimitiveLowering/VectorObfuscation for
+  alien-substrate pressure.  `max_candidates` and `max_candidate_passes` bound
+  the search cost.
+- The pass requires the best verified candidate to beat the baseline by
+  `score_floor` before modifying the real module.  With `emit_marker=true` it
+  writes private `morok.tune.choice` and `morok.tune.score` globals containing
+  the selected bundle id, baseline/final score, component scores, and candidate
+  seed.  That marker is evidence for tests and for downstream release audits.
+- The pass refuses oversized modules before cloning and skips oversized
+  functions inside candidate actions.  It is not enabled by the built-in
+  presets; real application builds must opt in explicitly.
+- Scheduler placement is after the full per-function obfuscation pipeline and
+  before AdversarialFunctionMerging/FunctionWrapper/PerBuildPolymorphism.  The
+  tuner therefore optimizes the already-layered IR shape, while the final module
+  passes can still perturb function boundaries and layout afterwards.
 
 ## Per-build polymorphism — final IR diversity
 - This is an explicit final diversity layer over the shared seeded PRNG.  With
@@ -509,6 +641,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - With `lift_comparisons=true`, scalar integer `icmp` instructions are lifted in
   the same way and extracted back to `i1`.  This lets select/branch conditions
   acquire vector provenance without changing control semantics.
+- Direct memory caps: each invocation lifts at most 128 binary operators and at
+  most 128 compares.
 - The scheduler runs this after table arithmetic and before path explosion:
   arithmetic and dispatcher values can be lifted, while later indirectbr-heavy
   anti-DSE regions are left intact.
@@ -525,6 +659,30 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - `max_blocks` and `max_iterations` make the explosion explicit and bounded.
   The pass runs after flattening/vectorization because its `indirectbr` regions
   intentionally defeat later CFG structuring.
+
+## MQ opaque gate — `core/MqGf2`
+- The pure core represents quadratic forms over GF(2), triangularly packed
+  coefficients, planted constant rebasing, and gate evaluation.  Tests prove
+  `triIndex` coverage, compare `evalForm` against a brute-force reference, and
+  check planted gates open at the planted assignment while rejecting a large
+  random non-root sample.
+- The current pass is a semantics-preserving planted opaque gate, not arbitrary
+  user-input validation.  It selects input-derived conditional branches, builds
+  `vars` gate bits from function arguments, stores each source bit to a volatile
+  scratch byte, reloads it twice, xors the two loads to zero, then xors in the
+  planted bit.  The emitted bits therefore equal the planted assignment at
+  runtime while still carrying volatile argument-derived structure in IR.
+- Each selected branch gets an unrolled dense MQ term tree: quadratic terms are
+  `morok.mq.term` `and`s, forms are `morok.mq.form` `xor`s, equations are
+  `morok.mq.eq` comparisons to zero, and their conjunction is `morok.mq.gate`.
+  A private constant `morok.mq.sys.*` stores the packed system for auditing; the
+  hot path uses the unrolled tree, not a coefficient interpreter.
+- The original conditional branch is moved into a continuation block.  The MQ
+  gate branches either to that continuation or to `morok.mq.fail`, whose
+  volatile scratch write rejoins the same continuation, so even an unexpected
+  fail preserves program semantics.  Scheduler placement is after
+  `PathExplosion` and before `TraceKeying`/`Dispatcherless`, letting later
+  anti-DSE passes hide the guard edge.
 
 ## Execution-trace keying — IR structure
 - The pass creates one private volatile `i64` accumulator in the function entry
@@ -551,6 +709,29 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   path explosion and before dispatcherless routing, so trace points are frozen
   late and later routing can still hide the guard branches.
 
+## Microcode stress — sparse computed jump tables
+- This is the IR-lowering half of the roadmap's Hex-Rays microcode stress item
+  that targets sparse/oversized jump-table recovery and aliased-memory pressure.
+  It is deliberately distinct from DispatcherlessRouting: it does not encode
+  source branch semantics.  Every table destination either reaches the original
+  body directly or through a decoy that rejoins it.
+- Each selected block is split, then the predecessor loads a target pointer from
+  a private `morok.micro.table` of `blockaddress` entries and reaches it via
+  `indirectbr`.  The table size is normalized to a power of two, usually much
+  larger than the number of unique destinations, so microcode sees a computed
+  table with many opaque holes rather than a compact source switch.
+- The table index is derived from a volatile private `morok.micro.seed`, live
+  integer/pointer terms at the split point, and per-build odd multipliers, then
+  masked into the table range.  Because all entries are semantically safe, the
+  index may be genuinely data-derived without changing program results.
+- Decoy destinations perform configurable volatile loads/stores through
+  `ptrtoint -> xor -> xor -> inttoptr` aliases into a per-function
+  `morok.micro.scratch` frame before branching to the original body.  This
+  combines goto-spaghetti CFG pressure with alias/lvar recovery pressure.
+- Scheduler placement is after TraceKeying and DispatcherlessRouting and before
+  checksum/integrity fusion.  Earlier CFG transforms see ordinary structure;
+  later integrity passes can hash/fuse the final microcode-stress shape.
+
 ## Indirect branch — `core/KnuthHash`
 - Per-function key: random `delta`, odd `mult`, `xork`. `encode = ((raw+delta)*mult)^xork`,
   `decode = ((enc^xork)*multInv) - delta`, `multInv = modInverse64(mult)` (5 Newton steps).
@@ -566,10 +747,13 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - StateOpaquePredicates: MBA opaque guards over flattened dispatcher state.
 - InterproceduralFsm: flattened state stores call mutually-recursive transition helpers.
 - DataEntangledFlattening: switch dispatcher with live-data/previous-state transition tokens.
+- ChaosStateMachine: switch dispatcher driven by logistic or single-cycle T-function state maps.
 - DispatcherlessRouting: per-block state-entangled indirectbrs through blockaddress tables.
+- MicrocodeStress: oversized blockaddress tables plus aliased decoy destinations that always rejoin.
 - Flattening: classic CFF; runs only when NiState/EntFla/CSM skipped.
 - SplitBasicBlocks: split + stack-confusion; `split_num`, stack_confusion.
 - StackCoalescing: one byte frame for static locals; opaque loaded offsets; skips escaping allocas.
+- StackDeltaGames: dynamic stack saves/restores plus odd overlapping volatile stack slots.
 - PointerLaundering: pointer-int round trips + computed byte GEPs; scalar byte-vector bitcasts.
 - TypePunning: volatile union-buffer scalar↔vector/integer reinterpretation chains.
 - PhiTangling: redundant edge-copy/direct PHI webs; zero cross-terms rewrite uses.
@@ -582,19 +766,47 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - TableArithmetic: encrypted lazy byte-op lookup tables.
 - UniformPrimitiveLowering: byte-op tables plus memory-loaded indirectbr dispatch.
 - Virtualization: encrypted per-function bytecode plus threaded computed-goto VM helpers.
-- HashGatedSelfDecrypt: VM bytecode globals get a hash-gated lazy outer decryptor.
+- HashGatedSelfDecrypt: VM bytecode globals get hash/context-gated lazy outer decryptors.
 - MutualGuardGraph: overlapping checksum nodes whose combined diff poisons returns.
 - AdversarialFunctionMerging: same-signature functions routed through shared selector dispatchers plus outlined scalar helpers.
+- AdversarialSelfTuning: cloned-candidate search over hardness metrics with best verified bundle replay.
 - PerBuildPolymorphism: seed-driven function/block order and volatile-zero return anchors.
 - PathExplosion: opaque-guarded input-derived loops with volatile symbolic stores and indirectbr dispatch.
+- MqGate: planted GF(2) quadratic opaque gates over volatile argument-derived bits.
 - TraceKeying: edge-carried rolling trace accumulator with guards and neutral poisoning.
 - SelfChecksumConstants: constants XORed with runtime checksum diffs for data-only tamper corruption.
+- ShamirShare: selected literals reconstructed from volatile GF(2^8) threshold shares.
 - VectorObfuscation: scalar→SIMD lifting; width 128/256/512, shuffle, lift_comparisons.
-- FunctionWrapper: polymorphic proxies; prob/times.
-- FunctionCallObfuscate: dlopen/dlsym indirection; uses a JSON symbol DB (`json.hpp`).
+- FunctionWrapper: polymorphic proxies; prob/times/max_wrappers/hard cap 256.
+- FunctionCallObfuscate: dlopen/dlsym indirection; hard cap 256 call sites.
 - AntiClassDump / AntiDebugging / AntiHooking: platform anti-analysis (module passes).
+
+## Scheduler memory guardrails
+- The scheduler re-measures instruction and block counts before each
+  growth-producing function pass.  Once earlier transforms push a function over
+  the relevant budget, later expansion passes for that function are skipped.
+- Whole-module growth passes are guarded by module instruction/block/function
+  budgets.  Early module-wide transforms such as FCO and string encryption are
+  also skipped when the input module already exceeds the growth budget.  The
+  self-tuning harness uses the stricter clone budget because it evaluates
+  candidates on full module copies.
+- String encryption also has its own byte caps because large global initializers
+  can be small in IR instruction count but expensive to lower into a decryptor.
+- Direct pass caps bound standalone growth for substitution, MBA, table
+  arithmetic, DFI, uniform/dispatcherless CFG routing, constant encryption,
+  pointer laundering, vector lifting, FCO, and FunctionWrapper, so those passes
+  remain finite even when invoked outside the scheduler.
+- IR-stage post-link contracts are emitted as retained `morok.postlink.*`
+  manifests rather than implicit placeholder globals; downstream patchers should
+  consume those records and update the referenced region/expected globals.
+- The high preset intentionally leaves VM lifting, hash self-decrypt, late
+  self-check/DFI/mutual-guard integrity, MQ, MicrocodeStress,
+  AdversarialSelfTuning, AdversarialFunctionMerging, and FunctionWrapper
+  disabled by default.  They remain available through explicit config or
+  standalone pass names, with their own local caps where they clone or generate
+  dense IR.
 
 ## Scheduler order (to preserve semantics)
 AntiHook → AntiClassDump → FCO(fn) → AntiDebug → StringEnc → Virtualization → HashSelfDecrypt → per-fn{ Split, BCF, OptAmp, Sub,
-MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, TraceKeying, Dispatcherless, SelfChecksum, MutualGuardGraph } → ConstEnc → IndirectBranch → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
+MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare } → ConstEnc → IndirectBranch → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 FeatureElimination (strip debug/names) → cleanup marker decls.

@@ -32,6 +32,8 @@ namespace morok::passes {
 
 namespace {
 
+constexpr std::size_t kMaxConstEncTargetsPerIteration = 128;
+
 // Width must be one we can round-trip through the 64-bit share representation.
 bool eligibleWidth(unsigned bits) {
     return bits == 8 || bits == 16 || bits == 32 || bits == 64;
@@ -80,8 +82,10 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
             ConstantInt *value;
         };
         std::vector<Target> targets;
-        for (BasicBlock &bb : F)
+        for (BasicBlock &bb : F) {
             for (Instruction &inst : bb) {
+                if (targets.size() >= kMaxConstEncTargetsPerIteration)
+                    break;
                 if (!isRewritableUser(inst))
                     continue;
                 for (unsigned i = 0; i < inst.getNumOperands(); ++i)
@@ -89,6 +93,9 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
                         if (eligibleWidth(c->getType()->getIntegerBitWidth()))
                             targets.push_back({&inst, i, c});
             }
+            if (targets.size() >= kMaxConstEncTargetsPerIteration)
+                break;
+        }
 
         for (const Target &t : targets) {
             if (!rng.chance(params.probability))

@@ -9,9 +9,10 @@
 
 #include "morok/core/Xoshiro256.hpp"
 #include "morok/ir/IRRandom.hpp"
+#include "morok/passes/AdversarialFunctionMerging.hpp"
+#include "morok/passes/AdversarialSelfTuning.hpp"
 #include "morok/passes/AliasOpaquePredicates.hpp"
 #include "morok/passes/AntiAnalysis.hpp"
-#include "morok/passes/AdversarialFunctionMerging.hpp"
 #include "morok/passes/ArithmeticTables.hpp"
 #include "morok/passes/BogusControlFlow.hpp"
 #include "morok/passes/ChaosStateMachine.hpp"
@@ -28,6 +29,8 @@
 #include "morok/passes/IndirectBranch.hpp"
 #include "morok/passes/InterproceduralFsm.hpp"
 #include "morok/passes/Mba.hpp"
+#include "morok/passes/MicrocodeStress.hpp"
+#include "morok/passes/MqGate.hpp"
 #include "morok/passes/MutualGuardGraph.hpp"
 #include "morok/passes/NonInvertibleState.hpp"
 #include "morok/passes/OptimizerAmplification.hpp"
@@ -36,8 +39,10 @@
 #include "morok/passes/PhiTangling.hpp"
 #include "morok/passes/PointerLaundering.hpp"
 #include "morok/passes/SelfChecksumConstants.hpp"
+#include "morok/passes/ShamirShare.hpp"
 #include "morok/passes/SplitBasicBlocks.hpp"
 #include "morok/passes/StackCoalescing.hpp"
+#include "morok/passes/StackDeltaGames.hpp"
 #include "morok/passes/StateOpaquePredicates.hpp"
 #include "morok/passes/StringEncryption.hpp"
 #include "morok/passes/SubThresholdPersistence.hpp"
@@ -45,17 +50,21 @@
 #include "morok/passes/TraceKeying.hpp"
 #include "morok/passes/TypePunning.hpp"
 #include "morok/passes/UniformPrimitiveLowering.hpp"
-#include "morok/passes/Virtualization.hpp"
 #include "morok/passes/VectorObfuscation.hpp"
+#include "morok/passes/Virtualization.hpp"
+#include "morok/pipeline/Scheduler.hpp"
 
+#include "llvm/ADT/Twine.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
@@ -119,6 +128,14 @@ std::size_t countNamedAllocas(Function &F, StringRef prefix) {
     return n;
 }
 
+std::size_t countNamedInstructions(Function &F, StringRef prefix) {
+    std::size_t n = 0;
+    for (Instruction &I : instructions(F))
+        if (I.getName().starts_with(prefix))
+            ++n;
+    return n;
+}
+
 std::size_t countPhis(Function &F) {
     std::size_t n = 0;
     for (Instruction &I : instructions(F))
@@ -142,6 +159,16 @@ std::size_t countVolatileAccesses(Function &F) {
     return n;
 }
 
+std::size_t countOpcode(Module &M, unsigned opcode) {
+    std::size_t n = 0;
+    for (Function &F : M)
+        if (!F.isDeclaration())
+            for (Instruction &I : instructions(F))
+                if (I.getOpcode() == opcode)
+                    ++n;
+    return n;
+}
+
 std::size_t countGlobals(Module &M, StringRef prefix) {
     std::size_t n = 0;
     for (GlobalVariable &GV : M.globals())
@@ -150,11 +177,36 @@ std::size_t countGlobals(Module &M, StringRef prefix) {
     return n;
 }
 
+bool constantReferencesGlobal(const Constant *C, const GlobalValue *GV) {
+    if (!C || !GV)
+        return false;
+    if (C == GV)
+        return true;
+    for (const Use &U : C->operands()) {
+        if (U.get() == GV)
+            return true;
+        if (auto *Child = dyn_cast<Constant>(U.get()))
+            if (constantReferencesGlobal(Child, GV))
+                return true;
+    }
+    return false;
+}
+
 std::size_t countFunctions(Module &M, StringRef prefix) {
     std::size_t n = 0;
     for (Function &F : M)
         if (F.getName().starts_with(prefix))
             ++n;
+    return n;
+}
+
+std::size_t countCallsTo(Function &F, StringRef name) {
+    std::size_t n = 0;
+    for (Instruction &I : instructions(F))
+        if (auto *CB = dyn_cast<CallBase>(&I))
+            if (Function *Callee = CB->getCalledFunction())
+                if (Callee->getName() == name)
+                    ++n;
     return n;
 }
 
@@ -193,7 +245,240 @@ bool hasPlainI8Arithmetic(Function &F) {
     return false;
 }
 
+Function *makeLargeLinearFunction(Module &M, unsigned Adds) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *FT = FunctionType::get(I32, {I32}, false);
+    auto *F =
+        Function::Create(FT, GlobalValue::ExternalLinkage, "large_linear", M);
+    F->arg_begin()->setName("x");
+
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
+    Value *V = &*F->arg_begin();
+    for (unsigned I = 0; I < Adds; ++I)
+        V = B.CreateAdd(V, B.getInt32(I + 1), "step");
+    B.CreateRet(V);
+    return F;
+}
+
+Function *makeI8OpChain(Module &M, unsigned Ops, StringRef Name) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I8 = Type::getInt8Ty(Ctx);
+    auto *FT = FunctionType::get(I8, {I8, I8}, false);
+    auto *F = Function::Create(FT, GlobalValue::ExternalLinkage, Name, M);
+    auto ArgIt = F->arg_begin();
+    Value *A = &*ArgIt++;
+    A->setName("a");
+    Value *Bv = &*ArgIt;
+    Bv->setName("b");
+
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
+    Value *V = A;
+    for (unsigned I = 0; I < Ops; ++I)
+        V = B.CreateXor(V, Bv, "byte");
+    B.CreateRet(V);
+    return F;
+}
+
+Function *makeTinyAddFunction(Module &M, StringRef Name) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *FT = FunctionType::get(I32, {I32}, false);
+    auto *F = Function::Create(FT, GlobalValue::ExternalLinkage, Name, M);
+    F->arg_begin()->setName("x");
+
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
+    Value *X = &*F->arg_begin();
+    Value *Y = B.CreateAdd(X, B.getInt32(1), "y");
+    B.CreateRet(Y);
+    return F;
+}
+
+Function *makeBranchChainFunction(Module &M, unsigned Branches,
+                                  StringRef Name) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *FT = FunctionType::get(I32, {I32}, false);
+    auto *F = Function::Create(FT, GlobalValue::ExternalLinkage, Name, M);
+    Value *X = &*F->arg_begin();
+    X->setName("x");
+
+    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+    BasicBlock *Done = BasicBlock::Create(Ctx, "done", F);
+    std::vector<BasicBlock *> Tests;
+    std::vector<BasicBlock *> Returns;
+    Tests.reserve(Branches);
+    Returns.reserve(Branches);
+    for (unsigned I = 0; I < Branches; ++I) {
+        Tests.push_back(
+            BasicBlock::Create(Ctx, (Twine("test") + Twine(I)).str(), F));
+        Returns.push_back(
+            BasicBlock::Create(Ctx, (Twine("ret") + Twine(I)).str(), F));
+    }
+
+    IRBuilder<> B(Entry);
+    if (Branches == 0) {
+        B.CreateRet(X);
+        return F;
+    }
+    B.CreateBr(Tests.front());
+
+    for (unsigned I = 0; I < Branches; ++I) {
+        B.SetInsertPoint(Tests[I]);
+        Value *Cond = B.CreateICmpEQ(X, B.getInt32(I), "match");
+        BasicBlock *Next = (I + 1 < Branches) ? Tests[I + 1] : Done;
+        B.CreateCondBr(Cond, Returns[I], Next);
+
+        B.SetInsertPoint(Returns[I]);
+        B.CreateRet(B.getInt32(I));
+    }
+
+    B.SetInsertPoint(Done);
+    B.CreateRet(X);
+    return F;
+}
+
+GlobalVariable *makePrivateString(Module &M, StringRef Name, StringRef Text) {
+    Constant *Init = ConstantDataArray::getString(M.getContext(), Text, true);
+    return new GlobalVariable(M, Init->getType(), /*isConstant=*/true,
+                              GlobalValue::PrivateLinkage, Init, Name);
+}
+
+Function *makeExternalCallFunction(Module &M, GlobalVariable *Text) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    auto *PutsTy = FunctionType::get(I32, {Ptr}, false);
+    Function *Puts =
+        Function::Create(PutsTy, GlobalValue::ExternalLinkage, "puts", M);
+
+    auto *FT = FunctionType::get(I32, false);
+    auto *F =
+        Function::Create(FT, GlobalValue::ExternalLinkage, "call_external", M);
+
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
+    Value *Msg = B.CreateConstInBoundsGEP2_64(Text->getValueType(), Text, 0, 0);
+    Value *Result = B.CreateCall(Puts, {Msg});
+    B.CreateRet(Result);
+    return F;
+}
+
+Function *makeRepeatedVoidCalls(Module &M, unsigned Calls) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *VoidTy = Type::getVoidTy(Ctx);
+    auto *CalleeTy = FunctionType::get(VoidTy, {I32}, false);
+    Function *Sink =
+        Function::Create(CalleeTy, GlobalValue::ExternalLinkage, "sink", M);
+
+    auto *CallerTy = FunctionType::get(VoidTy, {I32}, false);
+    auto *Caller =
+        Function::Create(CallerTy, GlobalValue::ExternalLinkage, "caller", M);
+    Value *X = &*Caller->arg_begin();
+    X->setName("x");
+
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Caller));
+    for (unsigned I = 0; I < Calls; ++I)
+        B.CreateCall(Sink, {X});
+    B.CreateRetVoid();
+    return Caller;
+}
+
+Function *makePointerStoreFunction(Module &M, unsigned Stores) {
+    M.setDataLayout("e-p:64:64");
+    LLVMContext &Ctx = M.getContext();
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    auto *FT = FunctionType::get(Type::getVoidTy(Ctx), {Ptr, I32}, false);
+    auto *F =
+        Function::Create(FT, GlobalValue::ExternalLinkage, "ptr_stress", M);
+    auto ArgIt = F->arg_begin();
+    Value *P = &*ArgIt++;
+    P->setName("p");
+    Value *X = &*ArgIt;
+    X->setName("x");
+
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", F));
+    for (unsigned I = 0; I < Stores; ++I) {
+        Value *Slot = B.CreateGEP(I32, P, B.getInt32(I), "slot");
+        B.CreateStore(X, Slot);
+    }
+    B.CreateRetVoid();
+    return F;
+}
+
 } // namespace
+
+TEST_CASE("MorokPass skips configured growth passes on oversized functions") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("large-module", ctx);
+    Function *F = makeLargeLinearFunction(*M, 3000);
+    REQUIRE(F);
+
+    morok::config::Config cfg;
+    cfg.seed = 101;
+    cfg.passes.split.enabled = true;
+    cfg.passes.split.splits = 5;
+
+    ModuleAnalysisManager AM;
+    morok::pipeline::MorokPass(std::move(cfg)).run(*M, AM);
+
+    CHECK(F->size() == 1u);
+    CHECK(countFunctions(*M, "morok.") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("MorokPass stops per-function growth on oversized modules") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("many-functions", ctx);
+    Function *First = makeTinyAddFunction(*M, "tiny_0");
+    for (unsigned I = 1; I < 1601; ++I)
+        makeTinyAddFunction(*M, (Twine("tiny_") + Twine(I)).str());
+    GlobalVariable *Text = makePrivateString(*M, "plain.str", "oversized");
+    makeExternalCallFunction(*M, Text);
+
+    morok::config::Config cfg;
+    cfg.seed = 102;
+    cfg.passes.sub.enabled = true;
+    cfg.passes.sub.probability = 100;
+    cfg.passes.sub.iterations = 1;
+    cfg.passes.str_enc.enabled = true;
+    cfg.passes.str_enc.probability = 100;
+    cfg.passes.fco.enabled = true;
+
+    ModuleAnalysisManager AM;
+    morok::pipeline::MorokPass(std::move(cfg)).run(*M, AM);
+
+    CHECK(countBinops(*First) == 1u);
+    CHECK(countFunctions(*M, "morok.") == 0u);
+    CHECK(M->getFunction("dlsym") == nullptr);
+    CHECK(countGlobals(*M, "morok.k1") == 0u);
+    CHECK(countGlobals(*M, "morok.sym") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("MorokPass caps eligible function visits on wide modules") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("wide-module", ctx);
+    Function *First = makeTinyAddFunction(*M, "wide_0");
+    Function *Tail = nullptr;
+    for (unsigned I = 1; I < 320; ++I)
+        Tail = makeTinyAddFunction(*M, (Twine("wide_") + Twine(I)).str());
+    REQUIRE(Tail);
+
+    morok::config::Config cfg;
+    cfg.seed = 103;
+    cfg.passes.sub.enabled = true;
+    cfg.passes.sub.probability = 100;
+    cfg.passes.sub.iterations = 1;
+
+    ModuleAnalysisManager AM;
+    morok::pipeline::MorokPass(std::move(cfg)).run(*M, AM);
+
+    CHECK(countBinops(*First) > 1u);
+    CHECK(countBinops(*Tail) == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
 
 TEST_CASE("substituteFunction grows the IR and preserves validity") {
     LLVMContext ctx;
@@ -223,6 +508,21 @@ TEST_CASE("substituteFunction handles constant shifts and stays valid") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("substituteFunction caps selected operators per iteration") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("sub-cap", ctx);
+    Function *F = makeLargeLinearFunction(*M, 400);
+    REQUIRE(F);
+    CHECK(countNamedInstructions(*F, "step") == 400u);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(71);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::substituteFunction(*F, {100, 1}, rng));
+
+    CHECK(countNamedInstructions(*F, "step") == 144u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("mbaFunction grows the IR and preserves validity") {
     LLVMContext ctx;
     auto M = parse(ctx, kArith);
@@ -237,6 +537,22 @@ TEST_CASE("mbaFunction grows the IR and preserves validity") {
 
     CHECK(changed);
     CHECK(countBinops(*F) > before);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("mbaFunction caps selected operators per layer") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("mba-cap", ctx);
+    Function *F = makeLargeLinearFunction(*M, 400);
+    REQUIRE(F);
+    CHECK(countNamedInstructions(*F, "step") == 400u);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(72);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::mbaFunction(
+        *F, {/*prob=*/100, /*layers=*/1, /*heuristic=*/true}, rng));
+
+    CHECK(countNamedInstructions(*F, "step") == 144u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -266,7 +582,7 @@ entry:
             ++bases;
         if (auto *Cmp = dyn_cast<ICmpInst>(&I))
             if (Cmp->getName().starts_with("morok.optamp.guard"))
-            ++guards;
+                ++guards;
         if (auto *SI = dyn_cast<SelectInst>(&I))
             if (SI->getName().starts_with("morok.optamp.select"))
                 ++selects;
@@ -416,6 +732,119 @@ entry:
     CHECK(shares >= 4);
 }
 
+TEST_CASE("constantEncryptFunction caps literal rewrites") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("const-cap", ctx);
+    Function *F = makeLargeLinearFunction(*M, 200);
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(73);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::constantEncryptFunction(
+        *F, {/*prob=*/100, /*k=*/2, /*iterations=*/1}, rng));
+
+    CHECK(countGlobals(*M, "morok.share") == 256u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("shamirShareFunction reconstructs literals from threshold shares") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @shamir_lit(i32 %a) {
+entry:
+  %x = add i32 %a, 305419896
+  %y = xor i32 %x, 90
+  ret i32 %y
+}
+)ir");
+    Function *F = M->getFunction("shamir_lit");
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x5348);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::shamirShareFunction(*F,
+                                             {/*probability=*/100,
+                                              /*threshold=*/3, /*shares=*/5,
+                                              /*max_secrets=*/1},
+                                             rng));
+
+    CHECK(M->getFunction("morok.gf8mul") != nullptr);
+    CHECK(countGlobals(*M, "morok.shamir.share") == 12u);
+    CHECK(countGlobals(*M, "morok.shamir.cell") == 12u);
+    CHECK(countCallsTo(*F, "morok.gf8mul") == 12u);
+
+    std::size_t volatileShareLoads = 0;
+    std::size_t volatileCellLoads = 0;
+    std::size_t volatileCellStores = 0;
+    bool hasByteReconstruction = false;
+    bool hasWideReconstruction = false;
+    for (Instruction &I : instructions(*F)) {
+        hasByteReconstruction |= I.getName().starts_with("morok.shamir.byte");
+        hasWideReconstruction |= I.getName().starts_with("morok.shamir.value");
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+            if (LI->isVolatile() &&
+                LI->getPointerOperand()->getName().starts_with(
+                    "morok.shamir.share"))
+                ++volatileShareLoads;
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+            if (LI->isVolatile() &&
+                LI->getPointerOperand()->getName().starts_with(
+                    "morok.shamir.cell"))
+                ++volatileCellLoads;
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+            if (SI->isVolatile() &&
+                SI->getPointerOperand()->getName().starts_with(
+                    "morok.shamir.cell"))
+                ++volatileCellStores;
+    }
+    CHECK(volatileShareLoads == 12u);
+    CHECK(volatileCellLoads == 12u);
+    CHECK(volatileCellStores == 12u);
+    CHECK(hasByteReconstruction);
+    CHECK(hasWideReconstruction);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("shamirShareFunction honors probability and max secret caps") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @shamir_off(i32 %a) {
+entry:
+  %x = add i32 %a, 305419896
+  ret i32 %x
+}
+)ir");
+    Function *F = M->getFunction("shamir_off");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x5349);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::shamirShareFunction(
+        *F,
+        {/*probability=*/0, /*threshold=*/3, /*shares=*/5,
+         /*max_secrets=*/1},
+        rng));
+    CHECK(countGlobals(*M, "morok.shamir.share") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+
+    auto M2 = parse(ctx, R"ir(
+define i32 @shamir_cap(i32 %a) {
+entry:
+  %x = add i32 %a, 305419896
+  ret i32 %x
+}
+)ir");
+    Function *F2 = M2->getFunction("shamir_cap");
+    REQUIRE(F2);
+    CHECK_FALSE(morok::passes::shamirShareFunction(
+        *F2,
+        {/*probability=*/100, /*threshold=*/3, /*shares=*/5,
+         /*max_secrets=*/0},
+        rng));
+    CHECK(countGlobals(*M2, "morok.shamir.share") == 0u);
+    CHECK_FALSE(verifyModule(*M2, &errs()));
+}
+
 TEST_CASE("stackCoalesceFunction folds static allocas into one byte buffer") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -502,6 +931,96 @@ entry:
         *F, {/*probability=*/100, /*opaque_offsets=*/true}, rng));
     CHECK(countNamedAllocas(*F, "local") == 1);
     CHECK(countNamedAllocas(*F, "morok.stack") == 0);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("stackDeltaGamesFunction emits dynamic stack-pointer deltas") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @stackdelta(i32 %x, i32 %y) {
+entry:
+  %seed = add i32 %x, %y
+  %c = icmp sgt i32 %seed, 10
+  br i1 %c, label %left, label %right
+left:
+  %l = xor i32 %seed, %x
+  br label %join
+right:
+  %r = sub i32 %seed, %y
+  br label %join
+join:
+  %p = phi i32 [ %l, %left ], [ %r, %right ]
+  ret i32 %p
+}
+)ir");
+    Function *F = M->getFunction("stackdelta");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(66);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::stackDeltaGamesFunction(
+        *F,
+        {/*probability=*/100, /*max_blocks=*/3, /*min_bytes=*/17,
+         /*max_extra_bytes=*/32, /*touches=*/2},
+        rng));
+
+    CHECK(countGlobals(*M, "morok.stackdelta.seed") == 1u);
+
+    bool hasDynamicAlloca = false;
+    bool hasStackSave = false;
+    bool hasStackRestore = false;
+    bool hasOddSize = false;
+    bool hasOverlapStore = false;
+    unsigned volatileStores = 0;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *AI = dyn_cast<AllocaInst>(&I))
+            if (AI->getName().starts_with("morok.stackdelta.frame"))
+                hasDynamicAlloca |= !AI->isStaticAlloca();
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+            if (Function *Callee = CI->getCalledFunction()) {
+                hasStackSave |= Callee->getName().starts_with("llvm.stacksave");
+                hasStackRestore |=
+                    Callee->getName().starts_with("llvm.stackrestore");
+            }
+        }
+        hasOddSize |= I.getName().starts_with("morok.stackdelta.size");
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+            if (SI->isVolatile())
+                ++volatileStores;
+            hasOverlapStore |= SI->getPointerOperand()->getName().starts_with(
+                "morok.stackdelta.overlap");
+        }
+    }
+
+    CHECK(hasDynamicAlloca);
+    CHECK(hasStackSave);
+    CHECK(hasStackRestore);
+    CHECK(hasOddSize);
+    CHECK(hasOverlapStore);
+    CHECK(volatileStores >= 2u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("stackDeltaGamesFunction honors zero probability") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @stackdelta_off(i32 %x) {
+entry:
+  %y = add i32 %x, 1
+  ret i32 %y
+}
+)ir");
+    Function *F = M->getFunction("stackdelta_off");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(67);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::stackDeltaGamesFunction(
+        *F,
+        {/*probability=*/0, /*max_blocks=*/3, /*min_bytes=*/17,
+         /*max_extra_bytes=*/32, /*touches=*/2},
+        rng));
+    CHECK(countGlobals(*M, "morok.stackdelta.seed") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -599,6 +1118,21 @@ entry:
         CHECK_FALSE(isa<PtrToIntInst>(&I));
         CHECK_FALSE(isa<IntToPtrInst>(&I));
     }
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("pointerLaunderFunction caps selected pointer operands") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("ptr-cap", ctx);
+    Function *F = makePointerStoreFunction(*M, 100);
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(74);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::pointerLaunderFunction(
+        *F, {/*pointer_probability=*/100, /*integer_probability=*/0}, rng));
+
+    CHECK(countGlobals(*M, "morok.ptr.key") == 256u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -1036,10 +1570,9 @@ merge:
                 if (BI->isConditional())
                     for (unsigned Succ = 0; Succ != BI->getNumSuccessors();
                          ++Succ)
-                        branchesToDecoy |= BI->getSuccessor(Succ)
-                                               ->getName()
-                                               .starts_with(
-                                                   "morok.extop.decoy");
+                        branchesToDecoy |=
+                            BI->getSuccessor(Succ)->getName().starts_with(
+                                "morok.extop.decoy");
             if (isDecoy)
                 if (auto *SI = dyn_cast<StoreInst>(&I))
                     decoyHasVolatileStore |= SI->isVolatile();
@@ -1140,12 +1673,73 @@ join:
     REQUIRE(F);
     auto engine = morok::core::Xoshiro256pp::fromSeed(19);
     morok::ir::IRRandom rng(engine);
-    CHECK(morok::passes::chaosStateMachineFunction(*F, rng));
+    morok::passes::CsmParams params;
+    params.generator = morok::passes::CsmGenerator::Logistic;
+    CHECK(morok::passes::chaosStateMachineFunction(*F, params, rng));
     bool hasSwitch = false;
+    bool hasLogisticShift = false;
     for (Instruction &I : instructions(*F))
-        if (isa<SwitchInst>(&I))
+        if (isa<SwitchInst>(&I)) {
             hasSwitch = true;
+        } else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+            if (BO->getOpcode() == Instruction::LShr &&
+                isa<ConstantInt>(BO->getOperand(1)) &&
+                cast<ConstantInt>(BO->getOperand(1))->getZExtValue() == 30u)
+                hasLogisticShift = true;
+        }
     CHECK(hasSwitch);
+    CHECK(hasLogisticShift);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("chaosStateMachineFunction can use a single-cycle T-function") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @branchy_tf(i32 %a, i32 %b) {
+entry:
+  %c = icmp slt i32 %a, %b
+  br i1 %c, label %then, label %else
+then:
+  %t = add i32 %a, 1
+  br label %join
+else:
+  %e = sub i32 %b, 1
+  br label %join
+join:
+  %p = phi i32 [ %t, %then ], [ %e, %else ]
+  ret i32 %p
+}
+)ir");
+    Function *F = M->getFunction("branchy_tf");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(20);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::CsmParams params;
+    params.generator = morok::passes::CsmGenerator::TFunction;
+    params.tf_const = 5;
+    CHECK(morok::passes::chaosStateMachineFunction(*F, params, rng));
+
+    bool hasSwitch = false;
+    bool hasTfMul = false;
+    bool hasTfOr = false;
+    bool hasTfAdd = false;
+    bool hasLogisticShift = false;
+    for (Instruction &I : instructions(*F)) {
+        hasSwitch |= isa<SwitchInst>(&I);
+        hasTfMul |= I.getName().starts_with("csm.tf.mul");
+        hasTfOr |= I.getName().starts_with("csm.tf.or");
+        hasTfAdd |= I.getName().starts_with("csm.tf.next");
+        if (auto *BO = dyn_cast<BinaryOperator>(&I))
+            if (BO->getOpcode() == Instruction::LShr &&
+                isa<ConstantInt>(BO->getOperand(1)) &&
+                cast<ConstantInt>(BO->getOperand(1))->getZExtValue() == 30u)
+                hasLogisticShift = true;
+    }
+    CHECK(hasSwitch);
+    CHECK(hasTfMul);
+    CHECK(hasTfOr);
+    CHECK(hasTfAdd);
+    CHECK_FALSE(hasLogisticShift);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -1333,7 +1927,8 @@ TEST_CASE("nonInvertibleStateFunction skips single-block functions") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("stateOpaquePredicatesFunction guards flattened blocks with MBA state") {
+TEST_CASE(
+    "stateOpaquePredicatesFunction guards flattened blocks with MBA state") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 define i32 @stateful(i32 %a, i32 %b, i32 %cmd) {
@@ -1556,8 +2151,9 @@ entry:
     auto engine = morok::core::Xoshiro256pp::fromSeed(21);
     morok::ir::IRRandom rng(engine);
     CHECK(morok::passes::vectorObfuscateFunction(
-        *F, {/*probability=*/100, /*width=*/128, /*shuffle=*/true,
-             /*lift_comparisons=*/true},
+        *F,
+        {/*probability=*/100, /*width=*/128, /*shuffle=*/true,
+         /*lift_comparisons=*/true},
         rng));
     bool hasVectorOp = false;
     bool hasFourLaneVector = false;
@@ -1576,6 +2172,25 @@ entry:
     CHECK(hasFourLaneVector);
     CHECK(hasShuffle);
     CHECK(hasVectorCompare);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("vectorObfuscateFunction caps selected operators") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("vec-cap", ctx);
+    Function *F = makeLargeLinearFunction(*M, 200);
+    REQUIRE(F);
+    CHECK(countNamedInstructions(*F, "step") == 200u);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(75);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::vectorObfuscateFunction(
+        *F,
+        {/*probability=*/100, /*width=*/128, /*shuffle=*/false,
+         /*lift_comparisons=*/false},
+        rng));
+
+    CHECK(countNamedInstructions(*F, "step") == 72u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -1670,7 +2285,22 @@ TEST_CASE("tableArithmeticFunction skips non-byte arithmetic") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("dataFlowIntegrityFunction derives table values from integrity hash") {
+TEST_CASE("tableArithmeticFunction caps selected table count") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("table-cap", ctx);
+    Function *F = makeI8OpChain(*M, 64, "many_bytes");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(831);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::tableArithmeticFunction(
+        *F, {/*probability=*/100, /*max_tables=*/100}, rng));
+
+    CHECK(countGlobals(*M, "morok.tablearith.table") == 16u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE(
+    "dataFlowIntegrityFunction derives table values from integrity hash") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 define i8 @dfi(i8 %a, i8 %b) {
@@ -1685,8 +2315,7 @@ entry:
     morok::ir::IRRandom rng(engine);
 
     CHECK(morok::passes::dataFlowIntegrityFunction(
-        *F, {/*probability=*/100, /*max_tables=*/1, /*region_bytes=*/32},
-        rng));
+        *F, {/*probability=*/100, /*max_tables=*/1, /*region_bytes=*/32}, rng));
 
     CHECK(countGlobals(*M, "morok.dfi.table") == 1u);
     CHECK(countGlobals(*M, "morok.dfi.region") == 1u);
@@ -1702,10 +2331,9 @@ entry:
         if (auto *CI = dyn_cast<CallInst>(&I))
             callsHash |= CI->getCalledFunction() == Hash;
         if (auto *LI = dyn_cast<LoadInst>(&I))
-            hasTableLoad |=
-                LI->isVolatile() &&
-                LI->getPointerOperand()->getName().starts_with(
-                    "morok.dfi.cell");
+            hasTableLoad |= LI->isVolatile() &&
+                            LI->getPointerOperand()->getName().starts_with(
+                                "morok.dfi.cell");
         hasDecodedValue |= I.getName().starts_with("morok.dfi.value");
     }
 
@@ -1765,15 +2393,30 @@ entry:
     morok::ir::IRRandom rng(engine);
 
     CHECK_FALSE(morok::passes::dataFlowIntegrityFunction(
-        *F, {/*probability=*/0, /*max_tables=*/1, /*region_bytes=*/32},
-        rng));
+        *F, {/*probability=*/0, /*max_tables=*/1, /*region_bytes=*/32}, rng));
     CHECK(hasPlainI8Arithmetic(*F));
     CHECK(countGlobals(*M, "morok.dfi.table") == 0u);
     CHECK(M->getFunction("morok.dfi.hash.dfi_zero") == nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("uniformPrimitiveLowerFunction table-lowers ops and branch dispatch") {
+TEST_CASE("dataFlowIntegrityFunction caps selected table count") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("dfi-cap", ctx);
+    Function *F = makeI8OpChain(*M, 32, "dfi_many");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(851);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::dataFlowIntegrityFunction(
+        *F, {/*probability=*/100, /*max_tables=*/100, /*region_bytes=*/32},
+        rng));
+
+    CHECK(countGlobals(*M, "morok.dfi.table") == 8u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE(
+    "uniformPrimitiveLowerFunction table-lowers ops and branch dispatch") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 define i8 @uniform(i8 %a, i8 %b, i1 %c) {
@@ -1847,6 +2490,27 @@ right:
         rng));
     CHECK(countGlobals(*M, "morok.tablearith.table") == 0u);
     CHECK(countGlobals(*M, "morok.uniform.table") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("uniformPrimitiveLowerFunction caps branch lowering") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("uniform-cap", ctx);
+    Function *F = makeBranchChainFunction(*M, 40, "uniform_many");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1421);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::uniformPrimitiveLowerFunction(
+        *F,
+        {/*op_probability=*/0, /*branch_probability=*/100,
+         /*max_tables=*/0, /*max_branches=*/100},
+        rng));
+
+    std::size_t indirects = 0;
+    for (Instruction &I : instructions(*F))
+        indirects += isa<IndirectBrInst>(&I) ? 1u : 0u;
+    CHECK(indirects == 16u);
+    CHECK(countGlobals(*M, "morok.uniform.table") == 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -1988,15 +2652,15 @@ entry:
     REQUIRE(Ensure);
     Function *Helper = M->getFunction("morok.vm.vm_secret.exec");
     REQUIRE(Helper);
+    CHECK(Ensure->arg_size() == Helper->arg_size());
 
     auto *AfterData = dyn_cast<ConstantDataArray>(Bytecode->getInitializer());
     REQUIRE(AfterData);
     bool payloadChanged = false;
     for (unsigned I = 0; I < AfterData->getNumElements() && I < Before.size();
          ++I)
-        payloadChanged |=
-            Before[I] !=
-            static_cast<std::uint8_t>(AfterData->getElementAsInteger(I));
+        payloadChanged |= Before[I] != static_cast<std::uint8_t>(
+                                           AfterData->getElementAsInteger(I));
     CHECK(payloadChanged);
 
     bool helperCallsEnsure = false;
@@ -2004,13 +2668,26 @@ entry:
     bool hasTrap = false;
     bool hasVolatileReadyLoad = false;
     bool hasVolatileReadyStore = false;
+    bool hasVolatileContextLoad = false;
+    bool hasVolatileContextStore = false;
+    bool hasContextZero = false;
+    bool keyUsesContext = false;
     bool storesPayload = false;
-    for (Instruction &I : instructions(*Helper))
-        if (auto *CI = dyn_cast<CallInst>(&I))
-            helperCallsEnsure |= CI->getCalledFunction() == Ensure;
+    for (Instruction &I : instructions(*Helper)) {
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+            if (CI->getCalledFunction() == Ensure) {
+                helperCallsEnsure = true;
+                CHECK(CI->arg_size() == Helper->arg_size());
+            }
+        }
+    }
     for (Instruction &I : instructions(*Ensure)) {
         if (I.getName().starts_with("morok.sdb.gate"))
             hasGate = true;
+        if (I.getName().starts_with("morok.sdb.context.zero"))
+            hasContextZero = true;
+        if (I.getName().starts_with("morok.sdb.key.context"))
+            keyUsesContext = true;
         if (auto *CI = dyn_cast<CallInst>(&I))
             if (Function *Callee = CI->getCalledFunction())
                 hasTrap |= Callee->getName() == "llvm.trap";
@@ -2019,14 +2696,22 @@ entry:
                 LI->isVolatile() &&
                 LI->getPointerOperand()->getName().starts_with(
                     "morok.sdb.ready");
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+            hasVolatileContextLoad |=
+                LI->isVolatile() &&
+                LI->getPointerOperand()->getName().starts_with(
+                    "morok.sdb.context.slot");
         if (auto *SI = dyn_cast<StoreInst>(&I)) {
             hasVolatileReadyStore |=
                 SI->isVolatile() &&
                 SI->getPointerOperand()->getName().starts_with(
                     "morok.sdb.ready");
-            storesPayload |=
+            hasVolatileContextStore |=
+                SI->isVolatile() &&
                 SI->getPointerOperand()->getName().starts_with(
-                    "morok.sdb.payload.ptr");
+                    "morok.sdb.context.slot");
+            storesPayload |= SI->getPointerOperand()->getName().starts_with(
+                "morok.sdb.payload.ptr");
         }
     }
     CHECK(helperCallsEnsure);
@@ -2034,6 +2719,10 @@ entry:
     CHECK(hasTrap);
     CHECK(hasVolatileReadyLoad);
     CHECK(hasVolatileReadyStore);
+    CHECK(hasVolatileContextLoad);
+    CHECK(hasVolatileContextStore);
+    CHECK(hasContextZero);
+    CHECK(keyUsesContext);
     CHECK(storesPayload);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
@@ -2084,6 +2773,29 @@ entry:
     CHECK(countGlobals(*M, "morok.sc.region") == 1u);
     CHECK(countGlobals(*M, "morok.sc.expected") == 1u);
     CHECK(countGlobals(*M, "morok.sc.mask") == 2u);
+    CHECK(countGlobals(*M, "morok.postlink.sc") == 1u);
+
+    GlobalVariable *Region = nullptr;
+    GlobalVariable *Expected = nullptr;
+    GlobalVariable *Manifest = nullptr;
+    for (GlobalVariable &GV : M->globals()) {
+        if (GV.getName().starts_with("morok.sc.region"))
+            Region = &GV;
+        if (GV.getName().starts_with("morok.sc.expected"))
+            Expected = &GV;
+        if (GV.getName().starts_with("morok.postlink.sc"))
+            Manifest = &GV;
+    }
+    REQUIRE(Region);
+    REQUIRE(Expected);
+    REQUIRE(Manifest);
+    REQUIRE(Manifest->hasInitializer());
+    CHECK(constantReferencesGlobal(Manifest->getInitializer(), Region));
+    CHECK(constantReferencesGlobal(Manifest->getInitializer(), Expected));
+    GlobalVariable *Used = M->getGlobalVariable("llvm.compiler.used");
+    REQUIRE(Used);
+    REQUIRE(Used->hasInitializer());
+    CHECK(constantReferencesGlobal(Used->getInitializer(), Manifest));
 
     Function *Diff = M->getFunction("morok.sc.diff.selfcheck");
     REQUIRE(Diff);
@@ -2099,8 +2811,7 @@ entry:
         if (auto *LI = dyn_cast<LoadInst>(&I))
             hasVolatileMaskLoad |=
                 LI->isVolatile() &&
-                LI->getPointerOperand()->getName().starts_with(
-                    "morok.sc.mask");
+                LI->getPointerOperand()->getName().starts_with("morok.sc.mask");
     }
 
     bool hasVolatileRegionLoad = false;
@@ -2171,23 +2882,50 @@ entry:
     morok::ir::IRRandom rng(engine);
 
     CHECK(morok::passes::mutualGuardGraphFunction(
-        *F, {/*probability=*/100, /*nodes=*/3, /*region_bytes=*/32,
-             /*max_returns=*/1},
+        *F,
+        {/*probability=*/100, /*nodes=*/3, /*region_bytes=*/32,
+         /*max_returns=*/1},
         rng));
 
     CHECK(countGlobals(*M, "morok.mg.region") == 3u);
     CHECK(countGlobals(*M, "morok.mg.expected") == 3u);
+    CHECK(countGlobals(*M, "morok.postlink.mg") == 1u);
+
+    GlobalVariable *Manifest = nullptr;
+    for (GlobalVariable &GV : M->globals())
+        if (GV.getName().starts_with("morok.postlink.mg"))
+            Manifest = &GV;
+    REQUIRE(Manifest);
+    REQUIRE(Manifest->hasInitializer());
 
     Function *Diff = M->getFunction("morok.mg.diff.mutual");
     REQUIRE(Diff);
 
     std::vector<Function *> nodes;
+    std::vector<GlobalVariable *> regions;
+    std::vector<GlobalVariable *> expected;
     for (unsigned i = 0; i != 3; ++i) {
         Function *Node =
             M->getFunction("morok.mg.node.mutual." + std::to_string(i));
         REQUIRE(Node);
         nodes.push_back(Node);
+        GlobalVariable *Region = M->getGlobalVariable(
+            "morok.mg.region.mutual." + std::to_string(i), true);
+        GlobalVariable *Expected = M->getGlobalVariable(
+            "morok.mg.expected.mutual." + std::to_string(i), true);
+        REQUIRE(Region);
+        REQUIRE(Expected);
+        regions.push_back(Region);
+        expected.push_back(Expected);
     }
+    for (GlobalVariable *Region : regions)
+        CHECK(constantReferencesGlobal(Manifest->getInitializer(), Region));
+    for (GlobalVariable *Expected : expected)
+        CHECK(constantReferencesGlobal(Manifest->getInitializer(), Expected));
+    GlobalVariable *Used = M->getGlobalVariable("llvm.compiler.used");
+    REQUIRE(Used);
+    REQUIRE(Used->hasInitializer());
+    CHECK(constantReferencesGlobal(Used->getInitializer(), Manifest));
 
     bool callsDiff = false;
     bool hasReturnPoison = false;
@@ -2227,10 +2965,9 @@ entry:
                 if (Function *Callee = CI->getCalledFunction())
                     hasTrap |= Callee->getName() == "llvm.trap";
             if (auto *LI = dyn_cast<LoadInst>(&I)) {
-                hasRegionLoad |=
-                    LI->isVolatile() &&
-                    LI->getPointerOperand()->getName().starts_with(
-                        "morok.mg.region.ptr");
+                hasRegionLoad |= LI->isVolatile() &&
+                                 LI->getPointerOperand()->getName().starts_with(
+                                     "morok.mg.region.ptr");
                 if (LI->isVolatile() &&
                     LI->getPointerOperand()->getName().starts_with(
                         "morok.mg.expected"))
@@ -2266,8 +3003,9 @@ entry:
     morok::ir::IRRandom rng(engine);
 
     CHECK_FALSE(morok::passes::mutualGuardGraphFunction(
-        *F, {/*probability=*/0, /*nodes=*/3, /*region_bytes=*/32,
-             /*max_returns=*/1},
+        *F,
+        {/*probability=*/0, /*nodes=*/3, /*region_bytes=*/32,
+         /*max_returns=*/1},
         rng));
     CHECK(countGlobals(*M, "morok.mg.region") == 0u);
     CHECK(countGlobals(*M, "morok.mg.expected") == 0u);
@@ -2337,6 +3075,118 @@ TEST_CASE("pathExplosionFunction honors zero probability") {
     CHECK(F->size() == beforeBlocks);
     CHECK(countNamedAllocas(*F, "morok.path.scratch") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("mqGateFunction emits planted quadratic gate and decoy path") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @mq_branch(i32 %a, i32 %b) {
+entry:
+  %mix = xor i32 %a, %b
+  %cond = icmp ult i32 %mix, 100
+  br i1 %cond, label %then, label %else
+then:
+  %x = add i32 %mix, 7
+  ret i32 %x
+else:
+  %y = sub i32 %mix, 3
+  ret i32 %y
+}
+)ir");
+    Function *F = M->getFunction("mq_branch");
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x51f7);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::mqGateFunction(*F,
+                                        {/*probability=*/100, /*vars=*/8,
+                                         /*eqs=*/6, /*density=*/60,
+                                         /*max_gates=*/1, /*fold_diff=*/true},
+                                        rng));
+
+    CHECK(countGlobals(*M, "morok.mq.sys") == 1u);
+
+    bool hasGate = false;
+    bool hasFail = false;
+    bool hasDecoyStore = false;
+    std::size_t mqAnds = 0;
+    std::size_t mqXors = 0;
+    std::size_t mqIcmps = 0;
+    for (BasicBlock &BB : *F) {
+        hasFail |= BB.getName().starts_with("morok.mq.fail");
+        for (Instruction &I : BB) {
+            if (I.getName().starts_with("morok.mq.gate"))
+                hasGate = true;
+            if (I.getName().starts_with("morok.mq.term"))
+                ++mqAnds;
+            if (I.getName().starts_with("morok.mq.form"))
+                ++mqXors;
+            if (auto *Cmp = dyn_cast<ICmpInst>(&I))
+                if (Cmp->getName().starts_with("morok.mq.eq"))
+                    ++mqIcmps;
+            if (auto *Store = dyn_cast<StoreInst>(&I))
+                hasDecoyStore |=
+                    Store->isVolatile() &&
+                    Store->getPointerOperand()->getName().starts_with(
+                        "morok.mq.scratch");
+        }
+    }
+
+    CHECK(hasGate);
+    CHECK(hasFail);
+    CHECK(hasDecoyStore);
+    CHECK(mqAnds > 0u);
+    CHECK(mqXors > 0u);
+    CHECK(mqIcmps == 6u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("mqGateFunction honors probability and max gate caps") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @mq_off(i32 %a, i32 %b) {
+entry:
+  %cond = icmp eq i32 %a, %b
+  br i1 %cond, label %t, label %f
+t:
+  ret i32 1
+f:
+  ret i32 0
+}
+)ir");
+    Function *F = M->getFunction("mq_off");
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x51f8);
+    morok::ir::IRRandom rng(engine);
+    CHECK_FALSE(morok::passes::mqGateFunction(
+        *F,
+        {/*probability=*/0, /*vars=*/8, /*eqs=*/6, /*density=*/60,
+         /*max_gates=*/1, /*fold_diff=*/true},
+        rng));
+    CHECK(countGlobals(*M, "morok.mq.sys") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+
+    auto M2 = parse(ctx, R"ir(
+define i32 @mq_cap(i32 %a, i32 %b) {
+entry:
+  %cond = icmp eq i32 %a, %b
+  br i1 %cond, label %t, label %f
+t:
+  ret i32 1
+f:
+  ret i32 0
+}
+)ir");
+    Function *F2 = M2->getFunction("mq_cap");
+    REQUIRE(F2);
+    CHECK_FALSE(morok::passes::mqGateFunction(
+        *F2,
+        {/*probability=*/100, /*vars=*/8, /*eqs=*/6, /*density=*/60,
+         /*max_gates=*/0, /*fold_diff=*/true},
+        rng));
+    CHECK(countGlobals(*M2, "morok.mq.sys") == 0u);
+    CHECK_FALSE(verifyModule(*M2, &errs()));
 }
 
 TEST_CASE("traceKeyFunction builds rolling accumulator guards") {
@@ -2537,6 +3387,127 @@ f:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("dispatcherlessRoutingFunction caps route lowering") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("dispatch-cap", ctx);
+    Function *F = makeBranchChainFunction(*M, 48, "dispatch_many");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1021);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::dispatcherlessRoutingFunction(
+        *F, {/*probability=*/100, /*max_routes=*/100, /*max_terms=*/100}, rng));
+
+    std::size_t indirects = 0;
+    std::size_t tokenFolds = 0;
+    for (Instruction &I : instructions(*F)) {
+        indirects += isa<IndirectBrInst>(&I) ? 1u : 0u;
+        tokenFolds += I.getName().starts_with("morok.dlf.token.fold") ? 1u : 0u;
+    }
+    CHECK(indirects == 32u);
+    CHECK(tokenFolds <= 32u * 8u);
+    CHECK(M->getGlobalVariable("morok.dlf.table", true) != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("microcodeStressFunction emits sparse aliased jump-table stress") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @microstress(i32 %a, i32 %b) {
+entry:
+  %x = add i32 %a, %b
+  %c = icmp sgt i32 %x, 17
+  br i1 %c, label %left, label %right
+left:
+  %l = xor i32 %x, %a
+  br label %join
+right:
+  %r = sub i32 %x, %b
+  br label %join
+join:
+  %p = phi i32 [ %l, %left ], [ %r, %right ]
+  ret i32 %p
+}
+)ir");
+    Function *F = M->getFunction("microstress");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(411);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::microcodeStressFunction(
+        *F,
+        {/*probability=*/100, /*max_sites=*/1, /*table_entries=*/16,
+         /*decoy_blocks=*/4, /*alias_stores=*/2},
+        rng));
+
+    CHECK(countNamedAllocas(*F, "morok.micro.scratch") == 1u);
+    CHECK(countGlobals(*M, "morok.micro.seed") == 1u);
+    CHECK(countGlobals(*M, "morok.micro.table") == 1u);
+
+    auto *Table = M->getGlobalVariable("morok.micro.table", true);
+    REQUIRE(Table);
+    auto *ArrTy = dyn_cast<ArrayType>(Table->getValueType());
+    REQUIRE(ArrTy);
+    CHECK(ArrTy->getNumElements() == 16u);
+
+    unsigned decoys = 0;
+    unsigned indirects = 0;
+    unsigned destinations = 0;
+    unsigned volatileStores = 0;
+    bool hasPtrToInt = false;
+    bool hasIntToPtr = false;
+    bool hasIndex = false;
+    for (BasicBlock &BB : *F) {
+        const bool IsDecoy = BB.getName().starts_with("morok.micro.decoy");
+        if (IsDecoy)
+            ++decoys;
+        for (Instruction &I : BB) {
+            hasIndex |= I.getName().starts_with("morok.micro.index");
+            hasPtrToInt |= isa<PtrToIntInst>(&I);
+            hasIntToPtr |= isa<IntToPtrInst>(&I);
+            if (auto *IB = dyn_cast<IndirectBrInst>(&I)) {
+                ++indirects;
+                destinations += IB->getNumDestinations();
+            }
+            if (IsDecoy)
+                if (auto *SI = dyn_cast<StoreInst>(&I))
+                    volatileStores += SI->isVolatile() ? 1u : 0u;
+        }
+    }
+
+    CHECK(decoys == 4u);
+    CHECK(indirects == 1u);
+    CHECK(destinations >= 5u);
+    CHECK(volatileStores >= 8u);
+    CHECK(hasPtrToInt);
+    CHECK(hasIntToPtr);
+    CHECK(hasIndex);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("microcodeStressFunction honors zero probability") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @microstress_off(i32 %a, i32 %b) {
+entry:
+  %x = add i32 %a, %b
+  ret i32 %x
+}
+)ir");
+    Function *F = M->getFunction("microstress_off");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(412);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::microcodeStressFunction(
+        *F,
+        {/*probability=*/0, /*max_sites=*/1, /*table_entries=*/16,
+         /*decoy_blocks=*/4, /*alias_stores=*/2},
+        rng));
+    CHECK(countNamedAllocas(*F, "morok.micro.scratch") == 0u);
+    CHECK(countGlobals(*M, "morok.micro.table") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE(
     "indirectBranchFunction replaces conditional branches with indirectbr") {
     LLVMContext ctx;
@@ -2581,7 +3552,22 @@ define i32 @caller(i32 %x) {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("adversarialFunctionMergingModule fuses functions behind a selector") {
+TEST_CASE("functionWrapModule caps generated forwarders") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("wrap-cap", ctx);
+    makeRepeatedVoidCalls(*M, 300);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(251);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::functionWrapModule(
+        *M, {/*probability=*/100, /*times=*/1, /*max_wrappers=*/1000}, rng));
+
+    CHECK(countFunctions(*M, "morok.wrap") == 256u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE(
+    "adversarialFunctionMergingModule fuses functions behind a selector") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 define i32 @alpha(i32 %a, i32 %b) {
@@ -2610,8 +3596,9 @@ entry:
     morok::ir::IRRandom rng(engine);
 
     CHECK(morok::passes::adversarialFunctionMergingModule(
-        *M, {/*probability=*/100, /*max_groups=*/1, /*max_functions=*/2,
-             /*outline_probability=*/100, /*max_outlines=*/4},
+        *M,
+        {/*probability=*/100, /*max_groups=*/1, /*max_functions=*/2,
+         /*outline_probability=*/100, /*max_outlines=*/4},
         rng));
 
     Function *Alpha = M->getFunction("alpha");
@@ -2654,10 +3641,9 @@ entry:
             if (auto *CI = dyn_cast<CallInst>(&I))
                 callsDispatch |= CI->getCalledFunction() == Dispatch;
             if (auto *LI = dyn_cast<LoadInst>(&I))
-                loadsSelector |=
-                    LI->isVolatile() &&
-                    LI->getPointerOperand()->getName().starts_with(
-                        "morok.afm.selector");
+                loadsSelector |= LI->isVolatile() &&
+                                 LI->getPointerOperand()->getName().starts_with(
+                                     "morok.afm.selector");
         }
         wrappersCallDispatch |= callsDispatch;
         wrappersLoadSelectors |= loadsSelector;
@@ -2715,12 +3701,106 @@ entry:
     morok::ir::IRRandom rng(engine);
 
     CHECK_FALSE(morok::passes::adversarialFunctionMergingModule(
-        *M, {/*probability=*/0, /*max_groups=*/1, /*max_functions=*/2,
-             /*outline_probability=*/100, /*max_outlines=*/4},
+        *M,
+        {/*probability=*/0, /*max_groups=*/1, /*max_functions=*/2,
+         /*outline_probability=*/100, /*max_outlines=*/4},
         rng));
     CHECK(countFunctions(*M, "morok.afm.dispatch") == 0u);
     CHECK(countFunctions(*M, "morok.afm.impl") == 0u);
     CHECK(countGlobals(*M, "morok.afm.selector") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("adversarialSelfTuneModule searches candidates and improves score") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @tune_target(i32 %x, i32 %y) {
+entry:
+  %slot = alloca i32, align 4
+  %seed = add i32 %x, %y
+  store i32 %seed, ptr %slot, align 4
+  %live = load i32, ptr %slot, align 4
+  %cmp = icmp ult i32 %live, 19
+  br i1 %cmp, label %left, label %right
+left:
+  %a = mul i32 %live, 17
+  %b = xor i32 %a, %y
+  br label %merge
+right:
+  %c = sub i32 %live, %x
+  %d = or i32 %c, 5
+  br label %merge
+merge:
+  %p = phi i32 [ %b, %left ], [ %d, %right ]
+  %r = add i32 %p, 11
+  ret i32 %r
+}
+
+define i32 @tune_side(i32 %x) {
+entry:
+  %a = add i32 %x, 3
+  %b = xor i32 %a, 9
+  ret i32 %b
+}
+)ir");
+    const auto Before = morok::passes::adversarialScoreModule(*M);
+    const std::size_t IndirectBefore = countOpcode(*M, Instruction::IndirectBr);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(450);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::adversarialSelfTuneModule(
+        *M,
+        {/*max_candidates=*/4, /*max_candidate_passes=*/3,
+         /*score_floor=*/1, /*emit_marker=*/true},
+        rng));
+
+    const auto After = morok::passes::adversarialScoreModule(*M);
+    CHECK(After.total > Before.total);
+    CHECK(After.cfg_recovery >= Before.cfg_recovery);
+    CHECK(After.lvar_recovery >= Before.lvar_recovery);
+    CHECK(countGlobals(*M, "morok.tune.choice") == 1u);
+    CHECK(countGlobals(*M, "morok.tune.score") == 1u);
+    CHECK(countOpcode(*M, Instruction::IndirectBr) >= IndirectBefore);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("adversarialSelfTuneModule honors disabled search") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @tune_off(i32 %x, i32 %y) {
+entry:
+  %a = add i32 %x, %y
+  ret i32 %a
+}
+)ir");
+    const auto Before = morok::passes::adversarialScoreModule(*M);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(451);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::adversarialSelfTuneModule(
+        *M,
+        {/*max_candidates=*/0, /*max_candidate_passes=*/3,
+         /*score_floor=*/1, /*emit_marker=*/true},
+        rng));
+    const auto After = morok::passes::adversarialScoreModule(*M);
+    CHECK(After.total == Before.total);
+    CHECK(countGlobals(*M, "morok.tune.choice") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("adversarialSelfTuneModule refuses oversized modules") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("large-tune", ctx);
+    makeLargeLinearFunction(*M, 25000);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(452);
+    morok::ir::IRRandom rng(engine);
+    CHECK_FALSE(morok::passes::adversarialSelfTuneModule(
+        *M,
+        {/*max_candidates=*/4, /*max_candidate_passes=*/3,
+         /*score_floor=*/1, /*emit_marker=*/true},
+        rng));
+    CHECK(countGlobals(*M, "morok.tune.choice") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -2762,8 +3842,9 @@ entry:
     auto engine = morok::core::Xoshiro256pp::fromSeed(301);
     morok::ir::IRRandom rng(engine);
     CHECK(morok::passes::perBuildPolymorphismModule(
-        *M, {/*function_order=*/true, /*block_order=*/true,
-             /*anchor_probability=*/100, /*max_anchors=*/8},
+        *M,
+        {/*function_order=*/true, /*block_order=*/true,
+         /*anchor_probability=*/100, /*max_anchors=*/8},
         rng));
 
     CHECK(functionOrder(*M) != BeforeFunctions);
@@ -2820,8 +3901,9 @@ entry:
         auto engine = morok::core::Xoshiro256pp::fromSeed(Seed);
         morok::ir::IRRandom rng(engine);
         CHECK(morok::passes::perBuildPolymorphismModule(
-            *M, {/*function_order=*/true, /*block_order=*/true,
-                 /*anchor_probability=*/100, /*max_anchors=*/8},
+            *M,
+            {/*function_order=*/true, /*block_order=*/true,
+             /*anchor_probability=*/100, /*max_anchors=*/8},
             rng));
         std::string Text;
         raw_string_ostream OS(Text);
@@ -2855,10 +3937,30 @@ entry:
     morok::ir::IRRandom rng(engine);
 
     CHECK_FALSE(morok::passes::perBuildPolymorphismModule(
-        *M, {/*function_order=*/false, /*block_order=*/false,
-             /*anchor_probability=*/0, /*max_anchors=*/0},
+        *M,
+        {/*function_order=*/false, /*block_order=*/false,
+         /*anchor_probability=*/0, /*max_anchors=*/0},
         rng));
     CHECK(countGlobals(*M, "morok.poly.salt") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("stringEncryptModule caps emitted decryptor size") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("strings", ctx);
+    GlobalVariable *Small = makePrivateString(*M, "small.str", "small");
+    const std::string LargeText(2048, 'x');
+    GlobalVariable *Large = makePrivateString(*M, "large.str", LargeText);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(305);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, {/*probability=*/100}, rng));
+
+    CHECK_FALSE(Small->isConstant());
+    CHECK(Large->isConstant());
+    CHECK(countGlobals(*M, "morok.k1") == 1u);
+    CHECK(countGlobals(*M, "morok.k2inv") == 1u);
+    CHECK(M->getFunction("morok.strdec") != nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -2876,6 +3978,21 @@ define i32 @caller() {
     morok::ir::IRRandom rng(engine);
     CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
     CHECK(M->getFunction("dlsym") != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("functionCallObfuscateModule caps redirected call sites") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("fco-cap", ctx);
+    Function *Caller = makeRepeatedVoidCalls(*M, 300);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(271);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::functionCallObfuscateModule(
+        *M, {/*probability=*/100, /*max_calls=*/1000}, rng));
+
+    CHECK(countGlobals(*M, "morok.sym") == 256u);
+    CHECK(countCallsTo(*Caller, "dlsym") == 256u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

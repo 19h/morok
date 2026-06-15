@@ -4,10 +4,11 @@
 //
 // morok/passes/UniformPrimitiveLowering.cpp
 //
-// IR-level uniform primitive lowering: arithmetic intent is moved into encrypted
-// byte lookup tables, while direct CFG intent is moved into memory-loaded
-// block-address dispatch.  The resulting function body favors loads, selects,
-// GEPs, and indirectbr over recognizable arithmetic opcodes and branch opcodes.
+// IR-level uniform primitive lowering: arithmetic intent is moved into
+// encrypted byte lookup tables, while direct CFG intent is moved into
+// memory-loaded block-address dispatch.  The resulting function body favors
+// loads, selects, GEPs, and indirectbr over recognizable arithmetic opcodes and
+// branch opcodes.
 
 #include "morok/passes/UniformPrimitiveLowering.hpp"
 
@@ -41,6 +42,9 @@ struct BranchSite {
     std::vector<BasicBlock *> successors;
 };
 
+constexpr std::uint32_t kMaxBranchesPerInvocation = 16;
+constexpr std::uint32_t kMaxSuccessorsPerSite = 32;
+
 bool generatedBlock(const BasicBlock &BB) {
     return BB.getName().starts_with("morok.");
 }
@@ -71,19 +75,12 @@ bool eligibleTerminator(Instruction &Term, BasicBlock *Entry) {
         generatedBlock(*Parent))
         return false;
     std::vector<BasicBlock *> Succs = successorsOf(Term);
-    if (Succs.empty())
+    if (Succs.empty() || Succs.size() > kMaxSuccessorsPerSite)
         return false;
     for (BasicBlock *Succ : Succs)
         if (!Succ || Succ == Entry || Succ->isEHPad() || Succ->isLandingPad())
             return false;
     return true;
-}
-
-void shuffleSites(std::vector<BranchSite> &Sites, ir::IRRandom &rng) {
-    for (std::size_t I = Sites.size(); I > 1; --I) {
-        const std::size_t J = rng.range(static_cast<std::uint32_t>(I));
-        std::swap(Sites[I - 1], Sites[J]);
-    }
 }
 
 GlobalVariable *createTargetTable(Function &F, ArrayRef<BasicBlock *> Targets) {
@@ -102,8 +99,9 @@ GlobalVariable *createTargetTable(Function &F, ArrayRef<BasicBlock *> Targets) {
         ConstantArray::get(ArrTy, Entries), "morok.uniform.table");
 }
 
-Value *selectedIndex(Builder &B, Instruction &Term,
-                     const std::unordered_map<BasicBlock *, std::uint32_t> &ID) {
+Value *
+selectedIndex(Builder &B, Instruction &Term,
+              const std::unordered_map<BasicBlock *, std::uint32_t> &ID) {
     auto *I32 = B.getInt32Ty();
 
     if (auto *Br = dyn_cast<BranchInst>(&Term)) {
@@ -128,8 +126,9 @@ Value *selectedIndex(Builder &B, Instruction &Term,
     return Index;
 }
 
-void lowerBranchSite(BranchSite &Site, GlobalVariable *Table,
-                     const std::unordered_map<BasicBlock *, std::uint32_t> &ID) {
+void lowerBranchSite(
+    BranchSite &Site, GlobalVariable *Table,
+    const std::unordered_map<BasicBlock *, std::uint32_t> &ID) {
     Instruction *Term = Site.term;
     Builder B(Term);
     auto *I32 = B.getInt32Ty();
@@ -152,21 +151,19 @@ bool lowerBranches(Function &F, const UniformLowerParams &Params,
     if (Params.branch_probability == 0 || Params.max_branches == 0)
         return false;
 
-    std::vector<BranchSite> Sites;
+    const std::uint32_t BranchLimit =
+        std::min(Params.max_branches, kMaxBranchesPerInvocation);
+    std::vector<BranchSite> Selected;
+    Selected.reserve(BranchLimit);
     BasicBlock *Entry = &F.getEntryBlock();
     for (BasicBlock &BB : F) {
-        Instruction *Term = BB.getTerminator();
-        if (Term && eligibleTerminator(*Term, Entry))
-            Sites.push_back(BranchSite{Term, successorsOf(*Term)});
-    }
-    shuffleSites(Sites, rng);
-
-    std::vector<BranchSite> Selected;
-    for (BranchSite &Site : Sites) {
-        if (Selected.size() >= Params.max_branches)
+        if (Selected.size() >= BranchLimit)
             break;
+        Instruction *Term = BB.getTerminator();
+        if (!Term || !eligibleTerminator(*Term, Entry))
+            continue;
         if (rng.chance(Params.branch_probability))
-            Selected.push_back(Site);
+            Selected.push_back(BranchSite{Term, successorsOf(*Term)});
     }
     if (Selected.empty())
         return false;
@@ -188,7 +185,8 @@ bool lowerBranches(Function &F, const UniformLowerParams &Params,
 
 } // namespace
 
-bool uniformPrimitiveLowerFunction(Function &F, const UniformLowerParams &Params,
+bool uniformPrimitiveLowerFunction(Function &F,
+                                   const UniformLowerParams &Params,
                                    ir::IRRandom &rng) {
     if (F.isDeclaration() || F.getName().starts_with("morok."))
         return false;
@@ -204,8 +202,8 @@ bool uniformPrimitiveLowerFunction(Function &F, const UniformLowerParams &Params
     return Changed;
 }
 
-PreservedAnalyses
-UniformPrimitiveLoweringPass::run(Function &F, FunctionAnalysisManager &) {
+PreservedAnalyses UniformPrimitiveLoweringPass::run(Function &F,
+                                                    FunctionAnalysisManager &) {
     if (F.isDeclaration())
         return PreservedAnalyses::all();
     ir::IRRandom rng(engine_);

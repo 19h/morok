@@ -34,6 +34,7 @@ namespace morok::passes {
 namespace {
 
 constexpr std::uint32_t kTableSize = 1u << 16;
+constexpr std::uint32_t kMaxTablesPerInvocation = 16;
 
 struct KeySchedule {
     std::uint32_t mul;
@@ -114,13 +115,6 @@ Value *emitKey(IRBuilder<> &B, Value *Idx, const KeySchedule &key) {
     Value *K = B.CreateTrunc(X, I8, "morok.tablearith.key.trunc");
     return B.CreateXor(K, ConstantInt::get(I8, key.xork),
                        "morok.tablearith.key");
-}
-
-void shuffleTargets(std::vector<BinaryOperator *> &targets, ir::IRRandom &rng) {
-    for (std::size_t i = targets.size(); i > 1; --i) {
-        const std::size_t j = rng.range(static_cast<std::uint32_t>(i));
-        std::swap(targets[i - 1], targets[j]);
-    }
 }
 
 Function *createEnsureFunction(Module &M, GlobalVariable *Table,
@@ -230,28 +224,32 @@ bool tableArithmeticFunction(Function &F, const TableArithParams &params,
         params.probability == 0 || params.max_tables == 0)
         return false;
 
+    const std::uint32_t limit =
+        std::min(params.max_tables, kMaxTablesPerInvocation);
     std::vector<BinaryOperator *> targets;
-    for (BasicBlock &BB : F)
-        for (Instruction &I : BB)
+    targets.reserve(limit);
+    for (BasicBlock &BB : F) {
+        if (targets.size() >= limit)
+            break;
+        for (Instruction &I : BB) {
+            if (targets.size() >= limit)
+                break;
             if (auto *BO = dyn_cast<BinaryOperator>(&I))
                 if (eligible(*BO))
-                    targets.push_back(BO);
-
-    shuffleTargets(targets, rng);
+                    if (rng.chance(params.probability))
+                        targets.push_back(BO);
+        }
+    }
+    if (targets.empty())
+        return false;
 
     Module &M = *F.getParent();
     bool changed = false;
-    std::uint32_t selected = 0;
     for (BinaryOperator *BO : targets) {
-        if (selected >= params.max_tables)
-            break;
-        if (!rng.chance(params.probability))
-            continue;
         Value *Replacement = emitLookup(M, *BO, rng);
         BO->replaceAllUsesWith(Replacement);
         BO->eraseFromParent();
         changed = true;
-        ++selected;
     }
     return changed;
 }

@@ -29,6 +29,12 @@ Opt<std::uint32_t> readU32(const Node &v) {
     return std::nullopt;
 }
 
+Opt<std::uint64_t> readU64(const Node &v) {
+    if (auto i = v.value<std::int64_t>())
+        return static_cast<std::uint64_t>(*i);
+    return std::nullopt;
+}
+
 Opt<bool> readBool(const Node &v) {
     if (auto b = v.value<bool>())
         return *b;
@@ -76,6 +82,15 @@ void parseStackCoalesce(const toml::table &t, StackCoalesceConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.probability = readU32(t["probability"]);
     c.opaque_offsets = readBool(t["opaque_offsets"]);
+}
+
+void parseStackDelta(const toml::table &t, StackDeltaConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.probability = readU32(t["probability"]);
+    c.max_blocks = readU32(t["max_blocks"]);
+    c.min_bytes = readU32(t["min_bytes"]);
+    c.max_extra_bytes = readU32(t["max_extra_bytes"]);
+    c.touches = readU32(t["touches"]);
 }
 
 void parsePointerLaunder(const toml::table &t, PointerLaunderConfig &c) {
@@ -185,6 +200,7 @@ void parseHashSelfDecrypt(const toml::table &t, HashSelfDecryptConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.probability = readU32(t["probability"]);
     c.max_payloads = readU32(t["max_payloads"]);
+    c.context_keying = readBool(t["context_keying"]);
 }
 
 void parseSelfChecksum(const toml::table &t, SelfChecksumConfig &c) {
@@ -194,8 +210,7 @@ void parseSelfChecksum(const toml::table &t, SelfChecksumConfig &c) {
     c.region_bytes = readU32(t["region_bytes"]);
 }
 
-void parseDataFlowIntegrity(const toml::table &t,
-                            DataFlowIntegrityConfig &c) {
+void parseDataFlowIntegrity(const toml::table &t, DataFlowIntegrityConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.probability = readU32(t["probability"]);
     c.max_tables = readU32(t["max_tables"]);
@@ -210,14 +225,39 @@ void parseMutualGuard(const toml::table &t, MutualGuardConfig &c) {
     c.max_returns = readU32(t["max_returns"]);
 }
 
-void parseAdversarialMerge(const toml::table &t,
-                           AdversarialMergeConfig &c) {
+void parseShamirShare(const toml::table &t, ShamirShareConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.probability = readU32(t["probability"]);
+    c.threshold = readU32(t["threshold"]);
+    c.shares = readU32(t["shares"]);
+    c.max_secrets = readU32(t["max_secrets"]);
+}
+
+void parseMqGate(const toml::table &t, MqGateConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.probability = readU32(t["probability"]);
+    c.vars = readU32(t["vars"]);
+    c.eqs = readU32(t["eqs"]);
+    c.density = readU32(t["density"]);
+    c.max_gates = readU32(t["max_gates"]);
+    c.fold_diff = readBool(t["fold_diff"]);
+}
+
+void parseAdversarialMerge(const toml::table &t, AdversarialMergeConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.probability = readU32(t["probability"]);
     c.max_groups = readU32(t["max_groups"]);
     c.max_functions = readU32(t["max_functions"]);
     c.outline_probability = readU32(t["outline_probability"]);
     c.max_outlines = readU32(t["max_outlines"]);
+}
+
+void parseAdversarialTuning(const toml::table &t, AdversarialTuningConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.max_candidates = readU32(t["max_candidates"]);
+    c.max_candidate_passes = readU32(t["max_candidate_passes"]);
+    c.score_floor = readU32(t["score_floor"]);
+    c.emit_marker = readBool(t["emit_marker"]);
 }
 
 void parsePerBuildPolymorphism(const toml::table &t,
@@ -247,6 +287,15 @@ void parseDispatcherless(const toml::table &t, DispatcherlessConfig &c) {
     c.probability = readU32(t["probability"]);
     c.max_routes = readU32(t["max_routes"]);
     c.max_terms = readU32(t["max_terms"]);
+}
+
+void parseMicrocodeStress(const toml::table &t, MicrocodeStressConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.probability = readU32(t["probability"]);
+    c.max_sites = readU32(t["max_sites"]);
+    c.table_entries = readU32(t["table_entries"]);
+    c.decoy_blocks = readU32(t["decoy_blocks"]);
+    c.alias_stores = readU32(t["alias_stores"]);
 }
 
 void parseStrEnc(const toml::table &t, StrEncConfig &c) {
@@ -279,6 +328,13 @@ void parseVec(const toml::table &t, VecConfig &c) {
 
 void parseCsm(const toml::table &t, CsmConfig &c) {
     c.enabled = readBool(t["enabled"]);
+    if (auto s = t["generator"].value<std::string>()) {
+        if (*s == "tfunction")
+            c.generator = CsmGenerator::TFunction;
+        else if (*s == "logistic")
+            c.generator = CsmGenerator::Logistic;
+    }
+    c.tf_const = readU64(t["tf_const"]);
     c.nested_dispatch = readBool(t["nested_dispatch"]);
     c.warmup = readU32(t["warmup"]);
 }
@@ -304,6 +360,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseSplit(*t, pc.split);
     if (auto *t = p["stack_coalescing"].as_table())
         parseStackCoalesce(*t, pc.stack_coalesce);
+    if (auto *t = p["stack_delta_games"].as_table())
+        parseStackDelta(*t, pc.stack_delta);
     if (auto *t = p["pointer_laundering"].as_table())
         parsePointerLaunder(*t, pc.pointer_launder);
     if (auto *t = p["type_punning"].as_table())
@@ -342,8 +400,14 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseDataFlowIntegrity(*t, pc.data_flow_integrity);
     if (auto *t = p["mutual_guard_graph"].as_table())
         parseMutualGuard(*t, pc.mutual_guard);
+    if (auto *t = p["shamir_share"].as_table())
+        parseShamirShare(*t, pc.shamir_share);
+    if (auto *t = p["mq_gate"].as_table())
+        parseMqGate(*t, pc.mq_gate);
     if (auto *t = p["adversarial_function_merging"].as_table())
         parseAdversarialMerge(*t, pc.adversarial_merge);
+    if (auto *t = p["adversarial_self_tuning"].as_table())
+        parseAdversarialTuning(*t, pc.adversarial_tuning);
     if (auto *t = p["per_build_polymorphism"].as_table())
         parsePerBuildPolymorphism(*t, pc.per_build_polymorphism);
     if (auto *t = p["path_explosion"].as_table())
@@ -352,6 +416,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseTraceKeying(*t, pc.trace_keying);
     if (auto *t = p["dispatcherless_routing"].as_table())
         parseDispatcherless(*t, pc.dispatcherless);
+    if (auto *t = p["microcode_stress"].as_table())
+        parseMicrocodeStress(*t, pc.microcode_stress);
     if (auto *t = p["string_encryption"].as_table())
         parseStrEnc(*t, pc.str_enc);
     if (auto *t = p["constant_encryption"].as_table())

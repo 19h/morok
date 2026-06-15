@@ -16,6 +16,8 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <vector>
 
 using namespace llvm;
@@ -23,6 +25,8 @@ using namespace llvm;
 namespace morok::passes {
 
 namespace {
+
+constexpr std::uint32_t kMaxWrappersPerModule = 256;
 
 bool wrappable(CallInst *ci) {
     if (ci->isInlineAsm() || ci->hasOperandBundles())
@@ -63,25 +67,40 @@ Function *makeForwarder(Module &M, Function *callee) {
 
 bool functionWrapModule(Module &M, const FuncWrapParams &params,
                         ir::IRRandom &rng) {
+    if (params.probability == 0 || params.max_wrappers == 0)
+        return false;
+
+    const std::uint32_t MaxWrappers =
+        std::min(params.max_wrappers, kMaxWrappersPerModule);
     const std::uint32_t times = params.times ? params.times : 1;
     bool changed = false;
+    std::uint32_t wrappers = 0;
 
     for (std::uint32_t round = 0; round < times; ++round) {
+        if (wrappers >= MaxWrappers)
+            return changed;
+        const std::uint32_t Remaining = MaxWrappers - wrappers;
         std::vector<CallInst *> targets;
+        targets.reserve(Remaining);
         for (Function &F : M) {
+            if (targets.size() >= Remaining)
+                break;
             if (F.isDeclaration() || F.getName().starts_with("morok."))
                 continue;
-            for (Instruction &inst : instructions(F))
+            for (Instruction &inst : instructions(F)) {
+                if (targets.size() >= Remaining)
+                    break;
                 if (auto *ci = dyn_cast<CallInst>(&inst))
                     if (wrappable(ci))
-                        targets.push_back(ci);
+                        if (rng.chance(params.probability))
+                            targets.push_back(ci);
+            }
         }
 
         for (CallInst *ci : targets) {
-            if (!rng.chance(params.probability))
-                continue;
             Function *forwarder = makeForwarder(M, ci->getCalledFunction());
             ci->setCalledFunction(forwarder);
+            ++wrappers;
             changed = true;
         }
     }

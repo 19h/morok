@@ -5,8 +5,8 @@
 // morok/passes/VectorObfuscation.cpp
 //
 // a OP b  becomes  extractelement(shuffle(<a,j...> OP <b,j...>), 0).  Per-lane
-// vector semantics keep the chosen real lane exactly equal to the scalar op; the
-// surrounding vector lanes and optional shuffle create a SIMD surface for
+// vector semantics keep the chosen real lane exactly equal to the scalar op;
+// the surrounding vector lanes and optional shuffle create a SIMD surface for
 // decompilers.
 
 #include "morok/passes/VectorObfuscation.hpp"
@@ -26,6 +26,9 @@ using namespace llvm;
 namespace morok::passes {
 
 namespace {
+
+constexpr std::size_t kMaxVectorLiftTargets = 128;
+constexpr std::size_t kMaxVectorCompareTargets = 128;
 
 bool liftable(BinaryOperator *bo) {
     auto *ty = dyn_cast<IntegerType>(bo->getType());
@@ -80,8 +83,8 @@ Value *buildVector(IRBuilder<> &B, Value *real, FixedVectorType *vecTy,
 }
 
 Value *extractRealLane(IRBuilder<> &B, Value *vector, std::uint32_t lanes,
-                       std::uint32_t realLane, bool shuffle,
-                       ir::IRRandom &rng, const Twine &name) {
+                       std::uint32_t realLane, bool shuffle, ir::IRRandom &rng,
+                       const Twine &name) {
     if (!shuffle)
         return B.CreateExtractElement(vector, B.getInt32(realLane), name);
 
@@ -90,9 +93,8 @@ Value *extractRealLane(IRBuilder<> &B, Value *vector, std::uint32_t lanes,
     mask.push_back(static_cast<int>(realLane));
     for (std::uint32_t lane = 1; lane < lanes; ++lane)
         mask.push_back(static_cast<int>(rng.range(lanes)));
-    Value *shuffled =
-        B.CreateShuffleVector(vector, PoisonValue::get(vector->getType()),
-                              mask, name + ".shuffle");
+    Value *shuffled = B.CreateShuffleVector(
+        vector, PoisonValue::get(vector->getType()), mask, name + ".shuffle");
     return B.CreateExtractElement(shuffled, B.getInt32(0), name);
 }
 
@@ -153,12 +155,22 @@ bool vectorObfuscateFunction(Function &F, const VecParams &params,
         for (Instruction &inst : bb) {
             if (auto *bo = dyn_cast<BinaryOperator>(&inst))
                 if (liftable(bo))
-                    targets.push_back(bo);
+                    if (targets.size() < kMaxVectorLiftTargets)
+                        targets.push_back(bo);
             if (params.lift_comparisons)
                 if (auto *cmp = dyn_cast<ICmpInst>(&inst))
                     if (liftableCompare(cmp))
-                        compares.push_back(cmp);
+                        if (compares.size() < kMaxVectorCompareTargets)
+                            compares.push_back(cmp);
+            if (targets.size() >= kMaxVectorLiftTargets &&
+                (!params.lift_comparisons ||
+                 compares.size() >= kMaxVectorCompareTargets))
+                break;
         }
+        if (targets.size() >= kMaxVectorLiftTargets &&
+            (!params.lift_comparisons ||
+             compares.size() >= kMaxVectorCompareTargets))
+            break;
     }
 
     bool changed = false;

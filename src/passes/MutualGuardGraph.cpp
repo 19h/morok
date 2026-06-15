@@ -23,6 +23,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
 #include "llvm/Support/ModRef.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -36,6 +37,8 @@ namespace morok::passes {
 namespace {
 
 using Builder = IRBuilder<NoFolder>;
+
+constexpr std::uint64_t kPostlinkMagic = 0x4D4F524F4B4D4731ULL; // MOROKMG1
 
 struct NodeRuntime {
     GlobalVariable *region = nullptr;
@@ -101,8 +104,7 @@ Value *rotl64(Builder &B, Value *V, unsigned Amount, const Twine &Name) {
     return B.CreateOr(L, R, Name);
 }
 
-std::vector<std::uint8_t> randomRegion(std::uint32_t Size,
-                                       ir::IRRandom &Rng) {
+std::vector<std::uint8_t> randomRegion(std::uint32_t Size, ir::IRRandom &Rng) {
     std::vector<std::uint8_t> Bytes;
     Bytes.reserve(Size);
     for (std::uint32_t I = 0; I < Size; ++I)
@@ -166,8 +168,7 @@ GlobalVariable *createRegion(Module &M, StringRef Suffix, std::uint32_t Index,
     return Region;
 }
 
-GlobalVariable *createExpected(Module &M, StringRef Suffix,
-                               std::uint32_t Index,
+GlobalVariable *createExpected(Module &M, StringRef Suffix, std::uint32_t Index,
                                std::uint64_t ExpectedHash) {
     auto *I64 = Type::getInt64Ty(M.getContext());
     auto *Expected = new GlobalVariable(
@@ -181,9 +182,8 @@ GlobalVariable *createExpected(Module &M, StringRef Suffix,
 Value *regionPtr(Builder &B, GlobalVariable *Region, Value *Idx) {
     auto *I32 = B.getInt32Ty();
     auto *ArrTy = cast<ArrayType>(Region->getValueType());
-    return B.CreateInBoundsGEP(
-        ArrTy, Region, {ConstantInt::get(I32, 0), Idx},
-        "morok.mg.region.ptr");
+    return B.CreateInBoundsGEP(ArrTy, Region, {ConstantInt::get(I32, 0), Idx},
+                               "morok.mg.region.ptr");
 }
 
 LoadInst *volatileExpectedLoad(Builder &B, GlobalVariable *Expected,
@@ -242,21 +242,18 @@ Function *createNodeFunction(Module &M, StringRef Suffix, std::uint32_t Index,
         LB.CreateAdd(I, ConstantInt::get(I32, 1), "morok.mg.hash.next");
     I->addIncoming(NextI, Loop);
     H->addIncoming(NextH, Loop);
-    Value *Done =
-        LB.CreateICmpEQ(NextI, ConstantInt::get(I32, Size),
-                        "morok.mg.hash.done");
+    Value *Done = LB.CreateICmpEQ(NextI, ConstantInt::get(I32, Size),
+                                  "morok.mg.hash.done");
     LB.CreateCondBr(Done, Exit, Loop);
 
     Builder XB(Exit);
     Value *OwnLoaded =
         volatileExpectedLoad(XB, Self.expected, "morok.mg.expected.load");
     Value *OwnDiff = XB.CreateXor(NextH, OwnLoaded, "morok.mg.node.diff");
-    Value *PrevDiff =
-        peerDiff(XB, Nodes[Prev].expected, Nodes[Prev].expected_hash,
-                 "morok.mg.peer.prev");
-    Value *NextDiff =
-        peerDiff(XB, Nodes[Next].expected, Nodes[Next].expected_hash,
-                 "morok.mg.peer.next");
+    Value *PrevDiff = peerDiff(XB, Nodes[Prev].expected,
+                               Nodes[Prev].expected_hash, "morok.mg.peer.prev");
+    Value *NextDiff = peerDiff(XB, Nodes[Next].expected,
+                               Nodes[Next].expected_hash, "morok.mg.peer.next");
     Value *Acc = XB.CreateXor(OwnDiff, PrevDiff, "morok.mg.node.diff");
     Acc = XB.CreateXor(Acc, NextDiff, "morok.mg.node.diff");
     Value *Rot = rotl64(XB, Acc, 9u + Index * 7u, "morok.mg.node.diff.rot");
@@ -295,12 +292,43 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
     return Fn;
 }
 
+GlobalVariable *createPostlinkManifest(Module &M, StringRef Suffix,
+                                       ArrayRef<NodeRuntime> Nodes,
+                                       std::uint32_t RegionSize) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *PtrTy = PointerType::getUnqual(Ctx);
+    auto *NodeTy = StructType::get(Ctx, {PtrTy, PtrTy, I64, I64});
+    SmallVector<Constant *, 16> NodeRecords;
+    NodeRecords.reserve(Nodes.size());
+    for (const NodeRuntime &Node : Nodes) {
+        NodeRecords.push_back(ConstantStruct::get(
+            NodeTy,
+            {Node.region, Node.expected, ConstantInt::get(I64, Node.seed),
+             ConstantInt::get(I64, Node.expected_hash)}));
+    }
+    auto *NodesTy = ArrayType::get(NodeTy, NodeRecords.size());
+    auto *ManifestTy = StructType::get(Ctx, {I64, I32, I32, I32, NodesTy});
+    auto *Init = ConstantStruct::get(
+        ManifestTy,
+        {ConstantInt::get(I64, kPostlinkMagic), ConstantInt::get(I32, 1),
+         ConstantInt::get(I32, Nodes.size()), ConstantInt::get(I32, RegionSize),
+         ConstantArray::get(NodesTy, NodeRecords)});
+    auto *Manifest = new GlobalVariable(
+        M, ManifestTy, /*isConstant=*/true, GlobalValue::PrivateLinkage, Init,
+        (Twine("morok.postlink.mg.") + Suffix).str());
+    Manifest->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
+    Manifest->setAlignment(Align(8));
+    appendToCompilerUsed(M, {Manifest});
+    return Manifest;
+}
+
 GraphRuntime createGraph(Function &F, const MutualGuardGraphParams &Params,
                          ir::IRRandom &Rng) {
     Module &M = *F.getParent();
     const std::string Suffix = suffixFor(F);
-    const std::uint32_t Count =
-        std::clamp<std::uint32_t>(Params.nodes, 2, 16);
+    const std::uint32_t Count = std::clamp<std::uint32_t>(Params.nodes, 2, 16);
     const std::uint32_t RegionSize =
         std::clamp<std::uint32_t>(Params.region_bytes, 8, 1024);
 
@@ -312,9 +340,8 @@ GraphRuntime createGraph(Function &F, const MutualGuardGraphParams &Params,
         std::vector<std::uint8_t> Bytes = randomRegion(RegionSize, Rng);
         Node.expected_hash = hashBytes(
             ArrayRef<std::uint8_t>(Bytes.data(), Bytes.size()), Node.seed);
-        Node.region = createRegion(M, Suffix, I,
-                                   ArrayRef<std::uint8_t>(Bytes.data(),
-                                                          Bytes.size()));
+        Node.region = createRegion(
+            M, Suffix, I, ArrayRef<std::uint8_t>(Bytes.data(), Bytes.size()));
         Node.expected = createExpected(M, Suffix, I, Node.expected_hash);
         G.nodes.push_back(Node);
     }
@@ -322,6 +349,8 @@ GraphRuntime createGraph(Function &F, const MutualGuardGraphParams &Params,
     for (std::uint32_t I = 0; I != Count; ++I)
         G.nodes[I].checker =
             createNodeFunction(M, Suffix, I, ArrayRef<NodeRuntime>(G.nodes));
+    createPostlinkManifest(M, Suffix, ArrayRef<NodeRuntime>(G.nodes),
+                           RegionSize);
     G.diff = createDiffFunction(M, Suffix, ArrayRef<NodeRuntime>(G.nodes));
     return G;
 }
@@ -340,12 +369,10 @@ Value *emitPoisonedReturn(ReturnInst *RI, Function *Diff) {
 
 } // namespace
 
-bool mutualGuardGraphFunction(Function &F,
-                              const MutualGuardGraphParams &Params,
+bool mutualGuardGraphFunction(Function &F, const MutualGuardGraphParams &Params,
                               ir::IRRandom &Rng) {
     if (F.isDeclaration() || generatedFunction(F) || Params.probability == 0 ||
-        Params.nodes < 2 || Params.region_bytes == 0 ||
-        Params.max_returns == 0)
+        Params.nodes < 2 || Params.region_bytes == 0 || Params.max_returns == 0)
         return false;
 
     const std::string DiffName = "morok.mg.diff." + suffixFor(F);
@@ -383,9 +410,8 @@ bool mutualGuardGraphFunction(Function &F,
 PreservedAnalyses MutualGuardGraphPass::run(Function &F,
                                             FunctionAnalysisManager &) {
     ir::IRRandom Rng(engine_);
-    return mutualGuardGraphFunction(F, params_, Rng)
-               ? PreservedAnalyses::none()
-               : PreservedAnalyses::all();
+    return mutualGuardGraphFunction(F, params_, Rng) ? PreservedAnalyses::none()
+                                                     : PreservedAnalyses::all();
 }
 
 } // namespace morok::passes

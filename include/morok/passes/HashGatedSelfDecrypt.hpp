@@ -21,8 +21,9 @@ class Module;
 namespace morok::passes {
 
 struct HashGatedSelfDecryptParams {
-    std::uint32_t probability = 100;   ///< per VM bytecode payload, 0..100
-    std::uint32_t max_payloads = 4;    ///< per-module wrapped payload cap
+    std::uint32_t probability = 100; ///< per VM bytecode payload, 0..100
+    std::uint32_t max_payloads = 4;  ///< per-module wrapped payload cap
+    bool context_keying = true;      ///< fold helper args into decrypt key
 };
 
 /// Add hash-gated lazy decryptors to VM bytecode payloads.
@@ -34,8 +35,8 @@ bool hashGatedSelfDecryptModule(llvm::Module &M,
 class HashGatedSelfDecryptPass
     : public llvm::PassInfoMixin<HashGatedSelfDecryptPass> {
 public:
-    explicit HashGatedSelfDecryptPass(
-        HashGatedSelfDecryptParams params = {}, std::uint64_t seed = 0x1337)
+    explicit HashGatedSelfDecryptPass(HashGatedSelfDecryptParams params = {},
+                                      std::uint64_t seed = 0x1337)
         : params_(params), engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M,

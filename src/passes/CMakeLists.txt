@@ -8,11 +8,13 @@
 
 add_library(morok_passes STATIC
   AdversarialFunctionMerging.cpp
+  AdversarialSelfTuning.cpp
   Substitution.cpp
   Mba.cpp
   ConstantEncryption.cpp
   SplitBasicBlocks.cpp
   StackCoalescing.cpp
+  StackDeltaGames.cpp
   PointerLaundering.cpp
   TypePunning.cpp
   PhiTangling.cpp
@@ -26,6 +28,8 @@ add_library(morok_passes STATIC
   NonInvertibleState.cpp
   StateOpaquePredicates.cpp
   InterproceduralFsm.cpp
+  MicrocodeStress.cpp
+  MqGate.cpp
   ChaosStateMachine.cpp
   OptimizerAmplification.cpp
   PerBuildPolymorphism.cpp
@@ -34,6 +38,7 @@ add_library(morok_passes STATIC
   Virtualization.cpp
   HashGatedSelfDecrypt.cpp
   SelfChecksumConstants.cpp
+  ShamirShare.cpp
   MutualGuardGraph.cpp
   PathExplosion.cpp
   TraceKeying.cpp

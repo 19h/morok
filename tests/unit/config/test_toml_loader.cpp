@@ -46,6 +46,13 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     enabled = true
     probability = 75
     opaque_offsets = true
+    [passes.stack_delta_games]
+    enabled = true
+    probability = 44
+    max_blocks = 5
+    min_bytes = 21
+    max_extra_bytes = 48
+    touches = 4
     [passes.pointer_laundering]
     enabled = true
     pointer_probability = 80
@@ -120,6 +127,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     enabled = true
     probability = 92
     max_payloads = 3
+    context_keying = true
     [passes.self_checksum_constants]
     enabled = true
     probability = 83
@@ -136,6 +144,20 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     nodes = 4
     region_bytes = 80
     max_returns = 3
+    [passes.shamir_share]
+    enabled = true
+    probability = 46
+    threshold = 4
+    shares = 7
+    max_secrets = 6
+    [passes.mq_gate]
+    enabled = true
+    probability = 21
+    vars = 40
+    eqs = 39
+    density = 47
+    max_gates = 3
+    fold_diff = false
     [passes.adversarial_function_merging]
     enabled = true
     probability = 57
@@ -143,6 +165,12 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     max_functions = 5
     outline_probability = 71
     max_outlines = 9
+    [passes.adversarial_self_tuning]
+    enabled = true
+    max_candidates = 7
+    max_candidate_passes = 4
+    score_floor = 96
+    emit_marker = false
     [passes.per_build_polymorphism]
     enabled = true
     function_order = false
@@ -163,12 +191,25 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     probability = 63
     max_routes = 9
     max_terms = 5
+    [passes.microcode_stress]
+    enabled = true
+    probability = 54
+    max_sites = 4
+    table_entries = 48
+    decoy_blocks = 9
+    alias_stores = 3
     [passes.vector_obfuscation]
     enabled = true
     probability = 88
     width = 512
     shuffle = true
     lift_comparisons = false
+    [passes.chaos_state_machine]
+    enabled = true
+    generator = "tfunction"
+    tf_const = 13
+    nested_dispatch = true
+    warmup = 128
   )");
     REQUIRE(r.ok);
     // From the mid preset base:
@@ -181,6 +222,12 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.stack_coalesce.enabled == true);
     CHECK(r.config.passes.stack_coalesce.probability == 75u);
     CHECK(r.config.passes.stack_coalesce.opaque_offsets == true);
+    CHECK(r.config.passes.stack_delta.enabled == true);
+    CHECK(r.config.passes.stack_delta.probability == 44u);
+    CHECK(r.config.passes.stack_delta.max_blocks == 5u);
+    CHECK(r.config.passes.stack_delta.min_bytes == 21u);
+    CHECK(r.config.passes.stack_delta.max_extra_bytes == 48u);
+    CHECK(r.config.passes.stack_delta.touches == 4u);
     CHECK(r.config.passes.pointer_launder.enabled == true);
     CHECK(r.config.passes.pointer_launder.pointer_probability == 80u);
     CHECK(r.config.passes.pointer_launder.integer_probability == 20u);
@@ -239,6 +286,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.hash_self_decrypt.enabled == true);
     CHECK(r.config.passes.hash_self_decrypt.probability == 92u);
     CHECK(r.config.passes.hash_self_decrypt.max_payloads == 3u);
+    CHECK(r.config.passes.hash_self_decrypt.context_keying == true);
     CHECK(r.config.passes.self_checksum.enabled == true);
     CHECK(r.config.passes.self_checksum.probability == 83u);
     CHECK(r.config.passes.self_checksum.max_constants == 6u);
@@ -252,12 +300,29 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.mutual_guard.nodes == 4u);
     CHECK(r.config.passes.mutual_guard.region_bytes == 80u);
     CHECK(r.config.passes.mutual_guard.max_returns == 3u);
+    CHECK(r.config.passes.shamir_share.enabled == true);
+    CHECK(r.config.passes.shamir_share.probability == 46u);
+    CHECK(r.config.passes.shamir_share.threshold == 4u);
+    CHECK(r.config.passes.shamir_share.shares == 7u);
+    CHECK(r.config.passes.shamir_share.max_secrets == 6u);
+    CHECK(r.config.passes.mq_gate.enabled == true);
+    CHECK(r.config.passes.mq_gate.probability == 21u);
+    CHECK(r.config.passes.mq_gate.vars == 40u);
+    CHECK(r.config.passes.mq_gate.eqs == 39u);
+    CHECK(r.config.passes.mq_gate.density == 47u);
+    CHECK(r.config.passes.mq_gate.max_gates == 3u);
+    CHECK(r.config.passes.mq_gate.fold_diff == false);
     CHECK(r.config.passes.adversarial_merge.enabled == true);
     CHECK(r.config.passes.adversarial_merge.probability == 57u);
     CHECK(r.config.passes.adversarial_merge.max_groups == 2u);
     CHECK(r.config.passes.adversarial_merge.max_functions == 5u);
     CHECK(r.config.passes.adversarial_merge.outline_probability == 71u);
     CHECK(r.config.passes.adversarial_merge.max_outlines == 9u);
+    CHECK(r.config.passes.adversarial_tuning.enabled == true);
+    CHECK(r.config.passes.adversarial_tuning.max_candidates == 7u);
+    CHECK(r.config.passes.adversarial_tuning.max_candidate_passes == 4u);
+    CHECK(r.config.passes.adversarial_tuning.score_floor == 96u);
+    CHECK(r.config.passes.adversarial_tuning.emit_marker == false);
     CHECK(r.config.passes.per_build_polymorphism.enabled == true);
     CHECK(r.config.passes.per_build_polymorphism.function_order == false);
     CHECK(r.config.passes.per_build_polymorphism.block_order == true);
@@ -274,11 +339,22 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.dispatcherless.probability == 63u);
     CHECK(r.config.passes.dispatcherless.max_routes == 9u);
     CHECK(r.config.passes.dispatcherless.max_terms == 5u);
+    CHECK(r.config.passes.microcode_stress.enabled == true);
+    CHECK(r.config.passes.microcode_stress.probability == 54u);
+    CHECK(r.config.passes.microcode_stress.max_sites == 4u);
+    CHECK(r.config.passes.microcode_stress.table_entries == 48u);
+    CHECK(r.config.passes.microcode_stress.decoy_blocks == 9u);
+    CHECK(r.config.passes.microcode_stress.alias_stores == 3u);
     CHECK(r.config.passes.vec.enabled == true);
     CHECK(r.config.passes.vec.probability == 88u);
     CHECK(r.config.passes.vec.width == 512u);
     CHECK(r.config.passes.vec.shuffle == true);
     CHECK(r.config.passes.vec.lift_comparisons == false);
+    CHECK(r.config.passes.csm.enabled == true);
+    CHECK(r.config.passes.csm.generator == CsmGenerator::TFunction);
+    CHECK(r.config.passes.csm.tf_const == 13u);
+    CHECK(r.config.passes.csm.nested_dispatch == true);
+    CHECK(r.config.passes.csm.warmup == 128u);
 }
 
 TEST_CASE("string-array filters are parsed") {

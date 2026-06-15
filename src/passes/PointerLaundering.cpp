@@ -33,6 +33,9 @@ namespace morok::passes {
 
 namespace {
 
+constexpr std::size_t kMaxPointerLaunderTargets = 128;
+constexpr std::size_t kMaxIntegerLaunderTargets = 128;
+
 struct PointerTarget {
     Instruction *user = nullptr;
     unsigned operandIndex = 0;
@@ -62,6 +65,8 @@ bool isPassGenerated(const Value *V) {
 
 void addPointerOperand(const DataLayout &DL, Instruction &I, unsigned index,
                        std::vector<PointerTarget> &targets) {
+    if (targets.size() >= kMaxPointerLaunderTargets)
+        return;
     Value *ptr = I.getOperand(index);
     if (isPassGenerated(ptr))
         return;
@@ -73,6 +78,8 @@ void collectPointerTargets(Function &F, const DataLayout &DL,
                            std::vector<PointerTarget> &targets) {
     for (BasicBlock &BB : F) {
         for (Instruction &I : BB) {
+            if (targets.size() >= kMaxPointerLaunderTargets)
+                break;
             if (auto *LI = dyn_cast<LoadInst>(&I)) {
                 addPointerOperand(DL, I, LI->getPointerOperandIndex(), targets);
                 continue;
@@ -105,6 +112,8 @@ void collectPointerTargets(Function &F, const DataLayout &DL,
                 continue;
             }
         }
+        if (targets.size() >= kMaxPointerLaunderTargets)
+            break;
     }
 }
 
@@ -123,10 +132,16 @@ bool canLaunderInteger(const Instruction &I) {
 }
 
 void collectIntegerTargets(Function &F, std::vector<Instruction *> &targets) {
-    for (BasicBlock &BB : F)
-        for (Instruction &I : BB)
+    for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+            if (targets.size() >= kMaxIntegerLaunderTargets)
+                break;
             if (canLaunderInteger(I))
                 targets.push_back(&I);
+        }
+        if (targets.size() >= kMaxIntegerLaunderTargets)
+            break;
+    }
 }
 
 ConstantInt *randomConstant(IntegerType *Ty, ir::IRRandom &rng) {

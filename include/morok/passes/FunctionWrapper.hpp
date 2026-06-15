@@ -28,8 +28,9 @@ class Module;
 namespace morok::passes {
 
 struct FuncWrapParams {
-    std::uint32_t probability = 50; ///< per-call-site chance, 0..100
-    std::uint32_t times = 1;        ///< wrapping rounds (nested proxies)
+    std::uint32_t probability = 50;   ///< per-call-site chance, 0..100
+    std::uint32_t times = 1;          ///< wrapping rounds (nested proxies)
+    std::uint32_t max_wrappers = 256; ///< total generated forwarder cap
 };
 
 /// Wrap eligible call sites in `M`.  Returns true if any call was redirected.

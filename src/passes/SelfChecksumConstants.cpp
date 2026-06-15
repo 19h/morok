@@ -5,11 +5,11 @@
 // morok/passes/SelfChecksumConstants.cpp
 //
 // IR-stage self-checksum-fused constants.  Final native code-region hashes need
-// post-link sizing, so this pass emits the data-flow shape and runtime hash stub
-// over a private IR-owned region that a post-link rewriter can later replace.
-// The hash result feeds values directly: there is no branch, trap, or separable
-// check to NOP.  If the hashed region diverges from the expected value, selected
-// constants reconstruct to corrupted values.
+// post-link sizing, so this pass emits the data-flow shape and runtime hash
+// stub over a private IR-owned region that a post-link rewriter can later
+// replace. The hash result feeds values directly: there is no branch, trap, or
+// separable check to NOP.  If the hashed region diverges from the expected
+// value, selected constants reconstruct to corrupted values.
 
 #include "morok/passes/SelfChecksumConstants.hpp"
 
@@ -24,6 +24,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
 #include "llvm/Support/ModRef.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -38,6 +39,8 @@ namespace {
 
 using Builder = IRBuilder<NoFolder>;
 
+constexpr std::uint64_t kPostlinkMagic = 0x4D4F524F4B534331ULL; // MOROKSC1
+
 struct Target {
     Instruction *user = nullptr;
     unsigned index = 0;
@@ -49,6 +52,7 @@ struct Runtime {
     GlobalVariable *region = nullptr;
     GlobalVariable *expected = nullptr;
     std::uint64_t expected_hash = 0;
+    std::uint64_t seed = 0;
 };
 
 bool generatedFunction(const Function &F) {
@@ -97,8 +101,7 @@ Value *emitHashStep(Builder &B, Value *H, Value *Byte) {
                        "morok.sc.hash.mix");
 }
 
-std::vector<std::uint8_t> randomRegion(std::uint32_t Size,
-                                       ir::IRRandom &Rng) {
+std::vector<std::uint8_t> randomRegion(std::uint32_t Size, ir::IRRandom &Rng) {
     std::vector<std::uint8_t> Bytes;
     Bytes.reserve(Size);
     for (std::uint32_t I = 0; I < Size; ++I)
@@ -194,12 +197,35 @@ GlobalVariable *createExpected(Module &M, StringRef Suffix,
     return Expected;
 }
 
+GlobalVariable *
+createPostlinkManifest(Module &M, StringRef Suffix, GlobalVariable *Region,
+                       GlobalVariable *Expected, std::uint32_t RegionSize,
+                       std::uint64_t Seed, std::uint64_t ExpectedHash) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *PtrTy = PointerType::getUnqual(Ctx);
+    auto *ManifestTy =
+        StructType::get(Ctx, {I64, I32, PtrTy, PtrTy, I32, I64, I64});
+    auto *Init = ConstantStruct::get(
+        ManifestTy,
+        {ConstantInt::get(I64, kPostlinkMagic), ConstantInt::get(I32, 1),
+         Region, Expected, ConstantInt::get(I32, RegionSize),
+         ConstantInt::get(I64, Seed), ConstantInt::get(I64, ExpectedHash)});
+    auto *Manifest = new GlobalVariable(
+        M, ManifestTy, /*isConstant=*/true, GlobalValue::PrivateLinkage, Init,
+        (Twine("morok.postlink.sc.") + Suffix).str());
+    Manifest->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
+    Manifest->setAlignment(Align(8));
+    appendToCompilerUsed(M, {Manifest});
+    return Manifest;
+}
+
 Value *regionPtr(Builder &B, GlobalVariable *Region, Value *Idx) {
     auto *I32 = B.getInt32Ty();
     auto *ArrTy = cast<ArrayType>(Region->getValueType());
-    return B.CreateInBoundsGEP(
-        ArrTy, Region, {ConstantInt::get(I32, 0), Idx},
-        "morok.sc.region.ptr");
+    return B.CreateInBoundsGEP(ArrTy, Region, {ConstantInt::get(I32, 0), Idx},
+                               "morok.sc.region.ptr");
 }
 
 Function *createDiffFunction(Module &M, StringRef Suffix,
@@ -230,8 +256,8 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
     PHINode *H = LB.CreatePHI(I64, 2, "morok.sc.hash");
     I->addIncoming(ConstantInt::get(I32, 0), Entry);
     H->addIncoming(ConstantInt::get(I64, Seed), Entry);
-    auto *Byte = LB.CreateLoad(I8, regionPtr(LB, Region, I),
-                               "morok.sc.region.byte");
+    auto *Byte =
+        LB.CreateLoad(I8, regionPtr(LB, Region, I), "morok.sc.region.byte");
     Byte->setVolatile(true);
     Byte->setAlignment(Align(1));
     Value *NextH = emitHashStep(LB, H, Byte);
@@ -239,14 +265,12 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
         LB.CreateAdd(I, ConstantInt::get(I32, 1), "morok.sc.hash.next");
     I->addIncoming(NextI, Loop);
     H->addIncoming(NextH, Loop);
-    Value *Done =
-        LB.CreateICmpEQ(NextI, ConstantInt::get(I32, Size),
-                        "morok.sc.hash.done");
+    Value *Done = LB.CreateICmpEQ(NextI, ConstantInt::get(I32, Size),
+                                  "morok.sc.hash.done");
     LB.CreateCondBr(Done, Exit, Loop);
 
     Builder XB(Exit);
-    auto *ExpectedLoad =
-        XB.CreateLoad(I64, Expected, "morok.sc.expected.load");
+    auto *ExpectedLoad = XB.CreateLoad(I64, Expected, "morok.sc.expected.load");
     ExpectedLoad->setVolatile(true);
     ExpectedLoad->setAlignment(Align(8));
     Value *Diff = XB.CreateXor(NextH, ExpectedLoad, "morok.sc.diff");
@@ -263,11 +287,13 @@ Runtime createRuntime(Function &F, const SelfChecksumParams &Params,
     const std::uint64_t Seed = Rng.next();
     std::vector<std::uint8_t> Bytes = randomRegion(RegionSize, Rng);
     Runtime R;
-    R.expected_hash = hashBytes(ArrayRef<std::uint8_t>(Bytes.data(),
-                                                       Bytes.size()),
-                                Seed);
+    R.expected_hash =
+        hashBytes(ArrayRef<std::uint8_t>(Bytes.data(), Bytes.size()), Seed);
+    R.seed = Seed;
     R.region = createRegion(M, Suffix, Bytes);
     R.expected = createExpected(M, Suffix, R.expected_hash);
+    createPostlinkManifest(M, Suffix, R.region, R.expected, RegionSize, R.seed,
+                           R.expected_hash);
     R.diff = createDiffFunction(M, Suffix, R.region, R.expected, Seed);
     return R;
 }
@@ -296,9 +322,8 @@ Value *emitFusedConstant(Function &F, Runtime &R, Instruction &User,
     GlobalVariable *MaskGV = createMask(M, F, Ty, Mask);
 
     Builder B(&User);
-    auto *Diff64 =
-        B.CreateCall(R.diff->getFunctionType(), R.diff, {},
-                     "morok.sc.diff.call");
+    auto *Diff64 = B.CreateCall(R.diff->getFunctionType(), R.diff, {},
+                                "morok.sc.diff.call");
     Value *Diff = Diff64;
     if (Bits < 64)
         Diff = B.CreateTrunc(Diff64, Ty, "morok.sc.diff.trunc");

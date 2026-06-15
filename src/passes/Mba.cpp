@@ -25,6 +25,8 @@ namespace morok::passes {
 
 namespace {
 
+constexpr std::size_t kMaxMbaTargetsPerLayer = 256;
+
 using Builder = IRBuilder<NoFolder>;
 
 // A value provably equal to zero, derived from a and b (mirrors core zeroTerm).
@@ -90,11 +92,17 @@ bool mbaFunction(Function &F, const MbaParams &params, ir::IRRandom &rng) {
 
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         std::vector<BinaryOperator *> targets;
-        for (BasicBlock &bb : F)
-            for (Instruction &inst : bb)
+        for (BasicBlock &bb : F) {
+            for (Instruction &inst : bb) {
+                if (targets.size() >= kMaxMbaTargetsPerLayer)
+                    break;
                 if (auto *bo = dyn_cast<BinaryOperator>(&inst))
                     if (bo->getType()->isIntegerTy())
                         targets.push_back(bo);
+            }
+            if (targets.size() >= kMaxMbaTargetsPerLayer)
+                break;
+        }
 
         for (BinaryOperator *bo : targets) {
             if (!rng.chance(params.probability))

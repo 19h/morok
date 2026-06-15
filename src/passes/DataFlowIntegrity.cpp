@@ -6,9 +6,9 @@
 //
 // Data-flow-entangled integrity.  Selected `i8 a OP b` operations become
 // volatile loads from encoded lookup tables.  The decode key is derived from a
-// runtime hash of a private byte region plus the expected hash; if the region or
-// expected value changes, the operation result is corrupted as data rather than
-// guarded by a separable branch.
+// runtime hash of a private byte region plus the expected hash; if the region
+// or expected value changes, the operation result is corrupted as data rather
+// than guarded by a separable branch.
 
 #include "morok/passes/DataFlowIntegrity.hpp"
 
@@ -39,6 +39,7 @@ namespace {
 using Builder = IRBuilder<NoFolder>;
 
 constexpr std::uint32_t kTableSize = 1u << 16;
+constexpr std::uint32_t kMaxTablesPerInvocation = 8;
 
 struct KeySchedule {
     std::uint64_t expected_hash = 0;
@@ -144,16 +145,15 @@ Value *emitHashStep(Builder &B, Value *H, Value *Byte) {
                        "morok.dfi.hash.mix");
 }
 
-Value *emitKey(Builder &B, Value *Idx, Value *Seed,
-               const KeySchedule &Key) {
+Value *emitKey(Builder &B, Value *Idx, Value *Seed, const KeySchedule &Key) {
     auto *I64 = B.getInt64Ty();
     auto *I8 = B.getInt8Ty();
     Value *Idx64 = B.CreateZExt(Idx, I64, "morok.dfi.key.idx");
-    Value *X = B.CreateAdd(Seed, ConstantInt::get(I64, Key.add),
-                           "morok.dfi.key.mix");
+    Value *X =
+        B.CreateAdd(Seed, ConstantInt::get(I64, Key.add), "morok.dfi.key.mix");
     X = B.CreateAdd(
-        X, B.CreateMul(Idx64, ConstantInt::get(I64, Key.mul),
-                       "morok.dfi.key.mul"),
+        X,
+        B.CreateMul(Idx64, ConstantInt::get(I64, Key.mul), "morok.dfi.key.mul"),
         "morok.dfi.key.mix");
     X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I64, 11)),
                     "morok.dfi.key.mix");
@@ -163,8 +163,7 @@ Value *emitKey(Builder &B, Value *Idx, Value *Seed,
     return B.CreateXor(K, ConstantInt::get(I8, Key.xork), "morok.dfi.key");
 }
 
-std::vector<std::uint8_t> randomRegion(std::uint32_t Size,
-                                       ir::IRRandom &Rng) {
+std::vector<std::uint8_t> randomRegion(std::uint32_t Size, ir::IRRandom &Rng) {
     std::vector<std::uint8_t> Bytes;
     Bytes.reserve(Size);
     for (std::uint32_t I = 0; I < Size; ++I)
@@ -209,14 +208,6 @@ void invalidateCallerEffects(Function &F) {
     }
 }
 
-void shuffleTargets(std::vector<BinaryOperator *> &Targets,
-                    ir::IRRandom &Rng) {
-    for (std::size_t I = Targets.size(); I > 1; --I) {
-        const std::size_t J = Rng.range(static_cast<std::uint32_t>(I));
-        std::swap(Targets[I - 1], Targets[J]);
-    }
-}
-
 GlobalVariable *createRegion(Module &M, StringRef Suffix,
                              ArrayRef<std::uint8_t> Bytes) {
     LLVMContext &Ctx = M.getContext();
@@ -245,9 +236,8 @@ GlobalVariable *createExpected(Module &M, StringRef Suffix,
 Value *regionPtr(Builder &B, GlobalVariable *Region, Value *Idx) {
     auto *I32 = B.getInt32Ty();
     auto *ArrTy = cast<ArrayType>(Region->getValueType());
-    return B.CreateInBoundsGEP(
-        ArrTy, Region, {ConstantInt::get(I32, 0), Idx},
-        "morok.dfi.region.ptr");
+    return B.CreateInBoundsGEP(ArrTy, Region, {ConstantInt::get(I32, 0), Idx},
+                               "morok.dfi.region.ptr");
 }
 
 Function *createHashFunction(Module &M, StringRef Suffix,
@@ -278,8 +268,8 @@ Function *createHashFunction(Module &M, StringRef Suffix,
     PHINode *H = LB.CreatePHI(I64, 2, "morok.dfi.hash");
     I->addIncoming(ConstantInt::get(I32, 0), Entry);
     H->addIncoming(ConstantInt::get(I64, Seed), Entry);
-    auto *Byte = LB.CreateLoad(I8, regionPtr(LB, Region, I),
-                               "morok.dfi.region.byte");
+    auto *Byte =
+        LB.CreateLoad(I8, regionPtr(LB, Region, I), "morok.dfi.region.byte");
     Byte->setVolatile(true);
     Byte->setAlignment(Align(1));
     Value *NextH = emitHashStep(LB, H, Byte);
@@ -287,9 +277,8 @@ Function *createHashFunction(Module &M, StringRef Suffix,
         LB.CreateAdd(I, ConstantInt::get(I32, 1), "morok.dfi.hash.next");
     I->addIncoming(NextI, Loop);
     H->addIncoming(NextH, Loop);
-    Value *Done =
-        LB.CreateICmpEQ(NextI, ConstantInt::get(I32, Size),
-                        "morok.dfi.hash.done");
+    Value *Done = LB.CreateICmpEQ(NextI, ConstantInt::get(I32, Size),
+                                  "morok.dfi.hash.done");
     LB.CreateCondBr(Done, Exit, Loop);
 
     Builder XB(Exit);
@@ -311,9 +300,8 @@ Runtime createRuntime(Function &F, const DataFlowIntegrityParams &Params,
     const std::uint64_t Seed = Rng.next();
     std::vector<std::uint8_t> Bytes = randomRegion(RegionSize, Rng);
     Runtime R;
-    R.expected_hash = hashBytes(ArrayRef<std::uint8_t>(Bytes.data(),
-                                                       Bytes.size()),
-                                Seed);
+    R.expected_hash =
+        hashBytes(ArrayRef<std::uint8_t>(Bytes.data(), Bytes.size()), Seed);
     R.region = createRegion(M, Suffix, Bytes);
     R.expected = createExpected(M, Suffix, R.expected_hash);
     R.diff = createHashFunction(M, Suffix, R.region, R.expected, Seed);
@@ -336,8 +324,7 @@ GlobalVariable *createTable(Module &M, Function &F, unsigned Opcode,
     for (std::uint32_t Idx = 0; Idx < kTableSize; ++Idx) {
         const auto Lhs = static_cast<std::uint8_t>(Idx >> 8);
         const auto Rhs = static_cast<std::uint8_t>(Idx & 0xFFu);
-        Enc[Idx] = eval(Opcode, Lhs, Rhs) ^
-                   keyAt(Idx, Key.expected_hash, Key);
+        Enc[Idx] = eval(Opcode, Lhs, Rhs) ^ keyAt(Idx, Key.expected_hash, Key);
     }
 
     auto *Table = new GlobalVariable(
@@ -361,9 +348,8 @@ Value *emitLookup(Module &M, Function &F, Runtime &R, BinaryOperator &BO,
     auto *I64 = B.getInt64Ty();
     auto *TableTy = cast<ArrayType>(Table->getValueType());
 
-    auto *Diff =
-        B.CreateCall(R.diff->getFunctionType(), R.diff, {},
-                     "morok.dfi.hash.call");
+    auto *Diff = B.CreateCall(R.diff->getFunctionType(), R.diff, {},
+                              "morok.dfi.hash.call");
     Value *Seed = B.CreateXor(Diff, ConstantInt::get(I64, Key.expected_hash),
                               "morok.dfi.seed");
     Value *L = B.CreateZExt(BO.getOperand(0), I16, "morok.dfi.lhs");
@@ -371,9 +357,8 @@ Value *emitLookup(Module &M, Function &F, Runtime &R, BinaryOperator &BO,
     Value *Hi = B.CreateShl(L, ConstantInt::get(I16, 8), "morok.dfi.hi");
     Value *Idx16 = B.CreateOr(Hi, Rhs, "morok.dfi.idx16");
     Value *Idx = B.CreateZExt(Idx16, I32, "morok.dfi.idx");
-    Value *Cell =
-        B.CreateInBoundsGEP(TableTy, Table, {ConstantInt::get(I32, 0), Idx},
-                            "morok.dfi.cell");
+    Value *Cell = B.CreateInBoundsGEP(
+        TableTy, Table, {ConstantInt::get(I32, 0), Idx}, "morok.dfi.cell");
     auto *Encoded = B.CreateLoad(I8, Cell, "morok.dfi.encoded");
     Encoded->setVolatile(true);
     Encoded->setAlignment(Align(1));
@@ -394,24 +379,20 @@ bool dataFlowIntegrityFunction(Function &F,
     if (F.getParent()->getFunction(HashName))
         return false;
 
-    std::vector<BinaryOperator *> Targets;
-    for (BasicBlock &BB : F)
-        for (Instruction &I : BB)
+    const std::uint32_t Limit =
+        std::min(Params.max_tables, kMaxTablesPerInvocation);
+    SmallVector<BinaryOperator *, 8> Selected;
+    for (BasicBlock &BB : F) {
+        if (Selected.size() >= Limit)
+            break;
+        for (Instruction &I : BB) {
+            if (Selected.size() >= Limit)
+                break;
             if (auto *BO = dyn_cast<BinaryOperator>(&I))
                 if (eligible(*BO))
-                    Targets.push_back(BO);
-
-    if (Targets.empty())
-        return false;
-    shuffleTargets(Targets, Rng);
-
-    SmallVector<BinaryOperator *, 8> Selected;
-    for (BinaryOperator *BO : Targets) {
-        if (Selected.size() >= Params.max_tables)
-            break;
-        if (!Rng.chance(Params.probability))
-            continue;
-        Selected.push_back(BO);
+                    if (Rng.chance(Params.probability))
+                        Selected.push_back(BO);
+        }
     }
     if (Selected.empty())
         return false;

@@ -80,6 +80,13 @@ PassConfig makeLow() {
     c.stack_coalesce.probability = 0;
     c.stack_coalesce.opaque_offsets = false;
 
+    c.stack_delta.enabled = false;
+    c.stack_delta.probability = 0;
+    c.stack_delta.max_blocks = 0;
+    c.stack_delta.min_bytes = 0;
+    c.stack_delta.max_extra_bytes = 0;
+    c.stack_delta.touches = 0;
+
     c.pointer_launder.enabled = false;
     c.pointer_launder.pointer_probability = 0;
     c.pointer_launder.integer_probability = 0;
@@ -153,6 +160,7 @@ PassConfig makeLow() {
     c.hash_self_decrypt.enabled = false;
     c.hash_self_decrypt.probability = 0;
     c.hash_self_decrypt.max_payloads = 0;
+    c.hash_self_decrypt.context_keying = false;
 
     c.self_checksum.enabled = false;
     c.self_checksum.probability = 0;
@@ -170,12 +178,32 @@ PassConfig makeLow() {
     c.mutual_guard.region_bytes = 0;
     c.mutual_guard.max_returns = 0;
 
+    c.shamir_share.enabled = false;
+    c.shamir_share.probability = 0;
+    c.shamir_share.threshold = 0;
+    c.shamir_share.shares = 0;
+    c.shamir_share.max_secrets = 0;
+
+    c.mq_gate.enabled = false;
+    c.mq_gate.probability = 0;
+    c.mq_gate.vars = 0;
+    c.mq_gate.eqs = 0;
+    c.mq_gate.density = 0;
+    c.mq_gate.max_gates = 0;
+    c.mq_gate.fold_diff = false;
+
     c.adversarial_merge.enabled = false;
     c.adversarial_merge.probability = 0;
     c.adversarial_merge.max_groups = 0;
     c.adversarial_merge.max_functions = 0;
     c.adversarial_merge.outline_probability = 0;
     c.adversarial_merge.max_outlines = 0;
+
+    c.adversarial_tuning.enabled = false;
+    c.adversarial_tuning.max_candidates = 0;
+    c.adversarial_tuning.max_candidate_passes = 0;
+    c.adversarial_tuning.score_floor = 0;
+    c.adversarial_tuning.emit_marker = false;
 
     c.per_build_polymorphism.enabled = false;
     c.per_build_polymorphism.function_order = false;
@@ -197,8 +225,17 @@ PassConfig makeLow() {
     c.dispatcherless.max_routes = 0;
     c.dispatcherless.max_terms = 0;
 
+    c.microcode_stress.enabled = false;
+    c.microcode_stress.probability = 0;
+    c.microcode_stress.max_sites = 0;
+    c.microcode_stress.table_entries = 0;
+    c.microcode_stress.decoy_blocks = 0;
+    c.microcode_stress.alias_stores = 0;
+
     c.vec.enabled = false;
     c.csm.enabled = false;
+    c.csm.generator = CsmGenerator::Logistic;
+    c.csm.tf_const = 0;
     c.flatten.enabled = false;
     c.indir_branch.enabled = false;
     c.func_wrap.enabled = false;
@@ -248,6 +285,13 @@ PassConfig makeMid() {
     c.stack_coalesce.enabled = true;
     c.stack_coalesce.probability = 60;
     c.stack_coalesce.opaque_offsets = true;
+
+    c.stack_delta.enabled = true;
+    c.stack_delta.probability = 15;
+    c.stack_delta.max_blocks = 2;
+    c.stack_delta.min_bytes = 17;
+    c.stack_delta.max_extra_bytes = 32;
+    c.stack_delta.touches = 2;
 
     c.pointer_launder.enabled = true;
     c.pointer_launder.pointer_probability = 50;
@@ -322,6 +366,7 @@ PassConfig makeMid() {
     c.hash_self_decrypt.enabled = false;
     c.hash_self_decrypt.probability = 0;
     c.hash_self_decrypt.max_payloads = 0;
+    c.hash_self_decrypt.context_keying = false;
 
     c.self_checksum.enabled = false;
     c.self_checksum.probability = 0;
@@ -339,12 +384,32 @@ PassConfig makeMid() {
     c.mutual_guard.region_bytes = 0;
     c.mutual_guard.max_returns = 0;
 
+    c.shamir_share.enabled = true;
+    c.shamir_share.probability = 15;
+    c.shamir_share.threshold = 3;
+    c.shamir_share.shares = 5;
+    c.shamir_share.max_secrets = 4;
+
+    c.mq_gate.enabled = false;
+    c.mq_gate.probability = 0;
+    c.mq_gate.vars = 0;
+    c.mq_gate.eqs = 0;
+    c.mq_gate.density = 0;
+    c.mq_gate.max_gates = 0;
+    c.mq_gate.fold_diff = false;
+
     c.adversarial_merge.enabled = false;
     c.adversarial_merge.probability = 0;
     c.adversarial_merge.max_groups = 0;
     c.adversarial_merge.max_functions = 0;
     c.adversarial_merge.outline_probability = 0;
     c.adversarial_merge.max_outlines = 0;
+
+    c.adversarial_tuning.enabled = false;
+    c.adversarial_tuning.max_candidates = 0;
+    c.adversarial_tuning.max_candidate_passes = 0;
+    c.adversarial_tuning.score_floor = 0;
+    c.adversarial_tuning.emit_marker = false;
 
     c.per_build_polymorphism.enabled = false;
     c.per_build_polymorphism.function_order = false;
@@ -366,6 +431,13 @@ PassConfig makeMid() {
     c.dispatcherless.max_routes = 8;
     c.dispatcherless.max_terms = 3;
 
+    c.microcode_stress.enabled = false;
+    c.microcode_stress.probability = 0;
+    c.microcode_stress.max_sites = 0;
+    c.microcode_stress.table_entries = 0;
+    c.microcode_stress.decoy_blocks = 0;
+    c.microcode_stress.alias_stores = 0;
+
     c.vec.enabled = true;
     c.vec.probability = 40;
     c.vec.width = 128;
@@ -373,6 +445,8 @@ PassConfig makeMid() {
     c.vec.lift_comparisons = true;
 
     c.csm.enabled = false;
+    c.csm.generator = CsmGenerator::TFunction;
+    c.csm.tf_const = 0;
     c.flatten.enabled = true;
     c.indir_branch.enabled = true;
 
@@ -423,6 +497,13 @@ PassConfig makeHigh() {
     c.stack_coalesce.enabled = true;
     c.stack_coalesce.probability = 100;
     c.stack_coalesce.opaque_offsets = true;
+
+    c.stack_delta.enabled = true;
+    c.stack_delta.probability = 35;
+    c.stack_delta.max_blocks = 6;
+    c.stack_delta.min_bytes = 17;
+    c.stack_delta.max_extra_bytes = 64;
+    c.stack_delta.touches = 3;
 
     c.pointer_launder.enabled = true;
     c.pointer_launder.pointer_probability = 90;
@@ -488,38 +569,59 @@ PassConfig makeHigh() {
     c.uniform_lower.max_tables = 2;
     c.uniform_lower.max_branches = 1;
 
-    c.virtualization.enabled = true;
-    c.virtualization.probability = 25;
-    c.virtualization.max_functions = 1;
-    c.virtualization.max_instructions = 48;
-    c.virtualization.max_registers = 64;
+    c.virtualization.enabled = false;
+    c.virtualization.probability = 0;
+    c.virtualization.max_functions = 0;
+    c.virtualization.max_instructions = 0;
+    c.virtualization.max_registers = 0;
 
-    c.hash_self_decrypt.enabled = true;
-    c.hash_self_decrypt.probability = 100;
-    c.hash_self_decrypt.max_payloads = 1;
+    c.hash_self_decrypt.enabled = false;
+    c.hash_self_decrypt.probability = 0;
+    c.hash_self_decrypt.max_payloads = 0;
+    c.hash_self_decrypt.context_keying = false;
 
-    c.self_checksum.enabled = true;
-    c.self_checksum.probability = 35;
-    c.self_checksum.max_constants = 8;
-    c.self_checksum.region_bytes = 32;
+    c.self_checksum.enabled = false;
+    c.self_checksum.probability = 0;
+    c.self_checksum.max_constants = 0;
+    c.self_checksum.region_bytes = 0;
 
-    c.data_flow_integrity.enabled = true;
-    c.data_flow_integrity.probability = 35;
-    c.data_flow_integrity.max_tables = 2;
-    c.data_flow_integrity.region_bytes = 32;
+    c.data_flow_integrity.enabled = false;
+    c.data_flow_integrity.probability = 0;
+    c.data_flow_integrity.max_tables = 0;
+    c.data_flow_integrity.region_bytes = 0;
 
-    c.mutual_guard.enabled = true;
-    c.mutual_guard.probability = 35;
-    c.mutual_guard.nodes = 3;
-    c.mutual_guard.region_bytes = 32;
-    c.mutual_guard.max_returns = 2;
+    c.mutual_guard.enabled = false;
+    c.mutual_guard.probability = 0;
+    c.mutual_guard.nodes = 0;
+    c.mutual_guard.region_bytes = 0;
+    c.mutual_guard.max_returns = 0;
 
-    c.adversarial_merge.enabled = true;
-    c.adversarial_merge.probability = 25;
-    c.adversarial_merge.max_groups = 1;
-    c.adversarial_merge.max_functions = 4;
-    c.adversarial_merge.outline_probability = 35;
-    c.adversarial_merge.max_outlines = 8;
+    c.shamir_share.enabled = true;
+    c.shamir_share.probability = 30;
+    c.shamir_share.threshold = 3;
+    c.shamir_share.shares = 5;
+    c.shamir_share.max_secrets = 8;
+
+    c.mq_gate.enabled = false;
+    c.mq_gate.probability = 0;
+    c.mq_gate.vars = 0;
+    c.mq_gate.eqs = 0;
+    c.mq_gate.density = 0;
+    c.mq_gate.max_gates = 0;
+    c.mq_gate.fold_diff = false;
+
+    c.adversarial_merge.enabled = false;
+    c.adversarial_merge.probability = 0;
+    c.adversarial_merge.max_groups = 0;
+    c.adversarial_merge.max_functions = 0;
+    c.adversarial_merge.outline_probability = 0;
+    c.adversarial_merge.max_outlines = 0;
+
+    c.adversarial_tuning.enabled = false;
+    c.adversarial_tuning.max_candidates = 0;
+    c.adversarial_tuning.max_candidate_passes = 0;
+    c.adversarial_tuning.score_floor = 0;
+    c.adversarial_tuning.emit_marker = false;
 
     c.per_build_polymorphism.enabled = true;
     c.per_build_polymorphism.function_order = true;
@@ -528,18 +630,25 @@ PassConfig makeHigh() {
     c.per_build_polymorphism.max_anchors = 16;
 
     c.path_explosion.enabled = true;
-    c.path_explosion.probability = 35;
-    c.path_explosion.max_blocks = 4;
-    c.path_explosion.max_iterations = 16;
+    c.path_explosion.probability = 15;
+    c.path_explosion.max_blocks = 2;
+    c.path_explosion.max_iterations = 8;
 
     c.trace_keying.enabled = true;
-    c.trace_keying.probability = 25;
-    c.trace_keying.max_blocks = 4;
+    c.trace_keying.probability = 10;
+    c.trace_keying.max_blocks = 2;
 
     c.dispatcherless.enabled = true;
-    c.dispatcherless.probability = 75;
-    c.dispatcherless.max_routes = 24;
-    c.dispatcherless.max_terms = 5;
+    c.dispatcherless.probability = 35;
+    c.dispatcherless.max_routes = 8;
+    c.dispatcherless.max_terms = 3;
+
+    c.microcode_stress.enabled = false;
+    c.microcode_stress.probability = 0;
+    c.microcode_stress.max_sites = 0;
+    c.microcode_stress.table_entries = 0;
+    c.microcode_stress.decoy_blocks = 0;
+    c.microcode_stress.alias_stores = 0;
 
     c.vec.enabled = true;
     c.vec.probability = 65;
@@ -548,15 +657,17 @@ PassConfig makeHigh() {
     c.vec.lift_comparisons = true;
 
     c.csm.enabled = true;
+    c.csm.generator = CsmGenerator::TFunction;
+    c.csm.tf_const = 0;
     c.csm.nested_dispatch = false;
     c.csm.warmup = 128;
     c.flatten.enabled = false;
 
     c.indir_branch.enabled = true;
 
-    c.func_wrap.enabled = true;
-    c.func_wrap.probability = 50;
-    c.func_wrap.times = 1;
+    c.func_wrap.enabled = false;
+    c.func_wrap.probability = 0;
+    c.func_wrap.times = 0;
 
     c.fco.enabled = true;
 

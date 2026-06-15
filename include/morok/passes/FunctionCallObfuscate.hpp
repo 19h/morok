@@ -27,6 +27,7 @@ namespace morok::passes {
 
 struct FcoParams {
     std::uint32_t probability = 100; ///< per-call-site chance, 0..100
+    std::uint32_t max_calls = 256;   ///< total redirected call-site cap
 };
 
 /// Redirect eligible external calls in `M` through dlsym.  Returns true if any
