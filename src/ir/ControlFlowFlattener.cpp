@@ -35,6 +35,11 @@ bool isFlattenable(Function &F) {
             return false;
         if (bb.isEHPad() || bb.isLandingPad())
             return false;
+        // Token-typed values (convergence/coroutine/GC tokens) cannot be
+        // demoted to stack by Reg2Mem, which flattening relies on.
+        for (Instruction &I : bb)
+            if (I.getType()->isTokenTy())
+                return false;
     }
     return true;
 }
