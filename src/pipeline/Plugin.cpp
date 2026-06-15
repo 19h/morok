@@ -42,6 +42,7 @@
 #include "morok/passes/SubThresholdPersistence.hpp"
 #include "morok/passes/Substitution.hpp"
 #include "morok/passes/TypePunning.hpp"
+#include "morok/passes/UniformPrimitiveLowering.hpp"
 #include "morok/passes/VectorObfuscation.hpp"
 #include "morok/pipeline/Scheduler.hpp"
 
@@ -278,6 +279,10 @@ PassPluginLibraryInfo getPluginInfo() {
                         }
                         if (name == "morok-tablearith") {
                             FPM.addPass(passes::ArithmeticTablesPass());
+                            return true;
+                        }
+                        if (name == "morok-uniform") {
+                            FPM.addPass(passes::UniformPrimitiveLoweringPass());
                             return true;
                         }
                         if (name == "morok-pathexplode") {

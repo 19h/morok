@@ -26,6 +26,7 @@ add_library(morok_passes STATIC
   ChaosStateMachine.cpp
   OptimizerAmplification.cpp
   ArithmeticTables.cpp
+  UniformPrimitiveLowering.cpp
   PathExplosion.cpp
   DispatcherlessRouting.cpp
   StringEncryption.cpp

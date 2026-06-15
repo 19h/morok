@@ -36,6 +36,7 @@
 #include "morok/passes/SubThresholdPersistence.hpp"
 #include "morok/passes/Substitution.hpp"
 #include "morok/passes/TypePunning.hpp"
+#include "morok/passes/UniformPrimitiveLowering.hpp"
 #include "morok/passes/VectorObfuscation.hpp"
 
 #include "llvm/AsmParser/Parser.h"
@@ -1535,6 +1536,83 @@ TEST_CASE("tableArithmeticFunction skips non-byte arithmetic") {
     CHECK_FALSE(morok::passes::tableArithmeticFunction(
         *F, {/*probability=*/100, /*max_tables=*/8}, rng));
     CHECK(countGlobals(*M, "morok.tablearith.table") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("uniformPrimitiveLowerFunction table-lowers ops and branch dispatch") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i8 @uniform(i8 %a, i8 %b, i1 %c) {
+entry:
+  %x = xor i8 %a, %b
+  br i1 %c, label %left, label %right
+left:
+  %l = add i8 %x, 7
+  ret i8 %l
+right:
+  %r = sub i8 %x, 3
+  ret i8 %r
+}
+)ir");
+    Function *F = M->getFunction("uniform");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(141);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::uniformPrimitiveLowerFunction(
+        *F,
+        {/*op_probability=*/100, /*branch_probability=*/100,
+         /*max_tables=*/2, /*max_branches=*/1},
+        rng));
+
+    CHECK(countGlobals(*M, "morok.tablearith.table") == 2u);
+    CHECK(countGlobals(*M, "morok.uniform.table") == 1u);
+    CHECK(M->getFunction("morok.tablearith.ensure") != nullptr);
+
+    std::size_t branches = 0;
+    std::size_t indirects = 0;
+    bool hasIndexSelect = false;
+    bool hasTargetLoad = false;
+    for (Instruction &I : instructions(*F)) {
+        branches += isa<BranchInst>(&I) ? 1u : 0u;
+        indirects += isa<IndirectBrInst>(&I) ? 1u : 0u;
+        if (auto *SI = dyn_cast<SelectInst>(&I))
+            hasIndexSelect |= SI->getName().starts_with("morok.uniform.index");
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+            hasTargetLoad |= LI->getName().starts_with("morok.uniform.target");
+    }
+    CHECK(branches == 0u);
+    CHECK(indirects == 1u);
+    CHECK(hasIndexSelect);
+    CHECK(hasTargetLoad);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("uniformPrimitiveLowerFunction honors zero probabilities") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i8 @uniform_zero(i8 %a, i8 %b, i1 %c) {
+entry:
+  %x = xor i8 %a, %b
+  br i1 %c, label %left, label %right
+left:
+  ret i8 %x
+right:
+  ret i8 %b
+}
+)ir");
+    Function *F = M->getFunction("uniform_zero");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(142);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::uniformPrimitiveLowerFunction(
+        *F,
+        {/*op_probability=*/0, /*branch_probability=*/0,
+         /*max_tables=*/2, /*max_branches=*/2},
+        rng));
+    CHECK(countGlobals(*M, "morok.tablearith.table") == 0u);
+    CHECK(countGlobals(*M, "morok.uniform.table") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

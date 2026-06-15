@@ -37,6 +37,7 @@
 #include "morok/passes/SubThresholdPersistence.hpp"
 #include "morok/passes/Substitution.hpp"
 #include "morok/passes/TypePunning.hpp"
+#include "morok/passes/UniformPrimitiveLowering.hpp"
 #include "morok/passes/VectorObfuscation.hpp"
 
 #include "llvm/Demangle/Demangle.h"
@@ -272,6 +273,20 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
             p.probability = eff.table_arith.probability.value_or(30);
             p.max_tables = eff.table_arith.max_tables.value_or(8);
             changed |= passes::tableArithmeticFunction(F, p, rng);
+        }
+
+        // Uniform primitive lowering moves byte ops to tables and selected
+        // direct branch structure to memory-loaded indirect dispatch.
+        if (ir::shouldObfuscate(
+                F, "uniform", eff.uniform_lower.enabled.value_or(false))) {
+            passes::UniformLowerParams p;
+            p.op_probability =
+                eff.uniform_lower.op_probability.value_or(25);
+            p.branch_probability =
+                eff.uniform_lower.branch_probability.value_or(35);
+            p.max_tables = eff.uniform_lower.max_tables.value_or(4);
+            p.max_branches = eff.uniform_lower.max_branches.value_or(8);
+            changed |= passes::uniformPrimitiveLowerFunction(F, p, rng);
         }
 
         // SIMD lifting after the control-flow passes, so even dispatcher

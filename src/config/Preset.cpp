@@ -133,6 +133,12 @@ PassConfig makeLow() {
     c.sub_threshold.probability = 0;
     c.sub_threshold.max_terms = 0;
 
+    c.uniform_lower.enabled = false;
+    c.uniform_lower.op_probability = 0;
+    c.uniform_lower.branch_probability = 0;
+    c.uniform_lower.max_tables = 0;
+    c.uniform_lower.max_branches = 0;
+
     c.path_explosion.enabled = false;
     c.path_explosion.probability = 0;
     c.path_explosion.max_blocks = 0;
@@ -247,6 +253,12 @@ PassConfig makeMid() {
     c.sub_threshold.enabled = true;
     c.sub_threshold.probability = 15;
     c.sub_threshold.max_terms = 1;
+
+    c.uniform_lower.enabled = true;
+    c.uniform_lower.op_probability = 15;
+    c.uniform_lower.branch_probability = 20;
+    c.uniform_lower.max_tables = 2;
+    c.uniform_lower.max_branches = 2;
 
     c.path_explosion.enabled = true;
     c.path_explosion.probability = 15;
@@ -368,6 +380,12 @@ PassConfig makeHigh() {
     c.sub_threshold.enabled = true;
     c.sub_threshold.probability = 15;
     c.sub_threshold.max_terms = 1;
+
+    c.uniform_lower.enabled = true;
+    c.uniform_lower.op_probability = 15;
+    c.uniform_lower.branch_probability = 10;
+    c.uniform_lower.max_tables = 2;
+    c.uniform_lower.max_branches = 1;
 
     c.path_explosion.enabled = true;
     c.path_explosion.probability = 35;

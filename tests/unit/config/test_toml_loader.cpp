@@ -99,6 +99,12 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     enabled = true
     probability = 58
     max_terms = 4
+    [passes.uniform_primitive_lowering]
+    enabled = true
+    op_probability = 49
+    branch_probability = 67
+    max_tables = 5
+    max_branches = 7
     [passes.path_explosion]
     enabled = true
     probability = 51
@@ -168,6 +174,11 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.sub_threshold.enabled == true);
     CHECK(r.config.passes.sub_threshold.probability == 58u);
     CHECK(r.config.passes.sub_threshold.max_terms == 4u);
+    CHECK(r.config.passes.uniform_lower.enabled == true);
+    CHECK(r.config.passes.uniform_lower.op_probability == 49u);
+    CHECK(r.config.passes.uniform_lower.branch_probability == 67u);
+    CHECK(r.config.passes.uniform_lower.max_tables == 5u);
+    CHECK(r.config.passes.uniform_lower.max_branches == 7u);
     CHECK(r.config.passes.path_explosion.enabled == true);
     CHECK(r.config.passes.path_explosion.probability == 51u);
     CHECK(r.config.passes.path_explosion.max_blocks == 4u);

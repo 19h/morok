@@ -51,6 +51,7 @@ TEST_CASE("low preset matches the documented table") {
     CHECK(c.opt_amplify.enabled == false);
     CHECK(c.table_arith.enabled == false);
     CHECK(c.sub_threshold.enabled == false);
+    CHECK(c.uniform_lower.enabled == false);
     CHECK(c.path_explosion.enabled == false);
     CHECK(c.dispatcherless.enabled == false);
     CHECK(c.vec.enabled == false);
@@ -106,6 +107,11 @@ TEST_CASE("mid preset matches the documented table") {
     CHECK(c.sub_threshold.enabled == true);
     CHECK(c.sub_threshold.probability == 15u);
     CHECK(c.sub_threshold.max_terms == 1u);
+    CHECK(c.uniform_lower.enabled == true);
+    CHECK(c.uniform_lower.op_probability == 15u);
+    CHECK(c.uniform_lower.branch_probability == 20u);
+    CHECK(c.uniform_lower.max_tables == 2u);
+    CHECK(c.uniform_lower.max_branches == 2u);
     CHECK(c.path_explosion.enabled == true);
     CHECK(c.path_explosion.probability == 15u);
     CHECK(c.path_explosion.max_blocks == 2u);
@@ -176,6 +182,11 @@ TEST_CASE("high preset matches the documented table") {
     CHECK(c.sub_threshold.enabled == true);
     CHECK(c.sub_threshold.probability == 15u);
     CHECK(c.sub_threshold.max_terms == 1u);
+    CHECK(c.uniform_lower.enabled == true);
+    CHECK(c.uniform_lower.op_probability == 15u);
+    CHECK(c.uniform_lower.branch_probability == 10u);
+    CHECK(c.uniform_lower.max_tables == 2u);
+    CHECK(c.uniform_lower.max_branches == 1u);
     CHECK(c.path_explosion.enabled == true);
     CHECK(c.path_explosion.probability == 35u);
     CHECK(c.path_explosion.max_blocks == 4u);

@@ -111,6 +111,11 @@ TEST_CASE("merge handles every pass family") {
     src.sub_threshold.enabled = true;
     src.sub_threshold.probability = 57u;
     src.sub_threshold.max_terms = 3u;
+    src.uniform_lower.enabled = true;
+    src.uniform_lower.op_probability = 48u;
+    src.uniform_lower.branch_probability = 64u;
+    src.uniform_lower.max_tables = 6u;
+    src.uniform_lower.max_branches = 8u;
     src.path_explosion.enabled = true;
     src.path_explosion.probability = 52u;
     src.path_explosion.max_blocks = 3u;
@@ -174,6 +179,11 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.sub_threshold.enabled == true);
     CHECK(dst.sub_threshold.probability == 57u);
     CHECK(dst.sub_threshold.max_terms == 3u);
+    CHECK(dst.uniform_lower.enabled == true);
+    CHECK(dst.uniform_lower.op_probability == 48u);
+    CHECK(dst.uniform_lower.branch_probability == 64u);
+    CHECK(dst.uniform_lower.max_tables == 6u);
+    CHECK(dst.uniform_lower.max_branches == 8u);
     CHECK(dst.path_explosion.enabled == true);
     CHECK(dst.path_explosion.probability == 52u);
     CHECK(dst.path_explosion.max_blocks == 3u);

@@ -299,6 +299,26 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - `max_tables` caps per-function table growth.  The scheduler skips generated
   `morok.*` helper functions so decoders are not recursively obfuscated.
 
+## Uniform primitive lowering — IR structure
+- This is the IR-level half of the roadmap's IR/MIR item.  It deliberately
+  avoids target-specific MOV-only lowering, but pushes visible intent toward a
+  small set of uniform primitives: table loads, GEPs, `select`, and `indirectbr`.
+- Selected byte-width `add/sub/mul/and/or/xor` operations reuse the encrypted
+  lazy table materialization from TableArithmetic, governed by `op_probability`
+  and `max_tables`.  This removes opcode intent from the function body while
+  keeping plaintext truth tables out of static initializers.
+- Selected direct branches and switches are collected up to `max_branches` and
+  lowered to a private per-function `morok.uniform.table` of `blockaddress`
+  entries.  Conditional branches become `select cond, true_id, false_id`;
+  switches become chained `icmp`/`select`; the resulting index GEPs into the
+  table, loads a target pointer, and dispatches through `indirectbr`.
+- PHI correctness is preserved because each transformed predecessor still has
+  the same possible successor set, only reached through memory-loaded dispatch.
+  EH pads, landing pads, entry-block backedges, and generated `morok.*` blocks
+  are skipped.
+- Scheduler placement is after TableArithmetic and before SIMD/path/dispatcher
+  passes.  Standalone `morok-uniform` composes both halves for targeted use.
+
 ## Vector obfuscation — IR structure
 - Eligible scalar integer binary ops are lifted to `<N x iM>` operations, where
   `N = width / M` for configured widths 128, 256, or 512 bits.  Lane `realLane`
@@ -356,6 +376,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - OptimizerAmplification: early branchless select lattice over equivalent forms.
 - SubThresholdPersistence: volatile local-seed opaque-zero terms under a small cap.
 - TableArithmetic: encrypted lazy byte-op lookup tables.
+- UniformPrimitiveLowering: byte-op tables plus memory-loaded indirectbr dispatch.
 - PathExplosion: opaque-guarded input-derived loops with volatile symbolic stores and indirectbr dispatch.
 - VectorObfuscation: scalar→SIMD lifting; width 128/256/512, shuffle, lift_comparisons.
 - FunctionWrapper: polymorphic proxies; prob/times.
@@ -364,5 +385,5 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Scheduler order (to preserve semantics)
 AntiHook → AntiClassDump → FCO(fn) → AntiDebug → StringEnc → per-fn{ Split, BCF, OptAmp, Sub,
-MBA, AliasOp, CoherentDecoys, NiState/EntFla/CSM/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, PointerLaunder, TableArith, Vec, PathExplosion, Dispatcherless } → ConstEnc → IndirectBranch → FunctionWrapper →
+MBA, AliasOp, CoherentDecoys, NiState/EntFla/CSM/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, PointerLaunder, TableArith, Uniform, Vec, PathExplosion, Dispatcherless } → ConstEnc → IndirectBranch → FunctionWrapper →
 FeatureElimination (strip debug/names) → cleanup marker decls.

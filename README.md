@@ -107,6 +107,7 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 | Type punning | `morok-typepun` | union-buffer scalar reinterpretation chains |
 | PHI tangling | `morok-phitangle` | redundant cross-block PHI webs |
 | Table arithmetic | `morok-tablearith` | byte arithmetic lowered to encrypted lookup tables |
+| Uniform primitive lowering | `morok-uniform` | byte ops and direct branches lowered to table/memory dispatch |
 | Path explosion | `morok-pathexplode` | opaque-guarded input-derived decoy loops |
 | Alias opaque predicates | `morok-aliasop` | pointer/alias invariant guarded decoy edges |
 | Coherent decoys | `morok-decoy` | opaque-dead alternate return implementations |

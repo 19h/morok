@@ -136,6 +136,14 @@ struct SubThresholdConfig {
     Opt<std::uint32_t> max_terms;
 };
 
+struct UniformLowerConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> op_probability;
+    Opt<std::uint32_t> branch_probability;
+    Opt<std::uint32_t> max_tables;
+    Opt<std::uint32_t> max_branches;
+};
+
 struct PathExplosionConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
@@ -207,6 +215,7 @@ struct PassConfig {
     OptAmplifyConfig opt_amplify;
     TableArithConfig table_arith;
     SubThresholdConfig sub_threshold;
+    UniformLowerConfig uniform_lower;
     PathExplosionConfig path_explosion;
     DispatcherlessConfig dispatcherless;
     StrEncConfig str_enc;

@@ -158,6 +158,14 @@ void parseSubThreshold(const toml::table &t, SubThresholdConfig &c) {
     c.max_terms = readU32(t["max_terms"]);
 }
 
+void parseUniformLower(const toml::table &t, UniformLowerConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.op_probability = readU32(t["op_probability"]);
+    c.branch_probability = readU32(t["branch_probability"]);
+    c.max_tables = readU32(t["max_tables"]);
+    c.max_branches = readU32(t["max_branches"]);
+}
+
 void parsePathExplosion(const toml::table &t, PathExplosionConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.probability = readU32(t["probability"]);
@@ -251,6 +259,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseTableArith(*t, pc.table_arith);
     if (auto *t = p["sub_threshold_persistence"].as_table())
         parseSubThreshold(*t, pc.sub_threshold);
+    if (auto *t = p["uniform_primitive_lowering"].as_table())
+        parseUniformLower(*t, pc.uniform_lower);
     if (auto *t = p["path_explosion"].as_table())
         parsePathExplosion(*t, pc.path_explosion);
     if (auto *t = p["dispatcherless_routing"].as_table())

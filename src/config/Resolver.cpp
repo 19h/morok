@@ -128,6 +128,14 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.sub_threshold.enabled, src.sub_threshold.enabled);
     mergeOpt(dst.sub_threshold.probability, src.sub_threshold.probability);
     mergeOpt(dst.sub_threshold.max_terms, src.sub_threshold.max_terms);
+    // Uniform primitive lowering
+    mergeOpt(dst.uniform_lower.enabled, src.uniform_lower.enabled);
+    mergeOpt(dst.uniform_lower.op_probability,
+             src.uniform_lower.op_probability);
+    mergeOpt(dst.uniform_lower.branch_probability,
+             src.uniform_lower.branch_probability);
+    mergeOpt(dst.uniform_lower.max_tables, src.uniform_lower.max_tables);
+    mergeOpt(dst.uniform_lower.max_branches, src.uniform_lower.max_branches);
     // Path explosion
     mergeOpt(dst.path_explosion.enabled, src.path_explosion.enabled);
     mergeOpt(dst.path_explosion.probability, src.path_explosion.probability);
