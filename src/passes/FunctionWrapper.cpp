@@ -47,6 +47,12 @@ Function *makeForwarder(Module &M, Function *callee) {
     auto *wrap =
         Function::Create(ft, GlobalValue::InternalLinkage, "morok.wrap", &M);
     wrap->setCallingConv(callee->getCallingConv());
+    // Carry the callee's parameter/return/function attributes onto both the
+    // forwarder declaration and the forwarded call, so ABI attributes
+    // (byval/sret/swifterror/align/...) survive the extra indirection instead
+    // of being silently dropped (which mismatches the redirected call site).
+    const AttributeList AL = callee->getAttributes();
+    wrap->setAttributes(AL);
 
     IRBuilder<> B(BasicBlock::Create(M.getContext(), "entry", wrap));
     std::vector<Value *> args;
@@ -55,6 +61,7 @@ Function *makeForwarder(Module &M, Function *callee) {
         args.push_back(&a);
     CallInst *fwd = B.CreateCall(ft, callee, args);
     fwd->setCallingConv(callee->getCallingConv());
+    fwd->setAttributes(AL);
     fwd->setTailCall();
     if (ft->getReturnType()->isVoidTy())
         B.CreateRetVoid();
