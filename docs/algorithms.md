@@ -345,6 +345,27 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   ineligible.  The generated `morok.*` helpers are skipped by the later
   per-function pipeline.
 
+## Hash-gated self-decrypting VM bytecode — IR structure
+- Native block encryption needs post-link layout and W^X runtime cooperation,
+  so the current IR-safe form targets VM bytecode payloads emitted by
+  Virtualization rather than native machine-code basic blocks.
+- Selected `morok.vm.bytecode.*` globals are rewritten from constant encrypted
+  VM bytecode to mutable payloads with a second encrypted outer layer.  The VM's
+  original per-PC bytecode encryption remains inside that layer.
+- For each wrapped payload the pass emits an internal
+  `morok.sdb.ensure.*` helper and private `morok.sdb.ready.*` flag.  The VM
+  helper calls the ensure function before its dispatch loop reads bytecode.
+- The ensure function first hashes the still-encrypted payload through volatile
+  byte loads.  A `morok.sdb.gate` compare must match the embedded expected hash;
+  mismatch calls `llvm.trap`.
+- Only after the hash gate passes does the helper derive the stream key from
+  the hash, decrypt each payload byte with volatile stores, set the ready flag
+  volatile, and return.  Later calls observe the ready flag and skip the hash
+  and decrypt loops.
+- Scheduler placement is directly after Virtualization and before the
+  per-function pipeline, so VM bytecode exists and generated `morok.*` helpers
+  remain outside later function-local transforms.
+
 ## Vector obfuscation — IR structure
 - Eligible scalar integer binary ops are lifted to `<N x iM>` operations, where
   `N = width / M` for configured widths 128, 256, or 512 bits.  Lane `realLane`
@@ -429,6 +450,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - TableArithmetic: encrypted lazy byte-op lookup tables.
 - UniformPrimitiveLowering: byte-op tables plus memory-loaded indirectbr dispatch.
 - Virtualization: encrypted per-function bytecode plus threaded computed-goto VM helpers.
+- HashGatedSelfDecrypt: VM bytecode globals get a hash-gated lazy outer decryptor.
 - PathExplosion: opaque-guarded input-derived loops with volatile symbolic stores and indirectbr dispatch.
 - TraceKeying: edge-carried rolling trace accumulator with guards and neutral poisoning.
 - VectorObfuscation: scalar→SIMD lifting; width 128/256/512, shuffle, lift_comparisons.
@@ -437,6 +459,6 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - AntiClassDump / AntiDebugging / AntiHooking: platform anti-analysis (module passes).
 
 ## Scheduler order (to preserve semantics)
-AntiHook → AntiClassDump → FCO(fn) → AntiDebug → StringEnc → Virtualization → per-fn{ Split, BCF, OptAmp, Sub,
+AntiHook → AntiClassDump → FCO(fn) → AntiDebug → StringEnc → Virtualization → HashSelfDecrypt → per-fn{ Split, BCF, OptAmp, Sub,
 MBA, AliasOp, CoherentDecoys, NiState/EntFla/CSM/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, PointerLaunder, TableArith, Uniform, Vec, PathExplosion, TraceKeying, Dispatcherless } → ConstEnc → IndirectBranch → FunctionWrapper →
 FeatureElimination (strip debug/names) → cleanup marker decls.

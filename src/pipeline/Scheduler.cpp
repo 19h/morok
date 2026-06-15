@@ -22,6 +22,7 @@
 #include "morok/passes/Flattening.hpp"
 #include "morok/passes/FunctionCallObfuscate.hpp"
 #include "morok/passes/FunctionWrapper.hpp"
+#include "morok/passes/HashGatedSelfDecrypt.hpp"
 #include "morok/passes/IndirectBranch.hpp"
 #include "morok/passes/InterproceduralFsm.hpp"
 #include "morok/passes/Mba.hpp"
@@ -103,6 +104,15 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         p.max_registers =
             config_.passes.virtualization.max_registers.value_or(96);
         changed |= passes::virtualizeModule(M, p, rng);
+    }
+
+    if (config_.passes.hash_self_decrypt.enabled.value_or(false)) {
+        passes::HashGatedSelfDecryptParams p;
+        p.probability =
+            config_.passes.hash_self_decrypt.probability.value_or(100);
+        p.max_payloads =
+            config_.passes.hash_self_decrypt.max_payloads.value_or(2);
+        changed |= passes::hashGatedSelfDecryptModule(M, p, rng);
     }
 
     for (Function &F : M) {

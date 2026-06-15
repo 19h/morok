@@ -21,6 +21,7 @@
 #include "morok/passes/Flattening.hpp"
 #include "morok/passes/FunctionCallObfuscate.hpp"
 #include "morok/passes/FunctionWrapper.hpp"
+#include "morok/passes/HashGatedSelfDecrypt.hpp"
 #include "morok/passes/IndirectBranch.hpp"
 #include "morok/passes/InterproceduralFsm.hpp"
 #include "morok/passes/Mba.hpp"
@@ -56,6 +57,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 using namespace llvm;
 
@@ -1711,6 +1713,122 @@ right:
         rng));
     CHECK(countGlobals(*M, "morok.vm.bytecode") == 0u);
     CHECK(M->getFunction("morok.vm.branchy.exec") == nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("hashGatedSelfDecryptModule wraps VM bytecode in lazy decryptor") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @vm_secret(i32 %a, i32 %b) {
+entry:
+  %x = add i32 %a, %b
+  %y = xor i32 %x, 1515870810
+  %z = mul i32 %y, %a
+  ret i32 %z
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(171);
+    morok::ir::IRRandom rng(engine);
+
+    REQUIRE(morok::passes::virtualizeModule(
+        *M,
+        {/*probability=*/100, /*max_functions=*/1,
+         /*max_instructions=*/16, /*max_registers=*/32},
+        rng));
+
+    GlobalVariable *Bytecode = nullptr;
+    for (GlobalVariable &GV : M->globals())
+        if (GV.getName().starts_with("morok.vm.bytecode"))
+            Bytecode = &GV;
+    REQUIRE(Bytecode);
+    REQUIRE(Bytecode->isConstant());
+    auto *BeforeData = dyn_cast<ConstantDataArray>(Bytecode->getInitializer());
+    REQUIRE(BeforeData);
+    std::vector<std::uint8_t> Before;
+    for (unsigned I = 0; I < BeforeData->getNumElements(); ++I)
+        Before.push_back(
+            static_cast<std::uint8_t>(BeforeData->getElementAsInteger(I)));
+
+    CHECK(morok::passes::hashGatedSelfDecryptModule(
+        *M, {/*probability=*/100, /*max_payloads=*/4}, rng));
+
+    CHECK_FALSE(Bytecode->isConstant());
+    CHECK(countGlobals(*M, "morok.sdb.ready") == 1u);
+    Function *Ensure = M->getFunction("morok.sdb.ensure.vm_secret");
+    REQUIRE(Ensure);
+    Function *Helper = M->getFunction("morok.vm.vm_secret.exec");
+    REQUIRE(Helper);
+
+    auto *AfterData = dyn_cast<ConstantDataArray>(Bytecode->getInitializer());
+    REQUIRE(AfterData);
+    bool payloadChanged = false;
+    for (unsigned I = 0; I < AfterData->getNumElements() && I < Before.size();
+         ++I)
+        payloadChanged |=
+            Before[I] !=
+            static_cast<std::uint8_t>(AfterData->getElementAsInteger(I));
+    CHECK(payloadChanged);
+
+    bool helperCallsEnsure = false;
+    bool hasGate = false;
+    bool hasTrap = false;
+    bool hasVolatileReadyLoad = false;
+    bool hasVolatileReadyStore = false;
+    bool storesPayload = false;
+    for (Instruction &I : instructions(*Helper))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            helperCallsEnsure |= CI->getCalledFunction() == Ensure;
+    for (Instruction &I : instructions(*Ensure)) {
+        if (I.getName().starts_with("morok.sdb.gate"))
+            hasGate = true;
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            if (Function *Callee = CI->getCalledFunction())
+                hasTrap |= Callee->getName() == "llvm.trap";
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+            hasVolatileReadyLoad |=
+                LI->isVolatile() &&
+                LI->getPointerOperand()->getName().starts_with(
+                    "morok.sdb.ready");
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+            hasVolatileReadyStore |=
+                SI->isVolatile() &&
+                SI->getPointerOperand()->getName().starts_with(
+                    "morok.sdb.ready");
+            storesPayload |=
+                SI->getPointerOperand()->getName().starts_with(
+                    "morok.sdb.payload.ptr");
+        }
+    }
+    CHECK(helperCallsEnsure);
+    CHECK(hasGate);
+    CHECK(hasTrap);
+    CHECK(hasVolatileReadyLoad);
+    CHECK(hasVolatileReadyStore);
+    CHECK(storesPayload);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("hashGatedSelfDecryptModule honors zero probability") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @vm_zero(i32 %a, i32 %b) {
+entry:
+  %x = add i32 %a, %b
+  ret i32 %x
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(172);
+    morok::ir::IRRandom rng(engine);
+
+    REQUIRE(morok::passes::virtualizeModule(
+        *M,
+        {/*probability=*/100, /*max_functions=*/1,
+         /*max_instructions=*/16, /*max_registers=*/32},
+        rng));
+    CHECK_FALSE(morok::passes::hashGatedSelfDecryptModule(
+        *M, {/*probability=*/0, /*max_payloads=*/4}, rng));
+    CHECK(countGlobals(*M, "morok.sdb.ready") == 0u);
+    CHECK(M->getFunction("morok.sdb.ensure.vm_zero") == nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

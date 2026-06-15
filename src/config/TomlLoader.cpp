@@ -174,6 +174,12 @@ void parseVirtualization(const toml::table &t, VirtualizationConfig &c) {
     c.max_registers = readU32(t["max_registers"]);
 }
 
+void parseHashSelfDecrypt(const toml::table &t, HashSelfDecryptConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.probability = readU32(t["probability"]);
+    c.max_payloads = readU32(t["max_payloads"]);
+}
+
 void parsePathExplosion(const toml::table &t, PathExplosionConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.probability = readU32(t["probability"]);
@@ -277,6 +283,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseUniformLower(*t, pc.uniform_lower);
     if (auto *t = p["virtualization"].as_table())
         parseVirtualization(*t, pc.virtualization);
+    if (auto *t = p["hash_gated_self_decrypt"].as_table())
+        parseHashSelfDecrypt(*t, pc.hash_self_decrypt);
     if (auto *t = p["path_explosion"].as_table())
         parsePathExplosion(*t, pc.path_explosion);
     if (auto *t = p["execution_trace_keying"].as_table())

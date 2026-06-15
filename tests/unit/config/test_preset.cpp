@@ -53,6 +53,7 @@ TEST_CASE("low preset matches the documented table") {
     CHECK(c.sub_threshold.enabled == false);
     CHECK(c.uniform_lower.enabled == false);
     CHECK(c.virtualization.enabled == false);
+    CHECK(c.hash_self_decrypt.enabled == false);
     CHECK(c.path_explosion.enabled == false);
     CHECK(c.trace_keying.enabled == false);
     CHECK(c.dispatcherless.enabled == false);
@@ -115,6 +116,7 @@ TEST_CASE("mid preset matches the documented table") {
     CHECK(c.uniform_lower.max_tables == 2u);
     CHECK(c.uniform_lower.max_branches == 2u);
     CHECK(c.virtualization.enabled == false);
+    CHECK(c.hash_self_decrypt.enabled == false);
     CHECK(c.path_explosion.enabled == true);
     CHECK(c.path_explosion.probability == 15u);
     CHECK(c.path_explosion.max_blocks == 2u);
@@ -198,6 +200,9 @@ TEST_CASE("high preset matches the documented table") {
     CHECK(c.virtualization.max_functions == 1u);
     CHECK(c.virtualization.max_instructions == 48u);
     CHECK(c.virtualization.max_registers == 64u);
+    CHECK(c.hash_self_decrypt.enabled == true);
+    CHECK(c.hash_self_decrypt.probability == 100u);
+    CHECK(c.hash_self_decrypt.max_payloads == 1u);
     CHECK(c.path_explosion.enabled == true);
     CHECK(c.path_explosion.probability == 35u);
     CHECK(c.path_explosion.max_blocks == 4u);

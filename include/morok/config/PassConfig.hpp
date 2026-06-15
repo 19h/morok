@@ -152,6 +152,12 @@ struct VirtualizationConfig {
     Opt<std::uint32_t> max_registers;
 };
 
+struct HashSelfDecryptConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> max_payloads;
+};
+
 struct PathExplosionConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
@@ -231,6 +237,7 @@ struct PassConfig {
     SubThresholdConfig sub_threshold;
     UniformLowerConfig uniform_lower;
     VirtualizationConfig virtualization;
+    HashSelfDecryptConfig hash_self_decrypt;
     PathExplosionConfig path_explosion;
     TraceKeyConfig trace_keying;
     DispatcherlessConfig dispatcherless;

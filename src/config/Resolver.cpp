@@ -145,6 +145,12 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.virtualization.max_instructions);
     mergeOpt(dst.virtualization.max_registers,
              src.virtualization.max_registers);
+    // Hash-gated VM bytecode self-decrypt
+    mergeOpt(dst.hash_self_decrypt.enabled, src.hash_self_decrypt.enabled);
+    mergeOpt(dst.hash_self_decrypt.probability,
+             src.hash_self_decrypt.probability);
+    mergeOpt(dst.hash_self_decrypt.max_payloads,
+             src.hash_self_decrypt.max_payloads);
     // Path explosion
     mergeOpt(dst.path_explosion.enabled, src.path_explosion.enabled);
     mergeOpt(dst.path_explosion.probability, src.path_explosion.probability);

@@ -145,6 +145,10 @@ PassConfig makeLow() {
     c.virtualization.max_instructions = 0;
     c.virtualization.max_registers = 0;
 
+    c.hash_self_decrypt.enabled = false;
+    c.hash_self_decrypt.probability = 0;
+    c.hash_self_decrypt.max_payloads = 0;
+
     c.path_explosion.enabled = false;
     c.path_explosion.probability = 0;
     c.path_explosion.max_blocks = 0;
@@ -275,6 +279,10 @@ PassConfig makeMid() {
     c.virtualization.max_functions = 0;
     c.virtualization.max_instructions = 0;
     c.virtualization.max_registers = 0;
+
+    c.hash_self_decrypt.enabled = false;
+    c.hash_self_decrypt.probability = 0;
+    c.hash_self_decrypt.max_payloads = 0;
 
     c.path_explosion.enabled = true;
     c.path_explosion.probability = 15;
@@ -412,6 +420,10 @@ PassConfig makeHigh() {
     c.virtualization.max_functions = 1;
     c.virtualization.max_instructions = 48;
     c.virtualization.max_registers = 64;
+
+    c.hash_self_decrypt.enabled = true;
+    c.hash_self_decrypt.probability = 100;
+    c.hash_self_decrypt.max_payloads = 1;
 
     c.path_explosion.enabled = true;
     c.path_explosion.probability = 35;

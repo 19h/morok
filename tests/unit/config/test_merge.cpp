@@ -121,6 +121,9 @@ TEST_CASE("merge handles every pass family") {
     src.virtualization.max_functions = 2u;
     src.virtualization.max_instructions = 40u;
     src.virtualization.max_registers = 48u;
+    src.hash_self_decrypt.enabled = true;
+    src.hash_self_decrypt.probability = 91u;
+    src.hash_self_decrypt.max_payloads = 3u;
     src.path_explosion.enabled = true;
     src.path_explosion.probability = 52u;
     src.path_explosion.max_blocks = 3u;
@@ -197,6 +200,9 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.virtualization.max_functions == 2u);
     CHECK(dst.virtualization.max_instructions == 40u);
     CHECK(dst.virtualization.max_registers == 48u);
+    CHECK(dst.hash_self_decrypt.enabled == true);
+    CHECK(dst.hash_self_decrypt.probability == 91u);
+    CHECK(dst.hash_self_decrypt.max_payloads == 3u);
     CHECK(dst.path_explosion.enabled == true);
     CHECK(dst.path_explosion.probability == 52u);
     CHECK(dst.path_explosion.max_blocks == 3u);

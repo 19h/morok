@@ -27,6 +27,7 @@
 #include "morok/passes/Flattening.hpp"
 #include "morok/passes/FunctionCallObfuscate.hpp"
 #include "morok/passes/FunctionWrapper.hpp"
+#include "morok/passes/HashGatedSelfDecrypt.hpp"
 #include "morok/passes/IndirectBranch.hpp"
 #include "morok/passes/InterproceduralFsm.hpp"
 #include "morok/passes/Mba.hpp"
@@ -186,6 +187,10 @@ PassPluginLibraryInfo getPluginInfo() {
                         }
                         if (name == "morok-vm") {
                             MPM.addPass(passes::VirtualizationPass());
+                            return true;
+                        }
+                        if (name == "morok-selfdecrypt") {
+                            MPM.addPass(passes::HashGatedSelfDecryptPass());
                             return true;
                         }
                         if (name == "morok-antidbg") {

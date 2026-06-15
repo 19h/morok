@@ -111,6 +111,10 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     max_functions = 2
     max_instructions = 44
     max_registers = 52
+    [passes.hash_gated_self_decrypt]
+    enabled = true
+    probability = 92
+    max_payloads = 3
     [passes.path_explosion]
     enabled = true
     probability = 51
@@ -194,6 +198,9 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.virtualization.max_functions == 2u);
     CHECK(r.config.passes.virtualization.max_instructions == 44u);
     CHECK(r.config.passes.virtualization.max_registers == 52u);
+    CHECK(r.config.passes.hash_self_decrypt.enabled == true);
+    CHECK(r.config.passes.hash_self_decrypt.probability == 92u);
+    CHECK(r.config.passes.hash_self_decrypt.max_payloads == 3u);
     CHECK(r.config.passes.path_explosion.enabled == true);
     CHECK(r.config.passes.path_explosion.probability == 51u);
     CHECK(r.config.passes.path_explosion.max_blocks == 4u);

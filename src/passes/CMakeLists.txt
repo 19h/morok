@@ -28,6 +28,7 @@ add_library(morok_passes STATIC
   ArithmeticTables.cpp
   UniformPrimitiveLowering.cpp
   Virtualization.cpp
+  HashGatedSelfDecrypt.cpp
   PathExplosion.cpp
   TraceKeying.cpp
   DispatcherlessRouting.cpp
