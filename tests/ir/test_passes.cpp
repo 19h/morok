@@ -5364,6 +5364,89 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("virtualizeModule lifts integer division and remainder") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @vm_divrem(i32 %a, i32 %b) {
+entry:
+  %uq = udiv i32 %a, %b
+  %ur = urem i32 %a, %b
+  %sq = sdiv i32 %a, %b
+  %sr = srem i32 %a, %b
+  %t0 = xor i32 %uq, %ur
+  %t1 = xor i32 %sq, %sr
+  %r  = add i32 %t0, %t1
+  ret i32 %r
+}
+)ir");
+    Function *F = M->getFunction("vm_divrem");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1771);
+    morok::ir::IRRandom rng(engine);
+
+    // udiv/urem/sdiv/srem used to make the whole function ineligible
+    // (buildProgram returned nullopt).  A successful lift proves every one is
+    // now accepted and encoded into the bytecode.
+    CHECK(morok::passes::virtualizeModule(
+        *M,
+        {/*probability=*/100, /*max_functions=*/1,
+         /*max_instructions=*/64, /*max_registers=*/96},
+        rng));
+
+    Function *Helper = M->getFunction("morok.vm.vm_divrem.exec");
+    REQUIRE(Helper);
+    CHECK(countOpcode(*M, Instruction::UDiv) >= 1u);
+    CHECK(countOpcode(*M, Instruction::SDiv) >= 1u);
+    CHECK(countOpcode(*M, Instruction::URem) >= 1u);
+    CHECK(countOpcode(*M, Instruction::SRem) >= 1u);
+
+    std::size_t wrapperCalls = 0;
+    std::size_t wrapperBinops = 0;
+    for (Instruction &I : instructions(*F)) {
+        wrapperCalls += isa<CallInst>(&I) ? 1u : 0u;
+        wrapperBinops += isa<BinaryOperator>(&I) ? 1u : 0u;
+    }
+    CHECK(wrapperCalls == 1u);
+    CHECK(wrapperBinops == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("virtualizeModule lifts narrow signed division and remainder") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @vm_narrow_div(i8 %a, i8 %b) {
+entry:
+  %sq = sdiv i8 %a, %b
+  %sr = srem i8 %a, %b
+  %uq = udiv i8 %a, %b
+  %x0 = xor i8 %sq, %sr
+  %x1 = xor i8 %x0, %uq
+  %r  = sext i8 %x1 to i32
+  ret i32 %r
+}
+)ir");
+    Function *F = M->getFunction("vm_narrow_div");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1772);
+    morok::ir::IRRandom rng(engine);
+
+    // Narrow signed div/rem must sign-extend both operands into the register
+    // width; the lift must succeed and stay well-formed.
+    CHECK(morok::passes::virtualizeModule(
+        *M,
+        {/*probability=*/100, /*max_functions=*/1,
+         /*max_instructions=*/96, /*max_registers=*/128},
+        rng));
+
+    Function *Helper = M->getFunction("morok.vm.vm_narrow_div.exec");
+    REQUIRE(Helper);
+    std::size_t wrapperBinops = 0;
+    for (Instruction &I : instructions(*F))
+        wrapperBinops += isa<BinaryOperator>(&I) ? 1u : 0u;
+    CHECK(wrapperBinops == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("virtualizeModule skips unsupported control flow") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

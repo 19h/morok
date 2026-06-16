@@ -57,6 +57,10 @@ enum class VmOp : std::uint8_t {
     Shl,
     LShr,
     AShr,
+    UDiv,
+    SDiv,
+    URem,
+    SRem,
     ICmpEQ,
     ICmpNE,
     ICmpULT,
@@ -140,6 +144,16 @@ std::optional<VmOp> binaryOpcode(BinaryOperator &BO, unsigned Width) {
         return VmOp::Or;
     case Instruction::Xor:
         return VmOp::Xor;
+    case Instruction::UDiv:
+        // `exact` udiv/sdiv is poison when the division has a remainder; the VM
+        // emits an ordinary division, so reject the exact form to stay safe.
+        return BO.isExact() ? std::nullopt : std::optional<VmOp>(VmOp::UDiv);
+    case Instruction::SDiv:
+        return BO.isExact() ? std::nullopt : std::optional<VmOp>(VmOp::SDiv);
+    case Instruction::URem:
+        return VmOp::URem;
+    case Instruction::SRem:
+        return VmOp::SRem;
     case Instruction::Shl:
         if (BO.hasNoSignedWrap() || BO.hasNoUnsignedWrap())
             return std::nullopt;
@@ -365,6 +379,17 @@ std::optional<Program> buildProgram(Function &F,
                 if (!L)
                     return std::nullopt;
             }
+            // Signed division/remainder of a narrow type needs both operands
+            // sign-extended into the register width so the handler's signed
+            // re-extension reconstructs the value correctly.
+            if (NarrowOp && (*Op == VmOp::SDiv || *Op == VmOp::SRem)) {
+                L = signExtendRegister(P, *L, BOTy->getBitWidth(), NextReg,
+                                       Params);
+                R = signExtendRegister(P, *R, BOTy->getBitWidth(), NextReg,
+                                       Params);
+                if (!L || !R)
+                    return std::nullopt;
+            }
             auto Dst = appendRegisterBinary(P, *Op, *L, *R, NextReg, Params);
             if (!Dst)
                 return std::nullopt;
@@ -526,6 +551,10 @@ HandlerLayout makeLayout(ir::IRRandom &Rng) {
         {VmOp::Shl, 0, "shl.a"},   {VmOp::Shl, 1, "shl.b"},
         {VmOp::LShr, 0, "lshr.a"}, {VmOp::LShr, 1, "lshr.b"},
         {VmOp::AShr, 0, "ashr.a"}, {VmOp::AShr, 1, "ashr.b"},
+        {VmOp::UDiv, 0, "udiv.a"}, {VmOp::UDiv, 1, "udiv.b"},
+        {VmOp::SDiv, 0, "sdiv.a"}, {VmOp::SDiv, 1, "sdiv.b"},
+        {VmOp::URem, 0, "urem.a"}, {VmOp::URem, 1, "urem.b"},
+        {VmOp::SRem, 0, "srem.a"}, {VmOp::SRem, 1, "srem.b"},
         {VmOp::ICmpEQ, 0, "icmp.eq"},   {VmOp::ICmpNE, 0, "icmp.ne"},
         {VmOp::ICmpULT, 0, "icmp.ult"}, {VmOp::ICmpULE, 0, "icmp.ule"},
         {VmOp::ICmpUGT, 0, "icmp.ugt"}, {VmOp::ICmpUGE, 0, "icmp.uge"},
@@ -811,6 +840,24 @@ Value *emitBinary(Builder &B, VmOp Op, std::uint8_t Variant, Value *L, Value *R,
             Signed, R, Variant == 0 ? "morok.vm.ashr" : "morok.vm.ashr.alt");
         break;
     }
+    case VmOp::UDiv:
+        Out = B.CreateUDiv(
+            L, R, Variant == 0 ? "morok.vm.udiv" : "morok.vm.udiv.alt");
+        break;
+    case VmOp::SDiv:
+        Out = B.CreateSDiv(
+            signedValue(L, "morok.vm.sdiv.l"), signedValue(R, "morok.vm.sdiv.r"),
+            Variant == 0 ? "morok.vm.sdiv" : "morok.vm.sdiv.alt");
+        break;
+    case VmOp::URem:
+        Out = B.CreateURem(
+            L, R, Variant == 0 ? "morok.vm.urem" : "morok.vm.urem.alt");
+        break;
+    case VmOp::SRem:
+        Out = B.CreateSRem(
+            signedValue(L, "morok.vm.srem.l"), signedValue(R, "morok.vm.srem.r"),
+            Variant == 0 ? "morok.vm.srem" : "morok.vm.srem.alt");
+        break;
     case VmOp::ICmpEQ:
         Out = B.CreateZExt(B.CreateICmpEQ(L, R, "morok.vm.icmp.eq"), I64,
                            "morok.vm.icmp.zext");
@@ -866,8 +913,10 @@ Value *emitBinary(Builder &B, VmOp Op, std::uint8_t Variant, Value *L, Value *R,
         Out = ConstantInt::get(I64, 0);
         break;
     }
-    if (Variant != 0 && (Op == VmOp::Mul || Op == VmOp::Shl ||
-                         Op == VmOp::LShr || Op == VmOp::AShr)) {
+    if (Variant != 0 &&
+        (Op == VmOp::Mul || Op == VmOp::Shl || Op == VmOp::LShr ||
+         Op == VmOp::AShr || Op == VmOp::UDiv || Op == VmOp::SDiv ||
+         Op == VmOp::URem || Op == VmOp::SRem)) {
         Value *PcWide = B.CreateZExt(Pc, I64, "morok.vm.poly.pc");
         Value *Zero = B.CreateXor(PcWide, PcWide, "morok.vm.poly.zero");
         Out = B.CreateXor(Out, Zero, "morok.vm.poly.keep");
