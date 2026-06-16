@@ -64,6 +64,25 @@ bool isPassGenerated(const Value *V) {
     return false;
 }
 
+bool safeCallPointerArgs(const CallBase &CB) {
+    if (CB.isInlineAsm() || CB.hasOperandBundles() || CB.isMustTailCall())
+        return false;
+    if (Function *Callee = CB.getCalledFunction())
+        if (Callee->isIntrinsic())
+            return false;
+    return true;
+}
+
+bool safeReturnPointer(ReturnInst &RI) {
+    if (!RI.getReturnValue())
+        return false;
+    Instruction *Prev = RI.getPrevNode();
+    if (auto *CI = dyn_cast_or_null<CallInst>(Prev))
+        if (CI->isMustTailCall())
+            return false;
+    return true;
+}
+
 void addPointerOperand(const DataLayout &DL, Instruction &I, unsigned index,
                        std::vector<PointerTarget> &targets) {
     if (targets.size() >= kMaxPointerLaunderTargets)
@@ -110,6 +129,22 @@ void collectPointerTargets(Function &F, const DataLayout &DL,
                 if (auto *MT = dyn_cast<MemTransferInst>(MI))
                     addPointerOperand(
                         DL, I, MT->getRawSourceUse().getOperandNo(), targets);
+                continue;
+            }
+            if (auto *CB = dyn_cast<CallBase>(&I)) {
+                if (!safeCallPointerArgs(*CB))
+                    continue;
+                for (unsigned Arg = 0; Arg < CB->arg_size(); ++Arg)
+                    if (CB->getArgOperand(Arg)->getType()->isPointerTy())
+                        addPointerOperand(
+                            DL, I, CB->getArgOperandUse(Arg).getOperandNo(),
+                            targets);
+                continue;
+            }
+            if (auto *RI = dyn_cast<ReturnInst>(&I)) {
+                if (safeReturnPointer(*RI) &&
+                    RI->getReturnValue()->getType()->isPointerTy())
+                    addPointerOperand(DL, I, 0, targets);
                 continue;
             }
         }

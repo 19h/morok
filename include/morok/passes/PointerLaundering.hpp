@@ -4,10 +4,10 @@
 //
 // morok/passes/PointerLaundering.hpp — pointer/integer laundering.
 //
-// Launders memory pointer operands through ptrtoint/inttoptr and computed byte
-// GEPs, and launders integer SSA values through vector/scalar bitcast chains.
-// The transformed value is bit-identical, but alias analysis and decompiler
-// type propagation see an opaque integer/pointer boundary.
+// Launders memory/call/return pointer operands through ptrtoint/inttoptr and
+// computed byte GEPs, and launders integer SSA values through vector/scalar
+// bitcast chains.  The transformed value is bit-identical, but alias analysis
+// and decompiler type propagation see an opaque integer/pointer boundary.
 
 #ifndef MOROK_PASSES_POINTER_LAUNDERING_HPP
 #define MOROK_PASSES_POINTER_LAUNDERING_HPP

@@ -225,9 +225,11 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   added, then later pointer laundering can further obscure stack accesses.
 
 ## Pointer/integer laundering — IR structure
-- Pointer operands of loads, stores, GEPs, atomics, and memory intrinsics are
-  laundered when their address space is integral and target rules allow both
-  `ptrtoint` and `inttoptr`.  Non-integral/unstable pointer spaces are skipped.
+- Pointer operands of loads, stores, GEPs, atomics, memory intrinsics, ordinary
+  call arguments, and returns are laundered when their address space is integral
+  and target rules allow both `ptrtoint` and `inttoptr`.  Non-integral/unstable
+  pointer spaces are skipped.  Callees, operand bundles, intrinsics, inline asm,
+  and musttail-sensitive positions remain structural and are not rewritten.
 - Runtime shape: `ptr -> ptrtoint -> xor volatile-key -> xor same-key ->
   inttoptr -> gep i8, computed-zero`.  The value is unchanged, but LLVM AA and
   downstream type recovery must cross an explicit integer/pointer boundary.

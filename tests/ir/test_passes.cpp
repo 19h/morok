@@ -1823,6 +1823,51 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("pointerLaunderFunction launders call and return pointer operands") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target datalayout = "e-p:64:64"
+declare void @sink(ptr)
+
+define ptr @callret(ptr %p) {
+entry:
+  call void @sink(ptr %p)
+  ret ptr %p
+}
+)ir");
+    Function *F = M->getFunction("callret");
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(36);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::pointerLaunderFunction(
+        *F, {/*pointer_probability=*/100, /*integer_probability=*/0}, rng));
+
+    CallInst *Call = nullptr;
+    ReturnInst *Ret = nullptr;
+    unsigned ptrToIntCount = 0;
+    unsigned intToPtrCount = 0;
+    for (Instruction &I : instructions(*F)) {
+        ptrToIntCount += isa<PtrToIntInst>(&I);
+        intToPtrCount += isa<IntToPtrInst>(&I);
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            if (CI->getCalledFunction() &&
+                CI->getCalledFunction()->getName() == "sink")
+                Call = CI;
+        if (auto *RI = dyn_cast<ReturnInst>(&I))
+            Ret = RI;
+    }
+
+    REQUIRE(Call);
+    REQUIRE(Ret);
+    CHECK(Call->getArgOperand(0)->getName().starts_with("morok.ptr.gep"));
+    CHECK(Ret->getReturnValue()->getName().starts_with("morok.ptr.gep"));
+    CHECK(ptrToIntCount == 2u);
+    CHECK(intToPtrCount == 2u);
+    CHECK(countGlobals(*M, "morok.ptr.key") == 4u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("pointerLaunderFunction launders integer SSA through bitcasts") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
