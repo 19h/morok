@@ -4,15 +4,15 @@
 //
 // morok/passes/IndirectBranch.hpp — replace direct edges with indirect jumps.
 //
-// Conditional branches are rewritten to an `indirectbr` through a private table
-// of block addresses, indexed by the condition XOR a per-branch key bit (the
-// table order is permuted to match).  Static CFG-edge recovery must now resolve
-// a data-dependent table load.
+// Conditional branches and switches are rewritten to an `indirectbr` through a
+// private table of block addresses.  The table order is randomized per site and
+// the original condition/case chain selects the matching slot, so static
+// CFG-edge recovery must now resolve a data-dependent table load.
 //
 // Note: a multiplicative (Knuth-hash) encryption of the loaded pointer is not
-// expressible here because modern LLVM forbids the multiply/XOR ConstantExprs it
-// would require, so the indirection keys the index instead; the verified Knuth
-// primitive remains available in morok/core/KnuthHash.hpp.
+// expressible here because modern LLVM forbids the multiply/XOR ConstantExprs
+// it would require, so the indirection keys the index instead; the verified
+// Knuth primitive remains available in morok/core/KnuthHash.hpp.
 
 #ifndef MOROK_PASSES_INDIRECT_BRANCH_HPP
 #define MOROK_PASSES_INDIRECT_BRANCH_HPP
@@ -31,10 +31,11 @@ class Function;
 namespace morok::passes {
 
 struct IndirParams {
-    std::uint32_t probability = 100; ///< per-branch chance, 0..100
+    std::uint32_t probability = 100; ///< per-terminator chance, 0..100
 };
 
-/// Indirect-ify eligible conditional branches in `F`.  Returns true if changed.
+/// Indirect-ify eligible conditional branches and switches in `F`.
+/// Returns true if changed.
 bool indirectBranchFunction(llvm::Function &F, const IndirParams &params,
                             morok::ir::IRRandom &rng);
 

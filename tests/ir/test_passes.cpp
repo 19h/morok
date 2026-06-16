@@ -6960,6 +6960,48 @@ f:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("indirectBranchFunction replaces switches with indirectbr") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @indirect_switch(i32 %x) {
+entry:
+  switch i32 %x, label %def [
+    i32 1, label %one
+    i32 2, label %two
+    i32 3, label %one
+  ]
+one:
+  ret i32 10
+two:
+  ret i32 20
+def:
+  ret i32 0
+}
+)ir");
+    Function *F = M->getFunction("indirect_switch");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(24);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::indirectBranchFunction(*F, {/*prob=*/100}, rng));
+    CHECK(countGlobals(*M, "morok.ibtable") == 1u);
+    unsigned switchCount = 0;
+    unsigned indirectCount = 0;
+    unsigned destinationCount = 0;
+    for (Instruction &I : instructions(*F)) {
+        if (isa<SwitchInst>(&I))
+            ++switchCount;
+        if (auto *IB = dyn_cast<IndirectBrInst>(&I)) {
+            ++indirectCount;
+            destinationCount = IB->getNumDestinations();
+        }
+    }
+    CHECK(switchCount == 0u);
+    CHECK(indirectCount == 1u);
+    CHECK(destinationCount == 3u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("functionWrapModule proxies a call and stays valid") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

@@ -150,7 +150,7 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 | MQ opaque gate | `morok-mq` | planted GF(2) quadratic systems guarding input-derived branch sites |
 | Constant encryption | `morok-constenc` | literals split into XOR shares |
 | String encryption | `morok-strenc` | literals stored GF(2⁸)-encrypted, decrypted in a ctor |
-| Indirect branch | `morok-indbr` | conditional edges → keyed `indirectbr` table |
+| Indirect branch | `morok-indbr` | conditional/switch edges → randomized `indirectbr` table |
 | Function wrapper | `morok-funcwrap` | call sites routed through forwarder proxies |
 | Function-call obfuscate | `morok-fco` | external calls resolved via `dlsym` |
 | Anti-debugging | `morok-antidbg` | `ptrace`-based debugger denial at startup |
