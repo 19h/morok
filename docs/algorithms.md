@@ -244,14 +244,16 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Runtime shape: `ptr -> ptrtoint -> xor volatile-key -> xor same-key ->
   inttoptr -> gep i8, computed-zero`.  The value is unchanged, but LLVM AA and
   downstream type recovery must cross an explicit integer/pointer boundary.
-- Integer SSA values from `i1` through `i1024` are laundered through a
-  byte-vector view.  Byte-multiple widths use
+- Scalar SSA values are laundered through a byte-vector view.  Integer widths
+  from `i1` through `i1024` use
   `iN -> <N/8 x i8> -> shufflevector identity -> iN`; sub-byte and odd widths
   first zero-extend to the smallest covering byte width, then truncate back
-  after the identity shuffle.  The extra high bits are never observed, while
+  after the identity shuffle.  Scalar FP values (`half`, `bfloat`, `float`,
+  `double`) first bitcast to equal-width integer carriers, then return through
+  the same byte-vector path.  The extra high bits are never observed, while
   decompilers still have to reconcile the conflicting scalar/vector views.
 - Direct memory caps: each invocation launders at most 128 pointer operands and
-  at most 128 integer SSA values.
+  at most 128 scalar SSA values.
 
 ## Type punning — IR structure
 - Eligible scalar-producing instructions (`i1` through `i1024`, `half`,
@@ -866,7 +868,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - SplitBasicBlocks: split + stack-confusion; `split_num`, stack_confusion.
 - StackCoalescing: one byte frame for static locals; opaque loaded offsets; skips escaping allocas.
 - StackDeltaGames: dynamic stack saves/restores plus odd overlapping volatile stack slots.
-- PointerLaundering: pointer-int round trips + computed byte GEPs; scalar byte-vector bitcasts.
+- PointerLaundering: pointer-int round trips + computed byte GEPs; integer/FP byte-vector bitcasts.
 - TypePunning: volatile union-buffer scalar↔vector/integer reinterpretation chains.
 - PhiTangling: redundant scalar integer/FP edge-copy/direct PHI webs; zero cross-terms rewrite uses.
 - AliasOpaquePredicates: maintained pointer/alias memory invariant guards with decoy edges.

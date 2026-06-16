@@ -113,7 +113,7 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 | Split basic blocks | `morok-split` | cuts blocks into more dispatch targets |
 | Stack coalescing | `morok-stackcoalesce` | locals → one opaque byte buffer |
 | Stack delta games | `morok-stackdelta` | dynamic stack-pointer deltas with odd overlapping volatile slots |
-| Pointer laundering | `morok-ptrlaunder` | pointer/int round trips and byte-vector value views |
+| Pointer laundering | `morok-ptrlaunder` | pointer/scalar round trips and byte-vector value views |
 | Type punning | `morok-typepun` | union-buffer scalar reinterpretation chains |
 | PHI tangling | `morok-phitangle` | redundant cross-block PHI webs |
 | Adversarial merge/outline | `morok-afm` | unrelated functions fused behind selector dispatchers and shared helpers |

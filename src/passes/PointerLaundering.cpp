@@ -4,11 +4,11 @@
 //
 // morok/passes/PointerLaundering.cpp
 //
-// Pointer/integer laundering targets the decompiler value layer: pointer
+// Pointer/scalar laundering targets the decompiler value layer: pointer
 // operands cross an integer boundary and return through a computed byte GEP,
-// while integer SSA values round-trip through a vector byte view or a covering
-// byte-width view.  Both rewrites preserve the value but poison simple
-// alias/type propagation.
+// while integer and scalar FP SSA values round-trip through a vector byte view
+// or a covering byte-width view.  Both rewrites preserve the value but poison
+// simple alias/type propagation.
 
 #include "morok/passes/PointerLaundering.hpp"
 
@@ -35,7 +35,7 @@ namespace morok::passes {
 namespace {
 
 constexpr std::size_t kMaxPointerLaunderTargets = 128;
-constexpr std::size_t kMaxIntegerLaunderTargets = 128;
+constexpr std::size_t kMaxScalarLaunderTargets = 128;
 
 struct PointerTarget {
     Instruction *user = nullptr;
@@ -43,7 +43,7 @@ struct PointerTarget {
     Value *pointer = nullptr;
 };
 
-struct IntegerLaunderResult {
+struct ScalarLaunderResult {
     Value *replacement = nullptr;
     SmallVector<Instruction *, 5> generated;
 };
@@ -62,6 +62,29 @@ bool isPassGenerated(const Value *V) {
         return I->getName().starts_with("morok.ptr") ||
                I->getName().starts_with("morok.int");
     return false;
+}
+
+bool isSupportedScalarFp(Type *Ty) {
+    return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+           Ty->isDoubleTy();
+}
+
+IntegerType *integerCarrierForFp(Type *Ty) {
+    if (Ty->isHalfTy() || Ty->isBFloatTy())
+        return IntegerType::get(Ty->getContext(), 16);
+    if (Ty->isFloatTy())
+        return IntegerType::get(Ty->getContext(), 32);
+    if (Ty->isDoubleTy())
+        return IntegerType::get(Ty->getContext(), 64);
+    return nullptr;
+}
+
+bool isLaunderableScalar(Type *Ty) {
+    if (auto *IT = dyn_cast<IntegerType>(Ty)) {
+        const unsigned bits = IT->getBitWidth();
+        return bits >= 1 && bits <= 1024;
+    }
+    return isSupportedScalarFp(Ty);
 }
 
 bool safeCallPointerArgs(const CallBase &CB) {
@@ -153,7 +176,7 @@ void collectPointerTargets(Function &F, const DataLayout &DL,
     }
 }
 
-bool canLaunderInteger(const Instruction &I) {
+bool canLaunderScalar(const Instruction &I) {
     if (I.isTerminator() || isa<PHINode>(I) || isa<AllocaInst>(I) ||
         isa<LandingPadInst>(I) || isa<IntrinsicInst>(I))
         return false;
@@ -165,22 +188,18 @@ bool canLaunderInteger(const Instruction &I) {
     if (isPassGenerated(&I))
         return false;
 
-    auto *Ty = dyn_cast<IntegerType>(I.getType());
-    if (!Ty)
-        return false;
-    const unsigned bits = Ty->getBitWidth();
-    return bits >= 1 && bits <= 1024 && I.getNextNode();
+    return isLaunderableScalar(I.getType()) && I.getNextNode();
 }
 
-void collectIntegerTargets(Function &F, std::vector<Instruction *> &targets) {
+void collectScalarTargets(Function &F, std::vector<Instruction *> &targets) {
     for (BasicBlock &BB : F) {
         for (Instruction &I : BB) {
-            if (targets.size() >= kMaxIntegerLaunderTargets)
+            if (targets.size() >= kMaxScalarLaunderTargets)
                 break;
-            if (canLaunderInteger(I))
+            if (canLaunderScalar(I))
                 targets.push_back(&I);
         }
-        if (targets.size() >= kMaxIntegerLaunderTargets)
+        if (targets.size() >= kMaxScalarLaunderTargets)
             break;
     }
 }
@@ -217,19 +236,19 @@ Value *launderPointer(Module &M, const DataLayout &DL, Instruction &user,
     return B.CreateGEP(B.getInt8Ty(), round, zero, "morok.ptr.gep");
 }
 
-IntegerLaunderResult launderInteger(Instruction &I) {
-    auto *Ty = cast<IntegerType>(I.getType());
+ScalarLaunderResult launderIntegerBits(IRBuilder<NoFolder> &B, Value *input,
+                                       IntegerType *Ty,
+                                       const Twine &outputName) {
     const unsigned bits = Ty->getBitWidth();
     const unsigned lanes = (bits + 7u) / 8u;
-    auto *WorkTy = bits % 8u == 0
-                       ? Ty
-                       : IntegerType::get(I.getContext(), lanes * 8u);
-    auto *VecTy = FixedVectorType::get(Type::getInt8Ty(I.getContext()), lanes);
+    auto *WorkTy =
+        bits % 8u == 0 ? Ty : IntegerType::get(Ty->getContext(), lanes * 8u);
+    auto *VecTy =
+        FixedVectorType::get(Type::getInt8Ty(Ty->getContext()), lanes);
 
-    IRBuilder<NoFolder> B(I.getNextNode());
-    Value *Work = &I;
+    Value *Work = input;
     if (WorkTy != Ty)
-        Work = B.CreateZExt(&I, WorkTy, "morok.int.wide");
+        Work = B.CreateZExt(input, WorkTy, "morok.int.wide");
     Value *bytes = B.CreateBitCast(Work, VecTy, "morok.int.bytes");
 
     SmallVector<int, 16> mask;
@@ -239,12 +258,12 @@ IntegerLaunderResult launderInteger(Instruction &I) {
     Value *shuffled = B.CreateShuffleVector(bytes, PoisonValue::get(VecTy),
                                             mask, "morok.int.shuffle");
     Value *wideBack = B.CreateBitCast(shuffled, WorkTy, "morok.int.wide.value");
-    Value *back = WorkTy == Ty ? wideBack
-                               : B.CreateTrunc(wideBack, Ty, "morok.int.value");
+    Value *back =
+        WorkTy == Ty ? wideBack : B.CreateTrunc(wideBack, Ty, outputName);
 
-    IntegerLaunderResult result;
+    ScalarLaunderResult result;
     result.replacement = back;
-    if (Work != &I)
+    if (Work != input)
         result.generated.push_back(cast<Instruction>(Work));
     result.generated.push_back(cast<Instruction>(bytes));
     result.generated.push_back(cast<Instruction>(shuffled));
@@ -254,7 +273,24 @@ IntegerLaunderResult launderInteger(Instruction &I) {
     return result;
 }
 
-void replaceIntegerUses(Instruction &I, const IntegerLaunderResult &result) {
+ScalarLaunderResult launderScalar(Instruction &I) {
+    IRBuilder<NoFolder> B(I.getNextNode());
+    if (auto *Ty = dyn_cast<IntegerType>(I.getType()))
+        return launderIntegerBits(B, &I, Ty, "morok.int.value");
+
+    auto *CarrierTy = integerCarrierForFp(I.getType());
+    Value *bits = B.CreateBitCast(&I, CarrierTy, "morok.int.fpbits");
+    ScalarLaunderResult result =
+        launderIntegerBits(B, bits, CarrierTy, "morok.int.fpbits.value");
+    Value *fp =
+        B.CreateBitCast(result.replacement, I.getType(), "morok.int.fpvalue");
+    result.replacement = fp;
+    result.generated.insert(result.generated.begin(), cast<Instruction>(bits));
+    result.generated.push_back(cast<Instruction>(fp));
+    return result;
+}
+
+void replaceScalarUses(Instruction &I, const ScalarLaunderResult &result) {
     SmallPtrSet<const User *, 4> generated;
     for (Instruction *generatedInst : result.generated)
         generated.insert(generatedInst);
@@ -277,11 +313,11 @@ bool pointerLaunderFunction(Function &F, const PointerLaunderParams &params,
     const DataLayout &DL = M->getDataLayout();
 
     std::vector<PointerTarget> pointerTargets;
-    std::vector<Instruction *> integerTargets;
+    std::vector<Instruction *> scalarTargets;
     if (params.pointer_probability > 0)
         collectPointerTargets(F, DL, pointerTargets);
     if (params.integer_probability > 0)
-        collectIntegerTargets(F, integerTargets);
+        collectScalarTargets(F, scalarTargets);
 
     bool changed = false;
 
@@ -294,11 +330,11 @@ bool pointerLaunderFunction(Function &F, const PointerLaunderParams &params,
         changed = true;
     }
 
-    for (Instruction *I : integerTargets) {
+    for (Instruction *I : scalarTargets) {
         if (!rng.chance(params.integer_probability))
             continue;
-        IntegerLaunderResult replacement = launderInteger(*I);
-        replaceIntegerUses(*I, replacement);
+        ScalarLaunderResult replacement = launderScalar(*I);
+        replaceScalarUses(*I, replacement);
         changed = true;
     }
 

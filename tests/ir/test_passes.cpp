@@ -2327,6 +2327,75 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("pointerLaunderFunction launders floating SSA through bit carriers") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define float @fp_launder(float %a, float %b) {
+entry:
+  %sum = fadd float %a, %b
+  %prod = fmul float %sum, %a
+  ret float %prod
+}
+
+define double @fp_launder_d(double %a, double %b) {
+entry:
+  %sum = fadd double %a, %b
+  ret double %sum
+}
+)ir");
+    Function *FloatF = M->getFunction("fp_launder");
+    Function *DoubleF = M->getFunction("fp_launder_d");
+    REQUIRE(FloatF);
+    REQUIRE(DoubleF);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(371);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::pointerLaunderFunction(
+        *FloatF, {/*pointer_probability=*/0, /*integer_probability=*/100},
+        rng));
+    CHECK(morok::passes::pointerLaunderFunction(
+        *DoubleF, {/*pointer_probability=*/0, /*integer_probability=*/100},
+        rng));
+
+    bool hasFloatBits = false;
+    bool hasFloatBack = false;
+    bool hasFloatShuffle = false;
+    for (Instruction &I : instructions(*FloatF)) {
+        if (auto *cast = dyn_cast<BitCastInst>(&I)) {
+            hasFloatBits |= I.getName().starts_with("morok.int.fpbits") &&
+                            cast->getSrcTy()->isFloatTy() &&
+                            cast->getDestTy()->isIntegerTy(32);
+            hasFloatBack |= I.getName().starts_with("morok.int.fpvalue") &&
+                            cast->getSrcTy()->isIntegerTy(32) &&
+                            cast->getDestTy()->isFloatTy();
+        }
+        hasFloatShuffle |= isa<ShuffleVectorInst>(&I);
+    }
+
+    bool hasDoubleBits = false;
+    bool hasDoubleBack = false;
+    bool hasDoubleShuffle = false;
+    for (Instruction &I : instructions(*DoubleF)) {
+        if (auto *cast = dyn_cast<BitCastInst>(&I)) {
+            hasDoubleBits |= I.getName().starts_with("morok.int.fpbits") &&
+                             cast->getSrcTy()->isDoubleTy() &&
+                             cast->getDestTy()->isIntegerTy(64);
+            hasDoubleBack |= I.getName().starts_with("morok.int.fpvalue") &&
+                             cast->getSrcTy()->isIntegerTy(64) &&
+                             cast->getDestTy()->isDoubleTy();
+        }
+        hasDoubleShuffle |= isa<ShuffleVectorInst>(&I);
+    }
+
+    CHECK(hasFloatBits);
+    CHECK(hasFloatBack);
+    CHECK(hasFloatShuffle);
+    CHECK(hasDoubleBits);
+    CHECK(hasDoubleBack);
+    CHECK(hasDoubleShuffle);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("pointerLaunderFunction launders sub-byte and odd-width integers") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
