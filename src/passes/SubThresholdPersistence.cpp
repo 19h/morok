@@ -31,7 +31,7 @@ constexpr StringRef kSeedPrefix = "morok.threshold.seed";
 
 bool eligible(BinaryOperator *bo) {
     auto *Ty = dyn_cast<IntegerType>(bo->getType());
-    if (!Ty || Ty->getBitWidth() < 8)
+    if (!Ty || Ty->getBitWidth() == 0)
         return false;
     if (bo->getName().starts_with("morok.threshold"))
         return false;

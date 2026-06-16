@@ -68,7 +68,17 @@ std::uint64_t widthMask(unsigned Bits) {
 }
 
 bool isRewritableUser(const Instruction &I) {
-    return isa<BinaryOperator>(I) || isa<ICmpInst>(I);
+    return isa<BinaryOperator>(I) || isa<ICmpInst>(I) ||
+           isa<SelectInst>(I) || isa<CastInst>(I) || isa<ReturnInst>(I);
+}
+
+bool safeCallArgs(const CallBase &CB) {
+    if (CB.isInlineAsm() || CB.hasOperandBundles() || CB.isMustTailCall())
+        return false;
+    if (Function *Callee = CB.getCalledFunction())
+        if (Callee->isIntrinsic())
+            return false;
+    return true;
 }
 
 std::uint64_t hashStep(std::uint64_t H, std::uint8_t B) {
@@ -115,16 +125,30 @@ std::vector<Target> collectTargets(Function &F) {
     std::vector<Target> Targets;
     for (BasicBlock &BB : F)
         for (Instruction &I : BB) {
-            if (!isRewritableUser(I))
-                continue;
-            for (unsigned Op = 0; Op < I.getNumOperands(); ++Op) {
-                auto *C = dyn_cast<ConstantInt>(I.getOperand(Op));
-                if (!C)
+            if (auto *CB = dyn_cast<CallBase>(&I)) {
+                if (!safeCallArgs(*CB))
                     continue;
-                auto *Ty = dyn_cast<IntegerType>(C->getType());
-                if (!Ty || !eligibleWidth(Ty->getBitWidth()))
+                for (unsigned Op = 0; Op < CB->arg_size(); ++Op) {
+                    auto *C = dyn_cast<ConstantInt>(CB->getArgOperand(Op));
+                    if (!C)
+                        continue;
+                    auto *Ty = dyn_cast<IntegerType>(C->getType());
+                    if (!Ty || !eligibleWidth(Ty->getBitWidth()))
+                        continue;
+                    Targets.push_back({&I, Op, C});
+                }
+            } else {
+                if (!isRewritableUser(I))
                     continue;
-                Targets.push_back({&I, Op, C});
+                for (unsigned Op = 0; Op < I.getNumOperands(); ++Op) {
+                    auto *C = dyn_cast<ConstantInt>(I.getOperand(Op));
+                    if (!C)
+                        continue;
+                    auto *Ty = dyn_cast<IntegerType>(C->getType());
+                    if (!Ty || !eligibleWidth(Ty->getBitWidth()))
+                        continue;
+                    Targets.push_back({&I, Op, C});
+                }
             }
         }
     return Targets;
@@ -300,7 +324,7 @@ Runtime createRuntime(Function &F, const SelfChecksumParams &Params,
 
 GlobalVariable *createMask(Module &M, Function &F, IntegerType *Ty,
                            std::uint64_t Mask) {
-    const unsigned Bytes = std::max<unsigned>(1, Ty->getBitWidth() / 8);
+    const unsigned Bytes = (Ty->getBitWidth() + 7u) / 8u;
     auto *GV = new GlobalVariable(
         M, Ty, /*isConstant=*/false, GlobalValue::PrivateLinkage,
         ConstantInt::get(Ty, Mask),

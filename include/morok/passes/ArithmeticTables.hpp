@@ -4,10 +4,10 @@
 //
 // morok/passes/ArithmeticTables.hpp — arithmetic-as-table lowering.
 //
-// Replaces selected byte-width integer arithmetic with lookup-table loads.  The
-// table is stored encrypted and lazily materialized by a tiny runtime decoder,
-// so the opcode intent disappears from the function body and plaintext tables
-// are not present in the static initializer.
+// Replaces selected i1..i8 integer arithmetic and comparisons with
+// lookup-table loads.  The table is stored encrypted and lazily materialized by
+// a tiny runtime decoder, so the opcode intent disappears from the function
+// body and plaintext tables are not present in the static initializer.
 
 #ifndef MOROK_PASSES_ARITHMETIC_TABLES_HPP
 #define MOROK_PASSES_ARITHMETIC_TABLES_HPP
@@ -30,7 +30,8 @@ struct TableArithParams {
     std::uint32_t max_tables = 8;   ///< per-function table cap
 };
 
-/// Replace eligible i8 binary operations in `F` with encrypted table lookups.
+/// Replace eligible i1..i8 binary operations/comparisons in `F` with encrypted
+/// table lookups.
 bool tableArithmeticFunction(llvm::Function &F, const TableArithParams &params,
                              morok::ir::IRRandom &rng);
 

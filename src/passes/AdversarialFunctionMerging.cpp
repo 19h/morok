@@ -173,7 +173,7 @@ bool eligibleOutline(BinaryOperator &BO) {
     if (BO.getName().starts_with("morok.afm."))
         return false;
     auto *Ty = dyn_cast<IntegerType>(BO.getType());
-    if (!Ty || Ty->getBitWidth() < 8 || Ty->getBitWidth() > 64)
+    if (!Ty || Ty->getBitWidth() == 0 || Ty->getBitWidth() > 64)
         return false;
     return !BO.hasPoisonGeneratingFlags();
 }

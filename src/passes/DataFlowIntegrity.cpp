@@ -4,11 +4,12 @@
 //
 // morok/passes/DataFlowIntegrity.cpp
 //
-// Data-flow-entangled integrity.  Selected `i1..i8 a OP b` operations become
-// volatile loads from encoded lookup tables.  The decode key is derived from a
-// runtime hash of a private byte region plus the expected hash; if the region
-// or expected value changes, the operation result is corrupted as data rather
-// than guarded by a separable branch.
+// Data-flow-entangled integrity.  Selected `i1..i8 a OP b` and
+// `icmp pred i1..i8 a, b` operations become volatile loads from encoded lookup
+// tables.  The decode key is derived from a runtime hash of a private byte
+// region plus the expected hash; if the region or expected value changes, the
+// operation result is corrupted as data rather than guarded by a separable
+// branch.
 
 #include "morok/passes/DataFlowIntegrity.hpp"
 
@@ -57,6 +58,19 @@ struct Runtime {
     std::uint64_t expected_hash = 0;
 };
 
+enum class TableOpKind { Binary, ICmp };
+
+struct TableOpSpec {
+    TableOpKind kind;
+    unsigned code;
+    unsigned bitWidth;
+};
+
+struct Target {
+    Instruction *inst = nullptr;
+    TableOpSpec spec;
+};
+
 bool generatedFunction(const Function &F) {
     return F.getName().starts_with("morok.");
 }
@@ -69,6 +83,24 @@ bool supportedOpcode(unsigned Opcode) {
     case Instruction::And:
     case Instruction::Or:
     case Instruction::Xor:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool supportedPredicate(CmpInst::Predicate Pred) {
+    switch (Pred) {
+    case CmpInst::ICMP_EQ:
+    case CmpInst::ICMP_NE:
+    case CmpInst::ICMP_UGT:
+    case CmpInst::ICMP_UGE:
+    case CmpInst::ICMP_ULT:
+    case CmpInst::ICMP_ULE:
+    case CmpInst::ICMP_SGT:
+    case CmpInst::ICMP_SGE:
+    case CmpInst::ICMP_SLT:
+    case CmpInst::ICMP_SLE:
         return true;
     default:
         return false;
@@ -89,9 +121,27 @@ bool eligible(BinaryOperator &BO) {
     return true;
 }
 
+bool eligible(ICmpInst &CI) {
+    auto *Ty = dyn_cast<IntegerType>(CI.getOperand(0)->getType());
+    if (!Ty || Ty != CI.getOperand(1)->getType() || Ty->getBitWidth() == 0 ||
+        Ty->getBitWidth() > 8)
+        return false;
+    return supportedPredicate(CI.getPredicate());
+}
+
 std::uint8_t bitMask(unsigned Width) {
     return Width >= 8 ? 0xFFu
                       : static_cast<std::uint8_t>((1u << Width) - 1u);
+}
+
+std::int32_t signExtend(std::uint8_t Value, unsigned Width) {
+    const std::uint32_t Mask =
+        Width >= 8 ? 0xFFu : static_cast<std::uint32_t>((1u << Width) - 1u);
+    std::uint32_t V = Value & Mask;
+    const std::uint32_t SignBit = 1u << (Width - 1u);
+    if ((V & SignBit) == 0)
+        return static_cast<std::int32_t>(V);
+    return static_cast<std::int32_t>(V | ~Mask);
 }
 
 std::uint8_t eval(unsigned Opcode, std::uint8_t Lhs, std::uint8_t Rhs,
@@ -123,6 +173,58 @@ std::uint8_t eval(unsigned Opcode, std::uint8_t Lhs, std::uint8_t Rhs,
         break;
     }
     return static_cast<std::uint8_t>(Result & Mask);
+}
+
+std::uint8_t evalPredicate(CmpInst::Predicate Pred, std::uint8_t Lhs,
+                           std::uint8_t Rhs, unsigned Width) {
+    const std::uint8_t Mask = bitMask(Width);
+    const std::uint32_t UL = Lhs & Mask;
+    const std::uint32_t UR = Rhs & Mask;
+    const std::int32_t SL = signExtend(Lhs, Width);
+    const std::int32_t SR = signExtend(Rhs, Width);
+    bool Result = false;
+    switch (Pred) {
+    case CmpInst::ICMP_EQ:
+        Result = UL == UR;
+        break;
+    case CmpInst::ICMP_NE:
+        Result = UL != UR;
+        break;
+    case CmpInst::ICMP_UGT:
+        Result = UL > UR;
+        break;
+    case CmpInst::ICMP_UGE:
+        Result = UL >= UR;
+        break;
+    case CmpInst::ICMP_ULT:
+        Result = UL < UR;
+        break;
+    case CmpInst::ICMP_ULE:
+        Result = UL <= UR;
+        break;
+    case CmpInst::ICMP_SGT:
+        Result = SL > SR;
+        break;
+    case CmpInst::ICMP_SGE:
+        Result = SL >= SR;
+        break;
+    case CmpInst::ICMP_SLT:
+        Result = SL < SR;
+        break;
+    case CmpInst::ICMP_SLE:
+        Result = SL <= SR;
+        break;
+    default:
+        break;
+    }
+    return static_cast<std::uint8_t>(Result);
+}
+
+std::uint8_t eval(const TableOpSpec &Op, std::uint8_t Lhs, std::uint8_t Rhs) {
+    if (Op.kind == TableOpKind::ICmp)
+        return evalPredicate(static_cast<CmpInst::Predicate>(Op.code), Lhs, Rhs,
+                             Op.bitWidth);
+    return eval(Op.code, Lhs, Rhs, Op.bitWidth);
 }
 
 std::uint64_t hashStep(std::uint64_t H, std::uint8_t B) {
@@ -333,8 +435,8 @@ KeySchedule makeKey(Runtime &R, ir::IRRandom &Rng) {
             static_cast<std::uint8_t>(Rng.next())};
 }
 
-GlobalVariable *createTable(Module &M, Function &F, unsigned Opcode,
-                            unsigned BitWidth, const KeySchedule &Key) {
+GlobalVariable *createTable(Module &M, Function &F, const TableOpSpec &Op,
+                            const KeySchedule &Key) {
     LLVMContext &Ctx = M.getContext();
     auto *I8 = Type::getInt8Ty(Ctx);
     auto *TableTy = ArrayType::get(I8, kTableSize);
@@ -343,8 +445,7 @@ GlobalVariable *createTable(Module &M, Function &F, unsigned Opcode,
     for (std::uint32_t Idx = 0; Idx < kTableSize; ++Idx) {
         const auto Lhs = static_cast<std::uint8_t>(Idx >> 8);
         const auto Rhs = static_cast<std::uint8_t>(Idx & 0xFFu);
-        Enc[Idx] = eval(Opcode, Lhs, Rhs, BitWidth) ^
-                   keyAt(Idx, Key.expected_hash, Key);
+        Enc[Idx] = eval(Op, Lhs, Rhs) ^ keyAt(Idx, Key.expected_hash, Key);
     }
 
     auto *Table = new GlobalVariable(
@@ -356,14 +457,14 @@ GlobalVariable *createTable(Module &M, Function &F, unsigned Opcode,
     return Table;
 }
 
-Value *emitLookup(Module &M, Function &F, Runtime &R, BinaryOperator &BO,
+Value *emitLookup(Module &M, Function &F, Runtime &R, Target &T,
                   ir::IRRandom &Rng) {
-    auto *SourceTy = cast<IntegerType>(BO.getType());
-    const unsigned BitWidth = SourceTy->getBitWidth();
+    Instruction &I = *T.inst;
+    const unsigned BitWidth = T.spec.bitWidth;
     KeySchedule Key = makeKey(R, Rng);
-    GlobalVariable *Table = createTable(M, F, BO.getOpcode(), BitWidth, Key);
+    GlobalVariable *Table = createTable(M, F, T.spec, Key);
 
-    Builder B(&BO);
+    Builder B(&I);
     auto *I8 = B.getInt8Ty();
     auto *I16 = B.getInt16Ty();
     auto *I32 = B.getInt32Ty();
@@ -374,12 +475,12 @@ Value *emitLookup(Module &M, Function &F, Runtime &R, BinaryOperator &BO,
                               "morok.dfi.hash.call");
     Value *Seed = B.CreateXor(Diff, ConstantInt::get(I64, Key.expected_hash),
                               "morok.dfi.seed");
-    Value *L8 = BitWidth == 8 ? BO.getOperand(0)
-                              : B.CreateZExt(BO.getOperand(0), I8,
-                                             "morok.dfi.lhs8");
-    Value *R8 = BitWidth == 8 ? BO.getOperand(1)
-                              : B.CreateZExt(BO.getOperand(1), I8,
-                                             "morok.dfi.rhs8");
+    Value *Lhs = I.getOperand(0);
+    Value *RhsOp = I.getOperand(1);
+    Value *L8 =
+        BitWidth == 8 ? Lhs : B.CreateZExt(Lhs, I8, "morok.dfi.lhs8");
+    Value *R8 =
+        BitWidth == 8 ? RhsOp : B.CreateZExt(RhsOp, I8, "morok.dfi.rhs8");
     Value *L = B.CreateZExt(L8, I16, "morok.dfi.lhs");
     Value *Rhs = B.CreateZExt(R8, I16, "morok.dfi.rhs");
     Value *Hi = B.CreateShl(L, ConstantInt::get(I16, 8), "morok.dfi.hi");
@@ -392,8 +493,11 @@ Value *emitLookup(Module &M, Function &F, Runtime &R, BinaryOperator &BO,
     Encoded->setAlignment(Align(1));
     Value *KeyByte = emitKey(B, Idx, Seed, Key);
     Value *Value = B.CreateXor(Encoded, KeyByte, "morok.dfi.value");
+    if (T.spec.kind == TableOpKind::ICmp)
+        return B.CreateTrunc(Value, B.getInt1Ty(), "morok.dfi.icmp");
     if (BitWidth == 8)
         return Value;
+    auto *SourceTy = cast<IntegerType>(I.getType());
     return B.CreateTrunc(Value, SourceTy, "morok.dfi.trunc");
 }
 
@@ -416,17 +520,26 @@ bool dataFlowIntegrityFunction(Function &F,
 
     const std::uint32_t Limit =
         std::min(Params.max_tables, kMaxTablesPerInvocation);
-    SmallVector<BinaryOperator *, 8> Selected;
+    SmallVector<Target, 8> Selected;
     for (BasicBlock &BB : F) {
         if (Selected.size() >= Limit)
             break;
         for (Instruction &I : BB) {
             if (Selected.size() >= Limit)
                 break;
-            if (auto *BO = dyn_cast<BinaryOperator>(&I))
-                if (eligible(*BO))
-                    if (Rng.chance(Params.probability))
-                        Selected.push_back(BO);
+            if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+                if (eligible(*BO) && Rng.chance(Params.probability))
+                    Selected.push_back(Target{
+                        BO, {TableOpKind::Binary, BO->getOpcode(),
+                             cast<IntegerType>(BO->getType())->getBitWidth()}});
+            } else if (auto *CI = dyn_cast<ICmpInst>(&I)) {
+                if (eligible(*CI) && Rng.chance(Params.probability))
+                    Selected.push_back(Target{
+                        CI, {TableOpKind::ICmp,
+                             static_cast<unsigned>(CI->getPredicate()),
+                             cast<IntegerType>(CI->getOperand(0)->getType())
+                                 ->getBitWidth()}});
+            }
         }
     }
     if (Selected.empty())
@@ -434,10 +547,10 @@ bool dataFlowIntegrityFunction(Function &F,
 
     Module &M = *F.getParent();
     Runtime R = createRuntime(F, Params, Rng);
-    for (BinaryOperator *BO : Selected) {
-        Value *Replacement = emitLookup(M, F, R, *BO, Rng);
-        BO->replaceAllUsesWith(Replacement);
-        BO->eraseFromParent();
+    for (Target &T : Selected) {
+        Value *Replacement = emitLookup(M, F, R, T, Rng);
+        T.inst->replaceAllUsesWith(Replacement);
+        T.inst->eraseFromParent();
     }
 
     relaxMemoryAttrs(F);

@@ -270,6 +270,21 @@ bool hasPlainNarrowArithmetic(Function &F) {
     return false;
 }
 
+bool hasPlainNarrowICmp(Function &F) {
+    for (Instruction &I : instructions(F)) {
+        if (I.getName().starts_with("morok."))
+            continue;
+        auto *CI = dyn_cast<ICmpInst>(&I);
+        if (!CI)
+            continue;
+        auto *Ty = dyn_cast<IntegerType>(CI->getOperand(0)->getType());
+        if (Ty && Ty == CI->getOperand(1)->getType() &&
+            Ty->getBitWidth() > 0 && Ty->getBitWidth() <= 8)
+            return true;
+    }
+    return false;
+}
+
 Function *makeLargeLinearFunction(Module &M, unsigned Adds) {
     LLVMContext &Ctx = M.getContext();
     auto *I32 = Type::getInt32Ty(Ctx);
@@ -533,6 +548,35 @@ TEST_CASE("substituteFunction handles constant shifts and stays valid") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("substituteFunction handles one-bit arithmetic without poison shifts") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i1 @sub_bool(i1 %a, i1 %b) {
+entry:
+  %x = add i1 %a, %b
+  %y = xor i1 %x, %a
+  ret i1 %y
+}
+)ir");
+    Function *F = M->getFunction("sub_bool");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(17);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::substituteFunction(*F, {100, 3}, rng));
+
+    for (Instruction &I : instructions(*F)) {
+        auto *BO = dyn_cast<BinaryOperator>(&I);
+        if (!BO || BO->getOpcode() != Instruction::Shl ||
+            !BO->getType()->isIntegerTy(1))
+            continue;
+        auto *Shift = dyn_cast<ConstantInt>(BO->getOperand(1));
+        const bool invalidShift = Shift && Shift->getZExtValue() >= 1u;
+        CHECK_FALSE(invalidShift);
+    }
+    CHECK(countBinops(*F) > 2u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("substituteFunction caps selected operators per iteration") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("sub-cap", ctx);
@@ -659,6 +703,55 @@ entry:
     CHECK_FALSE(verifyModule(*M2, &errs()));
 }
 
+TEST_CASE("optimizerAmplifyFunction supports sub-byte integer ops") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i1 @optamp_bool(i1 %a, i1 %b) {
+entry:
+  %sum = add i1 %a, %b
+  ret i1 %sum
+}
+
+define i4 @optamp_nibble(i4 %a, i4 %b) {
+entry:
+  %x = xor i4 %a, %b
+  ret i4 %x
+}
+)ir");
+    Function *BoolF = M->getFunction("optamp_bool");
+    Function *NibbleF = M->getFunction("optamp_nibble");
+    REQUIRE(BoolF);
+    REQUIRE(NibbleF);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(141);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::optimizerAmplifyFunction(
+        *BoolF, {/*probability=*/100, /*max_forms=*/3}, rng));
+    CHECK(morok::passes::optimizerAmplifyFunction(
+        *NibbleF, {/*probability=*/100, /*max_forms=*/3}, rng));
+
+    std::size_t boolSelects = 0;
+    bool boolHasShiftForm = false;
+    for (Instruction &I : instructions(*BoolF)) {
+        if (auto *SI = dyn_cast<SelectInst>(&I))
+            if (SI->getName().starts_with("morok.optamp.select") &&
+                SI->getType()->isIntegerTy(1))
+                ++boolSelects;
+        boolHasShiftForm |= I.getName().starts_with("morok.optamp.twice");
+    }
+    CHECK(boolSelects == 3u);
+    CHECK_FALSE(boolHasShiftForm);
+
+    std::size_t nibbleSelects = 0;
+    for (Instruction &I : instructions(*NibbleF))
+        if (auto *SI = dyn_cast<SelectInst>(&I))
+            if (SI->getName().starts_with("morok.optamp.select") &&
+                SI->getType()->isIntegerTy(4))
+                ++nibbleSelects;
+    CHECK(nibbleSelects == 3u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("subThresholdPersistFunction adds bounded volatile zero terms") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -731,6 +824,57 @@ entry:
     CHECK_FALSE(verifyModule(*M2, &errs()));
 }
 
+TEST_CASE("subThresholdPersistFunction supports sub-byte integer ops") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i1 @threshold_bool(i1 %a, i1 %b) {
+entry:
+  %x = xor i1 %a, %b
+  ret i1 %x
+}
+
+define i4 @threshold_nibble(i4 %a, i4 %b) {
+entry:
+  %x = add i4 %a, %b
+  ret i4 %x
+}
+)ir");
+    Function *BoolF = M->getFunction("threshold_bool");
+    Function *NibbleF = M->getFunction("threshold_nibble");
+    REQUIRE(BoolF);
+    REQUIRE(NibbleF);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(121);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::subThresholdPersistFunction(
+        *BoolF, {/*probability=*/100, /*max_terms=*/2}, rng));
+    CHECK(morok::passes::subThresholdPersistFunction(
+        *NibbleF, {/*probability=*/100, /*max_terms=*/2}, rng));
+
+    bool hasI1Zero = false;
+    bool hasI1Keep = false;
+    for (Instruction &I : instructions(*BoolF)) {
+        hasI1Zero |= I.getName().starts_with("morok.threshold.zero") &&
+                     I.getType()->isIntegerTy(1);
+        hasI1Keep |= I.getName().starts_with("morok.threshold.keep") &&
+                     I.getType()->isIntegerTy(1);
+    }
+    CHECK(hasI1Zero);
+    CHECK(hasI1Keep);
+
+    bool hasI4Zero = false;
+    bool hasI4Keep = false;
+    for (Instruction &I : instructions(*NibbleF)) {
+        hasI4Zero |= I.getName().starts_with("morok.threshold.zero") &&
+                     I.getType()->isIntegerTy(4);
+        hasI4Keep |= I.getName().starts_with("morok.threshold.keep") &&
+                     I.getType()->isIntegerTy(4);
+    }
+    CHECK(hasI4Zero);
+    CHECK(hasI4Keep);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("constantEncryptFunction hides literals behind XOR shares") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -795,6 +939,99 @@ entry:
             hasI12Load |= LI->isVolatile() && LI->getType()->isIntegerTy(12);
     CHECK(hasI1Load);
     CHECK(hasI12Load);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("constantEncryptFunction rewrites integer select literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @const_select(i1 %flag) {
+entry:
+  %x = select i1 %flag, i32 11, i32 29
+  ret i32 %x
+}
+)ir");
+    Function *F = M->getFunction("const_select");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(502);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::constantEncryptFunction(
+        *F, {/*prob=*/100, /*k=*/3, /*iterations=*/1}, rng));
+
+    SelectInst *Sel = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *SI = dyn_cast<SelectInst>(&I))
+            Sel = SI;
+    REQUIRE(Sel);
+    CHECK_FALSE(isa<ConstantInt>(Sel->getTrueValue()));
+    CHECK_FALSE(isa<ConstantInt>(Sel->getFalseValue()));
+    CHECK(countGlobals(*M, "morok.share") == 6u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("constantEncryptFunction rewrites cast and return literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @const_cast_ret() {
+entry:
+  %x = zext i8 7 to i32
+  ret i32 42
+}
+)ir");
+    Function *F = M->getFunction("const_cast_ret");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(503);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::constantEncryptFunction(
+        *F, {/*prob=*/100, /*k=*/3, /*iterations=*/1}, rng));
+
+    CastInst *Cast = nullptr;
+    ReturnInst *Ret = nullptr;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *CI = dyn_cast<CastInst>(&I))
+            Cast = CI;
+        if (auto *RI = dyn_cast<ReturnInst>(&I))
+            Ret = RI;
+    }
+    REQUIRE(Cast);
+    REQUIRE(Ret);
+    CHECK_FALSE(isa<ConstantInt>(Cast->getOperand(0)));
+    CHECK_FALSE(isa<ConstantInt>(Ret->getReturnValue()));
+    CHECK(countGlobals(*M, "morok.share") == 6u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("constantEncryptFunction rewrites ordinary call argument literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+declare i32 @const_arg_callee(i32, i8)
+
+define i32 @const_call_args() {
+entry:
+  %x = call i32 @const_arg_callee(i32 11, i8 29)
+  ret i32 %x
+}
+)ir");
+    Function *F = M->getFunction("const_call_args");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(504);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::constantEncryptFunction(
+        *F, {/*prob=*/100, /*k=*/3, /*iterations=*/1}, rng));
+
+    CallInst *Call = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            if (CI->getCalledFunction() &&
+                CI->getCalledFunction()->getName() == "const_arg_callee")
+                Call = CI;
+    REQUIRE(Call);
+    CHECK_FALSE(isa<ConstantInt>(Call->getArgOperand(0)));
+    CHECK_FALSE(isa<ConstantInt>(Call->getArgOperand(1)));
+    CHECK(countGlobals(*M, "morok.share") == 6u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -920,6 +1157,114 @@ entry:
                        I.getType()->isIntegerTy(12);
     CHECK(hasI1Trunc);
     CHECK(hasI12Trunc);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("shamirShareFunction reconstructs integer select literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i8 @shamir_select(i1 %flag) {
+entry:
+  %x = select i1 %flag, i8 11, i8 29
+  ret i8 %x
+}
+)ir");
+    Function *F = M->getFunction("shamir_select");
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x5351);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::shamirShareFunction(
+        *F,
+        {/*probability=*/100, /*threshold=*/2, /*shares=*/3,
+         /*max_secrets=*/2},
+        rng));
+
+    SelectInst *Sel = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *SI = dyn_cast<SelectInst>(&I))
+            Sel = SI;
+    REQUIRE(Sel);
+    CHECK_FALSE(isa<ConstantInt>(Sel->getTrueValue()));
+    CHECK_FALSE(isa<ConstantInt>(Sel->getFalseValue()));
+    CHECK(countGlobals(*M, "morok.shamir.share") == 4u);
+    CHECK(countGlobals(*M, "morok.shamir.cell") == 4u);
+    CHECK(countCallsTo(*F, "morok.gf8mul") == 4u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("shamirShareFunction reconstructs cast and return literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i8 @shamir_cast_ret() {
+entry:
+  %x = zext i4 7 to i8
+  ret i8 42
+}
+)ir");
+    Function *F = M->getFunction("shamir_cast_ret");
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x5352);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::shamirShareFunction(
+        *F,
+        {/*probability=*/100, /*threshold=*/2, /*shares=*/3,
+         /*max_secrets=*/2},
+        rng));
+
+    CastInst *Cast = nullptr;
+    ReturnInst *Ret = nullptr;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *CI = dyn_cast<CastInst>(&I))
+            Cast = CI;
+        if (auto *RI = dyn_cast<ReturnInst>(&I))
+            Ret = RI;
+    }
+    REQUIRE(Cast);
+    REQUIRE(Ret);
+    CHECK_FALSE(isa<ConstantInt>(Cast->getOperand(0)));
+    CHECK_FALSE(isa<ConstantInt>(Ret->getReturnValue()));
+    CHECK(countGlobals(*M, "morok.shamir.share") == 4u);
+    CHECK(countGlobals(*M, "morok.shamir.cell") == 4u);
+    CHECK(countCallsTo(*F, "morok.gf8mul") == 4u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("shamirShareFunction reconstructs ordinary call argument literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+declare i8 @shamir_arg_callee(i8, i8)
+
+define i8 @shamir_call_args() {
+entry:
+  %x = call i8 @shamir_arg_callee(i8 11, i8 29)
+  ret i8 %x
+}
+)ir");
+    Function *F = M->getFunction("shamir_call_args");
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x5353);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::shamirShareFunction(
+        *F,
+        {/*probability=*/100, /*threshold=*/2, /*shares=*/3,
+         /*max_secrets=*/2},
+        rng));
+
+    CallInst *Call = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            if (CI->getCalledFunction() &&
+                CI->getCalledFunction()->getName() == "shamir_arg_callee")
+                Call = CI;
+    REQUIRE(Call);
+    CHECK_FALSE(isa<ConstantInt>(Call->getArgOperand(0)));
+    CHECK_FALSE(isa<ConstantInt>(Call->getArgOperand(1)));
+    CHECK(countGlobals(*M, "morok.shamir.share") == 4u);
+    CHECK(countGlobals(*M, "morok.shamir.cell") == 4u);
+    CHECK(countCallsTo(*F, "morok.gf8mul") == 4u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -2093,6 +2438,7 @@ join:
     bool hasSwitch = false;
     bool hasShadow = false;
     bool hasToken = false;
+    bool hasTermZExt = false;
     bool hasNext = false;
     std::size_t volatileAccesses = 0;
     for (Instruction &I : instructions(*F)) {
@@ -2103,6 +2449,8 @@ join:
                 hasShadow = true;
         if (I.getName().starts_with("entfla.token"))
             hasToken = true;
+        if (I.getName().starts_with("entfla.term.zext"))
+            hasTermZExt = true;
         if (I.getName().starts_with("entfla.next"))
             hasNext = true;
         if (auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -2117,6 +2465,7 @@ join:
     CHECK(hasSwitch);
     CHECK(hasShadow);
     CHECK(hasToken);
+    CHECK(hasTermZExt);
     CHECK(hasNext);
     CHECK(volatileAccesses >= 4u);
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -2176,6 +2525,7 @@ done:
 
     bool hasSwitch = false;
     bool hasToken = false;
+    bool hasTermZExt = false;
     bool hasLossyHash = false;
     bool hasHashInput = false;
     bool hasNextStore = false;
@@ -2190,6 +2540,8 @@ done:
         }
         if (I.getName().starts_with("nistate.token"))
             hasToken = true;
+        if (I.getName().starts_with("nistate.term.zext"))
+            hasTermZExt = true;
         if (I.getName().starts_with("nistate.hash.loss"))
             hasLossyHash = true;
         if (I.getName().starts_with("nistate.hash.input"))
@@ -2222,6 +2574,7 @@ done:
     CHECK(hasSwitch);
     CHECK(countNamedAllocas(*F, "nistate.shadow") == 1u);
     CHECK(hasToken);
+    CHECK(hasTermZExt);
     CHECK(hasHashInput);
     CHECK(hasLossyHash);
     CHECK(hasNextStore);
@@ -2673,6 +3026,39 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("tableArithmeticFunction lowers narrow comparisons to tables") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i1 @cmp8(i8 %a, i8 %b) {
+entry:
+  %x = icmp slt i8 %a, %b
+  ret i1 %x
+}
+
+define i1 @cmp1(i1 %a, i1 %b) {
+entry:
+  %x = icmp uge i1 %a, %b
+  ret i1 %x
+}
+)ir");
+    Function *Cmp8 = M->getFunction("cmp8");
+    Function *Cmp1 = M->getFunction("cmp1");
+    REQUIRE(Cmp8);
+    REQUIRE(Cmp1);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(812);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::tableArithmeticFunction(
+        *Cmp8, {/*probability=*/100, /*max_tables=*/1}, rng));
+    CHECK(morok::passes::tableArithmeticFunction(
+        *Cmp1, {/*probability=*/100, /*max_tables=*/1}, rng));
+
+    CHECK(countGlobals(*M, "morok.tablearith.table") == 2u);
+    CHECK_FALSE(hasPlainNarrowICmp(*Cmp8));
+    CHECK_FALSE(hasPlainNarrowICmp(*Cmp1));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("tableArithmeticFunction honors zero probability") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -2841,6 +3227,43 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("dataFlowIntegrityFunction supports narrow comparisons") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i1 @dfi_cmp8(i8 %a, i8 %b) {
+entry:
+  %x = icmp ugt i8 %a, %b
+  ret i1 %x
+}
+
+define i1 @dfi_cmp1(i1 %a, i1 %b) {
+entry:
+  %x = icmp sle i1 %a, %b
+  ret i1 %x
+}
+)ir");
+    Function *Cmp8 = M->getFunction("dfi_cmp8");
+    Function *Cmp1 = M->getFunction("dfi_cmp1");
+    REQUIRE(Cmp8);
+    REQUIRE(Cmp1);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(842);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::dataFlowIntegrityFunction(
+        *Cmp8, {/*probability=*/100, /*max_tables=*/1, /*region_bytes=*/32},
+        rng));
+    CHECK(morok::passes::dataFlowIntegrityFunction(
+        *Cmp1, {/*probability=*/100, /*max_tables=*/1, /*region_bytes=*/32},
+        rng));
+
+    CHECK(countGlobals(*M, "morok.dfi.table") == 2u);
+    CHECK(countGlobals(*M, "morok.dfi.region") == 2u);
+    CHECK(countGlobals(*M, "morok.dfi.expected") == 2u);
+    CHECK_FALSE(hasPlainNarrowICmp(*Cmp8));
+    CHECK_FALSE(hasPlainNarrowICmp(*Cmp1));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("dataFlowIntegrityFunction honors zero probability") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -2925,6 +3348,31 @@ right:
     CHECK(indirects == 1u);
     CHECK(hasIndexSelect);
     CHECK(hasTargetLoad);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("uniformPrimitiveLowerFunction table-lowers comparisons") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i1 @uniform_cmp(i8 %a, i8 %b) {
+entry:
+  %x = icmp ult i8 %a, %b
+  ret i1 %x
+}
+)ir");
+    Function *F = M->getFunction("uniform_cmp");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(142);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::uniformPrimitiveLowerFunction(
+        *F,
+        {/*op_probability=*/100, /*branch_probability=*/0,
+         /*max_tables=*/1, /*max_branches=*/0},
+        rng));
+
+    CHECK(countGlobals(*M, "morok.tablearith.table") == 1u);
+    CHECK_FALSE(hasPlainNarrowICmp(*F));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -3438,6 +3886,12 @@ entry:
     CHECK(M->getFunction("morok.sc.diff.selfcheck_bool") != nullptr);
     CHECK(M->getFunction("morok.sc.diff.selfcheck_i12") != nullptr);
 
+    bool hasI12MaskAlignment = false;
+    for (GlobalVariable &GV : M->globals())
+        if (GV.getName().starts_with("morok.sc.mask") &&
+            GV.getValueType()->isIntegerTy(12))
+            hasI12MaskAlignment |= GV.getAlign().valueOrOne().value() >= 2u;
+
     bool hasI1Mix = false;
     bool hasI12Mix = false;
     for (Instruction &I : instructions(*BoolF))
@@ -3448,6 +3902,113 @@ entry:
                      I.getType()->isIntegerTy(12);
     CHECK(hasI1Mix);
     CHECK(hasI12Mix);
+    CHECK(hasI12MaskAlignment);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("selfChecksumConstantsFunction fuses integer select literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i12 @selfcheck_select(i1 %flag) {
+entry:
+  %x = select i1 %flag, i12 11, i12 291
+  ret i12 %x
+}
+)ir");
+    Function *F = M->getFunction("selfcheck_select");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1812);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::selfChecksumConstantsFunction(
+        *F, {/*probability=*/100, /*max_constants=*/2, /*region_bytes=*/32},
+        rng));
+
+    SelectInst *Sel = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *SI = dyn_cast<SelectInst>(&I))
+            Sel = SI;
+    REQUIRE(Sel);
+    CHECK_FALSE(isa<ConstantInt>(Sel->getTrueValue()));
+    CHECK_FALSE(isa<ConstantInt>(Sel->getFalseValue()));
+
+    bool hasI12Mix = false;
+    for (Instruction &I : instructions(*F))
+        hasI12Mix |= I.getName().starts_with("morok.sc.const") &&
+                     I.getType()->isIntegerTy(12);
+    CHECK(hasI12Mix);
+    CHECK(countGlobals(*M, "morok.sc.mask") == 2u);
+    CHECK(M->getFunction("morok.sc.diff.selfcheck_select") != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("selfChecksumConstantsFunction fuses cast and return literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i8 @selfcheck_cast_ret() {
+entry:
+  %x = zext i4 7 to i8
+  ret i8 42
+}
+)ir");
+    Function *F = M->getFunction("selfcheck_cast_ret");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1813);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::selfChecksumConstantsFunction(
+        *F, {/*probability=*/100, /*max_constants=*/2, /*region_bytes=*/32},
+        rng));
+
+    CastInst *Cast = nullptr;
+    ReturnInst *Ret = nullptr;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *CI = dyn_cast<CastInst>(&I))
+            Cast = CI;
+        if (auto *RI = dyn_cast<ReturnInst>(&I))
+            Ret = RI;
+    }
+    REQUIRE(Cast);
+    REQUIRE(Ret);
+    CHECK_FALSE(isa<ConstantInt>(Cast->getOperand(0)));
+    CHECK_FALSE(isa<ConstantInt>(Ret->getReturnValue()));
+    CHECK(countGlobals(*M, "morok.sc.mask") == 2u);
+    CHECK(M->getFunction("morok.sc.diff.selfcheck_cast_ret") != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE(
+    "selfChecksumConstantsFunction fuses ordinary call argument literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+declare i8 @selfcheck_arg_callee(i8, i8)
+
+define i8 @selfcheck_call_args() {
+entry:
+  %x = call i8 @selfcheck_arg_callee(i8 11, i8 29)
+  ret i8 %x
+}
+)ir");
+    Function *F = M->getFunction("selfcheck_call_args");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1814);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::selfChecksumConstantsFunction(
+        *F, {/*probability=*/100, /*max_constants=*/2, /*region_bytes=*/32},
+        rng));
+
+    CallInst *Call = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            if (CI->getCalledFunction() &&
+                CI->getCalledFunction()->getName() == "selfcheck_arg_callee")
+                Call = CI;
+    REQUIRE(Call);
+    CHECK_FALSE(isa<ConstantInt>(Call->getArgOperand(0)));
+    CHECK_FALSE(isa<ConstantInt>(Call->getArgOperand(1)));
+    CHECK(countGlobals(*M, "morok.sc.mask") == 2u);
+    CHECK(M->getFunction("morok.sc.diff.selfcheck_call_args") != nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -3592,6 +4153,55 @@ entry:
     CHECK(nodeCalls == 3u);
     CHECK(hasGraphDiff);
     CHECK_FALSE(hasTrap);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("mutualGuardGraphFunction poisons sub-byte integer returns") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i1 @mg_bool(i1 %a, i1 %b) {
+entry:
+  %x = xor i1 %a, %b
+  ret i1 %x
+}
+
+define i4 @mg_nibble(i4 %a, i4 %b) {
+entry:
+  %x = add i4 %a, %b
+  ret i4 %x
+}
+)ir");
+    Function *Bool = M->getFunction("mg_bool");
+    Function *Nibble = M->getFunction("mg_nibble");
+    REQUIRE(Bool);
+    REQUIRE(Nibble);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(203);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::mutualGuardGraphFunction(
+        *Bool,
+        {/*probability=*/100, /*nodes=*/2, /*region_bytes=*/16,
+         /*max_returns=*/1},
+        rng));
+    CHECK(morok::passes::mutualGuardGraphFunction(
+        *Nibble,
+        {/*probability=*/100, /*nodes=*/2, /*region_bytes=*/16,
+         /*max_returns=*/1},
+        rng));
+
+    bool hasI1Poison = false;
+    bool hasI4Poison = false;
+    for (Instruction &I : instructions(*Bool))
+        hasI1Poison |= I.getName().starts_with("morok.mg.value") &&
+                       I.getType()->isIntegerTy(1);
+    for (Instruction &I : instructions(*Nibble))
+        hasI4Poison |= I.getName().starts_with("morok.mg.value") &&
+                       I.getType()->isIntegerTy(4);
+
+    CHECK(hasI1Poison);
+    CHECK(hasI4Poison);
+    CHECK(M->getFunction("morok.mg.diff.mg_bool") != nullptr);
+    CHECK(M->getFunction("morok.mg.diff.mg_nibble") != nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -4289,6 +4899,75 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE(
+    "adversarialFunctionMergingModule outlines sub-byte integer fragments") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i1 @bool_a(i1 %a, i1 %b) {
+entry:
+  %x = xor i1 %a, %b
+  %y = and i1 %x, %a
+  ret i1 %y
+}
+
+define i1 @bool_b(i1 %a, i1 %b) {
+entry:
+  %x = or i1 %a, %b
+  %y = xor i1 %x, %b
+  ret i1 %y
+}
+
+define i4 @nib_a(i4 %a, i4 %b) {
+entry:
+  %x = add i4 %a, %b
+  %y = xor i4 %x, 3
+  ret i4 %y
+}
+
+define i4 @nib_b(i4 %a, i4 %b) {
+entry:
+  %x = mul i4 %a, %b
+  %y = or i4 %x, 1
+  ret i4 %y
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(223);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::adversarialFunctionMergingModule(
+        *M,
+        {/*probability=*/100, /*max_groups=*/2, /*max_functions=*/2,
+         /*outline_probability=*/100, /*max_outlines=*/4},
+        rng));
+
+    CHECK(countFunctions(*M, "morok.afm.dispatch") == 2u);
+    CHECK(countFunctions(*M, "morok.afm.impl") == 4u);
+
+    bool hasI1Helper = false;
+    bool hasI4Helper = false;
+    unsigned implOutlineCalls = 0;
+    for (Function &F : *M) {
+        if (F.getName().starts_with("morok.afm.outline")) {
+            auto *RetTy = dyn_cast<IntegerType>(F.getReturnType());
+            REQUIRE(RetTy);
+            hasI1Helper |= RetTy->getBitWidth() == 1;
+            hasI4Helper |= RetTy->getBitWidth() == 4;
+        }
+        if (!F.getName().starts_with("morok.afm.impl"))
+            continue;
+        for (Instruction &I : instructions(F))
+            if (auto *CI = dyn_cast<CallInst>(&I))
+                if (Function *Callee = CI->getCalledFunction())
+                    if (Callee->getName().starts_with("morok.afm.outline"))
+                        ++implOutlineCalls;
+    }
+
+    CHECK(hasI1Helper);
+    CHECK(hasI4Helper);
+    CHECK(implOutlineCalls >= 4u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("adversarialFunctionMergingModule honors zero probability") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -4478,6 +5157,50 @@ entry:
 
     CHECK(hasVolatileSalt);
     CHECK(hasAnchoredReturn);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("perBuildPolymorphismModule anchors sub-byte integer returns") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i1 @poly_bool(i1 %a, i1 %b) {
+entry:
+  %x = xor i1 %a, %b
+  ret i1 %x
+}
+
+define i4 @poly_nibble(i4 %a, i4 %b) {
+entry:
+  %x = add i4 %a, %b
+  ret i4 %x
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(305);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::perBuildPolymorphismModule(
+        *M,
+        {/*function_order=*/false, /*block_order=*/false,
+         /*anchor_probability=*/100, /*max_anchors=*/4},
+        rng));
+
+    Function *Bool = M->getFunction("poly_bool");
+    Function *Nibble = M->getFunction("poly_nibble");
+    REQUIRE(Bool);
+    REQUIRE(Nibble);
+
+    bool hasI1Anchor = false;
+    bool hasI4Anchor = false;
+    for (Instruction &I : instructions(*Bool))
+        hasI1Anchor |= I.getName().starts_with("morok.poly.value") &&
+                       I.getType()->isIntegerTy(1);
+    for (Instruction &I : instructions(*Nibble))
+        hasI4Anchor |= I.getName().starts_with("morok.poly.value") &&
+                       I.getType()->isIntegerTy(4);
+
+    CHECK(hasI1Anchor);
+    CHECK(hasI4Anchor);
+    CHECK(countGlobals(*M, "morok.poly.salt") == 2u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

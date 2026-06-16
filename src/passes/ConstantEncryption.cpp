@@ -4,9 +4,10 @@
 //
 // morok/passes/ConstantEncryption.cpp
 //
-// Only operands of integer arithmetic and comparison instructions are rewritten
-// — never switch cases, GEP indices, or intrinsic immediate arguments, which
-// must remain literal — so the output is always valid IR.  The XOR-share split
+// Only operands of integer arithmetic, comparison, select, cast, return, and
+// ordinary call-argument instructions are rewritten — never switch cases, GEP
+// indices, intrinsic immediate arguments, callees, or operand bundles, which
+// must remain literal — so the output is always valid IR. The XOR-share split
 // is the verified one from morok/core/XorShare.hpp; the shares live in private
 // mutable globals and are read with volatile loads so the reconstruction
 // survives optimisation.
@@ -40,7 +41,17 @@ bool eligibleWidth(unsigned bits) {
 
 // Only the operands of these instructions are safe to turn into runtime values.
 bool isRewritableUser(const Instruction &I) {
-    return isa<BinaryOperator>(I) || isa<ICmpInst>(I);
+    return isa<BinaryOperator>(I) || isa<ICmpInst>(I) ||
+           isa<SelectInst>(I) || isa<CastInst>(I) || isa<ReturnInst>(I);
+}
+
+bool safeCallArgs(const CallBase &CB) {
+    if (CB.isInlineAsm() || CB.hasOperandBundles() || CB.isMustTailCall())
+        return false;
+    if (Function *Callee = CB.getCalledFunction())
+        if (Callee->isIntrinsic())
+            return false;
+    return true;
 }
 
 Value *reconstruct(Module &M, Instruction &user, ConstantInt *c,
@@ -85,12 +96,25 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
             for (Instruction &inst : bb) {
                 if (targets.size() >= kMaxConstEncTargetsPerIteration)
                     break;
-                if (!isRewritableUser(inst))
-                    continue;
-                for (unsigned i = 0; i < inst.getNumOperands(); ++i)
-                    if (auto *c = dyn_cast<ConstantInt>(inst.getOperand(i)))
-                        if (eligibleWidth(c->getType()->getIntegerBitWidth()))
-                            targets.push_back({&inst, i, c});
+                if (auto *CB = dyn_cast<CallBase>(&inst)) {
+                    if (!safeCallArgs(*CB))
+                        continue;
+                    for (unsigned I = 0; I < CB->arg_size(); ++I) {
+                        if (auto *C =
+                                dyn_cast<ConstantInt>(CB->getArgOperand(I)))
+                            if (eligibleWidth(
+                                    C->getType()->getIntegerBitWidth()))
+                                targets.push_back({&inst, I, C});
+                    }
+                } else {
+                    if (!isRewritableUser(inst))
+                        continue;
+                    for (unsigned i = 0; i < inst.getNumOperands(); ++i)
+                        if (auto *c = dyn_cast<ConstantInt>(inst.getOperand(i)))
+                            if (eligibleWidth(
+                                    c->getType()->getIntegerBitWidth()))
+                                targets.push_back({&inst, i, c});
+                }
             }
             if (targets.size() >= kMaxConstEncTargetsPerIteration)
                 break;

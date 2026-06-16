@@ -22,6 +22,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Variant counts: Add 13, Sub 10, And 10, Or 10, Xor 12, Mul 7, Shl/LShr/AShr 2.
 - Shifts only substituted when shift amount is a `ConstantInt`; LShr/AShr skip k==0;
   all skip k>=width. AShr identity = "XOR distributes over arithmetic shift".
+- One-bit arithmetic identities lower `2*x` to zero instead of `x << 1`, because
+  shifting an `i1` by one would be poison even though the mathematical value is
+  zero modulo 2.
 - Direct memory cap: each sweep collects at most 256 target binary operators.
   Larger functions are partially transformed rather than expanding every
   eligible operation in one pass invocation.
@@ -53,7 +56,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Pipeline: `origC ─[Feistel if feistel && bits>=16]→ workC ─[k-share XOR or single XOR]→ shares`.
   Runtime reverses: XOR-fold shares → workC → inverse Feistel → origC.
 - k-share when `k>=3` (k clamp 2..8), else classic single-XOR for selected
-  `i1` through `i64` integer constants.  Shares: private non-const
+  `i1` through `i64` integer constants in binary, comparison, `select`, cast,
+  return, and ordinary call-argument operands.  Shares: private non-const
   `morok.share` globals loaded volatilely at each rewritten use.
 - Feistel: balanced, 4 rounds, per-round odd multiplier + xor key (random, masked to
   half width). `feistelEncrypt/Decrypt(value, bits, keys)`.
@@ -323,14 +327,16 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Optimizer amplification — IR structure
 - Eligible operations are unflagged scalar integer `add/sub/mul/and/or/xor`
-  binary operators with width at least 8 bits.  The pass skips poison-generating
-  flags and generated `morok.optamp.*` expressions, because it clones the base
-  operation and cannot legally erase `nuw`/`nsw`/disjoint semantics.
+  binary operators from `i1` upward.  The pass skips poison-generating flags and
+  generated `morok.optamp.*` expressions, because it clones the base operation
+  and cannot legally erase `nuw`/`nsw`/disjoint semantics.
 - Each selected op is cloned as `morok.optamp.base`, then expanded into up to
   `max_forms` mathematically equivalent forms: carry-split addition,
   borrow-split subtraction, De Morgan forms, xor-as-or-minus-and, and wrapping
-  multiplication variants.  The result is a chain of `select` instructions whose
-  guards are derived from shifted/xored operand bits plus a per-build salt.
+  multiplication variants.  One-bit add/sub avoid the carry/borrow forms whose
+  shift-by-one would be poison at width 1.  The result is a chain of `select`
+  instructions whose guards are derived from shifted/xored operand bits plus a
+  per-build salt.
 - All arms are equivalent, so runtime semantics do not depend on the guard.  The
   guard is still input-derived, so InstCombine cannot collapse the select chain
   with a local constant proof.  There are no volatile loads, allocas, globals, or
@@ -343,9 +349,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Sub-threshold persistence — IR structure
 - Eligible operations are scalar integer `add/sub/mul/and/or/xor` and
-  constant-agnostic shift binary operators with width at least 8 bits.  The pass
-  skips poison-generating flags (`nuw`/`nsw`/`exact`/disjoint forms) so it does
-  not weaken flagged semantics while cloning the base operation.
+  constant-agnostic shift binary operators from `i1` upward.  The pass skips
+  poison-generating flags (`nuw`/`nsw`/`exact`/disjoint forms) so it does not
+  weaken flagged semantics while cloning the base operation.
 - Each selected op is cloned as `morok.threshold.base`, then receives up to
   `max_terms` opaque-neutral combines.  A term is `zero = load volatile seed ^
   load volatile seed` from a private local seed slot, followed by
@@ -362,14 +368,16 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Table arithmetic — IR structure
 - Eligible operations are wrapping scalar `i1` through `i8`
-  `add/sub/mul/and/or/xor` binary operators.  `nuw`/`nsw` arithmetic is skipped
-  because replacing a potentially poison-producing operation with a total table
-  load would change LLVM semantics.
-- Each selected operator gets a private mutable `[65536 x i8]` table indexed as
-  `(zext(lhs) << 8) | zext(rhs)`.  Sub-byte operands are zero-extended for the
-  lookup and the decoded byte is truncated back to the source width.  The table
-  initializer is encrypted with a per-table affine/xor byte stream, so the
-  module does not contain the plaintext opcode truth table.
+  `add/sub/mul/and/or/xor` binary operators plus scalar integer `icmp`
+  predicates over same-width `i1` through `i8` operands.  `nuw`/`nsw`
+  arithmetic is skipped because replacing a potentially poison-producing
+  operation with a total table load would change LLVM semantics.
+- Each selected operator or comparison gets a private mutable `[65536 x i8]`
+  table indexed as `(zext(lhs) << 8) | zext(rhs)`.  Sub-byte operands are
+  zero-extended for the lookup; decoded arithmetic bytes are truncated back to
+  the source width, while decoded comparison bytes are truncated to `i1`.  The
+  table initializer is encrypted with a per-table affine/xor byte stream, so
+  the module does not contain the plaintext opcode/predicate truth table.
 - A private `morok.tablearith.ensure` decoder materializes the table lazily on
   first use.  It loops over the table, decrypts in place, and sets a volatile
   readiness flag.  Function bodies call the decoder, compute the byte-pair
@@ -383,10 +391,11 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - This is the IR-level half of the roadmap's IR/MIR item.  It deliberately
   avoids target-specific MOV-only lowering, but pushes visible intent toward a
   small set of uniform primitives: table loads, GEPs, `select`, and `indirectbr`.
-- Selected narrow `i1` through `i8` `add/sub/mul/and/or/xor` operations reuse
-  the encrypted lazy table materialization from TableArithmetic, governed by
-  `op_probability` and `max_tables`.  This removes opcode intent from the
-  function body while keeping plaintext truth tables out of static initializers.
+- Selected narrow `i1` through `i8` `add/sub/mul/and/or/xor` operations and
+  integer comparisons reuse the encrypted lazy table materialization from
+  TableArithmetic, governed by `op_probability` and `max_tables`.  This removes
+  opcode/predicate intent from the function body while keeping plaintext truth
+  tables out of static initializers.
 - Selected direct branches and switches are collected up to `max_branches` with
   a hard ceiling of 16 branch sites and 32 successors per site, then lowered to
   a private per-function `morok.uniform.table` of `blockaddress` entries.
@@ -462,7 +471,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   runtime/data-flow contract over private `morok.sc.region.*` byte regions and
   `morok.sc.expected.*` hash globals; a post-link rewriter can replace those
   regions and expected hashes with final native code slices.
-- Each selected `i1` through `i64` integer constant is reconstructed as
+- Each selected `i1` through `i64` integer constant in binary, comparison,
+  `select`, cast, return, and ordinary call-argument operands is reconstructed as
   `encoded ^ volatile_mask ^ (runtime_hash(region) ^ expected_hash)`.  When the
   region matches the expected hash, the diff is zero and the original constant
   appears.  If bytes change without updating the expected hash, the diff flows
@@ -485,8 +495,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Data-flow-entangled integrity — IR structure
 - The pass generalizes checksum-fused constants from scalars to live lookup
-  tables.  Selected `i1` through `i8` `a OP b` operations are replaced by
-  volatile loads from private `morok.dfi.table.*` globals.
+  tables.  Selected `i1` through `i8` `a OP b` operations and same-width
+  integer comparisons are replaced by volatile loads from private
+  `morok.dfi.table.*` globals.
 - Table entries are encoded with a stream key derived from the expected hash of
   a private `morok.dfi.region.*` byte region.  The runtime helper
   `morok.dfi.hash.*` hashes that region with volatile loads, volatile-loads
@@ -494,8 +505,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Each lookup derives its decode seed as `expected_hash_const ^ runtime_diff`.
   On the valid region the diff is zero and the loaded table byte decodes to the
   original operation result.  Sub-byte operands are zero-extended for the table
-  index and the decoded byte is truncated back to the source width.  Region or
-  expected-hash tampering changes the key and corrupts the value in data flow.
+  index; decoded arithmetic bytes are truncated back to the source width and
+  decoded comparison bytes to `i1`.  Region or expected-hash tampering changes
+  the key and corrupts the value in data flow.
 - The table stays encoded at rest; unlike generic TableArithmetic, there is no
   lazy plaintext materialization pass.  There is also no trap or integrity
   branch, only data poisoning.
@@ -524,8 +536,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   byte count, and per-node records containing the region pointer, expected-hash
   pointer, hash seed, and current expected hash.  A post-link rewriter can patch
   every node region and expected global from that single graph record.
-- Selected integer returns are rewritten as `ret_value ^ graph_diff` (truncated
-  to the return width as needed).  There is no trap and no check branch; the
+- Selected `i1` through `i64` integer returns are rewritten as
+  `ret_value ^ graph_diff` (truncated to the return width as needed).  There is
+  no trap and no check branch; the
   integrity graph affects program data directly.
 - Scheduler placement is after self-checksum constants and before constant
   encryption, so it sees late control/data shape while ordinary literal
@@ -537,9 +550,11 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   every 3-of-5 subset for all 256 byte secrets, invalid-parameter clamps, and
   constexpr reconstruction.
 - The pass targets safe `i1` through `i64` constant operands of integer binary
-  ops and `icmp`, then caps selected secrets by `max_secrets` after the
-  per-operand probability gate.  Values are split into the covering little-endian
-  bytes and truncated back to the exact source width after reconstruction.
+  ops, `icmp`, `select`, casts, returns, and ordinary call arguments, then caps
+  selected secrets by `max_secrets` after the per-operand probability gate.
+  Values are split into the covering
+  little-endian bytes and truncated back to the exact source width after
+  reconstruction.
 - Current IR is dominator-deposited fixed-quorum reconstruction: each byte
   secret is split into `n` build-time shares, the first `k` shares are loaded
   volatilely from private mutable `morok.shamir.share.*` globals in the entry
@@ -776,17 +791,17 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - AliasOpaquePredicates: maintained pointer/alias memory invariant guards with decoy edges.
 - ExternalOpaquePredicates: IPO-blocked volatile context helper guards with scratch decoy edges.
 - CoherentDecoys: opaque-dead alternate return computations, not junk blocks.
-- DataFlowIntegrity: byte-op tables decoded by runtime integrity hashes.
+- DataFlowIntegrity: `i1..i8` op tables decoded by runtime integrity hashes.
 - OptimizerAmplification: early branchless select lattice over equivalent forms.
 - SubThresholdPersistence: volatile local-seed opaque-zero terms under a small cap.
-- TableArithmetic: encrypted lazy byte-op lookup tables.
-- UniformPrimitiveLowering: byte-op tables plus memory-loaded indirectbr dispatch.
+- TableArithmetic: encrypted lazy `i1..i8` op lookup tables.
+- UniformPrimitiveLowering: `i1..i8` op tables plus memory-loaded indirectbr dispatch.
 - Virtualization: encrypted per-function bytecode plus threaded computed-goto VM helpers.
 - HashGatedSelfDecrypt: VM bytecode globals get hash/context-gated lazy outer decryptors.
-- MutualGuardGraph: overlapping checksum nodes whose combined diff poisons returns.
-- AdversarialFunctionMerging: same-signature functions routed through shared selector dispatchers plus outlined scalar helpers.
+- MutualGuardGraph: overlapping checksum nodes whose combined diff poisons `i1..i64` returns.
+- AdversarialFunctionMerging: same-signature functions routed through shared selector dispatchers plus outlined integer scalar helpers (`i1..i64`).
 - AdversarialSelfTuning: cloned-candidate search over hardness metrics with best verified bundle replay.
-- PerBuildPolymorphism: seed-driven function/block order and volatile-zero return anchors.
+- PerBuildPolymorphism: seed-driven function/block order and volatile-zero `i1..i64` return anchors.
 - PathExplosion: opaque-guarded input-derived loops with volatile symbolic stores and indirectbr dispatch.
 - MqGate: planted GF(2) quadratic opaque gates over volatile argument-derived bits.
 - TraceKeying: edge-carried rolling trace accumulator with guards and neutral poisoning.

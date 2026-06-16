@@ -41,7 +41,17 @@ bool eligibleWidth(unsigned Bits) {
 }
 
 bool isRewritableUser(const Instruction &I) {
-    return isa<BinaryOperator>(I) || isa<ICmpInst>(I);
+    return isa<BinaryOperator>(I) || isa<ICmpInst>(I) ||
+           isa<SelectInst>(I) || isa<CastInst>(I) || isa<ReturnInst>(I);
+}
+
+bool safeCallArgs(const CallBase &CB) {
+    if (CB.isInlineAsm() || CB.hasOperandBundles() || CB.isMustTailCall())
+        return false;
+    if (Function *Callee = CB.getCalledFunction())
+        if (Callee->isIntrinsic())
+            return false;
+    return true;
 }
 
 std::uint8_t lagrangeBasisAtZero(ArrayRef<core::shamir::Share> Shares,
@@ -223,14 +233,26 @@ bool shamirShareFunction(Function &F, const ShamirShareParams &Params,
     std::vector<Target> Targets;
     for (BasicBlock &BB : F) {
         for (Instruction &I : BB) {
-            if (!isRewritableUser(I))
-                continue;
-            for (unsigned Op = 0; Op < I.getNumOperands(); ++Op) {
-                auto *C = dyn_cast<ConstantInt>(I.getOperand(Op));
-                if (!C)
+            if (auto *CB = dyn_cast<CallBase>(&I)) {
+                if (!safeCallArgs(*CB))
                     continue;
-                if (eligibleWidth(C->getType()->getIntegerBitWidth()))
-                    Targets.push_back({&I, Op, C});
+                for (unsigned Op = 0; Op < CB->arg_size(); ++Op) {
+                    auto *C = dyn_cast<ConstantInt>(CB->getArgOperand(Op));
+                    if (!C)
+                        continue;
+                    if (eligibleWidth(C->getType()->getIntegerBitWidth()))
+                        Targets.push_back({&I, Op, C});
+                }
+            } else {
+                if (!isRewritableUser(I))
+                    continue;
+                for (unsigned Op = 0; Op < I.getNumOperands(); ++Op) {
+                    auto *C = dyn_cast<ConstantInt>(I.getOperand(Op));
+                    if (!C)
+                        continue;
+                    if (eligibleWidth(C->getType()->getIntegerBitWidth()))
+                        Targets.push_back({&I, Op, C});
+                }
             }
         }
     }

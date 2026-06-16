@@ -39,6 +39,8 @@ Value *emitSubstitution(BinaryOperator *bo, ir::IRRandom &rng) {
     const unsigned width = ty->getBitWidth();
 
     auto two = [&](Value *v) {
+        if (width == 1)
+            return static_cast<Value *>(ConstantInt::get(ty, 0));
         return B.CreateShl(v, ConstantInt::get(ty, 1));
     };
 

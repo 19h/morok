@@ -31,7 +31,7 @@ using Builder = IRBuilder<NoFolder>;
 
 bool eligible(BinaryOperator *BO) {
     auto *Ty = dyn_cast<IntegerType>(BO->getType());
-    if (!Ty || Ty->getBitWidth() < 8)
+    if (!Ty || Ty->getBitWidth() == 0)
         return false;
     if (BO->getName().starts_with("morok.optamp"))
         return false;
@@ -64,7 +64,7 @@ Value *equivalentForm(Builder &B, BinaryOperator *BO, std::uint32_t Variant) {
 
     switch (BO->getOpcode()) {
     case Instruction::Add:
-        if ((Variant & 1u) == 0)
+        if ((Variant & 1u) == 0 && Ty->getBitWidth() > 1)
             return B.CreateAdd(B.CreateXor(A, C, "morok.optamp.add.xor"),
                                two(B, B.CreateAnd(A, C,
                                                   "morok.optamp.add.carry"),
@@ -74,7 +74,7 @@ Value *equivalentForm(Builder &B, BinaryOperator *BO, std::uint32_t Variant) {
                            B.CreateAnd(A, C, "morok.optamp.add.and"),
                            "morok.optamp.form");
     case Instruction::Sub:
-        if ((Variant & 1u) == 0)
+        if ((Variant & 1u) == 0 && Ty->getBitWidth() > 1)
             return B.CreateSub(
                 B.CreateXor(A, C, "morok.optamp.sub.xor"),
                 two(B, B.CreateAnd(B.CreateNot(A, "morok.optamp.sub.nota"), C,

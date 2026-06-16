@@ -4,8 +4,8 @@
 //
 // morok/passes/ArithmeticTables.cpp
 //
-// Arithmetic-as-table lowering for narrow integer operators.  Each selected
-// `i1..i8 a OP b` becomes:
+// Arithmetic/comparison-as-table lowering for narrow integer operators.  Each
+// selected `i1..i8 a OP b` or `icmp pred i1..i8 a, b` becomes:
 //   ensure(table)
 //   load table[(zext(a) << 8) | zext(b)]
 // Tables are stored encrypted and materialized lazily by a small internal
@@ -49,6 +49,19 @@ struct TableMaterial {
     Function *ensure;
 };
 
+enum class TableOpKind { Binary, ICmp };
+
+struct TableOpSpec {
+    TableOpKind kind;
+    unsigned code;
+    unsigned bitWidth;
+};
+
+struct Target {
+    Instruction *inst;
+    TableOpSpec spec;
+};
+
 bool supportedOpcode(unsigned opcode) {
     switch (opcode) {
     case Instruction::Add:
@@ -57,6 +70,24 @@ bool supportedOpcode(unsigned opcode) {
     case Instruction::And:
     case Instruction::Or:
     case Instruction::Xor:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool supportedPredicate(CmpInst::Predicate pred) {
+    switch (pred) {
+    case CmpInst::ICMP_EQ:
+    case CmpInst::ICMP_NE:
+    case CmpInst::ICMP_UGT:
+    case CmpInst::ICMP_UGE:
+    case CmpInst::ICMP_ULT:
+    case CmpInst::ICMP_ULE:
+    case CmpInst::ICMP_SGT:
+    case CmpInst::ICMP_SGE:
+    case CmpInst::ICMP_SLT:
+    case CmpInst::ICMP_SLE:
         return true;
     default:
         return false;
@@ -77,8 +108,26 @@ bool eligible(BinaryOperator &BO) {
     return true;
 }
 
+bool eligible(ICmpInst &CI) {
+    auto *Ty = dyn_cast<IntegerType>(CI.getOperand(0)->getType());
+    if (!Ty || Ty != CI.getOperand(1)->getType() || Ty->getBitWidth() == 0 ||
+        Ty->getBitWidth() > 8)
+        return false;
+    return supportedPredicate(CI.getPredicate());
+}
+
 std::uint8_t bitMask(unsigned width) {
     return width >= 8 ? 0xFFu : static_cast<std::uint8_t>((1u << width) - 1u);
+}
+
+std::int32_t signExtend(std::uint8_t value, unsigned width) {
+    const std::uint32_t mask =
+        width >= 8 ? 0xFFu : static_cast<std::uint32_t>((1u << width) - 1u);
+    std::uint32_t v = value & mask;
+    const std::uint32_t signBit = 1u << (width - 1u);
+    if ((v & signBit) == 0)
+        return static_cast<std::int32_t>(v);
+    return static_cast<std::int32_t>(v | ~mask);
 }
 
 std::uint8_t eval(unsigned opcode, std::uint8_t lhs, std::uint8_t rhs,
@@ -110,6 +159,58 @@ std::uint8_t eval(unsigned opcode, std::uint8_t lhs, std::uint8_t rhs,
         break;
     }
     return static_cast<std::uint8_t>(result & mask);
+}
+
+std::uint8_t evalPredicate(CmpInst::Predicate pred, std::uint8_t lhs,
+                           std::uint8_t rhs, unsigned width) {
+    const std::uint8_t mask = bitMask(width);
+    const std::uint32_t ul = lhs & mask;
+    const std::uint32_t ur = rhs & mask;
+    const std::int32_t sl = signExtend(lhs, width);
+    const std::int32_t sr = signExtend(rhs, width);
+    bool result = false;
+    switch (pred) {
+    case CmpInst::ICMP_EQ:
+        result = ul == ur;
+        break;
+    case CmpInst::ICMP_NE:
+        result = ul != ur;
+        break;
+    case CmpInst::ICMP_UGT:
+        result = ul > ur;
+        break;
+    case CmpInst::ICMP_UGE:
+        result = ul >= ur;
+        break;
+    case CmpInst::ICMP_ULT:
+        result = ul < ur;
+        break;
+    case CmpInst::ICMP_ULE:
+        result = ul <= ur;
+        break;
+    case CmpInst::ICMP_SGT:
+        result = sl > sr;
+        break;
+    case CmpInst::ICMP_SGE:
+        result = sl >= sr;
+        break;
+    case CmpInst::ICMP_SLT:
+        result = sl < sr;
+        break;
+    case CmpInst::ICMP_SLE:
+        result = sl <= sr;
+        break;
+    default:
+        break;
+    }
+    return static_cast<std::uint8_t>(result);
+}
+
+std::uint8_t eval(const TableOpSpec &op, std::uint8_t lhs, std::uint8_t rhs) {
+    if (op.kind == TableOpKind::ICmp)
+        return evalPredicate(static_cast<CmpInst::Predicate>(op.code), lhs, rhs,
+                             op.bitWidth);
+    return eval(op.code, lhs, rhs, op.bitWidth);
 }
 
 std::uint8_t keyAt(std::uint32_t idx, const KeySchedule &key) {
@@ -186,7 +287,7 @@ Function *createEnsureFunction(Module &M, GlobalVariable *Table,
     return Fn;
 }
 
-TableMaterial createTable(Module &M, unsigned opcode, unsigned bitWidth,
+TableMaterial createTable(Module &M, const TableOpSpec &op,
                           ir::IRRandom &rng) {
     LLVMContext &Ctx = M.getContext();
     auto *I8 = Type::getInt8Ty(Ctx);
@@ -200,7 +301,7 @@ TableMaterial createTable(Module &M, unsigned opcode, unsigned bitWidth,
     for (std::uint32_t idx = 0; idx < kTableSize; ++idx) {
         const auto lhs = static_cast<std::uint8_t>(idx >> 8);
         const auto rhs = static_cast<std::uint8_t>(idx & 0xFFu);
-        encrypted[idx] = eval(opcode, lhs, rhs, bitWidth) ^ keyAt(idx, key);
+        encrypted[idx] = eval(op, lhs, rhs) ^ keyAt(idx, key);
     }
 
     Constant *Init = ConstantDataArray::get(Ctx, ArrayRef(encrypted));
@@ -215,25 +316,25 @@ TableMaterial createTable(Module &M, unsigned opcode, unsigned bitWidth,
     return {Table, Ensure};
 }
 
-Value *emitLookup(Module &M, BinaryOperator &BO, ir::IRRandom &rng) {
-    auto *SourceTy = cast<IntegerType>(BO.getType());
-    const unsigned bitWidth = SourceTy->getBitWidth();
-    TableMaterial Mat = createTable(M, BO.getOpcode(), bitWidth, rng);
-    IRBuilder<NoFolder> B(&BO);
+Value *emitLookup(Module &M, Target &T, ir::IRRandom &rng) {
+    Instruction &I = *T.inst;
+    const unsigned bitWidth = T.spec.bitWidth;
+    TableMaterial Mat = createTable(M, T.spec, rng);
+    IRBuilder<NoFolder> B(&I);
     auto *I8 = B.getInt8Ty();
     auto *I16 = B.getInt16Ty();
     auto *I32 = B.getInt32Ty();
     auto *TableTy = cast<ArrayType>(Mat.table->getValueType());
 
     B.CreateCall(Mat.ensure);
+    Value *Lhs = I.getOperand(0);
+    Value *Rhs = I.getOperand(1);
     Value *L8 = bitWidth == 8
-                    ? BO.getOperand(0)
-                    : B.CreateZExt(BO.getOperand(0), I8,
-                                   "morok.tablearith.lhs8");
+                    ? Lhs
+                    : B.CreateZExt(Lhs, I8, "morok.tablearith.lhs8");
     Value *R8 = bitWidth == 8
-                    ? BO.getOperand(1)
-                    : B.CreateZExt(BO.getOperand(1), I8,
-                                   "morok.tablearith.rhs8");
+                    ? Rhs
+                    : B.CreateZExt(Rhs, I8, "morok.tablearith.rhs8");
     Value *L = B.CreateZExt(L8, I16, "morok.tablearith.lhs");
     Value *R = B.CreateZExt(R8, I16, "morok.tablearith.rhs");
     Value *Hi = B.CreateShl(L, ConstantInt::get(I16, 8), "morok.tablearith.hi");
@@ -243,8 +344,11 @@ Value *emitLookup(Module &M, BinaryOperator &BO, ir::IRRandom &rng) {
         B.CreateInBoundsGEP(TableTy, Mat.table, {ConstantInt::get(I32, 0), Idx},
                             "morok.tablearith.ptr");
     Value *Result = B.CreateLoad(I8, Ptr, "morok.tablearith.value");
+    if (T.spec.kind == TableOpKind::ICmp)
+        return B.CreateTrunc(Result, B.getInt1Ty(), "morok.tablearith.icmp");
     if (bitWidth == 8)
         return Result;
+    auto *SourceTy = cast<IntegerType>(I.getType());
     return B.CreateTrunc(Result, SourceTy, "morok.tablearith.trunc");
 }
 
@@ -262,7 +366,7 @@ bool tableArithmeticFunction(Function &F, const TableArithParams &params,
 
     const std::uint32_t limit =
         std::min(params.max_tables, kMaxTablesPerInvocation);
-    std::vector<BinaryOperator *> targets;
+    std::vector<Target> targets;
     targets.reserve(limit);
     for (BasicBlock &BB : F) {
         if (targets.size() >= limit)
@@ -270,10 +374,19 @@ bool tableArithmeticFunction(Function &F, const TableArithParams &params,
         for (Instruction &I : BB) {
             if (targets.size() >= limit)
                 break;
-            if (auto *BO = dyn_cast<BinaryOperator>(&I))
-                if (eligible(*BO))
-                    if (rng.chance(params.probability))
-                        targets.push_back(BO);
+            if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+                if (eligible(*BO) && rng.chance(params.probability))
+                    targets.push_back(Target{
+                        BO, {TableOpKind::Binary, BO->getOpcode(),
+                             cast<IntegerType>(BO->getType())->getBitWidth()}});
+            } else if (auto *CI = dyn_cast<ICmpInst>(&I)) {
+                if (eligible(*CI) && rng.chance(params.probability))
+                    targets.push_back(Target{
+                        CI, {TableOpKind::ICmp,
+                             static_cast<unsigned>(CI->getPredicate()),
+                             cast<IntegerType>(CI->getOperand(0)->getType())
+                                 ->getBitWidth()}});
+            }
         }
     }
     if (targets.empty())
@@ -281,10 +394,10 @@ bool tableArithmeticFunction(Function &F, const TableArithParams &params,
 
     Module &M = *F.getParent();
     bool changed = false;
-    for (BinaryOperator *BO : targets) {
-        Value *Replacement = emitLookup(M, *BO, rng);
-        BO->replaceAllUsesWith(Replacement);
-        BO->eraseFromParent();
+    for (Target &T : targets) {
+        Value *Replacement = emitLookup(M, T, rng);
+        T.inst->replaceAllUsesWith(Replacement);
+        T.inst->eraseFromParent();
         changed = true;
     }
     return changed;
