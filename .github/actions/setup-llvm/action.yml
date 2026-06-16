@@ -84,7 +84,10 @@ runs:
         git -C "$SRC" checkout -q --detach FETCH_HEAD
         echo "::endgroup::"
 
-        COMMON=(
+        # Single args array (seeded non-empty) so expansion is safe under
+        # `set -u` even on the macOS runners' ancient bash 3.2, where expanding
+        # an empty array aborts with "unbound variable".
+        ARGS=(
           -G Ninja
           -S "$SRC/llvm" -B "$BUILD"
           -DCMAKE_BUILD_TYPE=Release
@@ -110,7 +113,7 @@ runs:
         if [ "$RUNNER_OS" = "Windows" ]; then
           # MSVC env is set up by the caller (msvc-dev-cmd). Release has no debug
           # info, which keeps sccache happy (it cannot cache /Zi PDB writes).
-          EXTRA=(
+          ARGS+=(
             -DCMAKE_C_COMPILER=cl
             -DCMAKE_CXX_COMPILER=cl
             -DCMAKE_POLICY_DEFAULT_CMP0141=NEW
@@ -121,14 +124,13 @@ runs:
           # loads the plugin (a libLLVM dylib build resolves plugin symbols
           # differently and is not what this project is validated against). Just
           # pick a fast linker when one is present.
-          EXTRA=()
           if command -v ld.lld >/dev/null 2>&1; then
-            EXTRA+=( -DLLVM_USE_LINKER=lld )
+            ARGS+=( -DLLVM_USE_LINKER=lld )
           fi
         fi
 
         echo "::group::Configure LLVM"
-        cmake "${COMMON[@]}" "${EXTRA[@]}"
+        cmake "${ARGS[@]}"
         echo "::endgroup::"
 
         echo "::group::Build + install LLVM (this is the slow, cached step)"
