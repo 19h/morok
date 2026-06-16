@@ -125,18 +125,19 @@ std::uint64_t widthMask(unsigned Width) {
 bool supportedWidth(unsigned Width) { return Width >= 1 && Width <= 64; }
 
 std::optional<VmOp> binaryOpcode(BinaryOperator &BO, unsigned Width) {
+    // Poison-generating flags (nsw/nuw on add/sub/mul/shl, exact on
+    // div/shr) are intentionally ignored: the VM emits the ordinary wrapping /
+    // non-exact operation, which is a sound refinement of the flagged form —
+    // identical for every input the flag promised about, and merely defined
+    // (instead of poison) for the inputs the flag declared could not occur.
+    // Without this, virtualization never fires on optimized (-O2) code, where
+    // essentially all arithmetic is flagged.
     switch (BO.getOpcode()) {
     case Instruction::Add:
-        if (BO.hasNoSignedWrap() || BO.hasNoUnsignedWrap())
-            return std::nullopt;
         return VmOp::Add;
     case Instruction::Sub:
-        if (BO.hasNoSignedWrap() || BO.hasNoUnsignedWrap())
-            return std::nullopt;
         return VmOp::Sub;
     case Instruction::Mul:
-        if (BO.hasNoSignedWrap() || BO.hasNoUnsignedWrap())
-            return std::nullopt;
         return VmOp::Mul;
     case Instruction::And:
         return VmOp::And;
@@ -145,23 +146,16 @@ std::optional<VmOp> binaryOpcode(BinaryOperator &BO, unsigned Width) {
     case Instruction::Xor:
         return VmOp::Xor;
     case Instruction::UDiv:
-        // `exact` udiv/sdiv is poison when the division has a remainder; the VM
-        // emits an ordinary division, so reject the exact form to stay safe.
-        return BO.isExact() ? std::nullopt : std::optional<VmOp>(VmOp::UDiv);
+        return VmOp::UDiv;
     case Instruction::SDiv:
-        return BO.isExact() ? std::nullopt : std::optional<VmOp>(VmOp::SDiv);
+        return VmOp::SDiv;
     case Instruction::URem:
         return VmOp::URem;
     case Instruction::SRem:
         return VmOp::SRem;
     case Instruction::Shl:
-        if (BO.hasNoSignedWrap() || BO.hasNoUnsignedWrap())
-            return std::nullopt;
-        break;
     case Instruction::LShr:
     case Instruction::AShr:
-        if (BO.isExact())
-            return std::nullopt;
         break;
     default:
         return std::nullopt;

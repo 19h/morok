@@ -86,6 +86,7 @@ max_tables = 8
 max_branches = 12
 
 [passes.virtualization]
+enabled = true
 probability = 100
 max_functions = 16
 max_instructions = 256

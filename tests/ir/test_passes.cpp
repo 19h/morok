@@ -5447,6 +5447,40 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("virtualizeModule lifts poison-flagged arithmetic") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @vm_flagged(i32 %a, i32 %b) {
+entry:
+  %p = mul nsw i32 %a, %b
+  %q = add nuw i32 %p, %a
+  %r = shl nuw nsw i32 %q, 3
+  %s = ashr exact i32 %r, 1
+  ret i32 %s
+}
+)ir");
+    Function *F = M->getFunction("vm_flagged");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1773);
+    morok::ir::IRRandom rng(engine);
+
+    // -O2 stamps nsw/nuw/exact onto essentially all arithmetic; the VM must
+    // accept these (emitting the sound unflagged refinement) or it never fires
+    // on optimized code.
+    CHECK(morok::passes::virtualizeModule(
+        *M,
+        {/*probability=*/100, /*max_functions=*/1,
+         /*max_instructions=*/64, /*max_registers=*/96},
+        rng));
+    Function *Helper = M->getFunction("morok.vm.vm_flagged.exec");
+    REQUIRE(Helper);
+    std::size_t wrapperBinops = 0;
+    for (Instruction &I : instructions(*F))
+        wrapperBinops += isa<BinaryOperator>(&I) ? 1u : 0u;
+    CHECK(wrapperBinops == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("virtualizeModule skips unsupported control flow") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
