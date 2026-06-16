@@ -554,9 +554,11 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   byte count, and per-node records containing the region pointer, expected-hash
   pointer, hash seed, and current expected hash.  A post-link rewriter can patch
   every node region and expected global from that single graph record.
-- Selected `i1` through `i64` integer returns are rewritten as
-  `ret_value ^ graph_diff` (truncated to the return width as needed).  There is
-  no trap and no check branch; the
+- Selected scalar integer and floating-point returns are rewritten as
+  `ret_value ^ graph_diff` (truncated to the return width as needed).  Floating
+  returns (`half`, `bfloat`, `float`, `double`) are bitcast to an equal-width
+  integer carrier for the xor and bitcast back, so an intact graph preserves the
+  exact returned bit pattern.  There is no trap and no check branch; the
   integrity graph affects program data directly.
 - Scheduler placement is after self-checksum constants and before constant
   encryption, so it sees late control/data shape while ordinary literal
@@ -826,7 +828,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - UniformPrimitiveLowering: `i1..i8` op tables plus memory-loaded indirectbr dispatch.
 - Virtualization: encrypted per-function bytecode plus threaded computed-goto VM helpers.
 - HashGatedSelfDecrypt: VM bytecode globals get hash/context-gated lazy outer decryptors.
-- MutualGuardGraph: overlapping checksum nodes whose combined diff poisons `i1..i64` returns.
+- MutualGuardGraph: overlapping checksum nodes whose combined diff poisons scalar integer/FP returns.
 - AdversarialFunctionMerging: same-signature functions routed through shared selector dispatchers plus outlined integer scalar operation/comparison helpers (`i1..i64` operands, `i1` comparison results).
 - AdversarialSelfTuning: cloned-candidate search over hardness metrics with best verified bundle replay.
 - PerBuildPolymorphism: seed-driven function/block order and volatile-zero scalar integer/FP return anchors.

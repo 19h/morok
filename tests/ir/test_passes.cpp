@@ -4982,6 +4982,67 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("mutualGuardGraphFunction poisons floating scalar returns") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define float @mg_float(float %a, float %b) {
+entry:
+  %x = fadd float %a, %b
+  ret float %x
+}
+
+define double @mg_double(double %a, double %b) {
+entry:
+  %x = fsub double %a, %b
+  ret double %x
+}
+)ir");
+    Function *FloatFn = M->getFunction("mg_float");
+    Function *DoubleFn = M->getFunction("mg_double");
+    REQUIRE(FloatFn);
+    REQUIRE(DoubleFn);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(204);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::mutualGuardGraphFunction(
+        *FloatFn,
+        {/*probability=*/100, /*nodes=*/2, /*region_bytes=*/16,
+         /*max_returns=*/1},
+        rng));
+    CHECK(morok::passes::mutualGuardGraphFunction(
+        *DoubleFn,
+        {/*probability=*/100, /*nodes=*/2, /*region_bytes=*/16,
+         /*max_returns=*/1},
+        rng));
+
+    bool hasFloatPoison = false;
+    bool hasDoublePoison = false;
+    bool hasFloatCarrier = false;
+    bool hasDoubleCarrier = false;
+    for (Instruction &I : instructions(*FloatFn)) {
+        hasFloatPoison |= I.getName().starts_with("morok.mg.value") &&
+                          I.getType()->isFloatTy();
+        if (auto *BC = dyn_cast<BitCastInst>(&I))
+            hasFloatCarrier |=
+                BC->getSrcTy()->isFloatTy() && BC->getDestTy()->isIntegerTy(32);
+    }
+    for (Instruction &I : instructions(*DoubleFn)) {
+        hasDoublePoison |= I.getName().starts_with("morok.mg.value") &&
+                           I.getType()->isDoubleTy();
+        if (auto *BC = dyn_cast<BitCastInst>(&I))
+            hasDoubleCarrier |= BC->getSrcTy()->isDoubleTy() &&
+                                BC->getDestTy()->isIntegerTy(64);
+    }
+
+    CHECK(hasFloatPoison);
+    CHECK(hasDoublePoison);
+    CHECK(hasFloatCarrier);
+    CHECK(hasDoubleCarrier);
+    CHECK(M->getFunction("morok.mg.diff.mg_float") != nullptr);
+    CHECK(M->getFunction("morok.mg.diff.mg_double") != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("mutualGuardGraphFunction honors zero probability") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

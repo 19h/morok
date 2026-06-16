@@ -66,8 +66,18 @@ bool eligibleReturn(ReturnInst *RI) {
         return false;
     if (ir::isMustTailReturn(*RI))
         return false;
-    auto *Ty = dyn_cast<IntegerType>(RI->getOperand(0)->getType());
-    return Ty && Ty->getBitWidth() <= 64;
+    Type *Ty = RI->getOperand(0)->getType();
+    if (auto *IntTy = dyn_cast<IntegerType>(Ty))
+        return IntTy->getBitWidth() <= 64;
+    return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+           Ty->isDoubleTy();
+}
+
+IntegerType *integerCarrierFor(Type *Ty) {
+    if (auto *IntTy = dyn_cast<IntegerType>(Ty))
+        return IntTy;
+    const unsigned Bits = static_cast<unsigned>(Ty->getPrimitiveSizeInBits());
+    return IntegerType::get(Ty->getContext(), Bits);
 }
 
 std::uint64_t hashStep(std::uint64_t H, std::uint8_t B) {
@@ -361,14 +371,26 @@ GraphRuntime createGraph(Function &F, const MutualGuardGraphParams &Params,
 
 Value *emitPoisonedReturn(ReturnInst *RI, Function *Diff) {
     Value *RetVal = RI->getOperand(0);
-    auto *Ty = cast<IntegerType>(RetVal->getType());
+    Type *ReturnTy = RetVal->getType();
+    IntegerType *CarrierTy = integerCarrierFor(ReturnTy);
     Builder B(RI);
     Value *GraphDiff =
         B.CreateCall(Diff->getFunctionType(), Diff, {}, "morok.mg.diff.call");
     Value *Narrow = GraphDiff;
-    if (Ty->getBitWidth() < 64)
-        Narrow = B.CreateTrunc(GraphDiff, Ty, "morok.mg.diff.trunc");
-    return B.CreateXor(RetVal, Narrow, "morok.mg.value");
+    if (CarrierTy->getBitWidth() < 64)
+        Narrow = B.CreateTrunc(GraphDiff, CarrierTy, "morok.mg.diff.trunc");
+
+    Value *RetBits = RetVal;
+    if (!ReturnTy->isIntegerTy())
+        RetBits = B.CreateBitCast(RetBits, CarrierTy, "morok.mg.bits");
+
+    Value *PoisonedBits =
+        B.CreateXor(RetBits, Narrow,
+                    ReturnTy->isIntegerTy() ? "morok.mg.value"
+                                            : "morok.mg.bits.value");
+    if (ReturnTy->isIntegerTy())
+        return PoisonedBits;
+    return B.CreateBitCast(PoisonedBits, ReturnTy, "morok.mg.value");
 }
 
 } // namespace
