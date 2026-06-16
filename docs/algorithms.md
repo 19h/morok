@@ -675,22 +675,26 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   stages.
 
 ## Vector obfuscation — IR structure
-- Eligible scalar integer binary ops are lifted to `<N x iM>` operations, where
-  `N = floor(width / M)` for configured widths 128, 256, or 512 bits.  Lane
-  `realLane` holds the original operands and all other lanes are per-build junk
-  constants, so per-lane vector semantics preserve the scalar value.
+- Eligible scalar integer binary ops and unflagged scalar floating binary ops
+  (`half`, `bfloat`, `float`, `double`) are lifted to `<N x T>` operations,
+  where `N = floor(width / bitwidth(T))` for configured widths 128, 256, or 512
+  bits.  Lane `realLane` holds the original operands and all other lanes are
+  per-build junk constants, so per-lane vector semantics preserve the scalar
+  value.  Floating ops with fast-math flags are skipped so the pass does not
+  change the source operation's NaN/Inf/signed-zero optimization contract.
 - With `shuffle=false`, the pass extracts `realLane` directly.  With
   `shuffle=true`, `shufflevector` first moves `realLane` to lane 0 and fills the
   rest of the result with randomized lane references before extraction.  This
   forces the decompiler surface toward SIMD shuffle/intrinsic idioms instead of
   a trivial two-lane insert/extract pattern.
-- With `lift_comparisons=true`, scalar integer `icmp` instructions are lifted in
-  the same way and extracted back to `i1`.  This lets select/branch conditions
-  acquire vector provenance without changing control semantics.
-- Scalar integer `select i1 cond, iM t, iM f` instructions lift the true/false
-  values into junk-filled vectors, perform a scalar-conditioned vector select,
-  then extract the original lane.  The condition remains scalar, but the chosen
-  value inherits SIMD provenance.
+- With `lift_comparisons=true`, scalar integer `icmp` and unflagged floating
+  `fcmp` instructions are lifted in the same way and extracted back to `i1`.
+  This lets select/branch conditions acquire vector provenance without changing
+  control semantics.
+- Scalar integer/floating `select i1 cond, T t, T f` instructions lift the
+  true/false values into junk-filled vectors, perform a scalar-conditioned
+  vector select, then extract the original lane.  The condition remains scalar,
+  but the chosen value inherits SIMD provenance.
 - Direct memory caps: each invocation lifts at most 128 binary operators, at
   most 128 compares, and at most 128 selects.
 - The scheduler runs this after table arithmetic and before path explosion:

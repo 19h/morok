@@ -3242,6 +3242,56 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("vectorObfuscateFunction lifts floating ops, compares, and selects") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define float @vecfloat(float %a, float %b) {
+entry:
+  %sum = fadd float %a, %b
+  %mix = fmul float %sum, %b
+  %cmp = fcmp olt float %mix, %a
+  %sel = select i1 %cmp, float %mix, float %b
+  ret float %sel
+}
+)ir");
+    Function *F = M->getFunction("vecfloat");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(2121);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::vectorObfuscateFunction(
+        *F,
+        {/*probability=*/100, /*width=*/128, /*shuffle=*/true,
+         /*lift_comparisons=*/true},
+        rng));
+
+    bool hasFloatVector = false;
+    bool hasVectorFAddOrFMul = false;
+    bool hasVectorFCmp = false;
+    bool hasVectorSelect = false;
+    bool hasShuffle = false;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *VT = dyn_cast<FixedVectorType>(I.getType()))
+            hasFloatVector |= VT->getElementType()->isFloatTy() &&
+                              VT->getNumElements() == 4u;
+        if (auto *BO = dyn_cast<BinaryOperator>(&I))
+            hasVectorFAddOrFMul |=
+                (BO->getOpcode() == Instruction::FAdd ||
+                 BO->getOpcode() == Instruction::FMul) &&
+                BO->getType()->isVectorTy();
+        if (auto *Cmp = dyn_cast<FCmpInst>(&I))
+            hasVectorFCmp |= Cmp->getType()->isVectorTy();
+        if (auto *Sel = dyn_cast<SelectInst>(&I))
+            hasVectorSelect |= Sel->getType()->isVectorTy();
+        hasShuffle |= isa<ShuffleVectorInst>(&I);
+    }
+    CHECK(hasFloatVector);
+    CHECK(hasVectorFAddOrFMul);
+    CHECK(hasVectorFCmp);
+    CHECK(hasVectorSelect);
+    CHECK(hasShuffle);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("vectorObfuscateFunction lifts sub-byte and odd-width selects") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

@@ -5,7 +5,7 @@
 // morok/passes/VectorObfuscation.cpp
 //
 // a OP b  becomes  extractelement(shuffle(<a,j...> OP <b,j...>), 0), and
-// integer selects get the same true/false vector treatment.  Per-lane vector
+// scalar selects get the same true/false vector treatment.  Per-lane vector
 // semantics keep the chosen real lane exactly equal to the scalar op; the
 // surrounding vector lanes and optional shuffle create a SIMD surface for
 // decompilers.
@@ -18,6 +18,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Operator.h"
 
 #include <algorithm>
 #include <vector>
@@ -33,57 +34,97 @@ constexpr std::size_t kMaxVectorCompareTargets = 128;
 constexpr std::size_t kMaxVectorSelectTargets = 128;
 
 bool liftable(BinaryOperator *bo) {
-    auto *ty = dyn_cast<IntegerType>(bo->getType());
-    if (!ty)
+    Type *Ty = bo->getType();
+    if (Ty->isIntegerTy()) {
+        switch (bo->getOpcode()) {
+        case Instruction::Add:
+        case Instruction::Sub:
+        case Instruction::Mul:
+        case Instruction::And:
+        case Instruction::Or:
+        case Instruction::Xor:
+        case Instruction::Shl:
+        case Instruction::LShr:
+        case Instruction::AShr:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    if (!(Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+          Ty->isDoubleTy()))
         return false;
+    if (auto *FPO = dyn_cast<FPMathOperator>(bo))
+        if (FPO->getFastMathFlags().any())
+            return false;
     switch (bo->getOpcode()) {
-    case Instruction::Add:
-    case Instruction::Sub:
-    case Instruction::Mul:
-    case Instruction::And:
-    case Instruction::Or:
-    case Instruction::Xor:
-    case Instruction::Shl:
-    case Instruction::LShr:
-    case Instruction::AShr:
+    case Instruction::FAdd:
+    case Instruction::FSub:
+    case Instruction::FMul:
+    case Instruction::FDiv:
+    case Instruction::FRem:
         return true;
     default:
         return false;
     }
 }
 
-bool liftableCompare(ICmpInst *cmp) {
-    return cmp->getOperand(0)->getType()->isIntegerTy() &&
-           cmp->getOperand(1)->getType()->isIntegerTy();
+bool liftableCompare(CmpInst *cmp) {
+    Type *Ty = cmp->getOperand(0)->getType();
+    if (auto *ICmp = dyn_cast<ICmpInst>(cmp))
+        return Ty->isIntegerTy() && ICmp->getOperand(1)->getType() == Ty;
+    if (auto *FCmp = dyn_cast<FCmpInst>(cmp)) {
+        if (!(Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+              Ty->isDoubleTy()))
+            return false;
+        if (FCmp->getOperand(1)->getType() != Ty)
+            return false;
+        return FCmp->getFastMathFlags().none();
+    }
+    return false;
 }
 
 bool liftableSelect(SelectInst *sel) {
-    return sel->getType()->isIntegerTy() &&
+    Type *Ty = sel->getType();
+    return (Ty->isIntegerTy() || Ty->isHalfTy() || Ty->isBFloatTy() ||
+            Ty->isFloatTy() || Ty->isDoubleTy()) &&
            sel->getCondition()->getType()->isIntegerTy(1);
 }
 
-std::uint32_t laneCount(IntegerType *ty, const VecParams &params) {
-    const std::uint32_t bits = std::max<std::uint32_t>(
-        static_cast<std::uint32_t>(ty->getBitWidth()), 1u);
+unsigned scalarBits(Type *Ty) {
+    if (auto *IT = dyn_cast<IntegerType>(Ty))
+        return IT->getBitWidth();
+    return static_cast<unsigned>(Ty->getPrimitiveSizeInBits());
+}
+
+std::uint32_t laneCount(Type *Ty, const VecParams &params) {
+    const std::uint32_t bits =
+        std::max<std::uint32_t>(static_cast<std::uint32_t>(scalarBits(Ty)), 1u);
     const std::uint32_t width =
         params.width == 256 || params.width == 512 ? params.width : 128u;
     const std::uint32_t lanes = width / bits;
     return lanes >= 2u ? lanes : 0u;
 }
 
-ConstantInt *junkInt(IntegerType *ty, ir::IRRandom &rng) {
-    return ConstantInt::get(ty, static_cast<std::uint64_t>(rng.next()));
+Constant *junkScalar(Type *Ty, ir::IRRandom &rng) {
+    if (auto *IT = dyn_cast<IntegerType>(Ty))
+        return ConstantInt::get(IT, static_cast<std::uint64_t>(rng.next()));
+    const double V =
+        static_cast<double>(static_cast<std::int32_t>(rng.next() & 0xffffu)) /
+        257.0;
+    return ConstantFP::get(Ty, V);
 }
 
 Value *buildVector(IRBuilder<> &B, Value *real, FixedVectorType *vecTy,
                    std::uint32_t realLane, ir::IRRandom &rng,
                    const Twine &name) {
-    auto *ty = cast<IntegerType>(real->getType());
+    Type *Ty = real->getType();
     Value *v = PoisonValue::get(vecTy);
     const std::uint32_t lanes =
         static_cast<std::uint32_t>(vecTy->getNumElements());
     for (std::uint32_t lane = 0; lane < lanes; ++lane) {
-        Value *element = lane == realLane ? real : junkInt(ty, rng);
+        Value *element = lane == realLane ? real : junkScalar(Ty, rng);
         v = B.CreateInsertElement(v, element, B.getInt32(lane), name);
     }
     return v;
@@ -107,12 +148,12 @@ Value *extractRealLane(IRBuilder<> &B, Value *vector, std::uint32_t lanes,
 
 bool liftBinary(BinaryOperator *bo, const VecParams &params,
                 ir::IRRandom &rng) {
-    auto *ty = cast<IntegerType>(bo->getType());
-    const std::uint32_t lanes = laneCount(ty, params);
+    Type *Ty = bo->getType();
+    const std::uint32_t lanes = laneCount(Ty, params);
     if (lanes < 2u)
         return false;
 
-    auto *vecTy = FixedVectorType::get(ty, lanes);
+    auto *vecTy = FixedVectorType::get(Ty, lanes);
     IRBuilder<> B(bo);
     const std::uint32_t realLane =
         params.shuffle ? rng.range(lanes) : static_cast<std::uint32_t>(0);
@@ -129,13 +170,13 @@ bool liftBinary(BinaryOperator *bo, const VecParams &params,
     return true;
 }
 
-bool liftCompare(ICmpInst *cmp, const VecParams &params, ir::IRRandom &rng) {
-    auto *ty = cast<IntegerType>(cmp->getOperand(0)->getType());
-    const std::uint32_t lanes = laneCount(ty, params);
+bool liftCompare(CmpInst *cmp, const VecParams &params, ir::IRRandom &rng) {
+    Type *Ty = cmp->getOperand(0)->getType();
+    const std::uint32_t lanes = laneCount(Ty, params);
     if (lanes < 2u)
         return false;
 
-    auto *vecTy = FixedVectorType::get(ty, lanes);
+    auto *vecTy = FixedVectorType::get(Ty, lanes);
     IRBuilder<> B(cmp);
     const std::uint32_t realLane =
         params.shuffle ? rng.range(lanes) : static_cast<std::uint32_t>(0);
@@ -143,7 +184,11 @@ bool liftCompare(ICmpInst *cmp, const VecParams &params, ir::IRRandom &rng) {
                             "morok.vec.cmp.a");
     Value *vb = buildVector(B, cmp->getOperand(1), vecTy, realLane, rng,
                             "morok.vec.cmp.b");
-    Value *vcmp = B.CreateICmp(cmp->getPredicate(), va, vb, "morok.vec.cmp");
+    Value *vcmp = isa<ICmpInst>(cmp)
+                      ? B.CreateICmp(cmp->getPredicate(), va, vb,
+                                     "morok.vec.cmp")
+                      : B.CreateFCmp(cmp->getPredicate(), va, vb,
+                                     "morok.vec.cmp");
     Value *r = extractRealLane(B, vcmp, lanes, realLane, params.shuffle, rng,
                                "morok.vec.cmp.value");
 
@@ -153,12 +198,12 @@ bool liftCompare(ICmpInst *cmp, const VecParams &params, ir::IRRandom &rng) {
 }
 
 bool liftSelect(SelectInst *sel, const VecParams &params, ir::IRRandom &rng) {
-    auto *ty = cast<IntegerType>(sel->getType());
-    const std::uint32_t lanes = laneCount(ty, params);
+    Type *Ty = sel->getType();
+    const std::uint32_t lanes = laneCount(Ty, params);
     if (lanes < 2u)
         return false;
 
-    auto *vecTy = FixedVectorType::get(ty, lanes);
+    auto *vecTy = FixedVectorType::get(Ty, lanes);
     IRBuilder<> B(sel);
     const std::uint32_t realLane =
         params.shuffle ? rng.range(lanes) : static_cast<std::uint32_t>(0);
@@ -181,7 +226,7 @@ bool liftSelect(SelectInst *sel, const VecParams &params, ir::IRRandom &rng) {
 bool vectorObfuscateFunction(Function &F, const VecParams &params,
                              ir::IRRandom &rng) {
     std::vector<BinaryOperator *> targets;
-    std::vector<ICmpInst *> compares;
+    std::vector<CmpInst *> compares;
     std::vector<SelectInst *> selects;
     for (BasicBlock &bb : F) {
         for (Instruction &inst : bb) {
@@ -190,7 +235,7 @@ bool vectorObfuscateFunction(Function &F, const VecParams &params,
                     if (targets.size() < kMaxVectorLiftTargets)
                         targets.push_back(bo);
             if (params.lift_comparisons)
-                if (auto *cmp = dyn_cast<ICmpInst>(&inst))
+                if (auto *cmp = dyn_cast<CmpInst>(&inst))
                     if (liftableCompare(cmp))
                         if (compares.size() < kMaxVectorCompareTargets)
                             compares.push_back(cmp);
@@ -217,7 +262,7 @@ bool vectorObfuscateFunction(Function &F, const VecParams &params,
             continue;
         changed |= liftBinary(bo, params, rng);
     }
-    for (ICmpInst *cmp : compares) {
+    for (CmpInst *cmp : compares) {
         if (!rng.chance(params.probability))
             continue;
         changed |= liftCompare(cmp, params, rng);
