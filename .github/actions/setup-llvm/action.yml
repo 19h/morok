@@ -64,7 +64,8 @@ runs:
       env:
         LLVM_REF: ${{ inputs.llvm-ref }}
         PREFIX: ${{ steps.vars.outputs.prefix }}
-        SCCACHE_GHA_ENABLED: "true"
+        # SCCACHE_DIR / sccache backend are configured by the caller workflow
+        # (local-disk cache persisted via actions/cache); just wire the launcher.
         CMAKE_C_COMPILER_LAUNCHER: sccache
         CMAKE_CXX_COMPILER_LAUNCHER: sccache
       run: |

@@ -74,6 +74,36 @@ jobs:
       - name: Set up sccache
         uses: mozilla/sccache-action@v0.0.6
 
+      - name: Configure sccache (local disk)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # sccache's GitHub Actions cache *backend* is unreliable: its storage
+          # endpoint intermittently returns service-unavailable, and because
+          # sccache is the compiler launcher that fails every compile (even
+          # CMake's compiler probe). Use a local-disk cache persisted by
+          # actions/cache instead — the same aggressive object caching, but no
+          # flaky network backend in the compile hot path.
+          # Kill any server the install action may have started with the GHA
+          # backend so the next compile starts one bound to local disk.
+          sccache --stop-server >/dev/null 2>&1 || true
+          dir="${RUNNER_TEMP//\\//}/sccache"
+          mkdir -p "$dir"
+          echo "SCCACHE_DIR=$dir" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=" >> "$GITHUB_ENV"
+          # Bound per-platform sccache so the install caches + 4 platforms of
+          # object cache stay within the repo's 10 GB Actions-cache budget.
+          echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
+
+      - name: Cache sccache objects
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ needs.prep.outputs.llvm_ref }}-${{ github.sha }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ runner.arch }}-${{ needs.prep.outputs.llvm_ref }}-
+            sccache-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Setup LLVM trunk
         id: llvm
         uses: ./.github/actions/setup-llvm
@@ -83,7 +113,6 @@ jobs:
       - name: Configure Morok
         shell: bash
         env:
-          SCCACHE_GHA_ENABLED: "true"
           CMAKE_C_COMPILER_LAUNCHER: sccache
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
         run: |
@@ -99,7 +128,6 @@ jobs:
       - name: Build Morok
         shell: bash
         env:
-          SCCACHE_GHA_ENABLED: "true"
           CMAKE_C_COMPILER_LAUNCHER: sccache
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
         run: cmake --build build --parallel
@@ -111,7 +139,10 @@ jobs:
 
       - name: Run tests
         shell: bash
-        run: ctest --test-dir build -j --output-on-failure --timeout 1200
+        run: |
+          set -euo pipefail
+          jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+          ctest --test-dir build --output-on-failure --timeout 1200 --parallel "$jobs"
 
       - name: Package artifacts
         id: pkg
