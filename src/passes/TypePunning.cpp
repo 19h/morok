@@ -63,8 +63,10 @@ bool eligibleType(Type *Ty, const TypePunParams &params) {
 }
 
 bool eligibleInstruction(const Instruction &I, const TypePunParams &params) {
-    if (I.isTerminator() || isa<PHINode>(I) || isa<AllocaInst>(I) ||
-        isa<LandingPadInst>(I) || isa<IntrinsicInst>(I))
+    if (I.isTerminator() || isa<AllocaInst>(I) || isa<LandingPadInst>(I) ||
+        isa<IntrinsicInst>(I))
+        return false;
+    if (isa<PHINode>(I) && I.getParent()->isEHPad())
         return false;
     if (isPassGenerated(&I))
         return false;
@@ -123,7 +125,10 @@ PunResult createPunChain(Function &F, const Target &target) {
     AllocaInst *buffer = createPunBuffer(F, target);
     Type *altTy = alternateLoadType(Ty, target.bytes);
 
-    IRBuilder<NoFolder> B(I.getNextNode());
+    Instruction *InsertBefore = isa<PHINode>(I)
+                                    ? &*I.getParent()->getFirstNonPHIIt()
+                                    : I.getNextNode();
+    IRBuilder<NoFolder> B(InsertBefore);
     Value *Stored = &I;
     if (needsCoveringInteger(Ty))
         Stored = B.CreateZExt(&I, altTy, "morok.pun.widen");
@@ -157,6 +162,8 @@ void replaceExternalUses(Instruction &I, const PunResult &result) {
         generated.insert(inst);
 
     I.replaceUsesWithIf(result.replacement, [&](Use &U) {
+        if (isa<PHINode>(I) && isa<PHINode>(U.getUser()))
+            return false;
         return !generated.contains(U.getUser());
     });
 }

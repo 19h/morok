@@ -244,9 +244,11 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Type punning — IR structure
 - Eligible scalar-producing instructions (`i1` through `i1024`, `half`,
-  `bfloat`, `float`, `double`) are stored into a local store-size
-  `alloca [N x i8]` union buffer with a volatile typed store, then reloaded
-  volatilely through a conflicting view.
+  `bfloat`, `float`, `double`), including ordinary PHI results, are stored into
+  a local store-size `alloca [N x i8]` union buffer with a volatile typed store,
+  then reloaded volatilely through a conflicting view.  PHI result punning is
+  inserted after the block's PHI cluster; EH-pad PHIs and PHI-to-PHI edge uses
+  are skipped to preserve LLVM placement and edge-use rules.
 - Byte-multiple integer scalars reload as `<N x i8>` byte vectors and bitcast
   back.  Non-byte-multiple integers are zero-extended to the covering byte-sized
   integer, reloaded, and truncated back to the exact source width.  Floating

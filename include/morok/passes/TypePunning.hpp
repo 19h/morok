@@ -4,10 +4,10 @@
 //
 // morok/passes/TypePunning.hpp — union/vector scalar punning.
 //
-// Round-trips scalar SSA values through a local byte buffer and reloads them
-// through a conflicting type view before bitcasting back.  The result is
-// bit-identical, but decompiler type recovery sees union-like memory and
-// vector/integer/scalar aliases for the same value.
+// Round-trips scalar SSA values, including ordinary PHI results, through a
+// local byte buffer and reloads them through a conflicting type view before
+// bitcasting back.  The result is bit-identical, but decompiler type recovery
+// sees union-like memory and vector/integer/scalar aliases for the same value.
 
 #ifndef MOROK_PASSES_TYPE_PUNNING_HPP
 #define MOROK_PASSES_TYPE_PUNNING_HPP

@@ -2247,6 +2247,57 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("typePunFunction round-trips PHI values after the PHI cluster") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target datalayout = "e-p:64:64"
+define i32 @pun_phi(i1 %flag, i32 %a, i32 %b) {
+entry:
+  br i1 %flag, label %join, label %right
+right:
+  br label %join
+join:
+  %x = phi i32 [ %a, %entry ], [ %b, %right ]
+  ret i32 %x
+}
+)ir");
+    Function *F = M->getFunction("pun_phi");
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(46);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::typePunFunction(*F,
+                                         {/*probability=*/100,
+                                          /*include_floating=*/true,
+                                          /*max_targets=*/1},
+                                         rng));
+
+    CHECK(countNamedAllocas(*F, "morok.pun") == 1);
+    PHINode *Phi = nullptr;
+    bool hasVolatileStore = false;
+    bool hasVolatileVectorLoad = false;
+    bool retUsesPunnedValue = false;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *PN = dyn_cast<PHINode>(&I))
+            Phi = PN;
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+            hasVolatileStore |= SI->isVolatile();
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+            hasVolatileVectorLoad |=
+                LI->isVolatile() && LI->getType()->isVectorTy();
+        if (auto *RI = dyn_cast<ReturnInst>(&I))
+            retUsesPunnedValue =
+                RI->getReturnValue()->getName().starts_with("morok.pun.value");
+    }
+    REQUIRE(Phi);
+    CHECK(Phi->getNextNode() != nullptr);
+    CHECK(!isa<PHINode>(Phi->getNextNode()));
+    CHECK(hasVolatileStore);
+    CHECK(hasVolatileVectorLoad);
+    CHECK(retUsesPunnedValue);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("typePunFunction respects its per-function target cap") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
