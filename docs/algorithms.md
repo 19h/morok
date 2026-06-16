@@ -218,10 +218,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   variable-sized `alloca i8, morok.stackdelta.size`, odd-offset volatile stack
   writes, and `llvm.stackrestore`.
 - The dynamic size is derived from a volatile private `morok.stackdelta.seed`
-  load, integer arguments/live terms visible at the split point, a per-build
-  salt, an odd minimum byte count, and a bounded `max_extra_bytes` mask.  The
-  allocation is therefore not a static frame object the decompiler can fold
-  into ordinary typed locals.
+  load, scalar integer/FP arguments and live terms visible at the split point, a
+  per-build salt, an odd minimum byte count, and a bounded `max_extra_bytes`
+  mask.  Floating terms are bitcast to same-width integer carriers before the
+  i64 mix reduction, so FP-heavy code still contributes live data to the dynamic
+  stack size.  The allocation is therefore not a static frame object the
+  decompiler can fold into ordinary typed locals.
 - The volatile stores deliberately overlap: an unaligned i64 write at byte
   offset 1 is followed by configurable i8 writes at offsets inside that word.
   Runtime program data is unchanged, but the backend must materialize irregular

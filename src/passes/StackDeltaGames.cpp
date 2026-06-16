@@ -49,6 +49,21 @@ bool isGeneratedBlock(const BasicBlock &BB) {
     return BB.getName().starts_with("morok.stackdelta");
 }
 
+bool isSupportedScalarFp(Type *Ty) {
+    return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+           Ty->isDoubleTy();
+}
+
+IntegerType *integerCarrierForFp(Type *Ty) {
+    if (Ty->isHalfTy() || Ty->isBFloatTy())
+        return IntegerType::get(Ty->getContext(), 16);
+    if (Ty->isFloatTy())
+        return IntegerType::get(Ty->getContext(), 32);
+    if (Ty->isDoubleTy())
+        return IntegerType::get(Ty->getContext(), 64);
+    return nullptr;
+}
+
 Instruction *guardSplitPoint(BasicBlock &BB) {
     for (Instruction &I : BB) {
         if (isa<PHINode>(&I) || isa<AllocaInst>(&I))
@@ -74,7 +89,8 @@ GlobalVariable *ensureSeed(Module &M, ir::IRRandom &rng) {
 
 void addTerm(Value *V, SmallPtrSetImpl<Value *> &Seen,
              std::vector<Value *> &Terms) {
-    if (!V || !V->getType()->isIntegerTy())
+    if (!V || (!V->getType()->isIntegerTy() &&
+               !isSupportedScalarFp(V->getType())))
         return;
     if (Seen.insert(V).second)
         Terms.push_back(V);
@@ -100,6 +116,16 @@ Value *asI64(Builder &B, Value *V) {
     auto *I64 = B.getInt64Ty();
     if (V->getType() == I64)
         return V;
+    if (isSupportedScalarFp(V->getType())) {
+        auto *CarrierTy = integerCarrierForFp(V->getType());
+        if (!CarrierTy)
+            return nullptr;
+        Value *Bits =
+            B.CreateBitCast(V, CarrierTy, "morok.stackdelta.term.fp");
+        if (CarrierTy->getBitWidth() < 64)
+            return B.CreateZExt(Bits, I64, "morok.stackdelta.term.zext");
+        return Bits;
+    }
     auto *IT = dyn_cast<IntegerType>(V->getType());
     if (!IT)
         return nullptr;

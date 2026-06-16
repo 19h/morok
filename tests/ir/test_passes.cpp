@@ -2138,6 +2138,55 @@ join:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("stackDeltaGamesFunction mixes floating live terms") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @stackdelta_fp(float %a, double %b, i1 %flag) {
+entry:
+  %b32 = fptrunc double %b to float
+  %sum = fadd float %a, %b32
+  %cmp = fcmp ogt float %sum, %a
+  br i1 %flag, label %body, label %alt
+body:
+  %out = select i1 %cmp, i32 1, i32 2
+  ret i32 %out
+alt:
+  ret i32 0
+}
+)ir");
+    Function *F = M->getFunction("stackdelta_fp");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(9211);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::stackDeltaGamesFunction(
+        *F,
+        {/*probability=*/100, /*max_blocks=*/4, /*min_bytes=*/17,
+         /*max_extra_bytes=*/64, /*touches=*/3},
+        rng));
+
+    bool hasFpTerm = false;
+    bool hasMix = false;
+    bool hasFrame = false;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *BC = dyn_cast<BitCastInst>(&I))
+            hasFpTerm |= BC->getName().starts_with(
+                             "morok.stackdelta.term.fp") &&
+                         (BC->getSrcTy()->isFloatTy() ||
+                          BC->getSrcTy()->isDoubleTy()) &&
+                         BC->getDestTy()->isIntegerTy();
+        hasMix |= I.getName().starts_with("morok.stackdelta.mix.term");
+        if (auto *AI = dyn_cast<AllocaInst>(&I))
+            hasFrame |= AI->getName().starts_with("morok.stackdelta.frame");
+    }
+
+    CHECK(hasFpTerm);
+    CHECK(hasMix);
+    CHECK(hasFrame);
+    CHECK(countGlobals(*M, "morok.stackdelta.seed") == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("stackDeltaGamesFunction honors zero probability") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

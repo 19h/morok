@@ -5,7 +5,8 @@
 // morok/passes/StackDeltaGames.hpp — dynamic stack-pointer perturbation.
 //
 // Forces backend-visible stack-pointer deltas from IR by injecting bounded
-// variable-sized allocas with odd, overlapping volatile stack touches.
+// variable-sized allocas keyed by integer/FP live data with odd, overlapping
+// volatile stack touches.
 
 #ifndef MOROK_PASSES_STACK_DELTA_GAMES_HPP
 #define MOROK_PASSES_STACK_DELTA_GAMES_HPP
