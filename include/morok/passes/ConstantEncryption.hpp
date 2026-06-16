@@ -4,11 +4,11 @@
 //
 // morok/passes/ConstantEncryption.hpp — constant hiding via XOR secret sharing.
 //
-// Each eligible integer literal is replaced by the XOR of k private global
-// "shares" (see morok/core/XorShare.hpp): the value never appears verbatim in
-// the binary and is reconstructed at run time.  The shares are loaded
-// volatilely so later optimisation passes cannot fold the reconstruction back
-// to the original constant.
+// Each eligible integer literal operand, including store values, is replaced by
+// the XOR of k private global "shares" (see morok/core/XorShare.hpp): the value
+// never appears verbatim in the binary and is reconstructed at run time.  The
+// shares are loaded volatilely so later optimisation passes cannot fold the
+// reconstruction back to the original constant.
 
 #ifndef MOROK_PASSES_CONSTANT_ENCRYPTION_HPP
 #define MOROK_PASSES_CONSTANT_ENCRYPTION_HPP

@@ -27,7 +27,8 @@ struct ShamirShareParams {
     std::uint32_t max_secrets = 8;  ///< per-function transformed literals
 };
 
-/// Replace selected integer literals with GF(2^8) Shamir reconstruction.
+/// Replace selected integer literal operands, including store values, with
+/// GF(2^8) Shamir reconstruction.
 bool shamirShareFunction(llvm::Function &F, const ShamirShareParams &params,
                          morok::ir::IRRandom &rng);
 

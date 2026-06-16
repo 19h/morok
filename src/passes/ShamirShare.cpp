@@ -54,6 +54,13 @@ bool safeCallArgs(const CallBase &CB) {
     return true;
 }
 
+ConstantInt *eligibleStoreValue(StoreInst &SI) {
+    auto *C = dyn_cast<ConstantInt>(SI.getValueOperand());
+    if (!C || !eligibleWidth(C->getType()->getIntegerBitWidth()))
+        return nullptr;
+    return C;
+}
+
 std::uint8_t lagrangeBasisAtZero(ArrayRef<core::shamir::Share> Shares,
                                  std::size_t J) {
     const std::uint8_t Xj = Shares[J].first;
@@ -243,6 +250,9 @@ bool shamirShareFunction(Function &F, const ShamirShareParams &Params,
                     if (eligibleWidth(C->getType()->getIntegerBitWidth()))
                         Targets.push_back({&I, Op, C});
                 }
+            } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+                if (auto *C = eligibleStoreValue(*SI))
+                    Targets.push_back({&I, 0, C});
             } else {
                 if (!isRewritableUser(I))
                     continue;

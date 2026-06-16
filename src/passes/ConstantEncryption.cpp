@@ -4,13 +4,13 @@
 //
 // morok/passes/ConstantEncryption.cpp
 //
-// Only operands of integer arithmetic, comparison, select, cast, return, and
-// ordinary call-argument instructions are rewritten — never switch cases, GEP
-// indices, intrinsic immediate arguments, callees, or operand bundles, which
-// must remain literal — so the output is always valid IR. The XOR-share split
-// is the verified one from morok/core/XorShare.hpp; the shares live in private
-// mutable globals and are read with volatile loads so the reconstruction
-// survives optimisation.
+// Only operands of integer arithmetic, comparison, select, cast, return, store
+// values, and ordinary call-argument instructions are rewritten — never switch
+// cases, GEP indices, store pointers, intrinsic immediate arguments, callees,
+// or operand bundles, which must remain literal — so the output is always valid
+// IR. The XOR-share split is the verified one from morok/core/XorShare.hpp; the
+// shares live in private mutable globals and are read with volatile loads so the
+// reconstruction survives optimisation.
 
 #include "morok/passes/ConstantEncryption.hpp"
 
@@ -52,6 +52,13 @@ bool safeCallArgs(const CallBase &CB) {
         if (Callee->isIntrinsic())
             return false;
     return true;
+}
+
+ConstantInt *eligibleStoreValue(StoreInst &SI) {
+    auto *C = dyn_cast<ConstantInt>(SI.getValueOperand());
+    if (!C || !eligibleWidth(C->getType()->getIntegerBitWidth()))
+        return nullptr;
+    return C;
 }
 
 Value *reconstruct(Module &M, Instruction &user, ConstantInt *c,
@@ -106,6 +113,9 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
                                     C->getType()->getIntegerBitWidth()))
                                 targets.push_back({&inst, I, C});
                     }
+                } else if (auto *SI = dyn_cast<StoreInst>(&inst)) {
+                    if (auto *C = eligibleStoreValue(*SI))
+                        targets.push_back({&inst, 0, C});
                 } else {
                     if (!isRewritableUser(inst))
                         continue;

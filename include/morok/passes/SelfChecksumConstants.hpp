@@ -26,8 +26,9 @@ struct SelfChecksumParams {
     std::uint32_t region_bytes = 32;    ///< bytes hashed by the runtime stub
 };
 
-/// Fuse selected constants with a runtime checksum diff.  The valid checksum
-/// reconstructs the original constant; tampering silently corrupts data flow.
+/// Fuse selected constant operands, including store values, with a runtime
+/// checksum diff.  The valid checksum reconstructs the original constant;
+/// tampering silently corrupts data flow.
 bool selfChecksumConstantsFunction(llvm::Function &F,
                                    const SelfChecksumParams &params,
                                    morok::ir::IRRandom &rng);

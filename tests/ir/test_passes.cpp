@@ -1057,6 +1057,34 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("constantEncryptFunction rewrites store value literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define void @const_store(ptr %p) {
+entry:
+  store i32 12345, ptr %p, align 4
+  ret void
+}
+)ir");
+    Function *F = M->getFunction("const_store");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(505);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::constantEncryptFunction(
+        *F, {/*prob=*/100, /*k=*/3, /*iterations=*/1}, rng));
+
+    StoreInst *Store = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+            Store = SI;
+    REQUIRE(Store);
+    CHECK_FALSE(isa<ConstantInt>(Store->getValueOperand()));
+    CHECK(Store->getPointerOperand()->getName() == "p");
+    CHECK(countGlobals(*M, "morok.share") == 3u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("constantEncryptFunction caps literal rewrites") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("const-cap", ctx);
@@ -1287,6 +1315,39 @@ entry:
     CHECK(countGlobals(*M, "morok.shamir.share") == 4u);
     CHECK(countGlobals(*M, "morok.shamir.cell") == 4u);
     CHECK(countCallsTo(*F, "morok.gf8mul") == 4u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("shamirShareFunction reconstructs store value literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define void @shamir_store(ptr %p) {
+entry:
+  store i8 37, ptr %p, align 1
+  ret void
+}
+)ir");
+    Function *F = M->getFunction("shamir_store");
+    REQUIRE(F);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x5354);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::shamirShareFunction(
+        *F,
+        {/*probability=*/100, /*threshold=*/2, /*shares=*/3,
+         /*max_secrets=*/1},
+        rng));
+
+    StoreInst *Store = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+            if (SI->getPointerOperand()->getName() == "p")
+                Store = SI;
+    REQUIRE(Store);
+    CHECK_FALSE(isa<ConstantInt>(Store->getValueOperand()));
+    CHECK(countGlobals(*M, "morok.shamir.share") == 2u);
+    CHECK(countGlobals(*M, "morok.shamir.cell") == 2u);
+    CHECK(countCallsTo(*F, "morok.gf8mul") == 2u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -4153,6 +4214,40 @@ entry:
     CHECK_FALSE(isa<ConstantInt>(Call->getArgOperand(1)));
     CHECK(countGlobals(*M, "morok.sc.mask") == 2u);
     CHECK(M->getFunction("morok.sc.diff.selfcheck_call_args") != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("selfChecksumConstantsFunction fuses store value literals") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define void @selfcheck_store(ptr %p) {
+entry:
+  store i8 37, ptr %p, align 1
+  ret void
+}
+)ir");
+    Function *F = M->getFunction("selfcheck_store");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1815);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::selfChecksumConstantsFunction(
+        *F, {/*probability=*/100, /*max_constants=*/1, /*region_bytes=*/32},
+        rng));
+
+    StoreInst *Store = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+            if (SI->getPointerOperand()->getName() == "p")
+                Store = SI;
+    REQUIRE(Store);
+    CHECK_FALSE(isa<ConstantInt>(Store->getValueOperand()));
+    CHECK(Store->getValueOperand()->getName().starts_with("morok.sc.const"));
+    CHECK(countGlobals(*M, "morok.sc.region") == 1u);
+    CHECK(countGlobals(*M, "morok.sc.expected") == 1u);
+    CHECK(countGlobals(*M, "morok.sc.mask") == 1u);
+    CHECK(countGlobals(*M, "morok.postlink.sc") == 1u);
+    CHECK(M->getFunction("morok.sc.diff.selfcheck_store") != nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

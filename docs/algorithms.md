@@ -57,7 +57,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   Runtime reverses: XOR-fold shares → workC → inverse Feistel → origC.
 - k-share when `k>=3` (k clamp 2..8), else classic single-XOR for selected
   `i1` through `i64` integer constants in binary, comparison, `select`, cast,
-  return, and ordinary call-argument operands.  Shares: private non-const
+  return, store-value, and ordinary call-argument operands.  Store pointers,
+  callees, GEP indices, switch cases, intrinsic immediates, and operand bundles
+  remain structural and are never rewritten.  Shares: private non-const
   `morok.share` globals loaded volatilely at each rewritten use.
 - Feistel: balanced, 4 rounds, per-round odd multiplier + xor key (random, masked to
   half width). `feistelEncrypt/Decrypt(value, bits, keys)`.
@@ -474,11 +476,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   `morok.sc.expected.*` hash globals; a post-link rewriter can replace those
   regions and expected hashes with final native code slices.
 - Each selected `i1` through `i64` integer constant in binary, comparison,
-  `select`, cast, return, and ordinary call-argument operands is reconstructed as
-  `encoded ^ volatile_mask ^ (runtime_hash(region) ^ expected_hash)`.  When the
-  region matches the expected hash, the diff is zero and the original constant
-  appears.  If bytes change without updating the expected hash, the diff flows
-  into the program value and silently corrupts output.
+  `select`, cast, return, store-value, and ordinary call-argument operands is
+  reconstructed as `encoded ^ volatile_mask ^ (runtime_hash(region) ^
+  expected_hash)`.  When the region matches the expected hash, the diff is zero
+  and the original constant appears.  If bytes change without updating the
+  expected hash, the diff flows into the program value and silently corrupts
+  output.
 - The pass deliberately emits no trap and no check branch.  The integrity value
   is data, so there is no separable success/failure edge to patch out.
 - Runtime hash helpers are internal `morok.sc.diff.*` functions with volatile
@@ -552,8 +555,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   every 3-of-5 subset for all 256 byte secrets, invalid-parameter clamps, and
   constexpr reconstruction.
 - The pass targets safe `i1` through `i64` constant operands of integer binary
-  ops, `icmp`, `select`, casts, returns, and ordinary call arguments, then caps
-  selected secrets by `max_secrets` after the per-operand probability gate.
+  ops, `icmp`, `select`, casts, returns, store values, and ordinary call
+  arguments, then caps selected secrets by `max_secrets` after the per-operand
+  probability gate.  Store pointers and other structural operands are skipped.
   Values are split into the covering
   little-endian bytes and truncated back to the exact source width after
   reconstruction.

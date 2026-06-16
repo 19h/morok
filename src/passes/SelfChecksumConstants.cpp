@@ -81,6 +81,16 @@ bool safeCallArgs(const CallBase &CB) {
     return true;
 }
 
+ConstantInt *eligibleStoreValue(StoreInst &SI) {
+    auto *C = dyn_cast<ConstantInt>(SI.getValueOperand());
+    if (!C)
+        return nullptr;
+    auto *Ty = dyn_cast<IntegerType>(C->getType());
+    if (!Ty || !eligibleWidth(Ty->getBitWidth()))
+        return nullptr;
+    return C;
+}
+
 std::uint64_t hashStep(std::uint64_t H, std::uint8_t B) {
     H ^= static_cast<std::uint64_t>(B);
     H *= 0xff51afd7ed558ccdULL;
@@ -137,6 +147,9 @@ std::vector<Target> collectTargets(Function &F) {
                         continue;
                     Targets.push_back({&I, Op, C});
                 }
+            } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+                if (auto *C = eligibleStoreValue(*SI))
+                    Targets.push_back({&I, 0, C});
             } else {
                 if (!isRewritableUser(I))
                     continue;
