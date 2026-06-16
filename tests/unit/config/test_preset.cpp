@@ -12,12 +12,14 @@ TEST_CASE("preset names round-trip") {
     CHECK(parsePreset("low") == Preset::Low);
     CHECK(parsePreset("mid") == Preset::Mid);
     CHECK(parsePreset("high") == Preset::High);
+    CHECK(parsePreset("max") == Preset::Max);
     CHECK(parsePreset("none") == Preset::None);
     CHECK(parsePreset("") == Preset::None);
     CHECK(parsePreset("bogus") == Preset::None);
     CHECK(presetName(Preset::Low) == "low");
     CHECK(presetName(Preset::Mid) == "mid");
     CHECK(presetName(Preset::High) == "high");
+    CHECK(presetName(Preset::Max) == "max");
     CHECK(presetName(Preset::None) == "none");
 }
 
@@ -319,4 +321,76 @@ TEST_CASE("high preset matches the documented table") {
     CHECK(c.func_wrap.probability == 20u);
     CHECK(c.func_wrap.times == 1u);
     CHECK(c.fco.enabled == true);
+}
+
+TEST_CASE("max preset enables every pass at full intensity") {
+    const PassConfig c = presetConfig(Preset::Max);
+
+    // Every toggleable pass is enabled — including the four the `high` preset
+    // leaves off (mutual_guard, adversarial_merge, adversarial_tuning, flatten)
+    // and the runtime anti-analysis trio.
+    CHECK(c.bcf.enabled == true);
+    CHECK(c.sub.enabled == true);
+    CHECK(c.mba.enabled == true);
+    CHECK(c.str_enc.enabled == true);
+    CHECK(c.const_enc.enabled == true);
+    CHECK(c.split.enabled == true);
+    CHECK(c.stack_coalesce.enabled == true);
+    CHECK(c.stack_delta.enabled == true);
+    CHECK(c.pointer_launder.enabled == true);
+    CHECK(c.type_pun.enabled == true);
+    CHECK(c.phi_tangle.enabled == true);
+    CHECK(c.alias_op.enabled == true);
+    CHECK(c.external_op.enabled == true);
+    CHECK(c.coherent_decoy.enabled == true);
+    CHECK(c.data_entangled_flatten.enabled == true);
+    CHECK(c.non_invertible_state.enabled == true);
+    CHECK(c.state_opaque.enabled == true);
+    CHECK(c.interprocedural_fsm.enabled == true);
+    CHECK(c.opt_amplify.enabled == true);
+    CHECK(c.table_arith.enabled == true);
+    CHECK(c.sub_threshold.enabled == true);
+    CHECK(c.uniform_lower.enabled == true);
+    CHECK(c.virtualization.enabled == true);
+    CHECK(c.hash_self_decrypt.enabled == true);
+    CHECK(c.self_checksum.enabled == true);
+    CHECK(c.data_flow_integrity.enabled == true);
+    CHECK(c.mutual_guard.enabled == true);
+    CHECK(c.shamir_share.enabled == true);
+    CHECK(c.mq_gate.enabled == true);
+    CHECK(c.adversarial_merge.enabled == true);
+    CHECK(c.adversarial_tuning.enabled == true);
+    CHECK(c.per_build_polymorphism.enabled == true);
+    CHECK(c.path_explosion.enabled == true);
+    CHECK(c.trace_keying.enabled == true);
+    CHECK(c.dispatcherless.enabled == true);
+    CHECK(c.microcode_stress.enabled == true);
+    CHECK(c.vec.enabled == true);
+    CHECK(c.csm.enabled == true);
+    CHECK(c.flatten.enabled == true);
+    CHECK(c.indir_branch.enabled == true);
+    CHECK(c.func_wrap.enabled == true);
+    CHECK(c.fco.enabled == true);
+    CHECK(c.anti_hook.enabled == true);
+    CHECK(c.anti_dbg.enabled == true);
+    CHECK(c.anti_class_dump.enabled == true);
+
+    // Probabilities are pinned at 100 and budgets exceed the high preset.
+    CHECK(c.bcf.probability == 100u);
+    CHECK(c.sub.probability == 100u);
+    CHECK(c.mba.probability == 100u);
+    CHECK(c.virtualization.probability == 100u);
+    CHECK(c.virtualization.max_functions == 16u);
+    CHECK(c.virtualization.max_instructions == 256u);
+    CHECK(c.virtualization.max_registers == 128u);
+    CHECK(c.vec.width == 512u);
+    CHECK(c.const_enc.share_count == 8u);
+    CHECK(c.func_wrap.times == 2u);
+
+    // Max is strictly at least as strong as high on shared scalar knobs.
+    const PassConfig h = presetConfig(Preset::High);
+    CHECK(c.bcf.probability >= h.bcf.probability);
+    CHECK(c.mba.probability >= h.mba.probability);
+    CHECK(c.virtualization.max_instructions >= h.virtualization.max_instructions);
+    CHECK(c.vec.width >= h.vec.width);
 }

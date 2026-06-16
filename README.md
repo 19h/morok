@@ -94,7 +94,12 @@ The scheduler has hard instruction/block/module budgets and skips growth passes
 once a function or module is too large.  The `high` preset is bounded-aggressive:
 it enables small capped slices of VM lifting, hash self-decrypt, DFI,
 self-checks, MQ, microcode stress, and call-site wrapping while keeping
-adversarial clone/merge tuning as explicit opt-ins.  String encryption also has
+adversarial clone/merge tuning as explicit opt-ins.  The `max` preset turns
+*everything* on — every pass enabled, every probability at 100, every budget at
+its proven ceiling (including mutual-guard, adversarial merge/outline and
+self-tuning, plain flattening, and the runtime anti-analysis trio) — and is the
+strongest configuration the whole sample corpus still compiles under.  String
+encryption also has
 direct byte caps so large global literals do not expand into unbounded
 constructor IR.  Standalone growth-heavy passes have fixed local caps for table,
 CFG-route, and call-site collection.
@@ -170,9 +175,9 @@ Every obfuscation pass is implemented as a New-PM pass, each available standalon
 
 Every pass is exercised by an IR-validity test, and the value/control-flow
 passes are additionally proven semantics-preserving by the end-to-end
-differential tests across the `low`/`mid`/`high` presets.  The `high` preset
-stacks the bounded aggressive pipeline and still reproduces the reference
-output byte-for-byte.
+differential tests across the `low`/`mid`/`high`/`max` presets.  The `max`
+preset stacks every pass at full intensity and still reproduces the reference
+output byte-for-byte, and the entire `programs/` corpus compiles under it.
 
 Faithfulness note for the current LLVM: indirect-branch keys the table index
 rather than multiplicatively encrypting the loaded pointer (modern LLVM forbids

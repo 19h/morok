@@ -82,7 +82,7 @@ cl::opt<std::string>
                     cl::desc("Path to a Morok TOML configuration file."));
 cl::opt<std::string>
     MorokPreset("morok-preset", cl::init(""), cl::NotHidden,
-                cl::desc("Obfuscation preset: low | mid | high."));
+                cl::desc("Obfuscation preset: low | mid | high | max."));
 cl::opt<std::uint64_t>
     MorokSeed("morok-seed", cl::init(0),
               cl::desc("Deterministic PRNG seed (0 = entropy)."));

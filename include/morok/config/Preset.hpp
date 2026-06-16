@@ -13,8 +13,9 @@
 
 namespace morok::config {
 
-/// Intensity presets.  `None` leaves everything unset (pure cl::opt defaults).
-enum class Preset { None, Low, Mid, High };
+/// Intensity presets.  `None` leaves everything unset (pure cl::opt defaults);
+/// `Max` enables every pass at full probability and the largest budgets.
+enum class Preset { None, Low, Mid, High, Max };
 
 /// Parse a preset name; unknown / empty strings map to `None`.
 Preset parsePreset(std::string_view name) noexcept;

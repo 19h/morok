@@ -21,6 +21,8 @@ Preset parsePreset(std::string_view name) noexcept {
         return Preset::Mid;
     if (name == "high")
         return Preset::High;
+    if (name == "max")
+        return Preset::Max;
     return Preset::None;
 }
 
@@ -32,6 +34,8 @@ std::string_view presetName(Preset p) noexcept {
         return "mid";
     case Preset::High:
         return "high";
+    case Preset::Max:
+        return "max";
     case Preset::None:
         break;
     }
@@ -677,6 +681,230 @@ PassConfig makeHigh() {
     return c;
 }
 
+// The maximum-intensity preset: every pass enabled, every probability at 100,
+// and every budget at its proven ceiling.  The values mirror the validated
+// `tests/e2e/max.toml` (the full corpus compiles at exactly these settings),
+// with the handful of fields that file leaves to the `high` base cranked up
+// further here.  This is the strongest configuration the project ships.
+PassConfig makeMax() {
+    PassConfig c;
+    c.bcf.enabled = true;
+    c.bcf.probability = 100;
+    c.bcf.iterations = 3;
+    c.bcf.complexity = 8;
+    c.bcf.entropy_chain = true;
+    c.bcf.junk_asm = true;
+    c.bcf.junk_asm_min = 3;
+    c.bcf.junk_asm_max = 6;
+
+    c.sub.enabled = true;
+    c.sub.probability = 100;
+    c.sub.iterations = 3;
+
+    c.mba.enabled = true;
+    c.mba.probability = 100;
+    c.mba.layers = 3;
+    c.mba.heuristic = true;
+
+    c.str_enc.enabled = true;
+    c.str_enc.probability = 100;
+
+    c.const_enc.enabled = true;
+    c.const_enc.iterations = 3;
+    c.const_enc.share_count = 8;
+    c.const_enc.feistel = true;
+    c.const_enc.substitute_xor = true;
+    c.const_enc.substitute_xor_prob = 100;
+    c.const_enc.globalize = true;
+    c.const_enc.globalize_prob = 100;
+
+    c.split.enabled = true;
+    c.split.splits = 8;
+    c.split.stack_confusion = true;
+
+    c.stack_coalesce.enabled = true;
+    c.stack_coalesce.probability = 100;
+    c.stack_coalesce.opaque_offsets = true;
+
+    c.stack_delta.enabled = true;
+    c.stack_delta.probability = 100;
+    c.stack_delta.max_blocks = 10;
+    c.stack_delta.min_bytes = 17;
+    c.stack_delta.max_extra_bytes = 96;
+    c.stack_delta.touches = 4;
+
+    c.pointer_launder.enabled = true;
+    c.pointer_launder.pointer_probability = 100;
+    c.pointer_launder.integer_probability = 100;
+
+    c.type_pun.enabled = true;
+    c.type_pun.probability = 100;
+    c.type_pun.include_floating = true;
+    c.type_pun.max_targets = 64;
+
+    c.phi_tangle.enabled = true;
+    c.phi_tangle.probability = 100;
+    c.phi_tangle.layers = 3;
+    c.phi_tangle.max_phis = 48;
+
+    c.alias_op.enabled = true;
+    c.alias_op.probability = 100;
+    c.alias_op.iterations = 3;
+    c.alias_op.max_blocks = 16;
+
+    c.external_op.enabled = true;
+    c.external_op.probability = 100;
+    c.external_op.max_blocks = 16;
+    c.external_op.decoy_stores = 3;
+
+    c.coherent_decoy.enabled = true;
+    c.coherent_decoy.probability = 100;
+    c.coherent_decoy.max_blocks = 12;
+    c.coherent_decoy.depth = 6;
+
+    c.data_entangled_flatten.enabled = true;
+    c.data_entangled_flatten.max_terms = 8;
+
+    c.non_invertible_state.enabled = true;
+    c.non_invertible_state.max_terms = 8;
+    c.non_invertible_state.rounds = 5;
+
+    c.state_opaque.enabled = true;
+    c.state_opaque.probability = 100;
+    c.state_opaque.max_blocks = 48;
+    c.state_opaque.max_terms = 8;
+
+    c.interprocedural_fsm.enabled = true;
+    c.interprocedural_fsm.probability = 100;
+    c.interprocedural_fsm.max_sites = 96;
+    c.interprocedural_fsm.max_terms = 8;
+
+    c.opt_amplify.enabled = true;
+    c.opt_amplify.probability = 100;
+    c.opt_amplify.max_forms = 4;
+
+    c.table_arith.enabled = true;
+    c.table_arith.probability = 100;
+    c.table_arith.max_tables = 12;
+
+    c.sub_threshold.enabled = true;
+    c.sub_threshold.probability = 100;
+    c.sub_threshold.max_terms = 4;
+
+    c.uniform_lower.enabled = true;
+    c.uniform_lower.op_probability = 100;
+    c.uniform_lower.branch_probability = 100;
+    c.uniform_lower.max_tables = 8;
+    c.uniform_lower.max_branches = 12;
+
+    c.virtualization.enabled = true;
+    c.virtualization.probability = 100;
+    c.virtualization.max_functions = 16;
+    c.virtualization.max_instructions = 256;
+    c.virtualization.max_registers = 128;
+
+    c.hash_self_decrypt.enabled = true;
+    c.hash_self_decrypt.probability = 100;
+    c.hash_self_decrypt.max_payloads = 16;
+    c.hash_self_decrypt.context_keying = true;
+
+    c.self_checksum.enabled = true;
+    c.self_checksum.probability = 100;
+    c.self_checksum.max_constants = 12;
+    c.self_checksum.region_bytes = 48;
+
+    c.data_flow_integrity.enabled = true;
+    c.data_flow_integrity.probability = 100;
+    c.data_flow_integrity.max_tables = 4;
+    c.data_flow_integrity.region_bytes = 48;
+
+    c.mutual_guard.enabled = true;
+    c.mutual_guard.probability = 100;
+    c.mutual_guard.nodes = 3;
+    c.mutual_guard.region_bytes = 48;
+    c.mutual_guard.max_returns = 2;
+
+    c.shamir_share.enabled = true;
+    c.shamir_share.probability = 100;
+    c.shamir_share.threshold = 3;
+    c.shamir_share.shares = 5;
+    c.shamir_share.max_secrets = 24;
+
+    c.mq_gate.enabled = true;
+    c.mq_gate.probability = 100;
+    c.mq_gate.vars = 24;
+    c.mq_gate.eqs = 24;
+    c.mq_gate.density = 50;
+    c.mq_gate.max_gates = 2;
+    c.mq_gate.fold_diff = true;
+
+    c.adversarial_merge.enabled = true;
+    c.adversarial_merge.probability = 100;
+    c.adversarial_merge.max_groups = 1;
+    c.adversarial_merge.max_functions = 3;
+    c.adversarial_merge.outline_probability = 100;
+    c.adversarial_merge.max_outlines = 4;
+
+    c.adversarial_tuning.enabled = true;
+    c.adversarial_tuning.max_candidates = 2;
+    c.adversarial_tuning.max_candidate_passes = 2;
+    c.adversarial_tuning.score_floor = 0;
+    c.adversarial_tuning.emit_marker = true;
+
+    c.per_build_polymorphism.enabled = true;
+    c.per_build_polymorphism.function_order = true;
+    c.per_build_polymorphism.block_order = true;
+    c.per_build_polymorphism.anchor_probability = 100;
+    c.per_build_polymorphism.max_anchors = 48;
+
+    c.path_explosion.enabled = true;
+    c.path_explosion.probability = 100;
+    c.path_explosion.max_blocks = 4;
+    c.path_explosion.max_iterations = 16;
+
+    c.trace_keying.enabled = true;
+    c.trace_keying.probability = 100;
+    c.trace_keying.max_blocks = 8;
+
+    c.dispatcherless.enabled = true;
+    c.dispatcherless.probability = 100;
+    c.dispatcherless.max_routes = 24;
+    c.dispatcherless.max_terms = 6;
+
+    c.microcode_stress.enabled = true;
+    c.microcode_stress.probability = 100;
+    c.microcode_stress.max_sites = 3;
+    c.microcode_stress.table_entries = 32;
+    c.microcode_stress.decoy_blocks = 8;
+    c.microcode_stress.alias_stores = 2;
+
+    c.vec.enabled = true;
+    c.vec.probability = 100;
+    c.vec.width = 512;
+    c.vec.shuffle = true;
+    c.vec.lift_comparisons = true;
+
+    c.csm.enabled = true;
+    c.csm.generator = CsmGenerator::TFunction;
+    c.csm.tf_const = 0;
+    c.csm.nested_dispatch = true;
+    c.csm.warmup = 256;
+
+    c.flatten.enabled = true;
+    c.indir_branch.enabled = true;
+
+    c.func_wrap.enabled = true;
+    c.func_wrap.probability = 100;
+    c.func_wrap.times = 2;
+
+    c.fco.enabled = true;
+
+    c.anti_hook.enabled = true;
+    c.anti_dbg.enabled = true;
+    c.anti_class_dump.enabled = true;
+    return c;
+}
+
 } // namespace
 
 PassConfig presetConfig(Preset p) {
@@ -687,6 +915,8 @@ PassConfig presetConfig(Preset p) {
         return makeMid();
     case Preset::High:
         return makeHigh();
+    case Preset::Max:
+        return makeMax();
     case Preset::None:
         break;
     }

@@ -16,7 +16,7 @@ set(_driver "${CMAKE_CURRENT_SOURCE_DIR}/differential.sh")
 set(_program_sweep "${CMAKE_CURRENT_SOURCE_DIR}/compile_programs.sh")
 set(_max_config "${CMAKE_CURRENT_SOURCE_DIR}/max.toml")
 
-foreach(preset low mid high)
+foreach(preset low mid high max)
   add_test(NAME "e2e/differential_${preset}"
     COMMAND bash "${_driver}"
             "${CMAKE_C_COMPILER}"
@@ -31,7 +31,9 @@ foreach(preset low mid high)
     REQUIRED_FILES "$<TARGET_FILE:morok_plugin>")
 endforeach()
 
-add_test(NAME "e2e/differential_max"
+# Same maximal intensity, but driven from the TOML config file path rather than
+# the built-in preset, so the loader/resolver merge is exercised end-to-end too.
+add_test(NAME "e2e/differential_maxtoml"
   COMMAND bash "${_driver}"
           "${CMAKE_C_COMPILER}"
           "$<TARGET_FILE:morok_plugin>"
@@ -39,7 +41,7 @@ add_test(NAME "e2e/differential_max"
           "${_workload}"
           "${_max_config}"
           4242)
-set_tests_properties("e2e/differential_max" PROPERTIES
+set_tests_properties("e2e/differential_maxtoml" PROPERTIES
   LABELS "e2e;max"
   REQUIRED_FILES "$<TARGET_FILE:morok_plugin>;${_max_config}")
 
@@ -69,4 +71,20 @@ add_test(NAME "e2e/programs_max_compile"
 set_tests_properties("e2e/programs_max_compile" PROPERTIES
   LABELS "e2e;programs;max"
   REQUIRED_FILES "$<TARGET_FILE:morok_plugin>;${_max_config}"
+  TIMEOUT 900)
+
+# The canonical "maximum settings" gate: every sample program must compile
+# clean and through the plugin at the built-in `max` preset.
+add_test(NAME "e2e/programs_maxpreset_compile"
+  COMMAND bash "${_program_sweep}"
+          "${CMAKE_C_COMPILER}"
+          "${CMAKE_CXX_COMPILER}"
+          "$<TARGET_FILE:morok_plugin>"
+          "${CMAKE_OSX_SYSROOT}"
+          "${PROJECT_SOURCE_DIR}/programs"
+          "max"
+          4242)
+set_tests_properties("e2e/programs_maxpreset_compile" PROPERTIES
+  LABELS "e2e;programs;max"
+  REQUIRED_FILES "$<TARGET_FILE:morok_plugin>"
   TIMEOUT 900)
