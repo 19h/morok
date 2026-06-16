@@ -2154,6 +2154,65 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("coherentDecoysFunction adds floating scalar return alternatives") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define float @score_float(float %a, float %b, i32 %n) {
+entry:
+  %i = sitofp i32 %n to float
+  %x = fadd float %a, %b
+  %y = fmul float %x, %i
+  ret float %y
+}
+
+define double @score_double(double %a, double %b, i64 %n) {
+entry:
+  %i = sitofp i64 %n to double
+  %x = fsub double %a, %b
+  %y = fmul double %x, %i
+  ret double %y
+}
+)ir");
+    Function *FloatF = M->getFunction("score_float");
+    Function *DoubleF = M->getFunction("score_double");
+    REQUIRE(FloatF);
+    REQUIRE(DoubleF);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1312);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::coherentDecoysFunction(
+        *FloatF, {/*probability=*/100, /*max_blocks=*/4, /*depth=*/8}, rng));
+    CHECK(morok::passes::coherentDecoysFunction(
+        *DoubleF, {/*probability=*/100, /*max_blocks=*/4, /*depth=*/8}, rng));
+
+    bool hasFloatAlt = false;
+    bool hasDoubleAlt = false;
+    bool hasFpAltArithmetic = false;
+    for (BasicBlock &BB : *FloatF) {
+        if (!BB.getName().starts_with("morok.decoy.alt"))
+            continue;
+        if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+            hasFloatAlt |= RI->getReturnValue()->getType()->isFloatTy();
+        for (Instruction &I : BB)
+            hasFpAltArithmetic |= I.getName().starts_with("morok.decoy.alt") &&
+                                  I.getType()->isFloatingPointTy();
+    }
+    for (BasicBlock &BB : *DoubleF) {
+        if (!BB.getName().starts_with("morok.decoy.alt"))
+            continue;
+        if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+            hasDoubleAlt |= RI->getReturnValue()->getType()->isDoubleTy();
+        for (Instruction &I : BB)
+            hasFpAltArithmetic |= I.getName().starts_with("morok.decoy.alt") &&
+                                  I.getType()->isFloatingPointTy();
+    }
+
+    CHECK(hasFloatAlt);
+    CHECK(hasDoubleAlt);
+    CHECK(hasFpAltArithmetic);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("coherentDecoysFunction honors zero probability") {
     LLVMContext ctx;
     auto M = parse(ctx, kArith);

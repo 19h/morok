@@ -319,18 +319,20 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   alias-invariant predicates before later CFG passes absorb the extra edges.
 
 ## Coherent decoy dead paths — IR structure
-- The pass selects integer-return blocks of any bit width, splits the return
-  into a real return block and a `morok.decoy.alt` false arm, then guards the
-  real path with an opaque-true predicate from two volatile loads of private
+- The pass selects scalar integer or floating-point return blocks, splits the
+  return into a real return block and a `morok.decoy.alt` false arm, then guards
+  the real path with an opaque-true predicate from two volatile loads of private
   global `morok.decoy.opaque`.
 - The false arm does not rejoin and does not contain arbitrary junk.  It returns
-  a type-correct alternate value computed from the real return value, integer
-  function arguments, and live integer values visible at the split point.  The
-  arithmetic is deliberately plausible (`xor`/`add`/odd `mul` folds) so static
+  a type-correct alternate value computed from the real return value, function
+  arguments, and live values visible at the split point.  Integer returns use
+  plausible `xor`/`add`/odd `mul` folds.  Floating returns (`half`, `bfloat`,
+  `float`, `double`) fold compatible FP terms and integer terms converted into
+  the return type through ordinary `fadd`/`fsub`/`fmul` arithmetic, so static
   triage cannot discard the arm by spotting meaningless noise.
 - Runtime semantics are preserved because the volatile predicate is true for
   the private global at execution, while LLVM may not fold the volatile loads.
-  The pass skips void/non-integer returns and generated `morok.decoy.*` blocks.
+  The pass skips void, aggregate/vector, and generated `morok.decoy.*` blocks.
 - Scheduler placement is after AliasOpaquePredicates and before flattening, so
   flattening/IFSM/dispatcherless routing absorb coherent dead arms as ordinary
   CFG rather than exposing a late BCF signature.

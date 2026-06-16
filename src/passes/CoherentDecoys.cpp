@@ -4,10 +4,10 @@
 //
 // morok/passes/CoherentDecoys.cpp
 //
-// Coherent decoy dead paths.  Each selected integer return is split into a
-// guard block, the real return block, and a dead alternate return block.  The
-// guard uses two volatile loads from a private global, so the predicate is true
-// at runtime but not foldable.  The decoy return computes a type-correct value
+// Coherent decoy dead paths.  Each selected scalar return is split into a guard
+// block, the real return block, and a dead alternate return block.  The guard
+// uses two volatile loads from a private global, so the predicate is true at
+// runtime but not foldable.  The decoy return computes a type-correct value
 // from real inputs and live values rather than emitting arbitrary junk.
 
 #include "morok/passes/CoherentDecoys.hpp"
@@ -61,8 +61,11 @@ bool eligibleReturn(ReturnInst &RI) {
     Value *Ret = RI.getReturnValue();
     if (!Ret)
         return false;
-    auto *IT = dyn_cast<IntegerType>(Ret->getType());
-    return IT && IT->getBitWidth() > 0;
+    Type *Ty = Ret->getType();
+    if (auto *IT = dyn_cast<IntegerType>(Ty))
+        return IT->getBitWidth() > 0;
+    return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+           Ty->isDoubleTy();
 }
 
 std::vector<ReturnInst *> collectReturns(Function &F) {
@@ -83,7 +86,16 @@ void shuffleReturns(std::vector<ReturnInst *> &Returns, ir::IRRandom &rng) {
     }
 }
 
-Value *asReturnType(IRBuilder<NoFolder> &B, Value *V, IntegerType *RetTy) {
+bool isCompatibleTerm(Type *RetTy, Type *TermTy) {
+    if (RetTy->isIntegerTy())
+        return TermTy->isIntegerTy();
+    return TermTy->isIntegerTy() || TermTy->isHalfTy() ||
+           TermTy->isBFloatTy() || TermTy->isFloatTy() ||
+           TermTy->isDoubleTy();
+}
+
+Value *asIntegerReturnType(IRBuilder<NoFolder> &B, Value *V,
+                           IntegerType *RetTy) {
     if (!V || !V->getType()->isIntegerTy())
         return nullptr;
     if (V->getType() == RetTy)
@@ -98,27 +110,48 @@ Value *asReturnType(IRBuilder<NoFolder> &B, Value *V, IntegerType *RetTy) {
     return B.CreateIntCast(V, RetTy, false, "morok.decoy.alt.cast");
 }
 
-void addTerm(Value *V, SmallPtrSetImpl<Value *> &Seen,
+Value *asFloatingReturnType(IRBuilder<NoFolder> &B, Value *V, Type *RetTy) {
+    if (!V)
+        return nullptr;
+    Type *Ty = V->getType();
+    if (Ty == RetTy)
+        return V;
+    if (Ty->isIntegerTy())
+        return B.CreateSIToFP(V, RetTy, "morok.decoy.alt.sitofp");
+    if (Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+        Ty->isDoubleTy())
+        return B.CreateFPCast(V, RetTy, "morok.decoy.alt.fpcast");
+    return nullptr;
+}
+
+Value *asReturnType(IRBuilder<NoFolder> &B, Value *V, Type *RetTy) {
+    if (auto *IT = dyn_cast<IntegerType>(RetTy))
+        return asIntegerReturnType(B, V, IT);
+    return asFloatingReturnType(B, V, RetTy);
+}
+
+void addTerm(Value *V, Type *RetTy, SmallPtrSetImpl<Value *> &Seen,
              std::vector<Value *> &Terms) {
-    if (!V || !V->getType()->isIntegerTy())
+    if (!V || !isCompatibleTerm(RetTy, V->getType()))
         return;
     if (Seen.insert(V).second)
         Terms.push_back(V);
 }
 
-std::vector<Value *> collectTerms(ReturnInst &RI) {
+std::vector<Value *> collectTerms(ReturnInst &RI, BasicBlock &VisibleBlock) {
     std::vector<Value *> Terms;
     SmallPtrSet<Value *, 32> Seen;
+    Type *RetTy = RI.getReturnValue()->getType();
     Function *F = RI.getFunction();
     for (Argument &Arg : F->args())
-        addTerm(&Arg, Seen, Terms);
+        addTerm(&Arg, RetTy, Seen, Terms);
 
-    for (Instruction &I : *RI.getParent()) {
-        if (&I == &RI)
+    for (Instruction &I : VisibleBlock) {
+        if (I.isTerminator())
             break;
         if (isa<AllocaInst>(&I))
             continue;
-        addTerm(&I, Seen, Terms);
+        addTerm(&I, RetTy, Seen, Terms);
     }
     return Terms;
 }
@@ -130,18 +163,22 @@ void shuffleTerms(std::vector<Value *> &Terms, ir::IRRandom &rng) {
     }
 }
 
-Value *buildAlternateValue(IRBuilder<NoFolder> &B, ReturnInst &RI,
-                           const CoherentDecoyParams &Params,
-                           ir::IRRandom &rng) {
+double fpSalt(ir::IRRandom &rng) {
+    const auto Raw = static_cast<std::uint32_t>(rng.next());
+    const double Mag = static_cast<double>((Raw & 0xffu) + 1u) / 13.0;
+    return (Raw & 0x100u) ? -Mag : Mag;
+}
+
+Value *buildIntegerAlternateValue(IRBuilder<NoFolder> &B, ReturnInst &RI,
+                                  ArrayRef<Value *> Terms,
+                                  const CoherentDecoyParams &Params,
+                                  ir::IRRandom &rng) {
     auto *RetTy = cast<IntegerType>(RI.getReturnValue()->getType());
     Value *Alt = RI.getReturnValue();
     Alt = B.CreateXor(Alt,
                       ConstantInt::get(RetTy,
                                        static_cast<std::uint64_t>(rng.next())),
                       "morok.decoy.alt.seed");
-
-    std::vector<Value *> Terms = collectTerms(RI);
-    shuffleTerms(Terms, rng);
     const std::uint32_t Limit = std::min<std::uint32_t>(
         Params.depth, static_cast<std::uint32_t>(Terms.size()));
 
@@ -160,6 +197,43 @@ Value *buildAlternateValue(IRBuilder<NoFolder> &B, ReturnInst &RI,
     }
 
     return Alt;
+}
+
+Value *buildFloatingAlternateValue(IRBuilder<NoFolder> &B, ReturnInst &RI,
+                                   ArrayRef<Value *> Terms,
+                                   const CoherentDecoyParams &Params,
+                                   ir::IRRandom &rng) {
+    Type *RetTy = RI.getReturnValue()->getType();
+    Value *Alt = B.CreateFAdd(RI.getReturnValue(),
+                              ConstantFP::get(RetTy, fpSalt(rng)),
+                              "morok.decoy.alt.seed");
+    const std::uint32_t Limit = std::min<std::uint32_t>(
+        Params.depth, static_cast<std::uint32_t>(Terms.size()));
+
+    for (std::uint32_t I = 0; I < Limit; ++I) {
+        Value *Term = asReturnType(B, Terms[I], RetTy);
+        if (!Term)
+            continue;
+        Value *Salt = ConstantFP::get(RetTy, fpSalt(rng));
+        Value *Scale = ConstantFP::get(RetTy, fpSalt(rng));
+        Value *Shift = B.CreateFSub(Term, Salt, "morok.decoy.alt.term");
+        Alt = B.CreateFAdd(Alt, Shift, "morok.decoy.alt.add");
+        Alt = B.CreateFMul(Alt, Scale, "morok.decoy.alt.mul");
+        Alt = B.CreateFSub(Alt, Term, "morok.decoy.alt.mix");
+    }
+
+    return Alt;
+}
+
+Value *buildAlternateValue(IRBuilder<NoFolder> &B, ReturnInst &RI,
+                           BasicBlock &VisibleBlock,
+                           const CoherentDecoyParams &Params,
+                           ir::IRRandom &rng) {
+    std::vector<Value *> Terms = collectTerms(RI, VisibleBlock);
+    shuffleTerms(Terms, rng);
+    if (RI.getReturnValue()->getType()->isIntegerTy())
+        return buildIntegerAlternateValue(B, RI, Terms, Params, rng);
+    return buildFloatingAlternateValue(B, RI, Terms, Params, rng);
 }
 
 Value *opaqueTrue(IRBuilder<NoFolder> &B, GlobalVariable *GV) {
@@ -182,7 +256,7 @@ bool rewriteReturn(ReturnInst *RI, GlobalVariable *GV,
 
     auto *AltBB = BasicBlock::Create(F->getContext(), kAltBlock, F, Real);
     IRBuilder<NoFolder> AltB(AltBB);
-    Value *Alt = buildAlternateValue(AltB, *RI, Params, rng);
+    Value *Alt = buildAlternateValue(AltB, *RI, *Head, Params, rng);
     AltB.CreateRet(Alt);
 
     IRBuilder<NoFolder> GuardB(HeadTerm);
