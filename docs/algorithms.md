@@ -661,9 +661,11 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   result.  Floating operation results apply that zero through raw integer
   bitcasts rather than extra FP arithmetic, preserving signed-zero and NaN
   payload bits from the outlined operation.
-- The pass skips varargs, declarations, generated `morok.*` functions,
-  personality/EH functions, noreturn/naked functions, and functions already
-  referenced by `blockaddress` constants.  The last guard avoids cloning
+- The pass accepts variadic signatures when the body does not use vararg
+  intrinsics; the original ABI remains variadic while the VM helper receives
+  only the fixed named parameters.  It skips declarations, generated `morok.*`
+  functions, personality/EH functions, noreturn/naked functions, and functions
+  already referenced by `blockaddress` constants.  The last guard avoids cloning
   post-dispatcher jump tables whose entries are tied to the original function's
   basic blocks.
 - It also skips functions above the clone budget.  AFM copies selected bodies,

@@ -197,8 +197,7 @@ std::optional<VmOp> icmpOpcode(ICmpInst &Cmp, unsigned Width) {
 }
 
 std::optional<unsigned> signatureWidth(Function &F) {
-    if (F.isDeclaration() || generatedFunction(F) || F.isVarArg() ||
-        F.hasPersonalityFn())
+    if (F.isDeclaration() || generatedFunction(F) || F.hasPersonalityFn())
         return std::nullopt;
     auto *RetTy = dyn_cast<IntegerType>(F.getReturnType());
     if (!RetTy || !supportedWidth(RetTy->getBitWidth()))
@@ -904,7 +903,12 @@ GlobalVariable *createTargetTable(Module &M, Function *Helper,
 Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                       const HandlerLayout &Layout, const Encoding &Enc) {
     Function *Src = P.source;
-    FunctionType *FT = Src->getFunctionType();
+    SmallVector<Type *, 8> Params;
+    Params.reserve(Src->arg_size());
+    for (Argument &Arg : Src->args())
+        Params.push_back(Arg.getType());
+    FunctionType *FT =
+        FunctionType::get(Src->getReturnType(), Params, /*isVarArg=*/false);
     const std::string HelperName =
         std::string("morok.vm.") + Src->getName().str() + ".exec";
     Function *Helper =

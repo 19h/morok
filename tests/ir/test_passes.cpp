@@ -5295,6 +5295,43 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("virtualizeModule lifts unused-vararg integer functions") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @vm_vararg(i32 %a, ...) {
+entry:
+  %x = add i32 %a, 5
+  %y = xor i32 %x, 17
+  ret i32 %y
+}
+)ir");
+    Function *F = M->getFunction("vm_vararg");
+    REQUIRE(F);
+    REQUIRE(F->isVarArg());
+    auto engine = morok::core::Xoshiro256pp::fromSeed(157);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::virtualizeModule(
+        *M,
+        {/*probability=*/100, /*max_functions=*/1,
+         /*max_instructions=*/16, /*max_registers=*/16},
+        rng));
+
+    Function *Helper = M->getFunction("morok.vm.vm_vararg.exec");
+    REQUIRE(Helper);
+    CHECK_FALSE(Helper->isVarArg());
+    CHECK(F->isVarArg());
+    std::size_t wrapperCalls = 0;
+    std::size_t wrapperBinops = 0;
+    for (Instruction &I : instructions(*F)) {
+        wrapperCalls += isa<CallInst>(&I) ? 1u : 0u;
+        wrapperBinops += isa<BinaryOperator>(&I) ? 1u : 0u;
+    }
+    CHECK(wrapperCalls == 1u);
+    CHECK(wrapperBinops == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("virtualizeModule skips unsupported control flow") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
