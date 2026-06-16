@@ -7019,6 +7019,38 @@ define i32 @caller(i32 %x) {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("functionWrapModule proxies a variadic call with concrete args") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+declare i32 @printf(ptr, ...)
+@.fmt = private constant [4 x i8] c"%d\0A\00"
+
+define i32 @caller(i32 %x) {
+  %r = call i32 (ptr, ...) @printf(ptr @.fmt, i32 %x)
+  ret i32 %r
+}
+)ir");
+    Function *Caller = M->getFunction("caller");
+    REQUIRE(Caller);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(253);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::functionWrapModule(*M, {/*prob=*/100, /*times=*/1},
+                                            rng));
+
+    Function *Wrap = nullptr;
+    for (Function &F : *M)
+        if (F.getName().starts_with("morok.wrap"))
+            Wrap = &F;
+
+    REQUIRE(Wrap);
+    CHECK_FALSE(Wrap->getFunctionType()->isVarArg());
+    CHECK(Wrap->arg_size() == 2u);
+    CHECK(countCallsTo(*Caller, "printf") == 0u);
+    CHECK(countCallsTo(*Wrap, "printf") == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("functionWrapModule proxies an invoke and preserves EH edges") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

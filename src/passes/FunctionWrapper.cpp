@@ -4,9 +4,9 @@
 //
 // morok/passes/FunctionWrapper.cpp
 //
-// Direct calls and invokes are wrapped: variadic callees, intrinsics, inline
-// asm, operand-bundle call sites, `callbr`, and `musttail` calls are left alone,
-// so the forwarder always has a well-defined, type-identical signature.
+// Direct calls and invokes are wrapped: intrinsics, inline asm, operand-bundle
+// call sites, `callbr`, and `musttail` calls are left alone.  Variadic callees
+// get a site-specific non-variadic wrapper matching the concrete argument list.
 
 #include "morok/passes/FunctionWrapper.hpp"
 
@@ -37,24 +37,41 @@ bool wrappable(CallBase *cb) {
         if (ci->isMustTailCall())
             return false;
     Function *callee = cb->getCalledFunction();
-    if (!callee || callee->isIntrinsic() || callee->isVarArg())
+    if (!callee || callee->isIntrinsic())
         return false;
     if (callee->getName().starts_with("morok."))
         return false;
     return true;
 }
 
-// Build an internal forwarder with the callee's exact signature.
-Function *makeForwarder(Module &M, Function *callee) {
-    FunctionType *ft = callee->getFunctionType();
+FunctionType *wrapperTypeFor(CallBase &cb) {
+    Function *callee = cb.getCalledFunction();
+    FunctionType *calleeTy = callee->getFunctionType();
+    if (!calleeTy->isVarArg())
+        return calleeTy;
+
+    std::vector<Type *> params;
+    params.reserve(cb.arg_size());
+    for (Use &arg : cb.args())
+        params.push_back(arg->getType());
+    return FunctionType::get(calleeTy->getReturnType(), params,
+                             /*isVarArg=*/false);
+}
+
+// Build an internal forwarder with either the callee's exact signature or, for
+// variadic callees, the concrete argument list used by this call site.
+Function *makeForwarder(Module &M, CallBase &cb) {
+    Function *callee = cb.getCalledFunction();
+    FunctionType *calleeTy = callee->getFunctionType();
+    FunctionType *wrapTy = wrapperTypeFor(cb);
     auto *wrap =
-        Function::Create(ft, GlobalValue::InternalLinkage, "morok.wrap", &M);
-    wrap->setCallingConv(callee->getCallingConv());
-    // Carry the callee's parameter/return/function attributes onto both the
+        Function::Create(wrapTy, GlobalValue::InternalLinkage, "morok.wrap", &M);
+    wrap->setCallingConv(cb.getCallingConv());
+    // Carry the call site's parameter/return/function attributes onto both the
     // forwarder declaration and the forwarded call, so ABI attributes
     // (byval/sret/swifterror/align/...) survive the extra indirection instead
-    // of being silently dropped (which mismatches the redirected call site).
-    const AttributeList AL = callee->getAttributes();
+    // of being silently dropped.
+    const AttributeList AL = cb.getAttributes();
     wrap->setAttributes(AL);
 
     IRBuilder<> B(BasicBlock::Create(M.getContext(), "entry", wrap));
@@ -62,11 +79,12 @@ Function *makeForwarder(Module &M, Function *callee) {
     args.reserve(wrap->arg_size());
     for (Argument &a : wrap->args())
         args.push_back(&a);
-    CallInst *fwd = B.CreateCall(ft, callee, args);
-    fwd->setCallingConv(callee->getCallingConv());
+    CallInst *fwd = B.CreateCall(calleeTy, callee, args);
+    fwd->setCallingConv(cb.getCallingConv());
     fwd->setAttributes(AL);
-    fwd->setTailCall();
-    if (ft->getReturnType()->isVoidTy())
+    if (!calleeTy->isVarArg())
+        fwd->setTailCall();
+    if (calleeTy->getReturnType()->isVoidTy())
         B.CreateRetVoid();
     else
         B.CreateRet(fwd);
@@ -108,7 +126,7 @@ bool functionWrapModule(Module &M, const FuncWrapParams &params,
         }
 
         for (CallBase *cb : targets) {
-            Function *forwarder = makeForwarder(M, cb->getCalledFunction());
+            Function *forwarder = makeForwarder(M, *cb);
             cb->setCalledFunction(forwarder);
             ++wrappers;
             changed = true;

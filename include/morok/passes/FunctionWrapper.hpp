@@ -5,8 +5,9 @@
 // morok/passes/FunctionWrapper.hpp — call-site proxying.
 //
 // Replaces direct calls and invokes with call/invoke sites targeting
-// freshly-generated forwarder functions that simply tail through to the
-// original callee.  This adds a layer of indirection at every wrapped site (and,
+// freshly-generated forwarder functions that simply forward to the original
+// callee.  Variadic callees use site-specific wrappers with the concrete
+// argument list.  This adds a layer of indirection at every wrapped site (and,
 // with multiple passes, distinct proxies for identical callees), frustrating
 // call-graph reconstruction.  It is value-neutral by construction: the
 // forwarder passes its arguments through unchanged.

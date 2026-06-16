@@ -903,7 +903,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - SelfChecksumConstants: scalar constants XORed with runtime checksum diffs for data-only tamper corruption.
 - ShamirShare: selected scalar literals reconstructed from volatile GF(2^8) threshold shares.
 - VectorObfuscation: scalar op/cast/compare/select → SIMD lifting; width 128/256/512, shuffle, lift_comparisons.
-- FunctionWrapper: polymorphic proxies; prob/times/max_wrappers/hard cap 256 call/invoke sites.
+- FunctionWrapper: polymorphic proxies including concrete variadic call/invoke sites; prob/times/max_wrappers/hard cap 256.
 - FunctionCallObfuscate: dlopen/dlsym indirection; hard cap 256 call/invoke sites.
 - AntiClassDump / AntiDebugging / AntiHooking: platform anti-analysis (module passes).
 
