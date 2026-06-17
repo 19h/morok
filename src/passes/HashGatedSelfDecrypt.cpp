@@ -283,8 +283,9 @@ Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
     BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
     BasicBlock *HashLoop = BasicBlock::Create(Ctx, "hash", Fn);
     BasicBlock *Gate = BasicBlock::Create(Ctx, "gate", Fn);
-    BasicBlock *Fail = BasicBlock::Create(Ctx, "fail", Fn);
     BasicBlock *DecryptLoop = BasicBlock::Create(Ctx, "decrypt", Fn);
+    BasicBlock *Decide = BasicBlock::Create(Ctx, "decide", Fn);
+    BasicBlock *Fail = BasicBlock::Create(Ctx, "fail", Fn);
     BasicBlock *MarkReady = BasicBlock::Create(Ctx, "ready", Fn);
     BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
 
@@ -317,7 +318,7 @@ Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
     Builder GB(Gate);
     Value *GateOk = GB.CreateICmpEQ(
         NextHash, ConstantInt::get(I64, S.expected_hash), "morok.sdb.gate");
-    GB.CreateCondBr(GateOk, DecryptLoop, Fail);
+    GB.CreateBr(DecryptLoop);
 
     Builder FB(Fail);
     Function *Trap = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::trap);
@@ -341,7 +342,10 @@ Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
     DecI->addIncoming(NextDecI, DecryptLoop);
     Value *DecryptDone = DB.CreateICmpEQ(NextDecI, ConstantInt::get(I32, Size),
                                          "morok.sdb.dec.done");
-    DB.CreateCondBr(DecryptDone, MarkReady, DecryptLoop);
+    DB.CreateCondBr(DecryptDone, Decide, DecryptLoop);
+
+    Builder ZB(Decide);
+    ZB.CreateCondBr(GateOk, MarkReady, Fail);
 
     Builder RB(MarkReady);
     auto *ReadyStore = RB.CreateStore(ConstantInt::get(I1, true), Ready);

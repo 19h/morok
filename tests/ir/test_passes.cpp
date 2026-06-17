@@ -1619,7 +1619,12 @@ entry:
                                               /*max_secrets=*/1},
                                              rng));
 
-    CHECK(M->getFunction("morok.gf8mul") != nullptr);
+    Function *Gf8Mul = M->getFunction("morok.gf8mul");
+    REQUIRE(Gf8Mul);
+    bool gf8MulHasBranch = false;
+    for (BasicBlock &BB : *Gf8Mul)
+        gf8MulHasBranch |= isa<BranchInst>(BB.getTerminator());
+    CHECK_FALSE(gf8MulHasBranch);
     CHECK(countGlobals(*M, "morok.shamir.share") == 12u);
     CHECK(countGlobals(*M, "morok.shamir.cell") == 12u);
     CHECK(countCallsTo(*F, "morok.gf8mul") == 12u);
@@ -5682,6 +5687,9 @@ entry:
     bool hasContextZero = false;
     bool keyUsesContext = false;
     bool storesPayload = false;
+    bool gateFallsIntoDecrypt = false;
+    bool decryptBranchesToDecide = false;
+    bool hasPostDecryptGateDecision = false;
     for (Instruction &I : instructions(*Helper)) {
         if (auto *CI = dyn_cast<CallInst>(&I)) {
             if (CI->getCalledFunction() == Ensure) {
@@ -5723,6 +5731,28 @@ entry:
                 "morok.sdb.payload.ptr");
         }
     }
+    for (BasicBlock &BB : *Ensure) {
+        bool blockHasGate = false;
+        for (Instruction &I : BB)
+            blockHasGate |= I.getName().starts_with("morok.sdb.gate");
+        if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator())) {
+            if (blockHasGate)
+                gateFallsIntoDecrypt =
+                    BI->isUnconditional() &&
+                    BI->getSuccessor(0)->getName() == "decrypt";
+            if (BB.getName() == "decrypt")
+                decryptBranchesToDecide =
+                    BI->isConditional() &&
+                    BI->getSuccessor(0)->getName() == "decide";
+            if (BB.getName() == "decide")
+                hasPostDecryptGateDecision =
+                    BI->isConditional() &&
+                    ((BI->getSuccessor(0)->getName() == "ready" &&
+                      BI->getSuccessor(1)->getName() == "fail") ||
+                     (BI->getSuccessor(0)->getName() == "fail" &&
+                      BI->getSuccessor(1)->getName() == "ready"));
+        }
+    }
     CHECK(helperCallsEnsure);
     CHECK(hasGate);
     CHECK(hasTrap);
@@ -5733,6 +5763,9 @@ entry:
     CHECK(hasContextZero);
     CHECK(keyUsesContext);
     CHECK(storesPayload);
+    CHECK(gateFallsIntoDecrypt);
+    CHECK(decryptBranchesToDecide);
+    CHECK(hasPostDecryptGateDecision);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

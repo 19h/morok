@@ -521,18 +521,21 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   helper calls the ensure function before its dispatch loop reads bytecode,
   passing through the helper's original arguments.
 - The ensure function first hashes the still-encrypted payload through volatile
-  byte loads.  A `morok.sdb.gate` compare must match the embedded expected hash;
-  mismatch calls `llvm.trap`.
+  byte loads.  A `morok.sdb.gate` compare is computed, but it does not branch
+  before decryption: the fixed-length decrypt loop always runs, then a
+  post-decrypt decision either marks the payload ready or calls `llvm.trap`.
+  This keeps the payload-key work shape constant and makes a patched failure
+  path carry corrupted bytecode instead of a cleanly skipped decryptor.
 - With `context_keying=true`, the ensure helper also folds VM call context into
   the stream key: each argument is volatile-stored to a local context slot,
   loaded twice, xored to a runtime zero, and mixed as `morok.sdb.key.context`.
   The correct path still decrypts exactly, but the IR key now carries
   argument-derived, volatile memory-dependent provenance instead of being a
   purely static payload-hash expression.
-- Only after the hash gate passes does the helper derive the stream key from
-  the hash, decrypt each payload byte with volatile stores, set the ready flag
-  volatile, and return.  Later calls observe the ready flag and skip the hash
-  and decrypt loops.
+- The helper derives the stream key from the computed hash, decrypts each
+  payload byte with volatile stores, sets the ready flag volatile only after the
+  post-decrypt gate succeeds, and returns.  Later calls observe the ready flag
+  and skip the hash and decrypt loops.
 - Scheduler placement is directly after Virtualization and before the
   per-function pipeline, so VM bytecode exists and generated `morok.*` helpers
   remain outside later function-local transforms.

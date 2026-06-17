@@ -25,6 +25,22 @@ namespace morok::core::gf8 {
 /// In-byte feedback term of the AES reduction polynomial x^8+x^4+x^3+x+1.
 inline constexpr std::uint8_t kReductionPoly = 0x1B;
 
+namespace detail {
+
+constexpr std::uint8_t maskFromBit(std::uint8_t bit) noexcept {
+    return static_cast<std::uint8_t>(0u - static_cast<unsigned>(bit & 1u));
+}
+
+constexpr std::uint8_t eqMask(std::uint8_t a, std::uint8_t b) noexcept {
+    std::uint8_t x = static_cast<std::uint8_t>(a ^ b);
+    x = static_cast<std::uint8_t>(x | (x >> 4));
+    x = static_cast<std::uint8_t>(x | (x >> 2));
+    x = static_cast<std::uint8_t>(x | (x >> 1));
+    return maskFromBit(static_cast<std::uint8_t>((x ^ 1u) & 1u));
+}
+
+} // namespace detail
+
 /// Addition in GF(2^8) is bitwise XOR.
 constexpr std::uint8_t add(std::uint8_t a, std::uint8_t b) noexcept {
     return static_cast<std::uint8_t>(a ^ b);
@@ -33,16 +49,20 @@ constexpr std::uint8_t add(std::uint8_t a, std::uint8_t b) noexcept {
 /// Multiply by the field generator x (i.e. by 0x02), reducing mod 0x11B.
 constexpr std::uint8_t xtime(std::uint8_t a) noexcept {
     const std::uint8_t shifted = static_cast<std::uint8_t>(a << 1);
-    return (a & 0x80u) ? static_cast<std::uint8_t>(shifted ^ kReductionPoly)
-                       : shifted;
+    const std::uint8_t reduce = static_cast<std::uint8_t>(
+        kReductionPoly &
+        detail::maskFromBit(static_cast<std::uint8_t>(a >> 7)));
+    return static_cast<std::uint8_t>(shifted ^ reduce);
 }
 
-/// Field multiplication via shift-and-add (Russian-peasant) over xtime.
+/// Field multiplication via fixed-round shift-and-add over xtime.  The
+/// multiplier bits select masked terms instead of branches, so runtime users do
+/// not leak key/share bits through branch timing.
 constexpr std::uint8_t mul(std::uint8_t a, std::uint8_t b) noexcept {
     std::uint8_t result = 0;
     for (int i = 0; i < 8; ++i) {
-        if (b & 1u)
-            result = static_cast<std::uint8_t>(result ^ a);
+        result =
+            static_cast<std::uint8_t>(result ^ (a & detail::maskFromBit(b)));
         a = xtime(a);
         b = static_cast<std::uint8_t>(b >> 1);
     }
@@ -50,15 +70,15 @@ constexpr std::uint8_t mul(std::uint8_t a, std::uint8_t b) noexcept {
 }
 
 /// Multiplicative inverse in GF(2^8).  `inv(0)` is defined as 0 by convention
-/// (the cipher never multiplies by a zero key).  Computed by exhaustive search,
-/// which is constexpr-evaluable and trivially auditable.
+/// (the cipher never multiplies by a zero key).  Computed by a fixed exhaustive
+/// scan with masked selection rather than early exit.
 constexpr std::uint8_t inv(std::uint8_t a) noexcept {
-    if (a == 0)
-        return 0;
+    std::uint8_t result = 0;
     for (unsigned b = 1; b < 256; ++b)
-        if (mul(a, static_cast<std::uint8_t>(b)) == 1)
-            return static_cast<std::uint8_t>(b);
-    return 0; // unreachable for non-zero a
+        result = static_cast<std::uint8_t>(
+            result | (static_cast<std::uint8_t>(b) &
+                      detail::eqMask(mul(a, static_cast<std::uint8_t>(b)), 1)));
+    return result;
 }
 
 // ── Vernam-GF8 per-byte cipher ───────────────────────────────────────────────
