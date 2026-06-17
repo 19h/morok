@@ -19,15 +19,20 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
 #include "llvm/Support/ModRef.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
+#include <utility>
 #include <vector>
 
 using namespace llvm;
@@ -42,6 +47,7 @@ constexpr char kSeedName[] = "morok.micro.seed";
 constexpr char kScratchName[] = "morok.micro.scratch";
 constexpr char kTableName[] = "morok.micro.table";
 constexpr char kDecoyPrefix[] = "morok.micro.decoy";
+constexpr char kAnalysisBaitName[] = "morok.micro.analysis.bait";
 
 bool isGeneratedFunction(const Function &F) {
     return F.getName().starts_with("morok.");
@@ -319,6 +325,69 @@ void rewriteSite(Function &F, BasicBlock *Body, Instruction &HeadTerm,
         IB->addDestination(Dest);
 }
 
+std::optional<std::pair<StringRef, StringRef>>
+analysisBaitAsm(const Triple &TT) {
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        return std::pair<StringRef, StringRef>{
+            "jmp 0f\n\t"
+            ".byte 0xf3,0x0f,0x1e,0xfa\n\t"
+            ".byte 0x55,0x48,0x89,0xe5\n\t"
+            ".byte 0x5d,0xc3\n\t"
+            ".byte 0x0f,0x1f,0x44,0x00,0x00\n"
+            "0:",
+            "~{dirflag},~{fpsr},~{flags},~{memory}"};
+    case Triple::x86:
+        return std::pair<StringRef, StringRef>{
+            "jmp 0f\n\t"
+            ".byte 0xf3,0x0f,0x1e,0xfb\n\t"
+            ".byte 0x55,0x89,0xe5\n\t"
+            ".byte 0x5d,0xc3\n"
+            "0:",
+            "~{dirflag},~{fpsr},~{flags},~{memory}"};
+    case Triple::aarch64:
+    case Triple::aarch64_be:
+        return std::pair<StringRef, StringRef>{
+            "b 0f\n\t"
+            ".inst 0xd503245f\n\t"
+            ".inst 0xa9bf7bfd\n\t"
+            ".inst 0x910003fd\n\t"
+            ".inst 0xa8c17bfd\n\t"
+            ".inst 0xd65f03c0\n"
+            "0:",
+            "~{memory}"};
+    default:
+        return std::nullopt;
+    }
+}
+
+void ensureAnalysisBait(Module &M) {
+    if (M.getFunction(kAnalysisBaitName))
+        return;
+
+    auto Asm = analysisBaitAsm(Triple(M.getTargetTriple()));
+    if (!Asm)
+        return;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), false);
+    auto *Fn = Function::Create(FTy, GlobalValue::InternalLinkage,
+                                kAnalysisBaitName, M);
+    Fn->setDSOLocal(true);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->addFnAttr(Attribute::Cold);
+    Fn->setAlignment(Align(16));
+
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Fn));
+    InlineAsm *IA = InlineAsm::get(FTy, Asm->first, Asm->second,
+                                   /*hasSideEffects=*/true);
+    B.CreateCall(FTy, IA);
+    B.CreateRetVoid();
+
+    appendToUsed(M, {Fn});
+    appendToCompilerUsed(M, {Fn});
+}
+
 void shuffleBlocks(std::vector<BasicBlock *> &Blocks, ir::IRRandom &rng) {
     for (std::size_t I = Blocks.size(); I > 1; --I) {
         const std::size_t J = rng.range(static_cast<std::uint32_t>(I));
@@ -371,6 +440,7 @@ bool microcodeStressFunction(Function &F, const MicrocodeStressParams &params,
     }
 
     if (Changed) {
+        ensureAnalysisBait(*F.getParent());
         relaxFunctionEffects(F);
         invalidateDirectCallers(F);
     }

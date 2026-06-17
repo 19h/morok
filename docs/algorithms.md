@@ -966,6 +966,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   `ptrtoint -> xor -> xor -> inttoptr` aliases into a per-function
   `morok.micro.scratch` frame before branching to the original body.  This
   combines goto-spaghetti CFG pressure with alias/lvar recovery pressure.
+- When the transform fires on x86/x86_64/aarch64, the module also retains a
+  cold local `morok.micro.analysis.bait` byte-sled helper.  Its inline-asm body
+  immediately jumps over bogus landing/prologue/epilogue bytes (`endbr64` on
+  x86_64, prologue-looking frame setup, fake `ret`), so normal execution is
+  unchanged while linear sweep and auto-function discovery see plausible but
+  unreachable function boundaries.
 - Scheduler placement is after TraceKeying and DispatcherlessRouting and before
   checksum/integrity fusion.  Earlier CFG transforms see ordinary structure;
   later integrity passes can hash/fuse the final microcode-stress shape.

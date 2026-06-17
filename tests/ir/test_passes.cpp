@@ -64,6 +64,7 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -7456,6 +7457,8 @@ TEST_CASE("dispatcherlessRoutingFunction caps route lowering") {
 TEST_CASE("microcodeStressFunction emits sparse aliased jump-table stress") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+
 define i32 @microstress(i32 %a, i32 %b) {
 entry:
   %x = add i32 %a, %b
@@ -7486,6 +7489,17 @@ join:
     CHECK(countNamedAllocas(*F, "morok.micro.scratch") == 1u);
     CHECK(countGlobals(*M, "morok.micro.seed") == 1u);
     CHECK(countGlobals(*M, "morok.micro.table") == 1u);
+    Function *Bait = M->getFunction("morok.micro.analysis.bait");
+    REQUIRE(Bait);
+    CHECK(Bait->hasInternalLinkage());
+    GlobalVariable *Used = M->getGlobalVariable("llvm.compiler.used");
+    REQUIRE(Used);
+    REQUIRE(Used->hasInitializer());
+    CHECK(constantReferencesGlobal(Used->getInitializer(), Bait));
+    GlobalVariable *LinkerUsed = M->getGlobalVariable("llvm.used");
+    REQUIRE(LinkerUsed);
+    REQUIRE(LinkerUsed->hasInitializer());
+    CHECK(constantReferencesGlobal(LinkerUsed->getInitializer(), Bait));
 
     auto *Table = M->getGlobalVariable("morok.micro.table", true);
     REQUIRE(Table);
@@ -7525,6 +7539,15 @@ join:
     CHECK(hasPtrToInt);
     CHECK(hasIntToPtr);
     CHECK(hasIndex);
+    bool hasAsmBait = false;
+    for (Instruction &I : instructions(*Bait)) {
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+            if (auto *Asm = dyn_cast<InlineAsm>(CB->getCalledOperand()))
+                hasAsmBait |= Asm->getAsmString().contains(
+                    ".byte 0xf3,0x0f,0x1e,0xfa");
+        }
+    }
+    CHECK(hasAsmBait);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -7603,6 +7626,7 @@ entry:
         rng));
     CHECK(countNamedAllocas(*F, "morok.micro.scratch") == 0u);
     CHECK(countGlobals(*M, "morok.micro.table") == 0u);
+    CHECK(M->getFunction("morok.micro.analysis.bait") == nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
