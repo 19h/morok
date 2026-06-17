@@ -967,12 +967,17 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   diversity means cracking one site does not crack the others. The recovered
   name is decrypted into a stack buffer that feeds `dlsym`, so a decompiler sees
   `dlsym(RTLD_DEFAULT, <computed buffer>)` with no symbol to annotate.
-- AntiClassDump / AntiDebugging / AntiHooking: platform anti-analysis
+- AntiClassDump / AntiDebugging / AntiHooking / TimingOracle: platform anti-analysis
   (module passes). AntiDebugging combines startup checks with a mutable hidden
   state word, platform-specific recheck helpers, pthread watchdogs where
   available, and once-gated randomized calls inserted into user functions so
   debugger evidence is sampled from both constructors and normal execution paths
   without repeatedly running expensive probes in hot loops.
+- TimingOracle emits a private constructor helper that samples several short
+  volatile spans with two clock sources.  x86 targets use serialized `rdtscp`
+  paired with a raw OS clock; Darwin targets use `mach_absolute_time` and
+  `CLOCK_MONOTONIC_RAW`.  Slow or divergent sample distributions are folded
+  into private state instead of causing immediate false-positive-prone exits.
 
 ## Scheduler memory guardrails
 - The scheduler re-measures instruction and block counts before each
@@ -1000,6 +1005,6 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   they can clone or generate dense IR.
 
 ## Scheduler order (to preserve semantics)
-AntiHook → AntiClassDump → FCO(fn) → AntiDebug → StringEnc → Virtualization → HashSelfDecrypt → per-fn{ Split, BCF, OptAmp, Sub,
+AntiHook → AntiClassDump → AntiDebug → TimingOracle → FCO(fn) → StringEnc → Virtualization → HashSelfDecrypt → per-fn{ Split, BCF, OptAmp, Sub,
 MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → SensitiveHelperHardening → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 FeatureElimination (strip debug/names) → cleanup marker decls.

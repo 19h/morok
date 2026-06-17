@@ -204,6 +204,7 @@ TEST_CASE("merge handles every pass family") {
     src.func_wrap.times = 3u;
     src.fco.enabled = true;
     src.anti_dbg.enabled = true;
+    src.timing_oracles.enabled = true;
     merge(dst, src);
     CHECK(dst.split.splits == 8u);
     CHECK(dst.stack_coalesce.enabled == true);
@@ -343,4 +344,5 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.func_wrap.times == 3u);
     CHECK(dst.fco.enabled == true);
     CHECK(dst.anti_dbg.enabled == true);
+    CHECK(dst.timing_oracles.enabled == true);
 }

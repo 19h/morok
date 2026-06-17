@@ -360,6 +360,7 @@ struct PassConfig {
     ToggleConfig anti_hook;
     ToggleConfig anti_dbg;
     ToggleConfig anti_class_dump;
+    ToggleConfig timing_oracles;
 
     struct FuncWrapConfig {
         Opt<bool> enabled;

@@ -9,7 +9,8 @@
 //   • AntiDebugging  — denies debugger attachment at startup.
 //   • AntiHooking    — checks a function prologue for inline-hook trampolines.
 //   • AntiClassDump  — scrambles Objective-C metadata (no-op on non-ObjC code).
-// All three are module passes that add code/metadata without altering the
+//   • TimingOracle   — samples independent clocks around short spans.
+// All four are module passes that add code/metadata without altering the
 // program's observable behaviour in an un-instrumented run.
 
 #ifndef MOROK_PASSES_ANTI_ANALYSIS_HPP
@@ -44,6 +45,11 @@ bool antiHookingModule(llvm::Module &M, morok::ir::IRRandom &rng);
 /// it.
 bool antiClassDumpModule(llvm::Module &M);
 
+/// Inject a runtime timing oracle.  The emitted helper samples independent
+/// clocks around short deterministic spans and folds distribution-level
+/// anomalies into hidden state.  Returns true if code was added.
+bool timingOracleModule(llvm::Module &M, morok::ir::IRRandom &rng);
+
 class AntiDebuggingPass : public llvm::PassInfoMixin<AntiDebuggingPass> {
 public:
     explicit AntiDebuggingPass(std::uint64_t seed = 0xA17D3B9u)
@@ -72,6 +78,18 @@ class AntiClassDumpPass : public llvm::PassInfoMixin<AntiClassDumpPass> {
 public:
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
     static bool isRequired() { return true; }
+};
+
+class TimingOraclePass : public llvm::PassInfoMixin<TimingOraclePass> {
+public:
+    explicit TimingOraclePass(std::uint64_t seed = 0x710C10C5u)
+        : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
+
+    llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
+    static bool isRequired() { return true; }
+
+private:
+    core::Xoshiro256pp engine_;
 };
 
 } // namespace morok::passes

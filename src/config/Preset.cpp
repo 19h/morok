@@ -247,6 +247,7 @@ PassConfig makeLow() {
     c.anti_hook.enabled = false;
     c.anti_dbg.enabled = false;
     c.anti_class_dump.enabled = false;
+    c.timing_oracles.enabled = false;
     return c;
 }
 
@@ -459,6 +460,7 @@ PassConfig makeMid() {
     c.anti_hook.enabled = false;
     c.anti_dbg.enabled = false;
     c.anti_class_dump.enabled = false;
+    c.timing_oracles.enabled = false;
     return c;
 }
 
@@ -678,6 +680,7 @@ PassConfig makeHigh() {
     c.anti_hook.enabled = false;
     c.anti_dbg.enabled = false;
     c.anti_class_dump.enabled = false;
+    c.timing_oracles.enabled = false;
     return c;
 }
 
@@ -902,6 +905,7 @@ PassConfig makeMax() {
     c.anti_hook.enabled = true;
     c.anti_dbg.enabled = true;
     c.anti_class_dump.enabled = true;
+    c.timing_oracles.enabled = true;
     return c;
 }
 

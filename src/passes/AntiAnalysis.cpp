@@ -17,6 +17,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Module.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -749,6 +750,187 @@ bool insertAntiDebugCallsiteProbes(Module &M, Function *Probe,
     return !sites.empty();
 }
 
+GlobalVariable *timingOracleState(Module &M, ir::IRRandom &rng) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.timing.state", /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, rng.next()), "morok.timing.state");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+bool isX86Target(const Triple &TT) {
+    return TT.getArch() == Triple::x86 || TT.getArch() == Triple::x86_64;
+}
+
+Value *emitRdtscp(IRBuilder<> &B, Module &M) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *pairTy = StructType::get(ctx, {i32, i32});
+    auto *asmTy = FunctionType::get(pairTy, false);
+    InlineAsm *rdtscp =
+        InlineAsm::get(asmTy, "lfence\nrdtscp\nlfence",
+                       "={eax},={edx},~{ecx},~{dirflag},~{fpsr},~{flags}",
+                       /*hasSideEffects=*/true);
+    Value *pair = B.CreateCall(asmTy, rdtscp, {}, "morok.timing.rdtscp");
+    Value *lo = B.CreateExtractValue(pair, {0}, "morok.timing.tsc.lo");
+    Value *hi = B.CreateExtractValue(pair, {1}, "morok.timing.tsc.hi");
+    return B.CreateOr(
+        B.CreateZExt(lo, i64),
+        B.CreateShl(B.CreateZExt(hi, i64), ConstantInt::get(i64, 32)),
+        "morok.timing.tsc");
+}
+
+Value *emitClockGettimeNanos(IRBuilder<> &B, Module &M, std::int32_t ClockId,
+                             const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *tsTy = StructType::get(ctx, {i64, i64});
+    auto *ts = B.CreateAlloca(tsTy, nullptr, Name + ".ts");
+
+    Value *secPtr = B.CreateStructGEP(tsTy, ts, 0, Name + ".sec.ptr");
+    Value *nsecPtr = B.CreateStructGEP(tsTy, ts, 1, Name + ".nsec.ptr");
+    B.CreateStore(ConstantInt::get(i64, 0), secPtr);
+    B.CreateStore(ConstantInt::get(i64, 0), nsecPtr);
+
+    FunctionCallee clockGettime = M.getOrInsertFunction(
+        "clock_gettime",
+        FunctionType::get(i32, {i32, PointerType::getUnqual(ctx)}, false));
+    Value *rc = B.CreateCall(
+        clockGettime, {ConstantInt::getSigned(i32, ClockId), ts}, Name + ".rc");
+    Value *sec = B.CreateLoad(i64, secPtr, Name + ".sec");
+    Value *nsec = B.CreateLoad(i64, nsecPtr, Name + ".nsec");
+    Value *nanos =
+        B.CreateAdd(B.CreateMul(sec, ConstantInt::get(i64, 1000000000ULL)),
+                    nsec, Name + ".nanos");
+    return B.CreateSelect(B.CreateICmpEQ(rc, ConstantInt::get(i32, 0)), nanos,
+                          ConstantInt::get(i64, 0), Name + ".ok");
+}
+
+Value *emitMachAbsoluteTime(IRBuilder<> &B, Module &M, const Twine &Name) {
+    FunctionCallee mach = M.getOrInsertFunction(
+        "mach_absolute_time", FunctionType::get(B.getInt64Ty(), false));
+    return B.CreateCall(mach, {}, Name);
+}
+
+Value *emitTimingPrimaryClock(IRBuilder<> &B, Module &M, const Triple &TT,
+                              const Twine &Name) {
+    if (isX86Target(TT))
+        return emitRdtscp(B, M);
+    if (TT.isOSDarwin())
+        return emitMachAbsoluteTime(B, M, Name + ".mach");
+    return emitClockGettimeNanos(B, M, 1, Name + ".mono");
+}
+
+Value *emitTimingSecondaryClock(IRBuilder<> &B, Module &M, const Triple &TT,
+                                const Twine &Name) {
+    if (TT.isOSDarwin() && isX86Target(TT))
+        return emitMachAbsoluteTime(B, M, Name + ".mach");
+    return emitClockGettimeNanos(B, M, 4, Name + ".raw");
+}
+
+void emitShortTimingSpan(IRBuilder<> &B, AllocaInst *Acc, std::uint64_t Salt) {
+    auto *i64 = B.getInt64Ty();
+    for (unsigned i = 0; i < 16; ++i) {
+        auto *load = B.CreateLoad(i64, Acc, "morok.timing.span.load");
+        load->setVolatile(true);
+        Value *mixed = B.CreateXor(
+            B.CreateAdd(load, ConstantInt::get(
+                                  i64, Salt + 0xD6E8FEB86659FD93ULL * (i + 1))),
+            B.CreateLShr(load, ConstantInt::get(i64, (i % 17) + 1)));
+        mixed = B.CreateMul(
+            mixed,
+            ConstantInt::get(i64, (Salt | 1ULL) ^ (0x9E3779B97F4A7C15ULL * i)));
+        auto *store = B.CreateStore(mixed, Acc);
+        store->setVolatile(true);
+    }
+}
+
+Function *timingOracleProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
+                            const Triple &TT) {
+    if (Function *existing = M.getFunction("morok.timing.oracle"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.timing.oracle", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    auto *acc = B.CreateAlloca(i64, nullptr, "morok.timing.span.acc");
+    B.CreateStore(ConstantInt::get(i64, rng.next()), acc)->setVolatile(true);
+
+    Value *badSamples = ConstantInt::get(i32, 0);
+    Value *divergentSamples = ConstantInt::get(i32, 0);
+    Value *mix = ConstantInt::get(i64, rng.next());
+    const bool hasCycleClock = isX86Target(TT);
+    const std::uint64_t primaryThreshold =
+        hasCycleClock ? 20000000ULL : 10000000ULL;
+    constexpr std::uint64_t secondaryThreshold = 10000000ULL;
+
+    for (unsigned sample = 0; sample < 5; ++sample) {
+        Value *primaryStart =
+            emitTimingPrimaryClock(B, M, TT, "morok.timing.primary.start");
+        Value *secondaryStart =
+            emitTimingSecondaryClock(B, M, TT, "morok.timing.secondary.start");
+        emitShortTimingSpan(B, acc, rng.next());
+        Value *primaryEnd =
+            emitTimingPrimaryClock(B, M, TT, "morok.timing.primary.end");
+        Value *secondaryEnd =
+            emitTimingSecondaryClock(B, M, TT, "morok.timing.secondary.end");
+
+        Value *primaryDelta =
+            B.CreateSub(primaryEnd, primaryStart, "morok.timing.primary.delta");
+        Value *secondaryDelta = B.CreateSub(secondaryEnd, secondaryStart,
+                                            "morok.timing.secondary.delta");
+        Value *primarySlow = B.CreateICmpUGT(
+            primaryDelta, ConstantInt::get(i64, primaryThreshold),
+            "morok.timing.primary.slow");
+        Value *secondarySlow = B.CreateICmpUGT(
+            secondaryDelta, ConstantInt::get(i64, secondaryThreshold),
+            "morok.timing.secondary.slow");
+        Value *sampleSlow =
+            B.CreateOr(primarySlow, secondarySlow, "morok.timing.sample.slow");
+        Value *sampleDiverged = B.CreateXor(primarySlow, secondarySlow,
+                                            "morok.timing.sample.diverged");
+        badSamples = B.CreateAdd(badSamples, B.CreateZExt(sampleSlow, i32),
+                                 "morok.timing.bad.n");
+        divergentSamples =
+            B.CreateAdd(divergentSamples, B.CreateZExt(sampleDiverged, i32),
+                        "morok.timing.divergent.n");
+        mix = B.CreateXor(
+            B.CreateAdd(mix,
+                        B.CreateMul(primaryDelta,
+                                    ConstantInt::get(i64, rng.next() | 1ULL))),
+            B.CreateMul(secondaryDelta,
+                        ConstantInt::get(i64, rng.next() | 1ULL)),
+            "morok.timing.mix");
+    }
+
+    foldState(B, State, mix, 0x275C92B4EF31D68BULL, "morok.timing.mix");
+    foldState(B, State, badSamples, 0x7A6D2E10B94F35C1ULL,
+              "morok.timing.bad.samples");
+    foldState(B, State, divergentSamples, 0xC541A9E72318BE6FULL,
+              "morok.timing.divergent.samples");
+    foldFlag(B, State, B.CreateICmpUGE(badSamples, ConstantInt::get(i32, 3)),
+             0xA331D8B47E1C5905ULL, "morok.timing.bad.distribution");
+    foldFlag(B, State,
+             B.CreateICmpUGE(divergentSamples, ConstantInt::get(i32, 2)),
+             0x5E74B29D13C8A60BULL, "morok.timing.divergent.distribution");
+    B.CreateRetVoid();
+    return fn;
+}
+
 } // namespace
 
 bool antiDebuggingModule(Module &M, ir::IRRandom &rng) {
@@ -782,6 +964,19 @@ bool antiDebuggingModule(Module &M) {
     auto engine = core::Xoshiro256pp::fromSeed(0xA17D3B9u);
     ir::IRRandom rng(engine);
     return antiDebuggingModule(M, rng);
+}
+
+bool timingOracleModule(Module &M, ir::IRRandom &rng) {
+    const Triple tt(M.getTargetTriple());
+    Function *ctor = makeCtorShell(M, "morok.timing");
+    GlobalVariable *state = timingOracleState(M, rng);
+    Function *oracle = timingOracleProbe(M, state, rng, tt);
+
+    IRBuilder<> B(&ctor->getEntryBlock());
+    B.CreateCall(oracle);
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, ctor, 0);
+    return true;
 }
 
 bool antiHookingModule(Module &M, ir::IRRandom &rng) {
@@ -861,6 +1056,12 @@ PreservedAnalyses AntiHookingPass::run(Module &M, ModuleAnalysisManager &) {
 PreservedAnalyses AntiClassDumpPass::run(Module &M, ModuleAnalysisManager &) {
     return antiClassDumpModule(M) ? PreservedAnalyses::none()
                                   : PreservedAnalyses::all();
+}
+
+PreservedAnalyses TimingOraclePass::run(Module &M, ModuleAnalysisManager &) {
+    ir::IRRandom rng(engine_);
+    return timingOracleModule(M, rng) ? PreservedAnalyses::none()
+                                      : PreservedAnalyses::all();
 }
 
 } // namespace morok::passes

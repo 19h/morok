@@ -189,3 +189,6 @@ enabled = true
 
 [passes.anti_class_dump]
 enabled = true
+
+[passes.timing_oracles]
+enabled = true

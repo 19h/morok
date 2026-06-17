@@ -229,6 +229,10 @@ PassPluginLibraryInfo getPluginInfo() {
                             MPM.addPass(passes::AntiClassDumpPass());
                             return true;
                         }
+                        if (name == "morok-timing") {
+                            MPM.addPass(passes::TimingOraclePass());
+                            return true;
+                        }
                         return false;
                     });
 

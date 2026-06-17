@@ -220,6 +220,14 @@ std::size_t countUserCallsTo(Module &M, StringRef name) {
     return n;
 }
 
+bool hasInlineAsmCall(Function &F) {
+    for (Instruction &I : instructions(F))
+        if (auto *CB = dyn_cast<CallBase>(&I))
+            if (CB->isInlineAsm())
+                return true;
+    return false;
+}
+
 bool hasReadableByteString(Module &M, StringRef needle) {
     for (GlobalVariable &GV : M.globals()) {
         if (!GV.hasInitializer())
@@ -8710,6 +8718,46 @@ entry:
     CHECK(countGlobals(*M, "morok.cloak.c") >= 8u);
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_INSERT_LIBRARIES"));
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_PRINT"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("timingOracleModule emits x86 rdtscp and raw clock probes") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(883);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::timingOracleModule(*M, rng));
+
+    Function *Oracle = M->getFunction("morok.timing.oracle");
+    REQUIRE(Oracle != nullptr);
+    CHECK(M->getGlobalVariable("morok.timing.state", true) != nullptr);
+    CHECK(M->getFunction("morok.timing") != nullptr);
+    CHECK(M->getFunction("clock_gettime") != nullptr);
+    CHECK(hasInlineAsmCall(*Oracle));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("timingOracleModule emits Darwin mach and raw clock probes") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "arm64-apple-macosx13.0.0"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(884);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::timingOracleModule(*M, rng));
+
+    Function *Oracle = M->getFunction("morok.timing.oracle");
+    REQUIRE(Oracle != nullptr);
+    CHECK(M->getGlobalVariable("morok.timing.state", true) != nullptr);
+    CHECK(M->getFunction("mach_absolute_time") != nullptr);
+    CHECK(M->getFunction("clock_gettime") != nullptr);
+    CHECK_FALSE(hasInlineAsmCall(*Oracle));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
