@@ -980,6 +980,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   It then installs a seccomp-BPF filter that kills `ptrace` requests other than
   Morok's own `PTRACE_TRACEME` re-arm and kills
   `process_vm_readv`/`process_vm_writev` in the protected process lineage.
+  On x86_64 Linux, sensitive anti-debug syscalls (`ptrace`, `prctl`,
+  `openat`/`read`/`close` for `/proc` probes, Landlock, and seccomp install)
+  are emitted as inline `syscall` instructions instead of libc imports.
 - TimingOracle emits a private constructor helper that samples several short
   volatile spans with two clock sources.  x86 targets use serialized `rdtscp`
   paired with a raw OS clock; Darwin targets use `mach_absolute_time` and

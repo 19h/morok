@@ -25,6 +25,7 @@
 
 #include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <vector>
 
 using namespace llvm;
@@ -117,6 +118,133 @@ Value *emitPtrace(IRBuilderBase &B, Module &M, int request) {
                                         ConstantInt::get(i32, 0)});
 }
 
+bool useDirectLinuxSyscalls(const Triple &TT) {
+    return TT.isOSLinux() && TT.getArch() == Triple::x86_64;
+}
+
+Value *toSyscallArg(IRBuilderBase &B, Value *V) {
+    auto *ip = intPtrTy(*B.GetInsertBlock()->getModule());
+    if (V->getType()->isPointerTy())
+        return B.CreatePtrToInt(V, ip);
+    if (V->getType()->isIntegerTy())
+        return B.CreateSExtOrTrunc(V, ip);
+    return ConstantInt::get(ip, 0);
+}
+
+FunctionCallee syscallDecl(Module &M) {
+    auto *ip = intPtrTy(M);
+    return M.getOrInsertFunction("syscall", FunctionType::get(ip, {ip}, true));
+}
+
+Value *emitLinuxSyscall(IRBuilder<> &B, Module &M, const Triple &TT,
+                        std::uint32_t Number,
+                        std::initializer_list<Value *> Args) {
+    auto *ip = intPtrTy(M);
+    std::array<Value *, 6> sysArgs = {
+        ConstantInt::get(ip, 0), ConstantInt::get(ip, 0),
+        ConstantInt::get(ip, 0), ConstantInt::get(ip, 0),
+        ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)};
+    std::size_t i = 0;
+    for (Value *arg : Args) {
+        if (i >= sysArgs.size())
+            break;
+        sysArgs[i++] = toSyscallArg(B, arg);
+    }
+
+    if (useDirectLinuxSyscalls(TT)) {
+        std::vector<Type *> params(7, ip);
+        auto *asmTy = FunctionType::get(ip, params, false);
+        InlineAsm *syscall = InlineAsm::get(
+            asmTy, "syscall",
+            "={rax},{rax},{rdi},{rsi},{rdx},{r10},{r8},{r9},~{rcx},~{r11},"
+            "~{memory},~{dirflag},~{fpsr},~{flags}",
+            /*hasSideEffects=*/true);
+        return B.CreateCall(asmTy, syscall,
+                            {ConstantInt::get(ip, Number), sysArgs[0],
+                             sysArgs[1], sysArgs[2], sysArgs[3], sysArgs[4],
+                             sysArgs[5]},
+                            "morok.linux.syscall");
+    }
+
+    return B.CreateCall(syscallDecl(M),
+                        {ConstantInt::get(ip, Number), sysArgs[0], sysArgs[1],
+                         sysArgs[2], sysArgs[3], sysArgs[4], sysArgs[5]},
+                        "morok.linux.syscall.wrap");
+}
+
+bool linuxCoreSyscalls(const Triple &TT, std::uint32_t &Ptrace,
+                       std::uint32_t &Prctl, std::uint32_t &OpenAt,
+                       std::uint32_t &Read, std::uint32_t &Close) {
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        Ptrace = 101;
+        Prctl = 157;
+        OpenAt = 257;
+        Read = 0;
+        Close = 3;
+        return true;
+    case Triple::aarch64:
+        Ptrace = 117;
+        Prctl = 167;
+        OpenAt = 56;
+        Read = 63;
+        Close = 57;
+        return true;
+    default:
+        return false;
+    }
+}
+
+Value *emitLinuxPtrace(IRBuilder<> &B, Module &M, const Triple &TT,
+                       int request) {
+    std::uint32_t ptraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    if (!linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr))
+        return emitPtrace(B, M, request);
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(M.getContext());
+    Value *rc = emitLinuxSyscall(
+        B, M, TT, ptraceNr,
+        {ConstantInt::getSigned(ip, request), ConstantInt::get(ip, 0),
+         ConstantPointerNull::get(ptr), ConstantInt::get(ip, 0)});
+    return B.CreateTruncOrBitCast(rc, i32);
+}
+
+Value *emitLinuxPrctl(IRBuilder<> &B, Module &M, const Triple &TT,
+                      std::int64_t Option, std::int64_t A2 = 0,
+                      std::int64_t A3 = 0, std::int64_t A4 = 0,
+                      std::int64_t A5 = 0) {
+    std::uint32_t ptraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    if (!linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr)) {
+        auto *i32 = Type::getInt32Ty(M.getContext());
+        auto *ip = intPtrTy(M);
+        FunctionCallee prctl = M.getOrInsertFunction(
+            "prctl", FunctionType::get(i32, {i32, ip, ip, ip, ip}, false));
+        auto arg = [&](std::int64_t v) {
+            return ConstantInt::getSigned(ip, v);
+        };
+        return B.CreateCall(prctl, {ConstantInt::getSigned(i32, Option),
+                                    arg(A2), arg(A3), arg(A4), arg(A5)});
+    }
+
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *ip = intPtrTy(M);
+    Value *rc = emitLinuxSyscall(
+        B, M, TT, prctlNr,
+        {ConstantInt::getSigned(ip, Option), ConstantInt::getSigned(ip, A2),
+         ConstantInt::getSigned(ip, A3), ConstantInt::getSigned(ip, A4),
+         ConstantInt::getSigned(ip, A5)});
+    return B.CreateTruncOrBitCast(rc, i32);
+}
+
 FunctionCallee openDecl(Module &M) {
     LLVMContext &ctx = M.getContext();
     auto *i32 = Type::getInt32Ty(ctx);
@@ -150,18 +278,34 @@ struct ReadFileIR {
 
 ReadFileIR emitReadSmallFile(IRBuilder<> &B, Module &M, Function *Fn,
                              StringRef Path, std::uint64_t BufBytes,
-                             ir::IRRandom &rng) {
+                             ir::IRRandom &rng, const Triple &TT) {
     LLVMContext &ctx = M.getContext();
     auto *i8 = Type::getInt8Ty(ctx);
     auto *i32 = Type::getInt32Ty(ctx);
     auto *ip = intPtrTy(M);
+    std::uint32_t ptraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
 
     ReadFileIR out;
     out.bufTy = ArrayType::get(i8, BufBytes);
     out.buf = B.CreateAlloca(out.bufTy, nullptr, "morok.antidbg.buf");
 
     Value *path = ir::emitCloakedSymbol(B, M, Path, rng);
-    Value *fd = B.CreateCall(openDecl(M), {path, ConstantInt::get(i32, 0)});
+    Value *fd = nullptr;
+    const bool hasLinuxSyscalls =
+        linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr);
+    if (hasLinuxSyscalls) {
+        Value *fdLong = emitLinuxSyscall(B, M, TT, openatNr,
+                                         {ConstantInt::getSigned(ip, -100),
+                                          path, ConstantInt::get(ip, 0),
+                                          ConstantInt::get(ip, 0)});
+        fd = B.CreateTruncOrBitCast(fdLong, i32);
+    } else {
+        fd = B.CreateCall(openDecl(M), {path, ConstantInt::get(i32, 0)});
+    }
 
     auto *readBB = BasicBlock::Create(ctx, "read", Fn);
     out.ret0 = BasicBlock::Create(ctx, "ret0", Fn);
@@ -171,9 +315,16 @@ ReadFileIR emitReadSmallFile(IRBuilder<> &B, Module &M, Function *Fn,
     IRBuilder<> RB(readBB);
     Value *bufPtr = RB.CreateInBoundsGEP(
         out.bufTy, out.buf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)});
-    out.n = RB.CreateCall(readDecl(M),
-                          {fd, bufPtr, ConstantInt::get(ip, BufBytes - 1)});
-    RB.CreateCall(closeDecl(M), {fd});
+    if (hasLinuxSyscalls) {
+        out.n =
+            emitLinuxSyscall(RB, M, TT, readNr,
+                             {fd, bufPtr, ConstantInt::get(ip, BufBytes - 1)});
+        emitLinuxSyscall(RB, M, TT, closeNr, {fd});
+    } else {
+        out.n = RB.CreateCall(readDecl(M),
+                              {fd, bufPtr, ConstantInt::get(ip, BufBytes - 1)});
+        RB.CreateCall(closeDecl(M), {fd});
+    }
     out.afterRead = readBB;
     return out;
 }
@@ -183,7 +334,8 @@ void finishI32Ret(BasicBlock *BB, std::uint32_t Value) {
     B.CreateRet(ConstantInt::get(Type::getInt32Ty(BB->getContext()), Value));
 }
 
-Function *linuxStatusTracerCheck(Module &M, ir::IRRandom &rng) {
+Function *linuxStatusTracerCheck(Module &M, ir::IRRandom &rng,
+                                 const Triple &TT) {
     if (Function *existing = M.getFunction("morok.antidbg.linux.status"))
         return existing;
 
@@ -198,7 +350,8 @@ Function *linuxStatusTracerCheck(Module &M, ir::IRRandom &rng) {
                                 "morok.antidbg.linux.status", &M);
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
     IRBuilder<> B(entry);
-    ReadFileIR rf = emitReadSmallFile(B, M, fn, "/proc/self/status", 1024, rng);
+    ReadFileIR rf =
+        emitReadSmallFile(B, M, fn, "/proc/self/status", 1024, rng, TT);
 
     constexpr std::array<unsigned char, 10> prefix = {'T', 'r', 'a', 'c', 'e',
                                                       'r', 'P', 'i', 'd', ':'};
@@ -269,7 +422,7 @@ Function *linuxStatusTracerCheck(Module &M, ir::IRRandom &rng) {
     return fn;
 }
 
-Function *linuxStatField4Check(Module &M, ir::IRRandom &rng) {
+Function *linuxStatField4Check(Module &M, ir::IRRandom &rng, const Triple &TT) {
     if (Function *existing = M.getFunction("morok.antidbg.linux.stat4"))
         return existing;
 
@@ -283,7 +436,8 @@ Function *linuxStatField4Check(Module &M, ir::IRRandom &rng) {
                                 "morok.antidbg.linux.stat4", &M);
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
     IRBuilder<> B(entry);
-    ReadFileIR rf = emitReadSmallFile(B, M, fn, "/proc/self/stat", 1024, rng);
+    ReadFileIR rf =
+        emitReadSmallFile(B, M, fn, "/proc/self/stat", 1024, rng, TT);
 
     auto *findBB = BasicBlock::Create(ctx, "find.close", fn);
     auto *findCharBB = BasicBlock::Create(ctx, "find.char", fn);
@@ -348,7 +502,7 @@ Function *linuxStatField4Check(Module &M, ir::IRRandom &rng) {
 }
 
 Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
-                           GlobalVariable *State) {
+                           GlobalVariable *State, const Triple &TT) {
     if (Function *existing = M.getFunction("morok.antidbg.linux.watch"))
         return existing;
 
@@ -377,7 +531,7 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
     FunctionCallee sleepFn =
         M.getOrInsertFunction("sleep", FunctionType::get(i32, {i32}, false));
     BB.CreateCall(sleepFn, {ConstantInt::get(i32, 1)});
-    emitPtrace(BB, M, 0);
+    emitLinuxPtrace(BB, M, TT, 0);
     Value *status = BB.CreateCall(StatusFn);
     Value *stat4 = BB.CreateCall(StatFn);
     foldFlag(BB, State, BB.CreateICmpNE(status, ConstantInt::get(i32, 0)),
@@ -393,20 +547,10 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
     return fn;
 }
 
-void emitLinuxHardening(IRBuilder<> &B, Module &M) {
-    LLVMContext &ctx = M.getContext();
-    auto *i32 = Type::getInt32Ty(ctx);
-    auto *ip = intPtrTy(M);
-    FunctionCallee prctl = M.getOrInsertFunction(
-        "prctl", FunctionType::get(i32, {i32, ip, ip, ip, ip}, false));
-    auto arg = [&](std::int64_t v) { return ConstantInt::getSigned(ip, v); };
-
-    B.CreateCall(prctl, {ConstantInt::get(i32, 4), arg(0), arg(0), arg(0),
-                         arg(0)}); // PR_SET_DUMPABLE
-    B.CreateCall(prctl, {ConstantInt::get(i32, 0x59616D61), arg(0), arg(0),
-                         arg(0), arg(0)}); // PR_SET_PTRACER
-    B.CreateCall(prctl, {ConstantInt::get(i32, 38), arg(1), arg(0), arg(0),
-                         arg(0)}); // PR_SET_NO_NEW_PRIVS
+void emitLinuxHardening(IRBuilder<> &B, Module &M, const Triple &TT) {
+    emitLinuxPrctl(B, M, TT, 4, 0, 0, 0, 0);          // PR_SET_DUMPABLE
+    emitLinuxPrctl(B, M, TT, 0x59616D61, 0, 0, 0, 0); // PR_SET_PTRACER
+    emitLinuxPrctl(B, M, TT, 38, 1, 0, 0, 0);         // PR_SET_NO_NEW_PRIVS
 }
 
 bool linuxSyscallNumbers(const Triple &TT, std::uint32_t &Ptrace,
@@ -441,11 +585,6 @@ bool linuxLandlockSyscalls(const Triple &TT, std::uint32_t &CreateRuleset,
     }
 }
 
-FunctionCallee syscallDecl(Module &M) {
-    auto *ip = intPtrTy(M);
-    return M.getOrInsertFunction("syscall", FunctionType::get(ip, {ip}, true));
-}
-
 void emitLinuxLandlockSandbox(IRBuilder<> &B, Module &M, GlobalVariable *State,
                               const Triple &TT) {
     std::uint32_t createRulesetNr = 0;
@@ -477,12 +616,11 @@ void emitLinuxLandlockSandbox(IRBuilder<> &B, Module &M, GlobalVariable *State,
         kWriteFile | kRemoveDir | kRemoveFile | kMakeChar | kMakeDir |
         kMakeReg | kMakeSock | kMakeFifo | kMakeBlock | kMakeSym;
 
-    FunctionCallee syscallFn = syscallDecl(M);
-    Value *version = B.CreateCall(
-        syscallFn,
-        {ConstantInt::get(ip, createRulesetNr), ConstantPointerNull::get(ptr),
-         ConstantInt::get(ip, 0), ConstantInt::get(ip, kCreateRulesetVersion)},
-        "morok.landlock.abi");
+    Value *version = emitLinuxSyscall(
+        B, M, TT, createRulesetNr,
+        {ConstantPointerNull::get(ptr), ConstantInt::get(ip, 0),
+         ConstantInt::get(ip, kCreateRulesetVersion)});
+    version->setName("morok.landlock.abi");
     foldState(B, State, version, 0x3A1E58C96D2740B5ULL, "morok.landlock.abi");
 
     auto *applyBB = BasicBlock::Create(ctx, "morok.landlock.apply", ctor);
@@ -510,22 +648,29 @@ void emitLinuxLandlockSandbox(IRBuilder<> &B, Module &M, GlobalVariable *State,
         LB.CreateAlloca(attrTy, nullptr, "morok.landlock.ruleset.attr");
     LB.CreateStore(handled, LB.CreateStructGEP(attrTy, attr, 0));
 
-    Value *fd =
-        LB.CreateCall(syscallFn,
-                      {ConstantInt::get(ip, createRulesetNr), attr,
-                       ConstantInt::get(ip, 8), ConstantInt::get(ip, 0)},
-                      "morok.landlock.fd");
-    Value *restrictRc = LB.CreateCall(
-        syscallFn,
-        {ConstantInt::get(ip, restrictSelfNr), fd, ConstantInt::get(ip, 0)},
-        "morok.landlock.restrict");
+    Value *fd = emitLinuxSyscall(
+        LB, M, TT, createRulesetNr,
+        {attr, ConstantInt::get(ip, 8), ConstantInt::get(ip, 0)});
+    fd->setName("morok.landlock.fd");
+    Value *restrictRc = emitLinuxSyscall(LB, M, TT, restrictSelfNr,
+                                         {fd, ConstantInt::get(ip, 0)});
+    restrictRc->setName("morok.landlock.restrict");
     foldState(LB, State, fd, 0x7124D8C90AE53B6FULL, "morok.landlock.fd");
     foldState(LB, State, restrictRc, 0xE95B2D47A6813C0BULL,
               "morok.landlock.restrict");
     foldFlag(LB, State,
              LB.CreateICmpEQ(restrictRc, ConstantInt::getSigned(ip, 0)),
              0xC64FB9182D70A5E3ULL, "morok.landlock.active");
-    LB.CreateCall(closeDecl(M), {LB.CreateTruncOrBitCast(fd, LB.getInt32Ty())});
+    std::uint32_t ptraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    if (linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr))
+        emitLinuxSyscall(LB, M, TT, closeNr, {fd});
+    else
+        LB.CreateCall(closeDecl(M),
+                      {LB.CreateTruncOrBitCast(fd, LB.getInt32Ty())});
     LB.CreateBr(contBB);
 
     B.SetInsertPoint(contBB);
@@ -595,12 +740,25 @@ void emitLinuxSeccompFilter(IRBuilder<> &B, Module &M, const Triple &TT) {
                   B.CreateStructGEP(progTy, prog, 0));
     B.CreateStore(filterPtr, B.CreateStructGEP(progTy, prog, 1));
 
-    FunctionCallee prctl = M.getOrInsertFunction(
-        "prctl", FunctionType::get(i32, {i32, ip, ip, ip, ip}, false));
-    B.CreateCall(prctl, {ConstantInt::get(i32, kPrSetSeccomp),
-                         ConstantInt::get(ip, kSeccompModeFilter),
-                         B.CreatePtrToInt(prog, ip), ConstantInt::get(ip, 0),
-                         ConstantInt::get(ip, 0)});
+    std::uint32_t corePtraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNrCore = 0;
+    std::uint32_t closeNrCore = 0;
+    if (linuxCoreSyscalls(TT, corePtraceNr, prctlNr, openatNr, readNrCore,
+                          closeNrCore)) {
+        emitLinuxSyscall(B, M, TT, prctlNr,
+                         {ConstantInt::get(ip, kPrSetSeccomp),
+                          ConstantInt::get(ip, kSeccompModeFilter), prog,
+                          ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)});
+    } else {
+        FunctionCallee prctl = M.getOrInsertFunction(
+            "prctl", FunctionType::get(i32, {i32, ip, ip, ip, ip}, false));
+        B.CreateCall(prctl, {ConstantInt::get(i32, kPrSetSeccomp),
+                             ConstantInt::get(ip, kSeccompModeFilter),
+                             B.CreatePtrToInt(prog, ip),
+                             ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)});
+    }
 }
 
 void emitLinuxWatcherStart(IRBuilder<> &B, Module &M, Function *WatchFn) {
@@ -685,13 +843,13 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
     auto *i32 = Type::getInt32Ty(ctx);
     IRBuilder<> B(&Ctor->getEntryBlock());
 
-    emitLinuxHardening(B, M);
-    Value *traceRc = emitPtrace(B, M, 0);
+    emitLinuxHardening(B, M, TT);
+    Value *traceRc = emitLinuxPtrace(B, M, TT, 0);
     foldFlag(B, State, B.CreateICmpSLT(traceRc, ConstantInt::getSigned(i32, 0)),
              0x3D2D7F2BAE63D5C9ULL, "morok.antidbg.ptrace.init");
 
-    Function *statusFn = linuxStatusTracerCheck(M, rng);
-    Function *statFn = linuxStatField4Check(M, rng);
+    Function *statusFn = linuxStatusTracerCheck(M, rng, TT);
+    Function *statFn = linuxStatField4Check(M, rng, TT);
     Value *status = B.CreateCall(statusFn);
     Value *stat4 = B.CreateCall(statFn);
     foldFlag(B, State, B.CreateICmpNE(status, ConstantInt::get(i32, 0)),
@@ -700,7 +858,7 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
     emitLinuxLandlockSandbox(B, M, State, TT);
     emitLinuxSeccompFilter(B, M, TT);
 
-    Function *watch = linuxWatchThread(M, statusFn, statFn, State);
+    Function *watch = linuxWatchThread(M, statusFn, statFn, State, TT);
     emitLinuxWatcherStart(B, M, watch);
     B.CreateRetVoid();
 }
@@ -844,8 +1002,8 @@ Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
 
     if (TT.isOSLinux()) {
         auto *i32 = Type::getInt32Ty(ctx);
-        Function *statusFn = linuxStatusTracerCheck(M, rng);
-        Function *statFn = linuxStatField4Check(M, rng);
+        Function *statusFn = linuxStatusTracerCheck(M, rng, TT);
+        Function *statFn = linuxStatField4Check(M, rng, TT);
         Value *status = B.CreateCall(statusFn);
         Value *stat4 = B.CreateCall(statFn);
         foldFlag(B, State, B.CreateICmpNE(status, ConstantInt::get(i32, 0)),

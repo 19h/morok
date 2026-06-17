@@ -228,20 +228,6 @@ bool hasInlineAsmCall(Function &F) {
     return false;
 }
 
-bool hasCallWithI32Arg0(Module &M, StringRef name, std::uint32_t value) {
-    for (Function &F : M)
-        if (!F.isDeclaration())
-            for (Instruction &I : instructions(F))
-                if (auto *CB = dyn_cast<CallBase>(&I))
-                    if (Function *Callee = CB->getCalledFunction())
-                        if (Callee->getName() == name && CB->arg_size() > 0)
-                            if (auto *CI =
-                                    dyn_cast<ConstantInt>(CB->getArgOperand(0)))
-                                if (CI->getZExtValue() == value)
-                                    return true;
-    return false;
-}
-
 bool hasReadableByteString(Module &M, StringRef needle) {
     for (GlobalVariable &GV : M.globals()) {
         if (!GV.hasInitializer())
@@ -8681,17 +8667,18 @@ entry:
     CHECK(M->getFunction("morok.antidbg.linux.watch") != nullptr);
     CHECK(M->getFunction("morok.antidbg.probe") != nullptr);
     CHECK(countUserCallsTo(*M, "morok.antidbg.probe") >= 1u);
-    CHECK(M->getFunction("ptrace") != nullptr);
-    CHECK(M->getFunction("prctl") != nullptr);
-    CHECK(hasCallWithI32Arg0(*M, "prctl", 22u));
-    CHECK(M->getFunction("syscall") != nullptr);
-    CHECK(hasCallWithI32Arg0(*M, "syscall", 444u));
-    CHECK(hasCallWithI32Arg0(*M, "syscall", 446u));
+    CHECK(M->getFunction("ptrace") == nullptr);
+    CHECK(M->getFunction("prctl") == nullptr);
+    CHECK(M->getFunction("syscall") == nullptr);
+    CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg")));
+    CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.status")));
+    CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.stat4")));
+    CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.watch")));
     CHECK(M->getFunction("pthread_create") != nullptr);
     CHECK(M->getFunction("pthread_detach") != nullptr);
-    CHECK(M->getFunction("open") != nullptr);
-    CHECK(M->getFunction("read") != nullptr);
-    CHECK(M->getFunction("close") != nullptr);
+    CHECK(M->getFunction("open") == nullptr);
+    CHECK(M->getFunction("read") == nullptr);
+    CHECK(M->getFunction("close") == nullptr);
     CHECK(M->getFunction("sleep") != nullptr);
 
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/status"));

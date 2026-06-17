@@ -38,7 +38,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 - [x] Embed `int3`/`icebp`/`INT 2Dh` traps and a single-step (TF) trap with your own SEH/VEH/`SIGTRAP`/Mach `EXC_BREAKPOINT` handler — handler not firing ⇒ a debugger swallowed it `[xplat · new]`
 - [x] Install a `seccomp-BPF` kill-filter on `ptrace`/`process_vm_readv`/`process_vm_writev`/`PTRACE_*` for self and children (closes the whole ptrace class) `[linux · new]`
 - [x] Self-sandbox the process with Landlock at startup `[linux · new]`
-- [ ] Emit direct syscalls for sensitive operations, bypassing libc/`dlsym` wrappers entirely `[posix · new]`
+- [x] Emit direct syscalls for sensitive operations, bypassing libc/`dlsym` wrappers entirely `[posix · new]`
 - [ ] Clean-copy byte-diff: fresh-map the on-disk module, apply relocations, byte-compare executable sections to the in-memory image to flag every inline/EAT/IAT patch `[posix · new]`
 - [ ] Prologue-pattern hook detector on critical functions (`E9`/`FF25`/`68..C3`/`EB`/`jcc` as first bytes) `[xplat · new]`
 - [ ] Per-function keyed-MAC code baseline verified at runtime to catch mid-body patches `[xplat · extends selfcheck]`
