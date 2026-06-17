@@ -613,6 +613,20 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   The correct path still decrypts exactly, but the IR key now carries
   argument-derived, volatile memory-dependent provenance instead of being a
   purely static payload-hash expression.
+- The same key path carries local environmental provenance.  Each payload gets
+  a private bound flag plus volatile `morok.sdb.bound.hash.*` and
+  `morok.sdb.bound.keymask.*` state.  The first decrypt uses the portable
+  build-time ciphertext hash/keymask; the matching seal re-encrypts the VM
+  bytecode under a stable live fingerprint (the VM helper/payload addresses,
+  CPUID vendor/features on x86, and Linux x86_64 `statfs("/")` filesystem
+  identity via a direct syscall with the path built on the stack), hashes that
+  new ciphertext, and stores the runtime hash/keymask for later calls.
+  Subsequent decrypts must see the same local fingerprint and the same sealed
+  image bytes or the VM bytecode key drifts.  Noisy probes
+  (`llvm.readcyclecounter` and x86 RDTSCP) still flow through volatile paired
+  reads as zero-valued provenance so instrumentation has to preserve the same
+  observation path without making the payload depend on an unstable counter
+  value.
 - The ensure helper derives the stream key from the computed hash, decrypts each
   payload byte with volatile stores, sets the active flag volatile only after
   the post-decrypt gate succeeds, and returns.  The seal helper derives the same

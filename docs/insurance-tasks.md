@@ -75,7 +75,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 - [x] Per-build-randomized VM ISA: permuted/duplicated handler tables, opaque dispatcher, optional nested VMs `[xplat · extends vm]`
 - [x] Run the anti-debug/anti-hook/integrity checkers themselves through the VM so the protection logic is never plaintext (highest-leverage composition) `[xplat · extends vm]`
 - [x] Stolen-code: physically remove critical instructions from the on-disk image and execute them only inside the VM `[xplat · extends vm]`
-- [ ] Environmental keying / anti-transplant: code-block decryption key = `H(expected image bytes ∥ CPUID/RDTSCP fingerprint ∥ volume-serial/MAC)` (local fingerprint; the server-nonce variant is out of scope) `[xplat · extends selfdecrypt]`
+- [x] Environmental keying / anti-transplant: code-block decryption key = `H(expected image bytes ∥ CPUID/RDTSCP fingerprint ∥ volume-serial/MAC)` (local fingerprint; the server-nonce variant is out of scope) `[xplat · extends selfdecrypt]`
 - [ ] Heartbeat-entangled crypto: continuously re-derive the live session key from the running code-checksum + watchdog liveness, so stopping/patching either drifts the key and corrupts later crypto `[xplat · extends selfcheck/tracekey]`
 - [ ] Disassembler desync via raw byte sleds (junk after unconditional jumps, overlapping/aliased instructions, jump-into-mid-instruction) emitted through inline asm `[xplat · new]`
 - [ ] Execute from `memfd` only: re-exec self from `memfd_create` + `execveat` so the running image is unbacked by an on-disk file `[linux · new]`

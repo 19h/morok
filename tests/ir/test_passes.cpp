@@ -6419,6 +6419,8 @@ entry:
 TEST_CASE("hashGatedSelfDecryptModule decrypts and reseals VM bytecode") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+
 define i32 @vm_secret(i32 %a, i32 %b) {
 entry:
   %x = add i32 %a, %b
@@ -6454,6 +6456,9 @@ entry:
 
     CHECK_FALSE(Bytecode->isConstant());
     CHECK(countGlobals(*M, "morok.sdb.ready") == 1u);
+    CHECK(countGlobals(*M, "morok.sdb.bound.") == 3u);
+    CHECK(countGlobals(*M, "morok.sdb.bound.hash.") == 1u);
+    CHECK(countGlobals(*M, "morok.sdb.bound.keymask.") == 1u);
     Function *Ensure = M->getFunction("morok.sdb.ensure.vm_secret");
     REQUIRE(Ensure);
     Function *Seal = M->getFunction("morok.sdb.seal.vm_secret");
@@ -6483,6 +6488,21 @@ entry:
     bool hasVolatileContextStore = false;
     bool hasContextZero = false;
     bool keyUsesContext = false;
+    bool hasEnvZero = false;
+    bool keyUsesEnv = false;
+    bool hasCycleProbe = false;
+    bool hasCpuidProbe = false;
+    bool hasRdtscpProbe = false;
+    bool hasVolumeProbe = false;
+    bool hasVolatileBoundLoad = false;
+    bool hasVolatileBoundHashLoad = false;
+    bool hasVolatileBoundKeyMaskLoad = false;
+    bool sealUsesEnv = false;
+    bool sealHashesOuter = false;
+    bool sealStoresBound = false;
+    bool sealStoresBoundHash = false;
+    bool sealStoresBoundKeyMask = false;
+    bool sealComputesNextKeyMask = false;
     bool storesPayload = false;
     bool sealStoresPayload = false;
     bool sealUsesExpectedHashKey = false;
@@ -6509,14 +6529,45 @@ entry:
             hasContextZero = true;
         if (I.getName().starts_with("morok.sdb.key.context"))
             keyUsesContext = true;
+        if (I.getName().starts_with("morok.sdb.env.zero"))
+            hasEnvZero = true;
+        if (I.getName().starts_with("morok.sdb.key.env"))
+            keyUsesEnv = true;
+        if (I.getName().starts_with("morok.sdb.env.cycle"))
+            hasCycleProbe = true;
+        if (I.getName().starts_with("morok.sdb.env.volume"))
+            hasVolumeProbe = true;
         if (auto *CI = dyn_cast<CallInst>(&I))
             if (Function *Callee = CI->getCalledFunction())
                 hasTrap |= Callee->getName() == "llvm.trap";
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+            if (Function *Callee = CB->getCalledFunction())
+                hasCycleProbe |= Callee->getName() == "llvm.readcyclecounter";
+            if (CB->isInlineAsm())
+                if (auto *Asm = dyn_cast<InlineAsm>(CB->getCalledOperand())) {
+                    hasCpuidProbe |= Asm->getAsmString().contains("cpuid");
+                    hasRdtscpProbe |= Asm->getAsmString().contains("rdtscp");
+                }
+        }
         if (auto *LI = dyn_cast<LoadInst>(&I))
             hasVolatileReadyLoad |=
                 LI->isVolatile() &&
                 LI->getPointerOperand()->getName().starts_with(
                     "morok.sdb.ready");
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+            hasVolatileBoundLoad |=
+                LI->isVolatile() &&
+                LI->getPointerOperand()->getName().starts_with(
+                    "morok.sdb.bound.");
+            hasVolatileBoundHashLoad |=
+                LI->isVolatile() &&
+                LI->getPointerOperand()->getName().starts_with(
+                    "morok.sdb.bound.hash.");
+            hasVolatileBoundKeyMaskLoad |=
+                LI->isVolatile() &&
+                LI->getPointerOperand()->getName().starts_with(
+                    "morok.sdb.bound.keymask.");
+        }
         if (auto *LI = dyn_cast<LoadInst>(&I))
             hasVolatileContextLoad |=
                 LI->isVolatile() &&
@@ -6567,11 +6618,29 @@ entry:
     for (Instruction &I : instructions(*Seal)) {
         if (I.getName().starts_with("morok.sdb.key.gate"))
             sealUsesExpectedHashKey = true;
+        if (I.getName().starts_with("morok.sdb.key.env"))
+            sealUsesEnv = true;
+        if (I.getName().starts_with("morok.sdb.seal.hash"))
+            sealHashesOuter = true;
+        if (I.getName().starts_with("morok.sdb.bound.keymask.next"))
+            sealComputesNextKeyMask = true;
         if (auto *SI = dyn_cast<StoreInst>(&I)) {
             hasVolatileSealReadyStore |=
                 SI->isVolatile() &&
                 SI->getPointerOperand()->getName().starts_with(
                     "morok.sdb.ready");
+            sealStoresBound |=
+                SI->isVolatile() &&
+                SI->getPointerOperand()->getName().starts_with(
+                    "morok.sdb.bound.");
+            sealStoresBoundHash |=
+                SI->isVolatile() &&
+                SI->getPointerOperand()->getName().starts_with(
+                    "morok.sdb.bound.hash.");
+            sealStoresBoundKeyMask |=
+                SI->isVolatile() &&
+                SI->getPointerOperand()->getName().starts_with(
+                    "morok.sdb.bound.keymask.");
             sealStoresPayload |=
                 SI->isVolatile() &&
                 SI->getPointerOperand()->getName().starts_with(
@@ -6589,6 +6658,21 @@ entry:
     CHECK(hasVolatileContextStore);
     CHECK(hasContextZero);
     CHECK(keyUsesContext);
+    CHECK(hasEnvZero);
+    CHECK(keyUsesEnv);
+    CHECK(hasCycleProbe);
+    CHECK(hasCpuidProbe);
+    CHECK(hasRdtscpProbe);
+    CHECK(hasVolumeProbe);
+    CHECK(hasVolatileBoundLoad);
+    CHECK(hasVolatileBoundHashLoad);
+    CHECK(hasVolatileBoundKeyMaskLoad);
+    CHECK(sealUsesEnv);
+    CHECK(sealHashesOuter);
+    CHECK(sealStoresBound);
+    CHECK(sealStoresBoundHash);
+    CHECK(sealStoresBoundKeyMask);
+    CHECK(sealComputesNextKeyMask);
     CHECK(storesPayload);
     CHECK(sealStoresPayload);
     CHECK(sealUsesExpectedHashKey);
