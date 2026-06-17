@@ -71,7 +71,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Generated `morok.decoy.str.*` globals are deliberately excluded from string
   encryption.  They are honeypot plaintext for cheap triage tools like
   `strings`; encrypting them removes the bait and makes the binary look cleaner
-  than intended.
+  than intended.  The decoy globals, fake logging functions, and volatile log
+  state are also retained through `llvm.used` / `llvm.compiler.used` so linker
+  garbage collection does not accidentally discard the bait.
 - Length hiding: read-only C strings are padded to a random multiple of a block
   size (16) with random trailing bytes before encryption.  The runtime consumer
   still stops at the original NUL, but the stored array size no longer reveals

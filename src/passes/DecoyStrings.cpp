@@ -13,6 +13,7 @@
 
 #include "morok/passes/DecoyStrings.hpp"
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -22,6 +23,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <array>
 #include <cstdint>
@@ -131,7 +133,8 @@ constexpr std::array<std::string_view, 5> kLogFnNames = {
 // Create a set of bogus logging functions.  Each writes to its own volatile
 // global so the optimizer cannot eliminate calls to it.  Returns the created
 // functions in the same order as kLogFnNames.
-std::vector<Function *> createLogFunctions(Module &M) {
+std::vector<Function *> createLogFunctions(
+    Module &M, SmallVectorImpl<GlobalValue *> &Retained) {
     auto &Ctx = M.getContext();
     auto *voidTy = Type::getVoidTy(Ctx);
     auto *i32Ty = Type::getInt32Ty(Ctx);
@@ -152,10 +155,12 @@ std::vector<Function *> createLogFunctions(Module &M) {
             ConstantAggregateZero::get(stateTy),
             "morok.dbglog.state." + Twine(i));
         state->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+        Retained.push_back(state);
 
         auto *fn = Function::Create(logFnTy, GlobalValue::InternalLinkage,
                                     kLogFnNames[i], &M);
         fn->setDoesNotThrow();
+        Retained.push_back(fn);
 
         BasicBlock *bb = BasicBlock::Create(Ctx, "entry", fn);
         auto argIt = fn->arg_begin();
@@ -238,7 +243,8 @@ bool decoyStringsModule(Module &M, ir::IRRandom &rng) {
     auto &Ctx = M.getContext();
 
     // Create the bogus logging infrastructure.
-    auto logFns = createLogFunctions(M);
+    SmallVector<GlobalValue *, 64> retained;
+    auto logFns = createLogFunctions(M, retained);
 
     // For each line of the decoy string, create a global constant and insert
     // a call to one of the logging functions in a random target function.
@@ -252,6 +258,7 @@ bool decoyStringsModule(Module &M, ir::IRRandom &rng) {
             GlobalValue::PrivateLinkage, strConst,
             "morok.decoy.str." + Twine(i));
         strGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+        retained.push_back(strGV);
 
         // Pick a random target function and a random position in its entry
         // block (but always after the first instruction, so allocas stay
@@ -283,6 +290,8 @@ bool decoyStringsModule(Module &M, ir::IRRandom &rng) {
         B.CreateCall(logFn->getFunctionType(), logFn, {strGV, level});
     }
 
+    appendToUsed(M, retained);
+    appendToCompilerUsed(M, retained);
     return true;
 }
 

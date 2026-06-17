@@ -896,11 +896,26 @@ entry:
     CHECK(countUserCallsToPrefix(*M, "morok.dbglog.") == decoyGlobals);
     CHECK_FALSE(hasReadableByteString(*M, "__TARGET_TRIPLE__"));
 
+    GlobalVariable *LinkerUsed = M->getGlobalVariable("llvm.used");
+    GlobalVariable *CompilerUsed = M->getGlobalVariable("llvm.compiler.used");
+    REQUIRE(LinkerUsed != nullptr);
+    REQUIRE(CompilerUsed != nullptr);
+    REQUIRE(LinkerUsed->hasInitializer());
+    REQUIRE(CompilerUsed->hasInitializer());
+
     for (Function &F : *M)
-        if (F.getName().starts_with("morok.dbglog."))
+        if (F.getName().starts_with("morok.dbglog.")) {
             CHECK(countVolatileAccesses(F) == 2u);
+            CHECK(constantReferencesGlobal(LinkerUsed->getInitializer(), &F));
+            CHECK(constantReferencesGlobal(CompilerUsed->getInitializer(), &F));
+        }
 
     for (GlobalVariable &GV : M->globals()) {
+        if (GV.getName().starts_with("morok.decoy.str.")) {
+            CHECK(constantReferencesGlobal(LinkerUsed->getInitializer(), &GV));
+            CHECK(constantReferencesGlobal(CompilerUsed->getInitializer(), &GV));
+            continue;
+        }
         if (!GV.getName().starts_with("morok.dbglog.state."))
             continue;
         auto *StateTy = dyn_cast<StructType>(GV.getValueType());
@@ -908,6 +923,8 @@ entry:
         REQUIRE(StateTy->getNumElements() == 2u);
         CHECK(StateTy->getElementType(0)->isPointerTy());
         CHECK(StateTy->getElementType(1)->isIntegerTy(32));
+        CHECK(constantReferencesGlobal(LinkerUsed->getInitializer(), &GV));
+        CHECK(constantReferencesGlobal(CompilerUsed->getInitializer(), &GV));
     }
 
     CHECK_FALSE(verifyModule(*M, &errs()));
