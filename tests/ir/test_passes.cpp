@@ -6117,7 +6117,7 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("hashGatedSelfDecryptModule wraps VM bytecode in lazy decryptor") {
+TEST_CASE("hashGatedSelfDecryptModule decrypts and reseals VM bytecode") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 define i32 @vm_secret(i32 %a, i32 %b) {
@@ -6157,9 +6157,12 @@ entry:
     CHECK(countGlobals(*M, "morok.sdb.ready") == 1u);
     Function *Ensure = M->getFunction("morok.sdb.ensure.vm_secret");
     REQUIRE(Ensure);
+    Function *Seal = M->getFunction("morok.sdb.seal.vm_secret");
+    REQUIRE(Seal);
     Function *Helper = M->getFunction("morok.vm.vm_secret.exec");
     REQUIRE(Helper);
     CHECK(Ensure->arg_size() == Helper->arg_size());
+    CHECK(Seal->arg_size() == Helper->arg_size());
 
     auto *AfterData = dyn_cast<ConstantDataArray>(Bytecode->getInitializer());
     REQUIRE(AfterData);
@@ -6171,15 +6174,20 @@ entry:
     CHECK(payloadChanged);
 
     bool helperCallsEnsure = false;
+    bool helperCallsSeal = false;
     bool hasGate = false;
     bool hasTrap = false;
     bool hasVolatileReadyLoad = false;
     bool hasVolatileReadyStore = false;
+    bool hasVolatileSealReadyStore = false;
     bool hasVolatileContextLoad = false;
     bool hasVolatileContextStore = false;
     bool hasContextZero = false;
     bool keyUsesContext = false;
     bool storesPayload = false;
+    bool sealStoresPayload = false;
+    bool sealUsesExpectedHashKey = false;
+    bool activePayloadTripsFail = false;
     bool gateFallsIntoDecrypt = false;
     bool decryptBranchesToDecide = false;
     bool hasPostDecryptGateDecision = false;
@@ -6187,6 +6195,10 @@ entry:
         if (auto *CI = dyn_cast<CallInst>(&I)) {
             if (CI->getCalledFunction() == Ensure) {
                 helperCallsEnsure = true;
+                CHECK(CI->arg_size() == Helper->arg_size());
+            }
+            if (CI->getCalledFunction() == Seal) {
+                helperCallsSeal = true;
                 CHECK(CI->arg_size() == Helper->arg_size());
             }
         }
@@ -6229,6 +6241,13 @@ entry:
         for (Instruction &I : BB)
             blockHasGate |= I.getName().starts_with("morok.sdb.gate");
         if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator())) {
+            if (BB.getName() == "entry")
+                activePayloadTripsFail =
+                    BI->isConditional() &&
+                    ((BI->getSuccessor(0)->getName() == "fail" &&
+                      BI->getSuccessor(1)->getName() == "hash") ||
+                     (BI->getSuccessor(0)->getName() == "hash" &&
+                      BI->getSuccessor(1)->getName() == "fail"));
             if (blockHasGate)
                 gateFallsIntoDecrypt =
                     BI->isUnconditional() &&
@@ -6246,16 +6265,35 @@ entry:
                       BI->getSuccessor(1)->getName() == "ready"));
         }
     }
+    for (Instruction &I : instructions(*Seal)) {
+        if (I.getName().starts_with("morok.sdb.key.gate"))
+            sealUsesExpectedHashKey = true;
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+            hasVolatileSealReadyStore |=
+                SI->isVolatile() &&
+                SI->getPointerOperand()->getName().starts_with(
+                    "morok.sdb.ready");
+            sealStoresPayload |=
+                SI->isVolatile() &&
+                SI->getPointerOperand()->getName().starts_with(
+                    "morok.sdb.payload.ptr");
+        }
+    }
     CHECK(helperCallsEnsure);
+    CHECK(helperCallsSeal);
     CHECK(hasGate);
     CHECK(hasTrap);
     CHECK(hasVolatileReadyLoad);
     CHECK(hasVolatileReadyStore);
+    CHECK(hasVolatileSealReadyStore);
     CHECK(hasVolatileContextLoad);
     CHECK(hasVolatileContextStore);
     CHECK(hasContextZero);
     CHECK(keyUsesContext);
     CHECK(storesPayload);
+    CHECK(sealStoresPayload);
+    CHECK(sealUsesExpectedHashKey);
+    CHECK(activePayloadTripsFail);
     CHECK(gateFallsIntoDecrypt);
     CHECK(decryptBranchesToDecide);
     CHECK(hasPostDecryptGateDecision);

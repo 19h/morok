@@ -7,9 +7,9 @@
 // IR-safe hash-gated self-decrypting blocks.  Native block encryption requires
 // post-link addresses and W^X cooperation, so this pass implements the
 // roadmap's bytecode route: selected VM bytecode globals receive an outer
-// encrypted layer, a mutable payload, and a lazy decryptor gated by a runtime
-// hash of the still- encrypted payload.  The VM helper calls the decryptor
-// before reading bytecode.
+// encrypted layer, a mutable payload, and a per-invocation decryptor gated by a
+// runtime hash of the still-encrypted payload.  The VM helper decrypts before
+// reading bytecode and seals the payload again before returning.
 
 #include "morok/passes/HashGatedSelfDecrypt.hpp"
 
@@ -295,7 +295,7 @@ Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
     auto *ReadyLoad = EB.CreateLoad(I1, Ready, "morok.sdb.ready.load");
     ReadyLoad->setVolatile(true);
     ReadyLoad->setAlignment(Align(1));
-    EB.CreateCondBr(ReadyLoad, Exit, HashLoop);
+    EB.CreateCondBr(ReadyLoad, Fail, HashLoop);
 
     Builder HB(HashLoop);
     PHINode *HashI = HB.CreatePHI(I32, 2, "morok.sdb.hash.i");
@@ -358,10 +358,73 @@ Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
     return Fn;
 }
 
-bool helperAlreadyCalls(Function *Helper, Function *Ensure) {
+Function *createSeal(Module &M, Payload &P, GlobalVariable *Ready,
+                     const StreamSchedule &S, bool ContextKeying) {
+    LLVMContext &Ctx = M.getContext();
+    auto *VoidTy = Type::getVoidTy(Ctx);
+    auto *I1 = Type::getInt1Ty(Ctx);
+    auto *I8 = Type::getInt8Ty(Ctx);
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    const std::uint32_t Size = static_cast<std::uint32_t>(P.original.size());
+
+    const std::string SealName = "morok.sdb.seal." + P.suffix;
+    SmallVector<Type *, 8> Params;
+    for (Type *Ty : P.helper->getFunctionType()->params())
+        Params.push_back(Ty);
+
+    auto *Fn = Function::Create(FunctionType::get(VoidTy, Params, false),
+                                GlobalValue::InternalLinkage, SealName, &M);
+    addRuntimeAttrs(Fn);
+
+    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    BasicBlock *SealLoop = BasicBlock::Create(Ctx, "seal", Fn);
+    BasicBlock *Done = BasicBlock::Create(Ctx, "done", Fn);
+    BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
+
+    Builder EB(Entry);
+    Value *ContextZero =
+        ContextKeying ? emitContextZero(EB, Fn) : ConstantInt::get(I64, 0);
+    auto *ReadyLoad = EB.CreateLoad(I1, Ready, "morok.sdb.ready.load");
+    ReadyLoad->setVolatile(true);
+    ReadyLoad->setAlignment(Align(1));
+    EB.CreateCondBr(ReadyLoad, SealLoop, Exit);
+
+    Builder SB(SealLoop);
+    PHINode *SealI = SB.CreatePHI(I32, 2, "morok.sdb.seal.i");
+    SealI->addIncoming(ConstantInt::get(I32, 0), Entry);
+    Value *SealPtr = payloadPtr(SB, P.bytecode, SealI);
+    auto *Inner = SB.CreateLoad(I8, SealPtr, "morok.sdb.inner.seal");
+    Inner->setVolatile(true);
+    Inner->setAlignment(Align(1));
+    Value *ExpectedHash = ConstantInt::get(I64, S.expected_hash);
+    Value *Key = emitKeyByte(SB, SealI, ExpectedHash, ContextZero, S);
+    Value *Outer = SB.CreateXor(Inner, Key, "morok.sdb.outer.seal");
+    auto *Store = SB.CreateStore(Outer, SealPtr);
+    Store->setVolatile(true);
+    Store->setAlignment(Align(1));
+    Value *NextSealI =
+        SB.CreateAdd(SealI, ConstantInt::get(I32, 1), "morok.sdb.seal.next");
+    SealI->addIncoming(NextSealI, SealLoop);
+    Value *SealDone = SB.CreateICmpEQ(NextSealI, ConstantInt::get(I32, Size),
+                                      "morok.sdb.seal.done");
+    SB.CreateCondBr(SealDone, Done, SealLoop);
+
+    Builder DB(Done);
+    auto *ReadyStore = DB.CreateStore(ConstantInt::get(I1, false), Ready);
+    ReadyStore->setVolatile(true);
+    ReadyStore->setAlignment(Align(1));
+    DB.CreateBr(Exit);
+
+    Builder XB(Exit);
+    XB.CreateRetVoid();
+    return Fn;
+}
+
+bool helperAlreadyCalls(Function *Helper, Function *Callee) {
     for (Instruction &I : instructions(*Helper))
         if (auto *CI = dyn_cast<CallInst>(&I))
-            if (CI->getCalledFunction() == Ensure)
+            if (CI->getCalledFunction() == Callee)
                 return true;
     return false;
 }
@@ -379,6 +442,26 @@ void insertEnsureCall(Function *Helper, Function *Ensure) {
     Helper->removeFnAttr(Attribute::NoSync);
 }
 
+void insertSealCalls(Function *Helper, Function *Seal) {
+    if (helperAlreadyCalls(Helper, Seal))
+        return;
+
+    SmallVector<ReturnInst *, 4> Returns;
+    for (BasicBlock &BB : *Helper)
+        if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+            Returns.push_back(RI);
+
+    for (ReturnInst *RI : Returns) {
+        Builder B(RI);
+        SmallVector<Value *, 8> Args;
+        for (Argument &Arg : Helper->args())
+            Args.push_back(&Arg);
+        B.CreateCall(Seal->getFunctionType(), Seal, Args);
+    }
+    Helper->setMemoryEffects(MemoryEffects::unknown());
+    Helper->removeFnAttr(Attribute::NoSync);
+}
+
 bool wrapPayload(Module &M, Payload &P,
                  const HashGatedSelfDecryptParams &Params, ir::IRRandom &Rng) {
     StreamSchedule S = makeSchedule(Rng);
@@ -387,7 +470,9 @@ bool wrapPayload(Module &M, Payload &P,
     makeMutablePayload(*P.bytecode, Outer);
     GlobalVariable *Ready = createReady(M, P.suffix);
     Function *Ensure = createEnsure(M, P, Ready, S, Params.context_keying);
+    Function *Seal = createSeal(M, P, Ready, S, Params.context_keying);
     insertEnsureCall(P.helper, Ensure);
+    insertSealCalls(P.helper, Seal);
     return true;
 }
 

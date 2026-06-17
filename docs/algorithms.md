@@ -580,9 +580,14 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   VM bytecode to mutable payloads with a second encrypted outer layer.  The VM's
   original per-PC bytecode encryption remains inside that layer.
 - For each wrapped payload the pass emits an internal
-  `morok.sdb.ensure.*` helper and private `morok.sdb.ready.*` flag.  The VM
-  helper calls the ensure function before its dispatch loop reads bytecode,
-  passing through the helper's original arguments.
+  `morok.sdb.ensure.*` helper, a matching `morok.sdb.seal.*` helper, and a
+  private `morok.sdb.ready.*` active flag.  The VM helper calls the ensure
+  function before its dispatch loop reads bytecode and calls the seal function
+  before every normal return, passing through the helper's original arguments.
+- The ready flag is no longer a permanent "decrypted once" cache.  It is set
+  only while the bytecode slice is plaintext.  Re-entering the ensure helper
+  while the flag is already set trips the failure path, so an interrupted or
+  recursively re-used plaintext payload does not get xor-decrypted twice.
 - The ensure function first hashes the still-encrypted payload through volatile
   byte loads.  A `morok.sdb.gate` compare is computed, but it does not branch
   before decryption: the fixed-length decrypt loop always runs, then a
@@ -595,10 +600,13 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   The correct path still decrypts exactly, but the IR key now carries
   argument-derived, volatile memory-dependent provenance instead of being a
   purely static payload-hash expression.
-- The helper derives the stream key from the computed hash, decrypts each
-  payload byte with volatile stores, sets the ready flag volatile only after the
-  post-decrypt gate succeeds, and returns.  Later calls observe the ready flag
-  and skip the hash and decrypt loops.
+- The ensure helper derives the stream key from the computed hash, decrypts each
+  payload byte with volatile stores, sets the active flag volatile only after
+  the post-decrypt gate succeeds, and returns.  The seal helper derives the same
+  stream from the expected encrypted-payload hash, volatile-xors the plaintext
+  bytes back to ciphertext before VM helper return, and clears the active flag.
+  Later calls therefore re-hash encrypted bytes and expose plaintext only for
+  the current helper invocation.
 - Scheduler placement is directly after Virtualization and before the
   per-function pipeline, so VM bytecode exists and generated `morok.*` helpers
   remain outside later function-local transforms.
@@ -1018,7 +1026,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - TableArithmetic: encrypted lazy `i1..i8` and const-indexed `i9..i16` op lookup tables.
 - UniformPrimitiveLowering: `i1..i8`/const-indexed `i9..i16` op tables plus memory-loaded indirectbr dispatch.
 - Virtualization: encrypted per-function bytecode plus threaded computed-goto VM helpers.
-- HashGatedSelfDecrypt: VM bytecode globals get hash/context-gated lazy outer decryptors.
+- HashGatedSelfDecrypt: VM bytecode globals get hash/context-gated outer
+  decryptors that re-encrypt each payload on VM helper exit.
 - MutualGuardGraph: overlapping checksum nodes whose combined diff poisons scalar integer/FP returns.
 - AdversarialFunctionMerging: same-signature functions routed through shared selector dispatchers plus outlined scalar integer/FP operation and comparison helpers.
 - AdversarialSelfTuning: cloned-candidate search over hardness metrics with best verified bundle replay.
