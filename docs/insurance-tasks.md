@@ -28,7 +28,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 - [x] Census `DYLD_INSERT_LIBRARIES` / `DYLD_PRINT_*` env vars — their presence under a hardened build is itself a tamper signal `[macos · new]`
 - [x] Emit `prctl(PR_SET_DUMPABLE,0)` + `PR_SET_PTRACER` + `no_new_privs` at startup to block `/proc/pid/mem` and non-root ptrace `[linux · new]`
 - [x] Constant-time the secret-dependent paths of environmental-keying crypto so the protection key doesn't leak via timing `[xplat · new]`
-- [ ] Raise MBA / opaque-predicate density specifically on sensitive functions to inflate IDA/Ghidra decompiler output `[xplat · extends mba/bcf/extop]`
+- [x] Raise MBA / opaque-predicate density specifically on sensitive functions to inflate IDA/Ghidra decompiler output `[xplat · extends mba/bcf/extop]`
 
 ## M — new passes / substantial extensions
 

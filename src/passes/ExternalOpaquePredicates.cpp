@@ -60,14 +60,13 @@ Instruction *guardSplitPoint(BasicBlock &BB) {
     return nullptr;
 }
 
-GlobalVariable *ensureI64Global(Module &M, StringRef Name,
-                                std::uint64_t Init) {
+GlobalVariable *ensureI64Global(Module &M, StringRef Name, std::uint64_t Init) {
     if (auto *GV = M.getGlobalVariable(Name, /*AllowInternal=*/true))
         return GV;
     auto *I64 = Type::getInt64Ty(M.getContext());
-    auto *GV = new GlobalVariable(
-        M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
-        ConstantInt::get(I64, Init), Name);
+    auto *GV = new GlobalVariable(M, I64, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(I64, Init), Name);
     GV->setAlignment(Align(8));
     GV->setDSOLocal(true);
     return GV;
@@ -95,8 +94,8 @@ Function *ensureContextHelper(Module &M, ir::IRRandom &rng) {
     auto *I64 = Type::getInt64Ty(Ctx);
     auto *Ptr = PointerType::get(Ctx, 0);
     auto *FTy = FunctionType::get(I64, {Ptr, I64}, false);
-    auto *F = Function::Create(FTy, GlobalValue::InternalLinkage, kContextName,
-                               M);
+    auto *F =
+        Function::Create(FTy, GlobalValue::InternalLinkage, kContextName, M);
     F->setDSOLocal(true);
     F->addFnAttr(Attribute::NoInline);
     F->addFnAttr(Attribute::OptimizeNone);
@@ -147,12 +146,10 @@ void buildDecoyBlock(BasicBlock *Decoy, BasicBlock *Body,
     const std::uint32_t Stores =
         std::max<std::uint32_t>(Params.decoy_stores, 1);
     for (std::uint32_t I = 0; I != Stores; ++I) {
-        Value *Prev =
-            volatileLoad(B, I64, Scratch, "morok.extop.decoy.prev");
+        Value *Prev = volatileLoad(B, I64, Scratch, "morok.extop.decoy.prev");
         Acc = B.CreateAdd(Acc, Prev, "morok.extop.decoy.add");
-        Acc = B.CreateXor(
-            Acc, ConstantInt::get(I64, rng.next()),
-            "morok.extop.decoy.mix");
+        Acc = B.CreateXor(Acc, ConstantInt::get(I64, rng.next()),
+                          "morok.extop.decoy.mix");
         volatileStore(B, Acc, Scratch);
     }
     B.CreateBr(Body);
@@ -170,8 +167,9 @@ void shuffleBlocks(std::vector<BasicBlock *> &Blocks, ir::IRRandom &rng) {
 bool externalOpaquePredicatesFunction(Function &F,
                                       const ExternalOpaqueParams &params,
                                       ir::IRRandom &rng) {
-    if (F.isDeclaration() || isGeneratedFunction(F) || params.probability == 0 ||
-        params.max_blocks == 0)
+    if (F.isDeclaration() ||
+        (!params.include_generated && isGeneratedFunction(F)) ||
+        params.probability == 0 || params.max_blocks == 0)
         return false;
 
     std::vector<BasicBlock *> Blocks;
@@ -219,8 +217,8 @@ bool externalOpaquePredicatesFunction(Function &F,
     return Changed;
 }
 
-PreservedAnalyses ExternalOpaquePredicatesPass::run(
-    Function &F, FunctionAnalysisManager &) {
+PreservedAnalyses ExternalOpaquePredicatesPass::run(Function &F,
+                                                    FunctionAnalysisManager &) {
     if (F.isDeclaration())
         return PreservedAnalyses::all();
     ir::IRRandom rng(engine_);

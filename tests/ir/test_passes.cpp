@@ -8,6 +8,7 @@
 #include "doctest.h"
 
 #include "morok/core/Xoshiro256.hpp"
+#include "morok/ir/Annotations.hpp"
 #include "morok/ir/IRRandom.hpp"
 #include "morok/passes/AdversarialFunctionMerging.hpp"
 #include "morok/passes/AdversarialSelfTuning.hpp"
@@ -585,6 +586,86 @@ TEST_CASE("MorokPass demotes generated symbols to private linkage") {
         CHECK(GV.hasPrivateLinkage());
     }
     CHECK(morokSyms >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("MorokPass boosts MBA and opaque predicates on sensitive functions") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @hot_path(i32 %x, i32 %y) {
+entry:
+  %s = add i32 %x, %y
+  %c = icmp sgt i32 %s, 7
+  br i1 %c, label %left, label %right
+left:
+  %l = xor i32 %s, %x
+  br label %merge
+right:
+  %r = sub i32 %s, %y
+  br label %merge
+merge:
+  %p = phi i32 [ %l, %left ], [ %r, %right ]
+  ret i32 %p
+}
+)ir");
+    Function *F = M->getFunction("hot_path");
+    REQUIRE(F);
+    morok::ir::addAnnotation(*F, "sensitive");
+    const std::size_t beforeBlocks = F->size();
+    const std::size_t beforeBinops = countBinops(*F);
+
+    morok::config::Config cfg;
+    cfg.seed = 710;
+
+    ModuleAnalysisManager AM;
+    morok::pipeline::MorokPass(std::move(cfg)).run(*M, AM);
+
+    CHECK(F->size() > beforeBlocks);
+    CHECK(countBinops(*F) > beforeBinops);
+    CHECK(M->getGlobalVariable("morok.bcf.opaque", true) != nullptr);
+    CHECK(M->getFunction("morok.extop.context") != nullptr);
+    CHECK(countNamedInstructions(*F, "morok.extop.pred") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("MorokPass hardens sensitive generated decryptor helpers") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("helper-density", ctx);
+    makePrivateString(*M, "secret.str", "generated-secret");
+
+    morok::config::Config cfg;
+    cfg.seed = 711;
+    cfg.passes.str_enc.enabled = true;
+    cfg.passes.str_enc.probability = 100;
+    cfg.passes.bcf.enabled = true;
+    cfg.passes.bcf.probability = 0;
+    cfg.passes.bcf.iterations = 1;
+    cfg.passes.mba.enabled = true;
+    cfg.passes.mba.probability = 0;
+    cfg.passes.mba.layers = 1;
+    cfg.passes.mba.heuristic = false;
+    cfg.passes.external_op.enabled = true;
+    cfg.passes.external_op.probability = 0;
+    cfg.passes.external_op.max_blocks = 0;
+    cfg.passes.external_op.decoy_stores = 0;
+
+    ModuleAnalysisManager AM;
+    morok::pipeline::MorokPass(std::move(cfg)).run(*M, AM);
+
+    Function *Dec = nullptr;
+    for (Function &F : *M)
+        if (F.getName().starts_with("morok.strdec")) {
+            Dec = &F;
+            break;
+        }
+    REQUIRE(Dec);
+
+    bool hasBcfJunk = false;
+    for (BasicBlock &BB : *Dec)
+        hasBcfJunk |= BB.getName().starts_with("morok.bcf.junk");
+    CHECK(hasBcfJunk);
+    CHECK(countNamedInstructions(*Dec, "morok.extop.pred") >= 1u);
+    CHECK(M->getFunction("morok.extop.context") != nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

@@ -58,8 +58,10 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 using namespace llvm;
 
@@ -73,6 +75,8 @@ constexpr std::uint64_t kHeavyFunctionInstLimit = 1200;
 constexpr std::uint64_t kHeavyFunctionBlockLimit = 160;
 constexpr std::uint64_t kExplosiveFunctionInstLimit = 700;
 constexpr std::uint64_t kExplosiveFunctionBlockLimit = 96;
+constexpr std::uint64_t kSensitiveFunctionInstLimit = 1600;
+constexpr std::uint64_t kSensitiveFunctionBlockLimit = 220;
 
 constexpr std::uint64_t kModuleGrowthInstLimit = 60000;
 constexpr std::uint64_t kModuleGrowthBlockLimit = 8000;
@@ -81,6 +85,7 @@ constexpr std::uint64_t kModuleCloneInstLimit = 20000;
 constexpr std::uint64_t kModuleCloneBlockLimit = 3000;
 constexpr std::uint64_t kModuleCloneFunctionLimit = 500;
 constexpr std::uint64_t kModuleEligibleFunctionVisitLimit = 256;
+constexpr std::uint64_t kSensitiveHelperVisitLimit = 64;
 
 struct ModuleSize {
     std::uint64_t instructions = 0;
@@ -112,8 +117,7 @@ bool withinFunctionBudget(const Function &F, std::uint64_t MaxInstructions,
                           std::uint64_t MaxBlocks) {
     // Cheap O(1) block-count check first, then the early-exiting instruction
     // count, so over-budget functions bail without a full instruction walk.
-    return F.size() <= MaxBlocks &&
-           instructionCountAtMost(F, MaxInstructions);
+    return F.size() <= MaxBlocks && instructionCountAtMost(F, MaxInstructions);
 }
 
 bool growthFunctionOk(const Function &F) {
@@ -129,6 +133,11 @@ bool heavyFunctionOk(const Function &F) {
 bool explosiveFunctionOk(const Function &F) {
     return withinFunctionBudget(F, kExplosiveFunctionInstLimit,
                                 kExplosiveFunctionBlockLimit);
+}
+
+bool sensitiveFunctionOk(const Function &F) {
+    return withinFunctionBudget(F, kSensitiveFunctionInstLimit,
+                                kSensitiveFunctionBlockLimit);
 }
 
 ModuleSize measureModule(const Module &M) {
@@ -159,6 +168,101 @@ bool moduleCloneOk(const ModuleSize &Size) {
     return withinModuleBudget(Size, kModuleCloneInstLimit,
                               kModuleCloneBlockLimit,
                               kModuleCloneFunctionLimit);
+}
+
+bool hasSensitiveGeneratedPrefix(StringRef Name) {
+    return Name.starts_with("morok.strdec") ||
+           Name.starts_with("morok.sdb.ensure") ||
+           Name.starts_with("morok.tablearith.ensure") ||
+           Name.starts_with("morok.dfi.hash.") ||
+           Name.starts_with("morok.sc.diff.") ||
+           Name.starts_with("morok.mg.node.") ||
+           Name.starts_with("morok.mg.diff.") ||
+           Name.starts_with("morok.antidbg") ||
+           Name.starts_with("morok.antihook");
+}
+
+bool isSensitiveGeneratedFunction(const Function &F) {
+    return !F.isDeclaration() && hasSensitiveGeneratedPrefix(F.getName());
+}
+
+bool isUserSensitiveFunction(const Function &F) {
+    return ir::hasAnnotation(F, "sensitive");
+}
+
+std::uint32_t raised(std::uint32_t Value, std::uint32_t Floor, bool Sensitive) {
+    return Sensitive ? std::max(Value, Floor) : Value;
+}
+
+passes::BcfParams bcfParams(const config::BcfConfig &C, bool Sensitive) {
+    passes::BcfParams P;
+    P.probability = raised(C.probability.value_or(60), 100, Sensitive);
+    P.iterations = C.iterations.value_or(1);
+    return P;
+}
+
+passes::MbaParams mbaParams(const config::MbaConfig &C, bool Sensitive) {
+    passes::MbaParams P;
+    P.probability = raised(C.probability.value_or(60), 100, Sensitive);
+    P.layers = raised(C.layers.value_or(2), 2, Sensitive);
+    P.heuristic = Sensitive ? true : C.heuristic.value_or(true);
+    return P;
+}
+
+passes::ExternalOpaqueParams
+externalOpaqueParams(const config::ExternalOpConfig &C, bool Sensitive,
+                     bool IncludeGenerated = false) {
+    passes::ExternalOpaqueParams P;
+    P.probability = raised(C.probability.value_or(35), 100, Sensitive);
+    P.max_blocks = raised(C.max_blocks.value_or(8), 12, Sensitive);
+    P.decoy_stores = raised(C.decoy_stores.value_or(2), 3, Sensitive);
+    P.include_generated = IncludeGenerated;
+    return P;
+}
+
+bool passEnabledOrImplicitSensitive(config::Opt<bool> Enabled, bool Sensitive) {
+    if (Enabled.has_value())
+        return *Enabled;
+    return Sensitive;
+}
+
+bool hardenSensitiveGeneratedFunctions(Module &M,
+                                       const config::PassConfig &Config,
+                                       ir::IRRandom &Rng) {
+    if (!Config.bcf.enabled.value_or(false) &&
+        !Config.mba.enabled.value_or(false) &&
+        !Config.external_op.enabled.value_or(false))
+        return false;
+
+    std::vector<Function *> Targets;
+    Targets.reserve(16);
+    for (Function &F : M) {
+        if (Targets.size() >= kSensitiveHelperVisitLimit)
+            break;
+        if (isSensitiveGeneratedFunction(F) && sensitiveFunctionOk(F))
+            Targets.push_back(&F);
+    }
+
+    bool Changed = false;
+    for (Function *F : Targets) {
+        if (!moduleGrowthOk(measureModule(M)))
+            break;
+
+        if (Config.bcf.enabled.value_or(false) && sensitiveFunctionOk(*F))
+            Changed |= passes::bogusControlFlowFunction(
+                *F, bcfParams(Config.bcf, /*Sensitive=*/true), Rng);
+        if (Config.external_op.enabled.value_or(false) &&
+            sensitiveFunctionOk(*F))
+            Changed |= passes::externalOpaquePredicatesFunction(
+                *F,
+                externalOpaqueParams(Config.external_op, /*Sensitive=*/true,
+                                     /*IncludeGenerated=*/true),
+                Rng);
+        if (Config.mba.enabled.value_or(false) && growthFunctionOk(*F))
+            Changed |= passes::mbaFunction(
+                *F, mbaParams(Config.mba, /*Sensitive=*/true), Rng);
+    }
+    return Changed;
 }
 
 } // namespace
@@ -246,6 +350,7 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
 
             const config::PassConfig eff =
                 config::resolve(config_, moduleName, F.getName(), demangle);
+            const bool Sensitive = isUserSensitiveFunction(F);
 
             // Structural passes first: split creates more dispatch targets,
             // then bogus control flow widens the CFG, before the value-level
@@ -260,11 +365,10 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
 
             if (heavyFunctionOk(F) &&
                 ir::shouldObfuscate(F, "bcf",
-                                    eff.bcf.enabled.value_or(false))) {
-                passes::BcfParams p;
-                p.probability = eff.bcf.probability.value_or(60);
-                p.iterations = eff.bcf.iterations.value_or(1);
-                changed |= passes::bogusControlFlowFunction(F, p, rng);
+                                    passEnabledOrImplicitSensitive(
+                                        eff.bcf.enabled, Sensitive))) {
+                changed |= passes::bogusControlFlowFunction(
+                    F, bcfParams(eff.bcf, Sensitive), rng);
             }
 
             // PM-sensitive: for `-mllvm -morok` this runs from the plugin's
@@ -292,12 +396,10 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
 
             if (growthFunctionOk(F) &&
                 ir::shouldObfuscate(F, "mba",
-                                    eff.mba.enabled.value_or(false))) {
-                passes::MbaParams p;
-                p.probability = eff.mba.probability.value_or(60);
-                p.layers = eff.mba.layers.value_or(2);
-                p.heuristic = eff.mba.heuristic.value_or(true);
-                changed |= passes::mbaFunction(F, p, rng);
+                                    passEnabledOrImplicitSensitive(
+                                        eff.mba.enabled, Sensitive))) {
+                changed |=
+                    passes::mbaFunction(F, mbaParams(eff.mba, Sensitive), rng);
             }
 
             // Add small volatile-neutral webs after Sub/MBA have expanded
@@ -328,14 +430,12 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
 
             // Context-derived opaque predicates add side-effecting guard calls
             // before decoys and flattening absorb the widened CFG.
-            if (heavyFunctionOk(F) &&
+            if ((Sensitive ? sensitiveFunctionOk(F) : heavyFunctionOk(F)) &&
                 ir::shouldObfuscate(F, "extop",
-                                    eff.external_op.enabled.value_or(false))) {
-                passes::ExternalOpaqueParams p;
-                p.probability = eff.external_op.probability.value_or(35);
-                p.max_blocks = eff.external_op.max_blocks.value_or(8);
-                p.decoy_stores = eff.external_op.decoy_stores.value_or(2);
-                changed |= passes::externalOpaquePredicatesFunction(F, p, rng);
+                                    passEnabledOrImplicitSensitive(
+                                        eff.external_op.enabled, Sensitive))) {
+                changed |= passes::externalOpaquePredicatesFunction(
+                    F, externalOpaqueParams(eff.external_op, Sensitive), rng);
             }
 
             // Coherent dead paths use opaque-true guards but return plausible
@@ -676,6 +776,15 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         }
     }
 
+    // Sensitive generated helpers (string decryptors, bytecode decryptors,
+    // integrity hash nodes, anti-debug constructors) are deliberately skipped
+    // by the normal per-function loop because they are `morok.*`.  Give only
+    // that allowlisted protection code a denser MBA/opaque-predicate shell
+    // when the corresponding families are enabled, after all per-function
+    // passes have had a chance to emit their own helpers.
+    if (InitialModuleGrowthOk)
+        changed |= hardenSensitiveGeneratedFunctions(M, config_.passes, rng);
+
     const ModuleSize PostFunctionSize =
         InitialModuleGrowthOk ? measureModule(M) : InitialSize;
 
@@ -747,11 +856,11 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
 
     // Final symbol hygiene: every generated `morok.*` helper still carries its
     // descriptive internal-linkage name (`morok.gf8mul`, `morok.strdec`, …),
-    // which leaks into the binary's symbol table and hands an analyst a labelled
-    // roadmap of the protection.  Demote them to private linkage — the IR name
-    // survives for any by-name coordination, but private symbols are dropped
-    // from the object symbol table (the encrypted string globals already rely on
-    // this), so the names never reach the artifact.
+    // which leaks into the binary's symbol table and hands an analyst a
+    // labelled roadmap of the protection.  Demote them to private linkage — the
+    // IR name survives for any by-name coordination, but private symbols are
+    // dropped from the object symbol table (the encrypted string globals
+    // already rely on this), so the names never reach the artifact.
     for (Function &F : M)
         if (F.hasLocalLinkage() && F.getName().starts_with("morok."))
             F.setLinkage(GlobalValue::PrivateLinkage);

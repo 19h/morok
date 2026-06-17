@@ -341,12 +341,33 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   body.  This gives the dead arm memory/context behavior instead of obvious
   junk, while keeping PHI repair unnecessary because the split preserves the
   original predecessor relation.
-- The pass skips generated `morok.*` functions, EH pads, landing pads, and
-  generated `morok.extop.*` blocks.  `max_blocks` caps transformed blocks per
-  function; `decoy_stores` controls scratch-store density.
+- The standalone pass skips generated `morok.*` functions by default, plus EH
+  pads, landing pads, and generated `morok.extop.*` blocks.  The scheduler can
+  opt back into generated functions only for its sensitive-helper allowlist.
+  `max_blocks` caps transformed blocks per function; `decoy_stores` controls
+  scratch-store density.
 - Scheduler placement is after AliasOpaquePredicates and before CoherentDecoys
   and flattening.  That layers a volatile/context hardness class on top of
   alias-invariant predicates before later CFG passes absorb the extra edges.
+
+## Sensitive-density boosting — scheduler behavior
+- A function annotated `__attribute__((annotate("sensitive")))` gets denser
+  BCF/MBA/ExternalOpaque treatment without changing global presets: unset
+  enable flags are treated as enabled for those three families, BCF/extop block
+  probabilities are raised to 100, MBA probability is raised to 100, MBA keeps
+  at least two layers, and extop gets larger block/store caps.  For this
+  `sensitive` boost, explicit `nobcf`/`nomba`/`noextop` annotations and
+  explicit disabled config fields keep the family off.
+- Generated protection helpers are normally skipped by the per-function loop
+  because their names start with `morok.`.  After per-function passes finish
+  emitting helpers, the scheduler applies the same dense BCF/extop/MBA shell to
+  an allowlist of sensitive helpers: per-string decryptors, hash-gated bytecode
+  ensure functions, table/DFI/self-check/mutual-guard hash helpers, and
+  anti-debug/anti-hook constructors/helpers.
+- The generated-helper phase is bounded by the normal module growth gate, a
+  helper visit cap, and a separate sensitive-function size cap.  It does not
+  recursively harden its own scaffold (`morok.extop.*`, `morok.bcf.*`) or every
+  generated layout helper.
 
 ## Coherent decoy dead paths — IR structure
 - The pass selects scalar integer or floating-point return blocks, splits the
@@ -896,6 +917,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - BogusControlFlow: opaque hardware-predicate edges; `bcf_prob`/loop/complexity/entropy_chain/junk_asm.
 - NonInvertibleState: encoded-state flattening with lossy keyed next-state hash.
 - StateOpaquePredicates: MBA opaque guards over flattened dispatcher state plus scalar integer/FP terms.
+- Sensitive-density boost: scheduler-only BCF/MBA/ExternalOpaque pressure for
+  `annotate("sensitive")` functions and allowlisted generated protection helpers.
 - InterproceduralFsm: flattened state stores call mutually-recursive transition helpers with scalar integer/FP token terms.
 - DataEntangledFlattening: switch dispatcher with scalar integer/FP live-data/previous-state transition tokens.
 - ChaosStateMachine: switch dispatcher driven by logistic or single-cycle T-function state maps.
@@ -967,5 +990,5 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Scheduler order (to preserve semantics)
 AntiHook → AntiClassDump → FCO(fn) → AntiDebug → StringEnc → Virtualization → HashSelfDecrypt → per-fn{ Split, BCF, OptAmp, Sub,
-MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare } → ConstEnc → IndirectBranch → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
+MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → SensitiveHelperHardening → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 FeatureElimination (strip debug/names) → cleanup marker decls.

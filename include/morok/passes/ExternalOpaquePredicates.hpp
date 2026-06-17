@@ -26,9 +26,11 @@ class Function;
 namespace morok::passes {
 
 struct ExternalOpaqueParams {
-    std::uint32_t probability = 35;    ///< per-block chance, 0..100
-    std::uint32_t max_blocks = 8;      ///< per-function transformed block cap
-    std::uint32_t decoy_stores = 2;    ///< volatile scratch writes in false arm
+    std::uint32_t probability = 35; ///< per-block chance, 0..100
+    std::uint32_t max_blocks = 8;   ///< per-function transformed block cap
+    std::uint32_t decoy_stores = 2; ///< volatile scratch writes in false arm
+    bool include_generated =
+        false; ///< allow explicitly selected morok.* helpers
 };
 
 /// Apply external/volatile-derived opaque predicates to `F`.
