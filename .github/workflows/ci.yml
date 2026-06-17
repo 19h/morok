@@ -123,21 +123,33 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
           )
           if [ "$RUNNER_OS" = "Linux" ]; then
-            # Point the freshly-built trunk clang at the newest installed
-            # libstdc++ (it otherwise picks a GCC dir whose headers are absent,
-            # making <initializer_list> et al. "not found").
+            # The vanilla trunk clang lacks Debian/Ubuntu's multiarch libstdc++
+            # path patches: --gcc-install-dir lets it link libstdc++/libgcc, but
+            # it cannot locate the C++ *headers*, so add them explicitly with
+            # -isystem (<initializer_list> et al. are otherwise "not found").
             ver="$(ls /usr/include/c++/ 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)"
-            gccdir="/usr/lib/gcc/$(gcc -dumpmachine)/${ver}"
+            triple="$(gcc -dumpmachine)"
+            gccdir="/usr/lib/gcc/${triple}/${ver}"
+            cxxinc="--gcc-install-dir=${gccdir} -isystem /usr/include/c++/${ver} -isystem /usr/include/${triple}/c++/${ver} -isystem /usr/include/c++/${ver}/backward"
             args+=(
-              -DCMAKE_C_FLAGS="--gcc-install-dir=$gccdir"
-              -DCMAKE_CXX_FLAGS="--gcc-install-dir=$gccdir"
+              -DCMAKE_C_FLAGS="--gcc-install-dir=${gccdir}"
+              -DCMAKE_CXX_FLAGS="${cxxinc}"
             )
           fi
           if [ "$RUNNER_OS" = "Windows" ]; then
-            # clang targeting MSVC promotes narrowing in braced-init to an error
-            # (it is ill-formed C++); the GNU-driver clang on Linux/macOS only
-            # warns, and the codebase relies on that leniency. Match it here.
-            args+=( -DCMAKE_CXX_FLAGS=-Wno-c++11-narrowing )
+            # The freshly-built clang++ does not pick up the MSVC STL / Windows
+            # SDK headers from the environment the way cl does, so pass them
+            # explicitly as -imsvc dirs (the MSVC dev shell exports them in
+            # EXTERNAL_INCLUDE). Also relax narrowing-in-braced-init, which is
+            # only warned (not errored) by the Linux/macOS clang the codebase is
+            # developed against.
+            imsvc=""
+            IFS=';' read -ra _paths <<< "${EXTERNAL_INCLUDE:-${INCLUDE:-}}" || true
+            for _d in "${_paths[@]}"; do
+              _d="${_d//\\//}"
+              [ -n "$_d" ] && imsvc="$imsvc -imsvc \"$_d\""
+            done
+            args+=( -DCMAKE_CXX_FLAGS="-Wno-c++11-narrowing $imsvc" )
           fi
           cmake "${args[@]}"
 
