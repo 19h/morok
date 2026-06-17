@@ -1067,6 +1067,16 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   checks it against executable segments from dyld's loaded image list.  Pointers
   that do not land in any loaded image `__TEXT`-style executable range are
   folded into the delayed anti-hook state.
+  AntiHooking also emits a bounded address-space census.  Linux parses a cloaked
+  `/proc/self/maps` buffer with direct syscalls where available, flags `rwx`
+  mappings, executable non-readable mappings, anonymous/private executable
+  mappings, and unexpected `LD_PRELOAD`/`LD_AUDIT`.  macOS walks
+  `mach_vm_region` with `VM_REGION_BASIC_INFO_64`, flags RWX/NOACCESS mappings,
+  executable regions outside dyld image text ranges, and loaded text ranges whose
+  live protection is no longer RX.  Windows x86_64 emits a `VirtualQuery` census
+  that flags committed guard/NOACCESS/RWX pages and private executable mappings;
+  deeper PE loader-list reconciliation remains tied to the later Windows/PE
+  foundation.
 - TimingOracle emits a private constructor helper that samples several short
   volatile spans with two clock sources.  x86 targets use serialized `rdtscp`
   paired with a raw OS clock; Darwin targets use `mach_absolute_time` and

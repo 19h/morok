@@ -8900,11 +8900,15 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Got != nullptr);
     Function *Rx = M->getFunction("morok.antihook.elf.rx");
     REQUIRE(Rx != nullptr);
+    Function *Maps = M->getFunction("morok.antihook.maps.linux");
+    REQUIRE(Maps != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
     CHECK(hasInlineAsmCall(*Clean));
     CHECK(hasInlineAsmCall(*Got));
+    CHECK(hasInlineAsmCall(*Maps));
     CHECK(M->getFunction("dlsym") != nullptr);
+    CHECK(M->getFunction("getenv") != nullptr);
     CHECK(M->getFunction("readlink") == nullptr);
     CHECK(M->getFunction("open") == nullptr);
     CHECK(M->getFunction("lseek") == nullptr);
@@ -8920,9 +8924,15 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.rx") >= 1u);
     CHECK(countNamedInstructions(*Rx, "morok.antihook.got.map.seg.hit") >= 1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.rwx") >= 1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.anonymous.exec") >=
+          1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.preload") >= 1u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
                                  "morok.antihook.prologue.x86.hit") >= 1u);
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/exe"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/self/maps"));
+    CHECK_FALSE(hasReadableByteString(*M, "LD_PRELOAD"));
     CHECK_FALSE(hasReadableByteString(*M, "MSHookFunction"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
@@ -8944,6 +8954,8 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Fixups != nullptr);
     Function *Text = M->getFunction("morok.antihook.macho.text");
     REQUIRE(Text != nullptr);
+    Function *Vm = M->getFunction("morok.antihook.vm.darwin");
+    REQUIRE(Vm != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
     CHECK(M->getFunction("morok.antihook.got.plt") == nullptr);
@@ -8965,13 +8977,39 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Fixups, "morok.antihook.fixup.text") >= 1u);
     CHECK(countNamedInstructions(*Text, "morok.antihook.macho.text.hit") >=
           1u);
+    CHECK(countNamedInstructions(*Vm, "morok.antihook.vm.rwx") >= 1u);
+    CHECK(countNamedInstructions(*Vm, "morok.antihook.vm.private.exec") >= 1u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
                                  "morok.antihook.prologue.x86.hit") >= 1u);
     CHECK(M->getFunction("_NSGetExecutablePath") != nullptr);
     CHECK(M->getFunction("_dyld_image_count") != nullptr);
     CHECK(M->getFunction("_dyld_get_image_header") != nullptr);
     CHECK(M->getFunction("_dyld_get_image_vmaddr_slide") != nullptr);
+    CHECK(M->getFunction("mach_vm_region") != nullptr);
+    CHECK(M->getFunction("mach_port_deallocate") != nullptr);
+    CHECK(M->getGlobalVariable("mach_task_self_") != nullptr);
     CHECK_FALSE(hasReadableByteString(*M, "MSHookFunction"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("antiHookingModule emits Windows VirtualQuery address-space census") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-pc-windows-msvc"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8804);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::antiHookingModule(*M, rng));
+
+    Function *Vm = M->getFunction("morok.antihook.vm.windows");
+    REQUIRE(Vm != nullptr);
+    CHECK(M->getFunction("VirtualQuery") != nullptr);
+    CHECK(M->getFunction("dlsym") == nullptr);
+    CHECK(M->getFunction("exit") == nullptr);
+    CHECK(countNamedInstructions(*Vm, "morok.antihook.win.rwx") >= 1u);
+    CHECK(countNamedInstructions(*Vm, "morok.antihook.win.private") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
