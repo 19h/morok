@@ -56,7 +56,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 - [x] Functional entanglement — derive real runtime values (crypto keys, jump-table indices, S-box bytes, next-block decryption keys) **from** the checksum / DR-state / watchdog-liveness so there is no `jz` to NOP `[xplat · extends selfcheck/dfi]`
 - [x] Delayed, probabilistic, decoupled failure: record tamper in obscure state, continue normally, degrade/crash much later at an unrelated site `[xplat · extends selfcheck/tracekey]`
 - [x] Plant realistic decoy checks whose patching flips hidden state that feeds the entanglement corruption `[xplat · extends decoy]`
-- [ ] Code-as-data: compute a constant the program needs (S-box / dispatch table) by hashing a function's bytes, so patching that function yields a wrong constant `[xplat · extends selfcheck/dfi]`
+- [x] Code-as-data: compute a constant the program needs (S-box / dispatch table) by hashing a function's bytes, so patching that function yields a wrong constant `[xplat · extends selfcheck/dfi]`
 - [ ] Anti-VM/sandbox heuristic battery: CPUID hypervisor leaf, Red Pill `sidt`/`sgdt`/`sldt`, VMware backdoor port, sleep-skip, CPU-count/RAM/uptime (decoy-grade, multi-signal) `[xplat · new]`
 - [ ] Anti-DBI battery: code-cache return-address origin check, large-RWX-region scan, SMC tripwire, Frida thread/port/maps signatures (`gum-js-loop`, `27042`, `frida`/`gadget`) `[xplat · extends antihook]`
 - [ ] Negative-space verification: assert the *absence* of tamper — no `0xCC` in `.text`, no extra modules, timing not slow, DR all zero `[xplat · new]`

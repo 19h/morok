@@ -605,9 +605,10 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Self-checksum-fused constants — IR structure
 - True code-region checksums need post-link byte ranges.  The IR pass emits the
-  runtime/data-flow contract over private `morok.sc.region.*` byte regions and
-  `morok.sc.expected.*` hash globals; a post-link rewriter can replace those
-  regions and expected hashes with final native code slices.
+  runtime/data-flow contract over private `morok.sc.region.*` byte regions,
+  patchable `morok.sc.code.size.*` live-code window lengths, and
+  `morok.sc.expected.*` hash globals.  A post-link rewriter can set the code
+  window size and patch the expected hash after final native bytes are fixed.
 - Each selected `i1` through `i64` integer constant, and each scalar
   half/bfloat/float/double constant via its raw integer bit pattern, is
   reconstructed as
@@ -624,15 +625,19 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - The pass deliberately emits no trap and no check branch.  The integrity value
   is data, so there is no separable success/failure edge to patch out.
 - Runtime hash helpers are internal `morok.sc.diff.*` functions with volatile
-  region and expected loads, `noinline`, and `optnone`.  Per-constant masks live
-  in private mutable `morok.sc.mask.*` globals and are volatile-loaded at each
-  use site.
+  region loads, patchable code-window loads from the protected function's live
+  address, volatile expected loads, `noinline`, and `optnone`.  The code window
+  defaults to zero bytes so ordinary IR-only builds keep the placeholder-region
+  semantics until post-link sizing is applied.  Per-constant masks live in
+  private mutable `morok.sc.mask.*` globals and are volatile-loaded at each use
+  site.
 - The pass also emits a retained `morok.postlink.sc.*` manifest and places it
   in `llvm.compiler.used`.  The manifest records magic/version, pointers to the
   `morok.sc.region.*` and `morok.sc.expected.*` globals, the region byte count,
-  the hash seed, and the current expected hash.  A post-link rewriter can use
-  that manifest to replace the placeholder region with final code bytes and
-  patch the expected-hash global without reverse-engineering the IR shape.
+  the hash seed, the current expected hash, the protected function pointer, and
+  the `morok.sc.code.size.*` global.  A post-link rewriter can use that manifest
+  to keep the placeholder region, add a final code-byte window, and patch the
+  expected-hash global without reverse-engineering the IR shape.
 - Scheduler placement is after trace keying/dispatcherless routing and before
   constant encryption, so the integrity fusion is late while ordinary constant
   encryption can still hide the encoded constants introduced by this pass.

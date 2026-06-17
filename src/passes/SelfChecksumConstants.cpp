@@ -6,10 +6,10 @@
 //
 // IR-stage self-checksum-fused constants.  Final native code-region hashes need
 // post-link sizing, so this pass emits the data-flow shape and runtime hash
-// stub over a private IR-owned region that a post-link rewriter can later
-// replace. The hash result feeds values directly: there is no branch, trap, or
-// separable check to NOP.  If the hashed region diverges from the expected
-// value, selected constants reconstruct to corrupted values.
+// stub over a private IR-owned region plus a patchable live-code window length.
+// The hash result feeds values directly: there is no branch, trap, or separable
+// check to NOP.  If the hashed data diverges from the expected value, selected
+// constants reconstruct to corrupted values.
 
 #include "morok/passes/SelfChecksumConstants.hpp"
 
@@ -62,6 +62,7 @@ struct Runtime {
     Function *diff = nullptr;
     GlobalVariable *region = nullptr;
     GlobalVariable *expected = nullptr;
+    GlobalVariable *code_size = nullptr;
     std::uint64_t expected_hash = 0;
     std::uint64_t seed = 0;
 };
@@ -314,21 +315,33 @@ GlobalVariable *createExpected(Module &M, StringRef Suffix,
     return Expected;
 }
 
+GlobalVariable *createCodeSize(Module &M, StringRef Suffix) {
+    auto *I32 = Type::getInt32Ty(M.getContext());
+    auto *CodeSize = new GlobalVariable(
+        M, I32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I32, 0),
+        (Twine("morok.sc.code.size.") + Suffix).str());
+    CodeSize->setAlignment(Align(4));
+    return CodeSize;
+}
+
 GlobalVariable *
-createPostlinkManifest(Module &M, StringRef Suffix, GlobalVariable *Region,
-                       GlobalVariable *Expected, std::uint32_t RegionSize,
+createPostlinkManifest(Module &M, Function &Target, StringRef Suffix,
+                       GlobalVariable *Region, GlobalVariable *Expected,
+                       GlobalVariable *CodeSize, std::uint32_t RegionSize,
                        std::uint64_t Seed, std::uint64_t ExpectedHash) {
     LLVMContext &Ctx = M.getContext();
     auto *I32 = Type::getInt32Ty(Ctx);
     auto *I64 = Type::getInt64Ty(Ctx);
     auto *PtrTy = PointerType::getUnqual(Ctx);
-    auto *ManifestTy =
-        StructType::get(Ctx, {I64, I32, PtrTy, PtrTy, I32, I64, I64});
+    auto *ManifestTy = StructType::get(
+        Ctx, {I64, I32, PtrTy, PtrTy, I32, I64, I64, PtrTy, PtrTy});
     auto *Init = ConstantStruct::get(
         ManifestTy,
-        {ConstantInt::get(I64, kPostlinkMagic), ConstantInt::get(I32, 1),
+        {ConstantInt::get(I64, kPostlinkMagic), ConstantInt::get(I32, 2),
          Region, Expected, ConstantInt::get(I32, RegionSize),
-         ConstantInt::get(I64, Seed), ConstantInt::get(I64, ExpectedHash)});
+         ConstantInt::get(I64, Seed), ConstantInt::get(I64, ExpectedHash),
+         &Target, CodeSize});
     auto *Manifest = new GlobalVariable(
         M, ManifestTy, /*isConstant=*/true, GlobalValue::PrivateLinkage, Init,
         (Twine("morok.postlink.sc.") + Suffix).str());
@@ -345,8 +358,18 @@ Value *regionPtr(Builder &B, GlobalVariable *Region, Value *Idx) {
                                "morok.sc.region.ptr");
 }
 
+Value *codePtr(Builder &B, Function *Target, Value *Idx) {
+    auto *I64 = B.getInt64Ty();
+    Value *Base = B.CreatePtrToInt(Target, I64, "morok.sc.code.base");
+    Value *Offset = B.CreateZExt(Idx, I64, "morok.sc.code.offset");
+    Value *Addr = B.CreateAdd(Base, Offset, "morok.sc.code.addr");
+    return B.CreateIntToPtr(Addr, PointerType::getUnqual(B.getContext()),
+                            "morok.sc.code.ptr");
+}
+
 Function *createDiffFunction(Module &M, StringRef Suffix,
                              GlobalVariable *Region, GlobalVariable *Expected,
+                             GlobalVariable *CodeSize, Function *Target,
                              std::uint64_t Seed) {
     LLVMContext &Ctx = M.getContext();
     auto *I8 = Type::getInt8Ty(Ctx);
@@ -363,6 +386,8 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
 
     BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
     BasicBlock *Loop = BasicBlock::Create(Ctx, "hash", Fn);
+    BasicBlock *CodeCheck = BasicBlock::Create(Ctx, "code.check", Fn);
+    BasicBlock *CodeLoop = BasicBlock::Create(Ctx, "code.hash", Fn);
     BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
 
     Builder EB(Entry);
@@ -384,13 +409,44 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
     H->addIncoming(NextH, Loop);
     Value *Done = LB.CreateICmpEQ(NextI, ConstantInt::get(I32, Size),
                                   "morok.sc.hash.done");
-    LB.CreateCondBr(Done, Exit, Loop);
+    LB.CreateCondBr(Done, CodeCheck, Loop);
+
+    Builder CB(CodeCheck);
+    auto *CodeSizeLoad =
+        CB.CreateLoad(I32, CodeSize, "morok.sc.code.size.load");
+    CodeSizeLoad->setVolatile(true);
+    CodeSizeLoad->setAlignment(Align(4));
+    Value *HasCode =
+        CB.CreateICmpNE(CodeSizeLoad, ConstantInt::get(I32, 0),
+                        "morok.sc.code.has");
+    CB.CreateCondBr(HasCode, CodeLoop, Exit);
+
+    Builder KB(CodeLoop);
+    PHINode *CI = KB.CreatePHI(I32, 2, "morok.sc.code.i");
+    PHINode *CH = KB.CreatePHI(I64, 2, "morok.sc.code.hash");
+    CI->addIncoming(ConstantInt::get(I32, 0), CodeCheck);
+    CH->addIncoming(NextH, CodeCheck);
+    auto *CodeByte =
+        KB.CreateLoad(I8, codePtr(KB, Target, CI), "morok.sc.code.byte");
+    CodeByte->setVolatile(true);
+    CodeByte->setAlignment(Align(1));
+    Value *NextCH = emitHashStep(KB, CH, CodeByte);
+    Value *NextCI =
+        KB.CreateAdd(CI, ConstantInt::get(I32, 1), "morok.sc.code.next");
+    CI->addIncoming(NextCI, CodeLoop);
+    CH->addIncoming(NextCH, CodeLoop);
+    Value *CodeDone =
+        KB.CreateICmpEQ(NextCI, CodeSizeLoad, "morok.sc.code.done");
+    KB.CreateCondBr(CodeDone, Exit, CodeLoop);
 
     Builder XB(Exit);
+    PHINode *FinalH = XB.CreatePHI(I64, 2, "morok.sc.final.hash");
+    FinalH->addIncoming(NextH, CodeCheck);
+    FinalH->addIncoming(NextCH, CodeLoop);
     auto *ExpectedLoad = XB.CreateLoad(I64, Expected, "morok.sc.expected.load");
     ExpectedLoad->setVolatile(true);
     ExpectedLoad->setAlignment(Align(8));
-    Value *Diff = XB.CreateXor(NextH, ExpectedLoad, "morok.sc.diff");
+    Value *Diff = XB.CreateXor(FinalH, ExpectedLoad, "morok.sc.diff");
     XB.CreateRet(Diff);
     return Fn;
 }
@@ -409,9 +465,11 @@ Runtime createRuntime(Function &F, const SelfChecksumParams &Params,
     R.seed = Seed;
     R.region = createRegion(M, Suffix, Bytes);
     R.expected = createExpected(M, Suffix, R.expected_hash);
-    createPostlinkManifest(M, Suffix, R.region, R.expected, RegionSize, R.seed,
-                           R.expected_hash);
-    R.diff = createDiffFunction(M, Suffix, R.region, R.expected, Seed);
+    R.code_size = createCodeSize(M, Suffix);
+    createPostlinkManifest(M, F, Suffix, R.region, R.expected, R.code_size,
+                           RegionSize, R.seed, R.expected_hash);
+    R.diff = createDiffFunction(M, Suffix, R.region, R.expected, R.code_size,
+                                &F, Seed);
     return R;
 }
 

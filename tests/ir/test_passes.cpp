@@ -6058,26 +6058,33 @@ entry:
 
     CHECK(countGlobals(*M, "morok.sc.region") == 1u);
     CHECK(countGlobals(*M, "morok.sc.expected") == 1u);
+    CHECK(countGlobals(*M, "morok.sc.code.size") == 1u);
     CHECK(countGlobals(*M, "morok.sc.mask") == 2u);
     CHECK(countGlobals(*M, "morok.postlink.sc") == 1u);
 
     GlobalVariable *Region = nullptr;
     GlobalVariable *Expected = nullptr;
+    GlobalVariable *CodeSize = nullptr;
     GlobalVariable *Manifest = nullptr;
     for (GlobalVariable &GV : M->globals()) {
         if (GV.getName().starts_with("morok.sc.region"))
             Region = &GV;
         if (GV.getName().starts_with("morok.sc.expected"))
             Expected = &GV;
+        if (GV.getName().starts_with("morok.sc.code.size"))
+            CodeSize = &GV;
         if (GV.getName().starts_with("morok.postlink.sc"))
             Manifest = &GV;
     }
     REQUIRE(Region);
     REQUIRE(Expected);
+    REQUIRE(CodeSize);
     REQUIRE(Manifest);
     REQUIRE(Manifest->hasInitializer());
     CHECK(constantReferencesGlobal(Manifest->getInitializer(), Region));
     CHECK(constantReferencesGlobal(Manifest->getInitializer(), Expected));
+    CHECK(constantReferencesGlobal(Manifest->getInitializer(), CodeSize));
+    CHECK(constantReferencesGlobal(Manifest->getInitializer(), F));
     GlobalVariable *Used = M->getGlobalVariable("llvm.compiler.used");
     REQUIRE(Used);
     REQUIRE(Used->hasInitializer());
@@ -6102,6 +6109,8 @@ entry:
 
     bool hasVolatileRegionLoad = false;
     bool hasVolatileExpectedLoad = false;
+    bool hasVolatileCodeSizeLoad = false;
+    bool hasVolatileCodeByteLoad = false;
     bool hasDiffValue = false;
     for (Instruction &I : instructions(*Diff)) {
         hasDiffValue |= I.getName().starts_with("morok.sc.diff");
@@ -6117,6 +6126,13 @@ entry:
                 LI->isVolatile() &&
                 LI->getPointerOperand()->getName().starts_with(
                     "morok.sc.expected");
+            hasVolatileCodeSizeLoad |=
+                LI->isVolatile() &&
+                LI->getPointerOperand()->getName().starts_with(
+                    "morok.sc.code.size");
+            hasVolatileCodeByteLoad |=
+                LI->isVolatile() &&
+                LI->getName().starts_with("morok.sc.code.byte");
         }
     }
 
@@ -6125,6 +6141,8 @@ entry:
     CHECK(hasVolatileMaskLoad);
     CHECK(hasVolatileRegionLoad);
     CHECK(hasVolatileExpectedLoad);
+    CHECK(hasVolatileCodeSizeLoad);
+    CHECK(hasVolatileCodeByteLoad);
     CHECK(hasDiffValue);
     CHECK_FALSE(hasTrap);
     CHECK_FALSE(verifyModule(*M, &errs()));
