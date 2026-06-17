@@ -643,14 +643,17 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   a private `morok.dfi.region.*` byte region.  The runtime helper
   `morok.dfi.hash.*` hashes that region with volatile loads, volatile-loads
   `morok.dfi.expected.*`, and returns `actual_hash ^ expected_hash`.
-- Each lookup derives its decode seed as `expected_hash_const ^ runtime_diff`.
-  On the valid region the diff is zero and the loaded table byte decodes to the
-  original operation result.  Sub-byte and pair-indexed narrow operands are
-  zero-extended for the table index; const-indexed wide operations index by the
-  non-constant operand and use `i16` table cells for arithmetic results or byte
-  cells for comparisons.  Decoded arithmetic values are truncated back to the
-  source width and decoded comparison bytes to `i1`.  Region or expected-hash
-  tampering changes the key and corrupts the value in data flow.
+- Each lookup derives its decode seed as `expected_hash_const ^ runtime_diff`
+  and also XORs the live table index with the low bits of `runtime_diff`,
+  masked back to the 16-bit table range.  On the valid region the diff is zero,
+  the original table cell is loaded, and the byte decodes to the original
+  operation result.  Sub-byte and pair-indexed narrow operands are zero-extended
+  for the table index; const-indexed wide operations index by the non-constant
+  operand and use `i16` table cells for arithmetic results or byte cells for
+  comparisons.  Decoded arithmetic values are truncated back to the source width
+  and decoded comparison bytes to `i1`.  Region or expected-hash tampering
+  changes both the selected table cell and the key, corrupting the value in data
+  flow.
 - The table stays encoded at rest; unlike generic TableArithmetic, there is no
   lazy plaintext materialization pass.  There is also no trap or integrity
   branch, only data poisoning.

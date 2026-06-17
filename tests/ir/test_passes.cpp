@@ -4920,6 +4920,7 @@ entry:
 
     bool callsHash = false;
     bool hasTableLoad = false;
+    bool hasEntangledIndex = false;
     bool hasDecodedValue = false;
     for (Instruction &I : instructions(*F)) {
         if (auto *CI = dyn_cast<CallInst>(&I))
@@ -4928,6 +4929,8 @@ entry:
             hasTableLoad |= LI->isVolatile() &&
                             LI->getPointerOperand()->getName().starts_with(
                                 "morok.dfi.cell");
+        hasEntangledIndex |=
+            I.getName().starts_with("morok.dfi.idx.entangled");
         hasDecodedValue |= I.getName().starts_with("morok.dfi.value");
     }
 
@@ -4965,6 +4968,7 @@ entry:
 
     CHECK(callsHash);
     CHECK(hasTableLoad);
+    CHECK(hasEntangledIndex);
     CHECK(hasDecodedValue);
     CHECK(hasVolatileRegionLoad);
     CHECK(hasVolatileExpectedLoad);

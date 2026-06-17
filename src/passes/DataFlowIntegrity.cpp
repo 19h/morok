@@ -9,7 +9,8 @@
 // lookup tables.  The decode key is derived from a runtime hash of a private
 // byte region plus the expected hash; if the region or expected value changes,
 // the operation result is corrupted as data rather than guarded by a separable
-// branch.
+// branch.  The same diff also perturbs the live table index, so tampering
+// changes both the decode key and the semantic cell being read.
 
 #include "morok/passes/DataFlowIntegrity.hpp"
 
@@ -623,12 +624,18 @@ Value *emitLookup(Module &M, Function &F, Runtime &R, Target &T,
             T.spec.indexKind == TableIndexKind::ConstLhs ? RhsOp : Lhs;
         Idx = B.CreateZExt(Variable, I32, "morok.dfi.idx");
     }
+    Value *DiffIdx = B.CreateTrunc(Diff, I32, "morok.dfi.diff.idx");
+    Value *EntangledIdx =
+        B.CreateAnd(B.CreateXor(Idx, DiffIdx, "morok.dfi.idx.entangled"),
+                    ConstantInt::get(I32, kTableSize - 1u),
+                    "morok.dfi.idx.entangled.mask");
     Value *Cell = B.CreateInBoundsGEP(
-        TableTy, Table, {ConstantInt::get(I32, 0), Idx}, "morok.dfi.cell");
+        TableTy, Table, {ConstantInt::get(I32, 0), EntangledIdx},
+        "morok.dfi.cell");
     auto *Encoded = B.CreateLoad(ElementTy, Cell, "morok.dfi.encoded");
     Encoded->setVolatile(true);
     Encoded->setAlignment(Align(ElementTy->getBitWidth() / 8u));
-    Value *KeyValue = emitKey(B, Idx, Seed, Key, ElementTy);
+    Value *KeyValue = emitKey(B, EntangledIdx, Seed, Key, ElementTy);
     Value *Value = B.CreateXor(Encoded, KeyValue, "morok.dfi.value");
     if (T.spec.kind == TableOpKind::ICmp)
         return B.CreateTrunc(Value, B.getInt1Ty(), "morok.dfi.icmp");
