@@ -1067,8 +1067,13 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   state word, platform-specific recheck helpers, pthread watchdogs where
   available, and once-gated randomized calls inserted into user functions so
   debugger evidence is sampled from both constructors and normal execution paths
-  without repeatedly running expensive probes in hot loops.  On Linux, the
-  startup path also applies a Landlock ruleset, when the kernel supports it, to
+  without repeatedly running expensive probes in hot loops.  POSIX targets also
+  start a separate watchdog constructor: one pthread re-runs the anti-debug
+  probe on a per-build jittered sleep cadence and advances a volatile heartbeat,
+  while a second pthread samples that heartbeat and folds repeated staleness into
+  `morok.antidbg.state`.  A stopped checker therefore poisons delayed hidden
+  state instead of exposing a single branch to patch.  On Linux, the startup path
+  also applies a Landlock ruleset, when the kernel supports it, to
   deny destructive filesystem rights (writes, creates, removes, renames,
   truncates, and device ioctls by ABI level) while keeping reads/exec available.
   It then installs a seccomp-BPF filter that kills `ptrace` requests and

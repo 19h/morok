@@ -9688,14 +9688,20 @@ entry:
 
     CHECK(M->getGlobalVariable("morok.antidbg.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antidbg.buddy.pid", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.watchdog.heartbeat", true) != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.status") != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.stat4") != nullptr);
     Function *Watch = M->getFunction("morok.antidbg.linux.watch");
     Function *Sentinel = M->getFunction("morok.antidbg.linux.dr.sentinel");
     Function *Scrub = M->getFunction("morok.antidbg.linux.dr.scrub");
+    Function *ProbeWatch = M->getFunction("morok.antidbg.probe.watch");
+    Function *HeartbeatWatch = M->getFunction("morok.watchdog.heartbeat.watch");
     CHECK(Watch != nullptr);
     CHECK(Sentinel != nullptr);
     CHECK(Scrub != nullptr);
+    CHECK(ProbeWatch != nullptr);
+    CHECK(HeartbeatWatch != nullptr);
+    CHECK(M->getFunction("morok.watchdog") != nullptr);
     CHECK(M->getFunction("morok.antidbg.probe") != nullptr);
     CHECK(countUserCallsTo(*M, "morok.antidbg.probe") >= 1u);
     CHECK(M->getFunction("ptrace") == nullptr);
@@ -9719,6 +9725,13 @@ entry:
                                  "morok.antidbg.buddy.scrub") >= 1u);
     CHECK(countNamedInstructions(*Sentinel,
                                  "morok.antidbg.buddy.ppid.live") >= 1u);
+    CHECK(countNamedInstructions(*ProbeWatch, "morok.watchdog.cadence") >= 1u);
+    CHECK(countNamedInstructions(*ProbeWatch,
+                                 "morok.watchdog.heartbeat.beat") >= 1u);
+    CHECK(countNamedInstructions(*HeartbeatWatch,
+                                 "morok.watchdog.heartbeat.cadence") >= 1u);
+    CHECK(countNamedInstructions(*HeartbeatWatch,
+                                 "morok.watchdog.heartbeat.missing") >= 1u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
                                  "morok.antidbg.dr.fork") >= 1u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
@@ -9836,12 +9849,15 @@ entry:
     CHECK(morok::passes::antiDebuggingModule(*M, rng));
 
     CHECK(M->getGlobalVariable("morok.antidbg.state", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.watchdog.heartbeat", true) != nullptr);
     CHECK(M->getFunction("ptrace") != nullptr);
     CHECK(M->getFunction("sysctl") != nullptr);
     CHECK(M->getFunction("csops") != nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
     CHECK(M->getFunction("morok.antidbg.probe") != nullptr);
     CHECK(M->getFunction("morok.antidbg.probe.watch") != nullptr);
+    CHECK(M->getFunction("morok.watchdog") != nullptr);
+    CHECK(M->getFunction("morok.watchdog.heartbeat.watch") != nullptr);
     CHECK(M->getFunction("morok.antidbg.darwin.dr.watch") != nullptr);
     CHECK(M->getFunction("morok.antidbg.darwin.dr.scrub") != nullptr);
     CHECK(M->getFunction("task_threads") != nullptr);
@@ -9856,6 +9872,11 @@ entry:
     CHECK(M->getFunction("pthread_detach") != nullptr);
     CHECK(M->getFunction("sleep") != nullptr);
     CHECK(countUserCallsTo(*M, "morok.antidbg.probe") >= 1u);
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg.probe.watch"),
+                                 "morok.watchdog.cadence") >= 1u);
+    CHECK(countNamedInstructions(
+              *M->getFunction("morok.watchdog.heartbeat.watch"),
+              "morok.watchdog.heartbeat.missing") >= 1u);
     CHECK(countGlobals(*M, "morok.cloak.c") >= 8u);
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_INSERT_LIBRARIES"));
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_PRINT"));

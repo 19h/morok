@@ -75,6 +75,19 @@ GlobalVariable *antiDebugBuddyPid(Module &M) {
     return gv;
 }
 
+GlobalVariable *antiDebugWatchdogHeartbeat(Module &M, ir::IRRandom &rng) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.watchdog.heartbeat",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, rng.next() | 1ULL), "morok.watchdog.heartbeat");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
 GlobalVariable *antiHookState(Module &M, ir::IRRandom &rng) {
     if (auto *existing =
             M.getGlobalVariable("morok.antihook.state", /*AllowInternal=*/true))
@@ -1718,7 +1731,8 @@ void emitLinuxWatcherStart(IRBuilder<> &B, Module &M, Function *WatchFn) {
 Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
                          const Triple &TT);
 
-Function *probeWatchThread(Module &M, Function *Probe) {
+Function *probeWatchThread(Module &M, Function *Probe, GlobalVariable *Heartbeat,
+                           ir::IRRandom &rng) {
     if (Function *existing = M.getFunction("morok.antidbg.probe.watch"))
         return existing;
 
@@ -1734,6 +1748,12 @@ Function *probeWatchThread(Module &M, Function *Probe) {
     auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
     auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
     auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+    const std::uint32_t cadenceMul =
+        static_cast<std::uint32_t>(rng.next() | 1ULL);
+    const std::uint32_t cadenceAdd =
+        static_cast<std::uint32_t>((rng.next() | 1ULL) & 0xffffu);
+    const std::uint64_t beatMul = rng.next() | 1ULL;
+    const std::uint64_t beatSalt = rng.next();
 
     IRBuilder<> EB(entry);
     EB.CreateBr(loopBB);
@@ -1741,17 +1761,28 @@ Function *probeWatchThread(Module &M, Function *Probe) {
     IRBuilder<> LB(loopBB);
     auto *iter = LB.CreatePHI(i32, 2, "morok.antidbg.probe.iter");
     iter->addIncoming(ConstantInt::get(i32, 0), entry);
-    LB.CreateCondBr(LB.CreateICmpULT(iter, ConstantInt::get(i32, 8)), bodyBB,
-                    retBB);
+    LB.CreateBr(bodyBB);
 
     IRBuilder<> BB(bodyBB);
     FunctionCallee sleepFn =
         M.getOrInsertFunction("sleep", FunctionType::get(i32, {i32}, false));
-    BB.CreateCall(sleepFn, {ConstantInt::get(i32, 1)});
+    Value *cadence = BB.CreateAdd(
+        BB.CreateAnd(BB.CreateAdd(BB.CreateMul(iter, ConstantInt::get(i32, cadenceMul)),
+                                  ConstantInt::get(i32, cadenceAdd)),
+                     ConstantInt::get(i32, 3)),
+        ConstantInt::get(i32, 1), "morok.watchdog.cadence");
+    BB.CreateCall(sleepFn, {cadence});
     Value *tag = BB.CreateAdd(BB.CreateZExt(iter, i64),
                               ConstantInt::get(i64, 0xD14B2E3520B47A11ULL),
                               "morok.antidbg.probe.watch.tag");
     BB.CreateCall(Probe->getFunctionType(), Probe, {tag});
+    auto *oldBeat = BB.CreateLoad(i64, Heartbeat, "morok.watchdog.heartbeat.old");
+    oldBeat->setVolatile(true);
+    Value *beat = BB.CreateXor(
+        BB.CreateAdd(BB.CreateMul(oldBeat, ConstantInt::get(i64, beatMul)), tag),
+        ConstantInt::get(i64, beatSalt), "morok.watchdog.heartbeat.beat");
+    auto *beatStore = BB.CreateStore(beat, Heartbeat);
+    beatStore->setVolatile(true);
     Value *next = BB.CreateAdd(iter, ConstantInt::get(i32, 1));
     BB.CreateBr(loopBB);
     iter->addIncoming(next, bodyBB);
@@ -1759,6 +1790,89 @@ Function *probeWatchThread(Module &M, Function *Probe) {
     IRBuilder<> RB(retBB);
     RB.CreateRet(ConstantPointerNull::get(ptr));
     return fn;
+}
+
+Function *heartbeatWatchThread(Module &M, GlobalVariable *State,
+                               GlobalVariable *Heartbeat, ir::IRRandom &rng) {
+    if (Function *existing = M.getFunction("morok.watchdog.heartbeat.watch"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(ptr, {ptr}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.watchdog.heartbeat.watch", &M);
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+    const std::uint32_t cadenceMul =
+        static_cast<std::uint32_t>(rng.next() | 1ULL);
+    const std::uint32_t cadenceAdd =
+        static_cast<std::uint32_t>((rng.next() | 1ULL) & 0xffffu);
+
+    IRBuilder<> EB(entry);
+    EB.CreateBr(loopBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *iter = LB.CreatePHI(i32, 2, "morok.watchdog.heartbeat.iter");
+    auto *last = LB.CreatePHI(i64, 2, "morok.watchdog.heartbeat.last");
+    auto *staleCount = LB.CreatePHI(i32, 2, "morok.watchdog.heartbeat.stale");
+    iter->addIncoming(ConstantInt::get(i32, 0), entry);
+    last->addIncoming(ConstantInt::get(i64, 0), entry);
+    staleCount->addIncoming(ConstantInt::get(i32, 0), entry);
+    LB.CreateBr(bodyBB);
+
+    IRBuilder<> BB(bodyBB);
+    FunctionCallee sleepFn =
+        M.getOrInsertFunction("sleep", FunctionType::get(i32, {i32}, false));
+    Value *cadence = BB.CreateAdd(
+        BB.CreateAnd(BB.CreateAdd(BB.CreateMul(iter, ConstantInt::get(i32, cadenceMul)),
+                                  ConstantInt::get(i32, cadenceAdd)),
+                     ConstantInt::get(i32, 3)),
+        ConstantInt::get(i32, 2), "morok.watchdog.heartbeat.cadence");
+    BB.CreateCall(sleepFn, {cadence});
+    auto *cur = BB.CreateLoad(i64, Heartbeat, "morok.watchdog.heartbeat.cur");
+    cur->setVolatile(true);
+    Value *armed =
+        BB.CreateICmpNE(last, ConstantInt::get(i64, 0), "morok.watchdog.armed");
+    Value *stale = BB.CreateAnd(armed, BB.CreateICmpEQ(cur, last),
+                                "morok.watchdog.heartbeat.same");
+    Value *staleNext = BB.CreateSelect(
+        stale, BB.CreateAdd(staleCount, ConstantInt::get(i32, 1)),
+        ConstantInt::get(i32, 0), "morok.watchdog.heartbeat.stale.next");
+    Value *missing = BB.CreateICmpUGE(staleNext, ConstantInt::get(i32, 2),
+                                      "morok.watchdog.heartbeat.missing");
+    foldState(BB, State, cur, 0x35A8F179C46D20B3ULL,
+              "morok.watchdog.heartbeat.sample");
+    foldFlag(BB, State, missing, 0xC7D2841AF09B53E6ULL,
+             "morok.watchdog.heartbeat.missing");
+    Value *next = BB.CreateAdd(iter, ConstantInt::get(i32, 1));
+    BB.CreateBr(loopBB);
+    iter->addIncoming(next, bodyBB);
+    last->addIncoming(cur, bodyBB);
+    staleCount->addIncoming(staleNext, bodyBB);
+
+    IRBuilder<> RB(retBB);
+    RB.CreateRet(ConstantPointerNull::get(ptr));
+    return fn;
+}
+
+void emitAntiDebugWatchdogStart(Module &M, Function *Probe, GlobalVariable *State,
+                                ir::IRRandom &rng, const Triple &TT) {
+    if (!TT.isOSLinux() && !TT.isOSDarwin())
+        return;
+    GlobalVariable *heartbeat = antiDebugWatchdogHeartbeat(M, rng);
+    Function *probeWatch = probeWatchThread(M, Probe, heartbeat, rng);
+    Function *heartbeatWatch = heartbeatWatchThread(M, State, heartbeat, rng);
+    Function *ctor = makeCtorShell(M, "morok.watchdog");
+    IRBuilder<> B(&ctor->getEntryBlock());
+    emitLinuxWatcherStart(B, M, probeWatch);
+    emitLinuxWatcherStart(B, M, heartbeatWatch);
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, ctor, 0);
 }
 
 void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
@@ -5678,15 +5792,9 @@ bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
         B.CreateRetVoid();
     }
     Function *probe = antiDebugProbe(M, state, rng, tt);
-    if (tt.isOSDarwin()) {
-        Instruction *term = ctor->getEntryBlock().getTerminator();
-        term->eraseFromParent();
-        IRBuilder<> B(&ctor->getEntryBlock());
-        emitLinuxWatcherStart(B, M, probeWatchThread(M, probe));
-        B.CreateRetVoid();
-    }
     insertAntiDebugCallsiteProbes(M, probe, rng);
     appendToGlobalCtors(M, ctor, 0);
+    emitAntiDebugWatchdogStart(M, probe, state, rng, tt);
     return true;
 }
 
