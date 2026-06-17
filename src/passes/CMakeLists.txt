@@ -41,6 +41,7 @@ add_library(morok_passes STATIC
   SelfChecksumConstants.cpp
   ShamirShare.cpp
   MutualGuardGraph.cpp
+  Nanomites.cpp
   PathExplosion.cpp
   TraceKeying.cpp
   DispatcherlessRouting.cpp

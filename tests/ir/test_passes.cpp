@@ -35,6 +35,7 @@
 #include "morok/passes/MisleadingMetadata.hpp"
 #include "morok/passes/MqGate.hpp"
 #include "morok/passes/MutualGuardGraph.hpp"
+#include "morok/passes/Nanomites.hpp"
 #include "morok/passes/NonInvertibleState.hpp"
 #include "morok/passes/OptimizerAmplification.hpp"
 #include "morok/passes/PathExplosion.hpp"
@@ -10621,6 +10622,78 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("signal") != nullptr);
     CHECK(M->getFunction("raise") != nullptr);
     CHECK_FALSE(hasInlineAsmCall(*Ctor));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("nanomitesModule lowers conditional branches to trap-mediated "
+          "indirectbr") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @pick(i32 %x, i32 %y) {
+entry:
+  %cmp = icmp sgt i32 %x, 0
+  br i1 %cmp, label %then, label %else
+then:
+  %tv = phi i32 [ %x, %entry ]
+  ret i32 %tv
+else:
+  %fv = phi i32 [ %y, %entry ]
+  ret i32 %fv
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(887);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::NanomiteParams params;
+    params.probability = 100;
+    params.max_sites = 1;
+
+    CHECK(morok::passes::nanomitesModule(*M, params, rng));
+
+    Function *Pick = M->getFunction("pick");
+    REQUIRE(Pick != nullptr);
+    std::size_t conditionalBranches = 0;
+    std::size_t indirectBranches = 0;
+    for (Instruction &I : instructions(Pick)) {
+        if (auto *BI = dyn_cast<BranchInst>(&I))
+            conditionalBranches += BI->isConditional() ? 1u : 0u;
+        indirectBranches += isa<IndirectBrInst>(&I) ? 1u : 0u;
+    }
+    CHECK(conditionalBranches == 0u);
+    CHECK(indirectBranches == 1u);
+    CHECK(hasInlineAsmCall(*Pick));
+    CHECK(M->getGlobalVariable("morok.nanomite.table", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.nanomite.decision", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.nanomite.token", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.nanomite.target", true) != nullptr);
+    CHECK(M->getFunction("morok.nanomite.handler") != nullptr);
+    CHECK(M->getFunction("morok.nanomite.install") != nullptr);
+    CHECK(M->getFunction("sigaction") != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("nanomitesModule is a no-op without a known POSIX trap layout") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "wasm32-unknown-unknown"
+define i32 @pick(i32 %x) {
+entry:
+  %cmp = icmp eq i32 %x, 0
+  br i1 %cmp, label %then, label %else
+then:
+  ret i32 1
+else:
+  ret i32 2
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(888);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::NanomiteParams params;
+    params.probability = 100;
+    params.max_sites = 1;
+
+    CHECK_FALSE(morok::passes::nanomitesModule(*M, params, rng));
+    CHECK(M->getGlobalVariable("morok.nanomite.table", true) == nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

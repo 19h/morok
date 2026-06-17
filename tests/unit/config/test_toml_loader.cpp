@@ -51,6 +51,19 @@ TEST_CASE("vtable_integrity toggle is parsed") {
     CHECK(r.config.passes.vtable_integrity.enabled == true);
 }
 
+TEST_CASE("nanomites section is parsed") {
+    const auto r = loadFromString(R"(
+    [passes.nanomites]
+    enabled = true
+    probability = 81
+    max_sites = 7
+  )");
+    REQUIRE(r.ok);
+    CHECK(r.config.passes.nanomites.enabled == true);
+    CHECK(r.config.passes.nanomites.probability == 81u);
+    CHECK(r.config.passes.nanomites.max_sites == 7u);
+}
+
 TEST_CASE("a tuning section does not disable a preset-enabled pass") {
     // Regression: a [passes.X] section that only tunes a parameter must NOT
     // reset the pass's other preset-provided fields (notably `enabled`).  The
@@ -240,6 +253,10 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     table_entries = 48
     decoy_blocks = 9
     alias_stores = 3
+    [passes.nanomites]
+    enabled = true
+    probability = 82
+    max_sites = 6
     [passes.vector_obfuscation]
     enabled = true
     probability = 88
@@ -391,6 +408,9 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.microcode_stress.table_entries == 48u);
     CHECK(r.config.passes.microcode_stress.decoy_blocks == 9u);
     CHECK(r.config.passes.microcode_stress.alias_stores == 3u);
+    CHECK(r.config.passes.nanomites.enabled == true);
+    CHECK(r.config.passes.nanomites.probability == 82u);
+    CHECK(r.config.passes.nanomites.max_sites == 6u);
     CHECK(r.config.passes.vec.enabled == true);
     CHECK(r.config.passes.vec.probability == 88u);
     CHECK(r.config.passes.vec.width == 512u);

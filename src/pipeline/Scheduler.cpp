@@ -35,6 +35,7 @@
 #include "morok/passes/MisleadingMetadata.hpp"
 #include "morok/passes/MqGate.hpp"
 #include "morok/passes/MutualGuardGraph.hpp"
+#include "morok/passes/Nanomites.hpp"
 #include "morok/passes/NonInvertibleState.hpp"
 #include "morok/passes/OptimizerAmplification.hpp"
 #include "morok/passes/PathExplosion.hpp"
@@ -865,6 +866,17 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
 
     if (InitialModuleGrowthOk)
         changed |= hardenSensitiveGeneratedFunctions(M, config_.passes, rng);
+
+    // Nanomites consume the branch shape that survives all per-function CFG
+    // passes.  Keep them late so their trap sites are not restructured away.
+    if (InitialModuleGrowthOk &&
+        config_.passes.nanomites.enabled.value_or(false) &&
+        moduleGrowthOk(measureModule(M))) {
+        passes::NanomiteParams p;
+        p.probability = config_.passes.nanomites.probability.value_or(35);
+        p.max_sites = config_.passes.nanomites.max_sites.value_or(16);
+        changed |= passes::nanomitesModule(M, p, rng);
+    }
 
     const ModuleSize PostFunctionSize =
         InitialModuleGrowthOk ? measureModule(M) : InitialSize;

@@ -193,6 +193,9 @@ TEST_CASE("merge handles every pass family") {
     src.microcode_stress.table_entries = 48u;
     src.microcode_stress.decoy_blocks = 9u;
     src.microcode_stress.alias_stores = 3u;
+    src.nanomites.enabled = true;
+    src.nanomites.probability = 79u;
+    src.nanomites.max_sites = 5u;
     src.vec.probability = 77u;
     src.vec.width = 512u;
     src.vec.shuffle = true;
@@ -336,6 +339,9 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.microcode_stress.table_entries == 48u);
     CHECK(dst.microcode_stress.decoy_blocks == 9u);
     CHECK(dst.microcode_stress.alias_stores == 3u);
+    CHECK(dst.nanomites.enabled == true);
+    CHECK(dst.nanomites.probability == 79u);
+    CHECK(dst.nanomites.max_sites == 5u);
     CHECK(dst.vec.probability == 77u);
     CHECK(dst.vec.width == 512u);
     CHECK(dst.vec.shuffle == true);

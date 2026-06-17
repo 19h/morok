@@ -269,6 +269,12 @@ struct MicrocodeStressConfig {
     Opt<std::uint32_t> alias_stores;
 };
 
+struct NanomiteConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> max_sites;
+};
+
 struct StrEncConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
@@ -350,6 +356,7 @@ struct PassConfig {
     TraceKeyConfig trace_keying;
     DispatcherlessConfig dispatcherless;
     MicrocodeStressConfig microcode_stress;
+    NanomiteConfig nanomites;
     StrEncConfig str_enc;
     ConstEncConfig const_enc;
     VecConfig vec;

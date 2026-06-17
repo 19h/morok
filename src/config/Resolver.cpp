@@ -256,6 +256,10 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.microcode_stress.decoy_blocks);
     mergeOpt(dst.microcode_stress.alias_stores,
              src.microcode_stress.alias_stores);
+    // Trap-mediated branch nanomites
+    mergeOpt(dst.nanomites.enabled, src.nanomites.enabled);
+    mergeOpt(dst.nanomites.probability, src.nanomites.probability);
+    mergeOpt(dst.nanomites.max_sites, src.nanomites.max_sites);
     // StrEnc
     mergeOpt(dst.str_enc.enabled, src.str_enc.enabled);
     mergeOpt(dst.str_enc.probability, src.str_enc.probability);

@@ -39,6 +39,7 @@
 #include "morok/passes/MicrocodeStress.hpp"
 #include "morok/passes/MqGate.hpp"
 #include "morok/passes/MutualGuardGraph.hpp"
+#include "morok/passes/Nanomites.hpp"
 #include "morok/passes/NonInvertibleState.hpp"
 #include "morok/passes/OptimizerAmplification.hpp"
 #include "morok/passes/PathExplosion.hpp"
@@ -237,6 +238,10 @@ PassPluginLibraryInfo getPluginInfo() {
                         }
                         if (name == "morok-trap") {
                             MPM.addPass(passes::TrapOraclePass());
+                            return true;
+                        }
+                        if (name == "morok-nanomites") {
+                            MPM.addPass(passes::NanomitesPass());
                             return true;
                         }
                         if (name == "morok-decoystr") {

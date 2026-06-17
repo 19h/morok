@@ -1293,6 +1293,17 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   `SIGILL`, advancing RIP over `icebp` when emulators such as Orb report byte
   `0xf1` as a non-resumable illegal instruction.  Windows `INT 2Dh`/VEH
   coverage remains gated on the future Windows foundation.
+- Nanomites lower selected conditional branches to a volatile predicate
+  materialization followed by a synchronous `SIGTRAP` site.  The original
+  condition no longer controls a direct branch; a `sigaction` `SA_SIGINFO`
+  handler reads the saved PC from `ucontext_t`, decodes a private encrypted
+  PC-to-target table initialized by the install constructor, reconstructs the
+  one-bit decision from per-site volatile state, stores the chosen target, and
+  rewrites the saved PC to a dispatch block.  That dispatch block performs the
+  final `indirectbr`, so PHIs and machine edge copies still execute on a normal
+  compiler-visible predecessor.  The pass is gated to POSIX triples with known
+  trap/ucontext layouts, skips backward loop edges, and caps sites per function
+  to avoid concentrating trap overhead and register pressure in one hot body.
 
 ## Scheduler memory guardrails
 - The scheduler re-measures instruction and block counts before each
@@ -1332,5 +1343,5 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Scheduler order (to preserve semantics)
 Virtualization(user) → HashSelfDecrypt → AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
-MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → ProtectionHelperVM → SensitiveHelperHardening → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
+MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → ProtectionHelperVM → SensitiveHelperHardening → Nanomites → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 MisleadingMetadata → FeatureElimination (strip debug/names) → cleanup marker decls.
