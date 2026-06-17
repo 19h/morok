@@ -9020,6 +9020,8 @@ entry:
     REQUIRE(Stack != nullptr);
     Function *Diverge = M->getFunction("morok.antihook.diverge.posix");
     REQUIRE(Diverge != nullptr);
+    Function *Sandbox = M->getFunction("morok.antihook.sandbox");
+    REQUIRE(Sandbox != nullptr);
     Function *Work = M->getFunction("work");
     REQUIRE(Work != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
@@ -9040,6 +9042,9 @@ entry:
     CHECK(M->getFunction("syscall") == nullptr);
     CHECK(M->getFunction("getpid") != nullptr);
     CHECK(M->getFunction("getppid") != nullptr);
+    CHECK(M->getFunction("sysconf") != nullptr);
+    CHECK(M->getFunction("clock_gettime") != nullptr);
+    CHECK(M->getFunction("nanosleep") != nullptr);
     CHECK(countNamedInstructions(*Clean, "morok.antihook.mac.mem.mix") >= 1u);
     CHECK(countNamedInstructions(*Clean, "morok.antihook.mac.file.mix") >=
           1u);
@@ -9050,12 +9055,34 @@ entry:
     CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.rx") >= 1u);
     CHECK(hasInlineAsmCall(*Diverge));
+    CHECK(hasInlineAsmCall(*Sandbox));
     CHECK(countNamedInstructions(*Diverge,
                                  "morok.antihook.diverge.getpid.direct") >=
           1u);
     CHECK(countNamedInstructions(*Diverge,
                                  "morok.antihook.diverge.getppid.wrapper") >=
           1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.cpuid.vendor") >=
+          1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.vmware.vendor") >=
+          1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.vmware.backdoor") >=
+          1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.sidt.base") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.sgdt.base") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox, "morok.antihook.sandbox.cpu.low") >=
+          1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.uptime.flag") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.sleep.skip") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.rwx") >= 1u);
@@ -9105,12 +9132,15 @@ entry:
     REQUIRE(Stack != nullptr);
     Function *Diverge = M->getFunction("morok.antihook.diverge.posix");
     REQUIRE(Diverge != nullptr);
+    Function *Sandbox = M->getFunction("morok.antihook.sandbox");
+    REQUIRE(Sandbox != nullptr);
     Function *Work = M->getFunction("work");
     REQUIRE(Work != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
     CHECK(M->getFunction("morok.antihook.got.plt") == nullptr);
     CHECK(hasInlineAsmCall(*Clean));
+    CHECK(hasInlineAsmCall(*Sandbox));
     CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(M->getFunction("open") == nullptr);
     CHECK(M->getFunction("lseek") == nullptr);
@@ -9139,6 +9169,13 @@ entry:
     CHECK(countNamedInstructions(*Diverge,
                                  "morok.antihook.diverge.getppid.wrapper") >=
           1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.vmware.backdoor") >=
+          1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.sidt.base") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.vm.rwx") >= 1u);
@@ -9183,12 +9220,22 @@ entry:
     REQUIRE(Wx != nullptr);
     Function *Stack = M->getFunction("morok.antihook.stack.windows");
     REQUIRE(Stack != nullptr);
+    Function *Sandbox = M->getFunction("morok.antihook.sandbox");
+    REQUIRE(Sandbox != nullptr);
     Function *Work = M->getFunction("work");
     REQUIRE(Work != nullptr);
     CHECK(M->getFunction("VirtualQuery") != nullptr);
     CHECK(M->getFunction("VirtualProtect") != nullptr);
     CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(M->getFunction("exit") == nullptr);
+    CHECK(hasInlineAsmCall(*Sandbox));
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.vmware.backdoor") >=
+          1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.sidt.base") >= 1u);
     CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.virtualprotect") >=
           1u);
     CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.query") >= 1u);

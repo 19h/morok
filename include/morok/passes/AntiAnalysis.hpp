@@ -11,6 +11,7 @@
 //   • AntiClassDump  — scrambles Objective-C metadata (no-op on non-ObjC code).
 //   • TimingOracle   — samples independent clocks around short spans.
 //   • TrapOracle     — checks whether SIGTRAP/int3-style traps reach the app.
+// AntiHooking also folds decoy-grade VM/sandbox heuristics into delayed state.
 // All five are module passes that add code/metadata without altering the
 // program's observable behaviour in an un-instrumented run.
 

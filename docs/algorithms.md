@@ -1128,6 +1128,15 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   any divergence into the same delayed anti-hook state.  This catches wrapper
   hooks or syscall-path hooks without introducing a readable probe string or a
   libc `syscall` import on the direct path.
+  AntiHooking also emits a decoy-grade VM/sandbox battery where safe for the
+  target: x86 CPUID hypervisor/vendor leaves, a VMware I/O backdoor probe
+  guarded behind the numeric VMware vendor leaf and a cold volatile tripwire,
+  SIDT/SGDT/SLDT descriptor probes behind the same tripwire, Linux
+  CPU-count/RAM-page/boottime heuristics, a short sleep elapsed-time probe, and
+  existing timing-oracle acceleration signals.  These are weak signatures
+  individually, so the helper returns a bounded score and folds only
+  multi-signal suspicion into delayed anti-hook state instead of exiting at the
+  probe site.
 - TimingOracle emits a private constructor helper that samples several short
   volatile spans with two clock sources.  x86 targets use serialized `rdtscp`
   paired with a raw OS clock; Darwin targets use `mach_absolute_time` and

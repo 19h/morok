@@ -394,6 +394,9 @@ Value *emitDarwinSysctl(IRBuilder<> &B, Module &M, const Triple &TT, Value *Mib,
                          OldLenP, NewP, B.CreateZExtOrTrunc(NewLen, ip)});
 }
 
+Value *emitClockGettimeNanos(IRBuilder<> &B, Module &M, std::int32_t ClockId,
+                             const Twine &Name);
+
 Value *emitDarwinCsops(IRBuilder<> &B, Module &M, const Triple &TT, Value *Pid,
                        Value *Ops, Value *UserAddr, Value *UserSize) {
     auto *i32 = Type::getInt32Ty(M.getContext());
@@ -4349,6 +4352,265 @@ Function *methodDivergenceProbe(Module &M, const Triple &TT) {
     return fn;
 }
 
+FunctionCallee sysconfDecl(Module &M) {
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *ip = intPtrTy(M);
+    return M.getOrInsertFunction("sysconf", FunctionType::get(ip, {i32}, false));
+}
+
+FunctionCallee nanosleepDecl(Module &M) {
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *ptr = PointerType::getUnqual(M.getContext());
+    return M.getOrInsertFunction("nanosleep",
+                                 FunctionType::get(i32, {ptr, ptr}, false));
+}
+
+GlobalVariable *sandboxTripwireGate(Module &M) {
+    if (auto *existing = M.getGlobalVariable(
+            "morok.antihook.sandbox.tripwire", /*AllowInternal=*/true))
+        return existing;
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i8, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i8, 0), "morok.antihook.sandbox.tripwire");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+Value *emitCpuid(IRBuilder<> &B, Module &M, Value *Leaf, Value *Subleaf) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *cpuidTy = StructType::get(ctx, {i32, i32, i32, i32});
+    auto *asmTy = FunctionType::get(cpuidTy, {i32, i32}, false);
+    InlineAsm *cpuid = InlineAsm::get(
+        asmTy, "cpuid",
+        "={eax},={ebx},={ecx},={edx},{eax},{ecx},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    return B.CreateCall(asmTy, cpuid, {Leaf, Subleaf},
+                        "morok.antihook.sandbox.cpuid");
+}
+
+Value *cpuidReg(IRBuilder<> &B, Value *Cpuid, unsigned Index,
+                const Twine &Name) {
+    return B.CreateExtractValue(Cpuid, {Index}, Name);
+}
+
+void emitDescriptorStore(IRBuilder<> &B, Value *Ptr, StringRef Asm,
+                         const Twine &Name) {
+    auto *asmTy =
+        FunctionType::get(Type::getVoidTy(B.getContext()),
+                          {PointerType::getUnqual(B.getContext())}, false);
+    InlineAsm *IA = InlineAsm::get(
+        asmTy, Asm, "r,~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    (void)Name;
+    B.CreateCall(asmTy, IA, {Ptr});
+}
+
+Value *emitVmwareBackdoor(IRBuilder<> &B, Module &M) {
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *asmTy = FunctionType::get(i32, {i32, i32, i32}, false);
+    InlineAsm *backdoor = InlineAsm::get(
+        asmTy, "inl %dx, %eax",
+        "={ebx},{eax},{ecx},{edx},~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    return B.CreateCall(
+        asmTy, backdoor,
+        {ConstantInt::get(i32, 0x564D5868u), ConstantInt::get(i32, 0x0au),
+         ConstantInt::get(i32, 0x5658u)},
+        "morok.antihook.sandbox.vmware.backdoor");
+}
+
+Function *sandboxHeuristicProbe(Module &M, const Triple &TT) {
+    const bool X86 =
+        TT.getArch() == Triple::x86 || TT.getArch() == Triple::x86_64;
+    const bool Posix = TT.isOSLinux() || TT.isOSDarwin();
+    if (!X86 && !Posix)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.sandbox"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.sandbox", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    AllocaInst *score =
+        B.CreateAlloca(i64, nullptr, "morok.antihook.sandbox.score");
+    B.CreateStore(ConstantInt::get(i64, 0), score)->setVolatile(true);
+
+    if (X86) {
+        auto *tripwire = B.CreateLoad(i8, sandboxTripwireGate(M),
+                                      "morok.antihook.sandbox.tripwire.load");
+        tripwire->setVolatile(true);
+        Value *tripwireArmed = B.CreateICmpNE(
+            tripwire, ConstantInt::get(i8, 0),
+            "morok.antihook.sandbox.tripwire.armed");
+
+        Value *leaf1 = emitCpuid(B, M, ConstantInt::get(i32, 1),
+                                 ConstantInt::get(i32, 0));
+        Value *ecx =
+            cpuidReg(B, leaf1, 2, "morok.antihook.sandbox.cpuid.ecx");
+        Value *hypervisor = B.CreateICmpNE(
+            B.CreateAnd(ecx, ConstantInt::get(i32, 1u << 31),
+                        "morok.antihook.sandbox.cpuid.hypervisor.bit"),
+            ConstantInt::get(i32, 0),
+            "morok.antihook.sandbox.cpuid.hypervisor");
+        incrementDiff(B, score, hypervisor,
+                      "morok.antihook.sandbox.cpuid.hypervisor");
+
+        Value *hvLeaf = emitCpuid(B, M, ConstantInt::get(i32, 0x40000000u),
+                                  ConstantInt::get(i32, 0));
+        Value *hvMax =
+            cpuidReg(B, hvLeaf, 0, "morok.antihook.sandbox.cpuid.hv.max");
+        Value *hvEbx =
+            cpuidReg(B, hvLeaf, 1, "morok.antihook.sandbox.cpuid.hv.ebx");
+        Value *hvEcx =
+            cpuidReg(B, hvLeaf, 2, "morok.antihook.sandbox.cpuid.hv.ecx");
+        Value *hvEdx =
+            cpuidReg(B, hvLeaf, 3, "morok.antihook.sandbox.cpuid.hv.edx");
+        Value *hvVendor = B.CreateICmpNE(
+            hvMax, ConstantInt::get(i32, 0),
+            "morok.antihook.sandbox.cpuid.hv.vendor");
+        incrementDiff(B, score, B.CreateAnd(hypervisor, hvVendor),
+                      "morok.antihook.sandbox.cpuid.vendor");
+        Value *vmwareVendor = B.CreateAnd(
+            B.CreateAnd(B.CreateICmpEQ(hvEbx, ConstantInt::get(i32, 0x61774D56u)),
+                        B.CreateICmpEQ(hvEcx,
+                                       ConstantInt::get(i32, 0x4D566572u))),
+            B.CreateICmpEQ(hvEdx, ConstantInt::get(i32, 0x65726177u)),
+            "morok.antihook.sandbox.vmware.vendor");
+        incrementDiff(B, score, vmwareVendor,
+                      "morok.antihook.sandbox.vmware.vendor");
+
+        auto *backdoorBB =
+            BasicBlock::Create(ctx, "morok.antihook.sandbox.vmware", fn);
+        auto *afterBackdoorBB =
+            BasicBlock::Create(ctx, "morok.antihook.sandbox.after.vmware", fn);
+        B.CreateCondBr(B.CreateAnd(B.CreateAnd(hypervisor, vmwareVendor),
+                                   tripwireArmed),
+                       backdoorBB, afterBackdoorBB);
+
+        IRBuilder<> VB(backdoorBB);
+        Value *reply = emitVmwareBackdoor(VB, M);
+        incrementDiff(VB, score,
+                      VB.CreateICmpEQ(reply, ConstantInt::get(i32, 0x564D5868u),
+                                      "morok.antihook.sandbox.vmware.reply"),
+                      "morok.antihook.sandbox.vmware.backdoor");
+        VB.CreateBr(afterBackdoorBB);
+        B.SetInsertPoint(afterBackdoorBB);
+
+        auto *descriptorBB =
+            BasicBlock::Create(ctx, "morok.antihook.sandbox.descriptor", fn);
+        auto *afterDescriptorBB = BasicBlock::Create(
+            ctx, "morok.antihook.sandbox.after.descriptor", fn);
+        B.CreateCondBr(tripwireArmed, descriptorBB, afterDescriptorBB);
+
+        IRBuilder<> DB(descriptorBB);
+        auto *descTy = ArrayType::get(i8, 16);
+        AllocaInst *idt = DB.CreateAlloca(descTy, nullptr,
+                                          "morok.antihook.sandbox.sidt.buf");
+        AllocaInst *gdt = DB.CreateAlloca(descTy, nullptr,
+                                          "morok.antihook.sandbox.sgdt.buf");
+        AllocaInst *ldt = DB.CreateAlloca(descTy, nullptr,
+                                          "morok.antihook.sandbox.sldt.buf");
+        emitDescriptorStore(DB, idt, "sidt ($0)",
+                            "morok.antihook.sandbox.sidt");
+        emitDescriptorStore(DB, gdt, "sgdt ($0)",
+                            "morok.antihook.sandbox.sgdt");
+        emitDescriptorStore(DB, ldt, "sldt ($0)",
+                            "morok.antihook.sandbox.sldt");
+
+        Value *idtBase =
+            loadAt(DB, M, i64, idt, 2, "morok.antihook.sandbox.sidt.base");
+        Value *gdtBase =
+            loadAt(DB, M, i64, gdt, 2, "morok.antihook.sandbox.sgdt.base");
+        Value *ldtSel =
+            loadAt(DB, M, i16, ldt, 0ULL, "morok.antihook.sandbox.sldt.sel");
+        Value *lowIdt = DB.CreateICmpULT(
+            idtBase, ConstantInt::get(i64, 0x100000000ULL),
+            "morok.antihook.sandbox.sidt.low");
+        Value *lowGdt = DB.CreateICmpULT(
+            gdtBase, ConstantInt::get(i64, 0x100000000ULL),
+            "morok.antihook.sandbox.sgdt.low");
+        Value *ldtSet = DB.CreateICmpNE(
+            ldtSel, ConstantInt::get(i16, 0),
+            "morok.antihook.sandbox.sldt.set");
+        incrementDiff(DB, score, DB.CreateOr(lowIdt, lowGdt),
+                      "morok.antihook.sandbox.redpill");
+        incrementDiff(DB, score, ldtSet, "morok.antihook.sandbox.ldt");
+        DB.CreateBr(afterDescriptorBB);
+        B.SetInsertPoint(afterDescriptorBB);
+    }
+
+    if (TT.isOSLinux()) {
+        FunctionCallee sysconf = sysconfDecl(M);
+        Value *cpus = B.CreateCall(sysconf, {ConstantInt::get(i32, 84)},
+                                   "morok.antihook.sandbox.cpu.count");
+        Value *pages = B.CreateCall(sysconf, {ConstantInt::get(i32, 85)},
+                                    "morok.antihook.sandbox.ram.pages");
+        Value *oneCpu = B.CreateICmpSLE(
+            cpus, ConstantInt::getSigned(ip, 1),
+            "morok.antihook.sandbox.cpu.low");
+        Value *lowPages = B.CreateICmpULT(
+            B.CreateZExtOrTrunc(pages, i64), ConstantInt::get(i64, 262144),
+            "morok.antihook.sandbox.ram.low");
+        incrementDiff(B, score, oneCpu, "morok.antihook.sandbox.cpu");
+        incrementDiff(B, score, lowPages, "morok.antihook.sandbox.ram");
+
+        Value *boot =
+            emitClockGettimeNanos(B, M, 7, "morok.antihook.sandbox.boottime");
+        Value *shortUptime = B.CreateAnd(
+            B.CreateICmpNE(boot, ConstantInt::get(i64, 0),
+                           "morok.antihook.sandbox.uptime.ok"),
+            B.CreateICmpULT(boot, ConstantInt::get(i64, 300000000000ULL),
+                            "morok.antihook.sandbox.uptime.short"),
+            "morok.antihook.sandbox.uptime.flag");
+        incrementDiff(B, score, shortUptime, "morok.antihook.sandbox.uptime");
+
+        Value *sleepStart = emitClockGettimeNanos(
+            B, M, 1, "morok.antihook.sandbox.sleep.start");
+        auto *tsTy = StructType::get(ctx, {i64, i64});
+        auto *req = B.CreateAlloca(tsTy, nullptr,
+                                   "morok.antihook.sandbox.sleep.req");
+        B.CreateStore(ConstantInt::get(i64, 0), B.CreateStructGEP(tsTy, req, 0));
+        B.CreateStore(ConstantInt::get(i64, 5000000),
+                      B.CreateStructGEP(tsTy, req, 1));
+        Value *sleepRc = B.CreateCall(
+            nanosleepDecl(M),
+            {req, ConstantPointerNull::get(PointerType::getUnqual(ctx))},
+            "morok.antihook.sandbox.sleep.rc");
+        Value *sleepEnd =
+            emitClockGettimeNanos(B, M, 1, "morok.antihook.sandbox.sleep.end");
+        Value *sleepDelta = B.CreateSub(
+            sleepEnd, sleepStart, "morok.antihook.sandbox.sleep.delta");
+        Value *sleepClockOk = B.CreateAnd(
+            B.CreateICmpNE(sleepStart, ConstantInt::get(i64, 0)),
+            B.CreateICmpUGT(sleepEnd, sleepStart),
+            "morok.antihook.sandbox.sleep.clock.ok");
+        Value *sleepSkipped = B.CreateAnd(
+            B.CreateAnd(sleepClockOk,
+                        B.CreateICmpEQ(sleepRc, ConstantInt::get(i32, 0))),
+            B.CreateICmpULT(sleepDelta, ConstantInt::get(i64, 1000000)),
+            "morok.antihook.sandbox.sleep.skip");
+        incrementDiff(B, score, sleepSkipped, "morok.antihook.sandbox.sleep");
+    }
+
+    auto *out = B.CreateLoad(i64, score, "morok.antihook.sandbox.score.ret");
+    out->setVolatile(true);
+    B.CreateRet(out);
+    return fn;
+}
+
 void emitProloguePatternChecks(IRBuilder<> &B, Module &M, const Triple &TT,
                                GlobalVariable *State,
                                const std::vector<Function *> &Targets,
@@ -5040,6 +5302,15 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
         foldFlag(B, state,
                  B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0)),
                  0xC58E90A37B42D16FULL, "morok.antihook.diverge.changed");
+    }
+    if (Function *sandbox = sandboxHeuristicProbe(M, tt)) {
+        Value *score =
+            B.CreateCall(sandbox, {}, "morok.antihook.sandbox.score");
+        foldState(B, state, score, 0x9A01C7E52D63B48FULL,
+                  "morok.antihook.sandbox");
+        foldFlag(B, state,
+                 B.CreateICmpUGE(score, ConstantInt::get(B.getInt64Ty(), 2)),
+                 0x4E87A61D39C205B3ULL, "morok.antihook.sandbox.changed");
     }
     insertStackOriginChecks(M, stackOriginCheck(M), state, prologueTargets, rng);
     emitProloguePatternChecks(B, M, tt, state, prologueTargets, rng);
