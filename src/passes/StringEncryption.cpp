@@ -115,6 +115,24 @@ Value *emitVolatileStableZero(IRBuilderBase &B, std::uint64_t Salt,
     return B.CreateSub(A, Bv, Twine(Prefix) + ".zero");
 }
 
+Value *emitDecodedByte(IRBuilderBase &B, Value *CipherByte, Value *KsByte,
+                       Value *ByteZero, bool AddCombined,
+                       StringRef Prefix) {
+    Value *MaskedKs = B.CreateXor(KsByte, ByteZero, Twine(Prefix) + ".km");
+    if (!AddCombined)
+        return B.CreateXor(CipherByte, MaskedKs, Twine(Prefix) + ".x");
+
+    auto *I32 = B.getInt32Ty();
+    Value *Cipher32 = B.CreateZExt(CipherByte, I32, Twine(Prefix) + ".c32");
+    Value *Ks32 = B.CreateZExt(MaskedKs, I32, Twine(Prefix) + ".k32");
+    Value *NegKs =
+        B.CreateAdd(B.CreateXor(Ks32, ConstantInt::get(I32, 0xff),
+                                Twine(Prefix) + ".kn"),
+                    ConstantInt::get(I32, 1), Twine(Prefix) + ".ka");
+    Value *Plain32 = B.CreateAdd(Cipher32, NegKs, Twine(Prefix) + ".p32");
+    return B.CreateTrunc(Plain32, CipherByte->getType(), Twine(Prefix) + ".p");
+}
+
 struct UseSite {
     Instruction *inst = nullptr;
     unsigned operand = 0;
@@ -193,6 +211,9 @@ void emitDecryptUnrolled(IRBuilder<> &B, const Cipher &c, GlobalVariable *seed,
                                            "morok.str.mix"),
                     "morok.str.k.mix");
     Value *rtKey = B.CreateXor(seedMix, ConstantInt::get(i64, c.key));
+    Value *byteZero = B.CreateTrunc(
+        emitVolatileStableZero(B, c.key + c.mul, "morok.str.byte.mix"), i8,
+        "morok.str.byte.zero");
     for (std::uint64_t i = 0; i < n; ++i) {
         Value *ks = ir::emitKeystream(B, c.variant, rtKey,
                                       static_cast<std::uint32_t>(i), c.mul);
@@ -203,7 +224,7 @@ void emitDecryptUnrolled(IRBuilder<> &B, const Cipher &c, GlobalVariable *seed,
             arrTy, dst, {ConstantInt::get(i64, 0), ConstantInt::get(i64, i)});
         Value *cipher = B.CreateLoad(i8, sp);
         Value *plain =
-            c.add ? B.CreateSub(cipher, ksByte) : B.CreateXor(cipher, ksByte);
+            emitDecodedByte(B, cipher, ksByte, byteZero, c.add, "morok.str");
         B.CreateStore(plain, dp);
     }
 }
@@ -248,6 +269,10 @@ Function *createStackDecryptHelper(Module &M, const Cipher &C,
                      "morok.str.stack.k.mix");
     Value *RtKey = EB.CreateXor(SeedMix, ConstantInt::get(I64, C.key),
                                 "morok.str.stack.k0");
+    Value *ByteZero = EB.CreateTrunc(
+        emitVolatileStableZero(EB, C.key + C.mul,
+                               "morok.str.stack.byte.mix"),
+        I8, "morok.str.stack.byte.zero");
     EB.CreateBr(Loop);
 
     IRBuilder<> LB(Loop);
@@ -261,8 +286,8 @@ Function *createStackDecryptHelper(Module &M, const Cipher &C,
     Value *Dst = LB.CreateInBoundsGEP(
         ArrTy, DstArg, {ConstantInt::get(I64, 0), I}, "morok.str.stack.dst");
     Value *CipherByte = LB.CreateLoad(I8, Src);
-    Value *Plain = C.add ? LB.CreateSub(CipherByte, KsByte)
-                         : LB.CreateXor(CipherByte, KsByte);
+    Value *Plain = emitDecodedByte(LB, CipherByte, KsByte, ByteZero, C.add,
+                                   "morok.str.stack");
     LB.CreateStore(Plain, Dst);
     Value *Next =
         LB.CreateAdd(I, ConstantInt::get(I64, 1), "morok.str.stack.next");
@@ -451,6 +476,10 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
                             "morok.str.loop.k.mix");
             Value *rtKey =
                 B.CreateXor(seedMix, ConstantInt::get(i64, c.key));
+            Value *byteZero = B.CreateTrunc(
+                emitVolatileStableZero(B, c.key + c.mul,
+                                       "morok.str.loop.byte.mix"),
+                i8, "morok.str.loop.byte.zero");
             B.CreateBr(loop);
 
             B.SetInsertPoint(loop);
@@ -460,10 +489,10 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
                 ir::emitKeystreamDynamic(B, c.variant, rtKey, iv, c.mul);
             Value *ptr = B.CreateInBoundsGEP(arrTy, target,
                                              {ConstantInt::get(i64, 0), iv});
-            Value *dec =
-                c.add
-                    ? B.CreateSub(B.CreateLoad(i8, ptr), B.CreateTrunc(ks, i8))
-                    : B.CreateXor(B.CreateLoad(i8, ptr), B.CreateTrunc(ks, i8));
+            Value *cipher = B.CreateLoad(i8, ptr);
+            Value *ksByte = B.CreateTrunc(ks, i8);
+            Value *dec = emitDecodedByte(B, cipher, ksByte, byteZero, c.add,
+                                         "morok.str.loop");
             B.CreateStore(dec, ptr);
             Value *next = B.CreateAdd(iv, ConstantInt::get(i64, 1));
             iv->addIncoming(next, loop);

@@ -9041,6 +9041,38 @@ TEST_CASE("stringEncryptModule leaves generated decoy strings as plaintext bait"
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("stringEncryptModule avoids byte-sub decryptor signature") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("string-signatures", ctx);
+    M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+    for (unsigned I = 0; I != 24; ++I) {
+        std::string Text = "signature-target-" + std::to_string(I) + "-";
+        Text.append(128, static_cast<char>('a' + (I % 23)));
+        makePrivateString(*M, "sig.str." + std::to_string(I), Text);
+    }
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(309);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, {/*probability=*/100}, rng));
+
+    bool sawAddDecodePath = false;
+    bool sawI8Sub = false;
+    for (Function &F : *M) {
+        if (!F.getName().starts_with("morok.strdec"))
+            continue;
+        for (Instruction &I : instructions(F)) {
+            sawAddDecodePath |= I.getName().contains(".ka");
+            if (auto *BO = dyn_cast<BinaryOperator>(&I))
+                sawI8Sub |= BO->getOpcode() == Instruction::Sub &&
+                            BO->getType()->isIntegerTy(8);
+        }
+    }
+
+    CHECK(sawAddDecodePath);
+    CHECK_FALSE(sawI8Sub);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("stringEncryptModule gives each string its own cipher") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("multi-strings", ctx);
@@ -9321,10 +9353,19 @@ entry:
     REQUIRE(Smc != nullptr);
     Function *NegativeTiming = M->getFunction("morok.negative.timing");
     REQUIRE(NegativeTiming != nullptr);
+    Function *Ctor = M->getFunction("morok.antihook");
+    REQUIRE(Ctor != nullptr);
+    GlobalVariable *Dynamic = M->getGlobalVariable("_DYNAMIC");
+    REQUIRE(Dynamic != nullptr);
     Function *Work = M->getFunction("work");
     REQUIRE(Work != nullptr);
+    bool hasGuardedDlsymBlock = false;
+    for (BasicBlock &BB : *Ctor)
+        hasGuardedDlsymBlock |= BB.getName() == "morok.antihook.dlsym";
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
+    CHECK(Dynamic->hasExternalWeakLinkage());
+    CHECK(hasGuardedDlsymBlock);
     CHECK(hasInlineAsmCall(*Clean));
     CHECK(hasInlineAsmCall(*Got));
     CHECK(hasInlineAsmCall(*Maps));
@@ -9392,14 +9433,14 @@ entry:
     CHECK(countNamedInstructions(*Smc, "morok.antihook.dbi.smc.trip") >= 1u);
     CHECK(countNamedInstructions(*NegativeTiming,
                                  "morok.negative.timing.slow") >= 1u);
-    CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
-                                 "morok.corroborate.score.final") >= 1u);
-    CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
-                                 "morok.corroborate.confirmed") >= 1u);
-    CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
-                                 "morok.corroborate.aggressive") >= 1u);
-    CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
-                                 "morok.negative.modules.extra") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antihook.dynamic.present") >=
+          1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antihook.hooked") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.corroborate.score.final") >=
+          1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.corroborate.confirmed") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.corroborate.aggressive") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.negative.modules.extra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.rwx") >= 1u);

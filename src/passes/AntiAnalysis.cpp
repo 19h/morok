@@ -315,6 +315,24 @@ Value *emitLinuxPrctl(IRBuilder<> &B, Module &M, const Triple &TT,
     return B.CreateTruncOrBitCast(rc, i32);
 }
 
+GlobalVariable *elfDynamicWeakSymbol(Module &M) {
+    if (auto *existing = M.getGlobalVariable("_DYNAMIC"))
+        return existing;
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    return new GlobalVariable(M, i8, /*isConstant=*/false,
+                              GlobalValue::ExternalWeakLinkage, nullptr,
+                              "_DYNAMIC");
+}
+
+Value *emitElfDynamicPresent(IRBuilder<> &B, Module &M, const Triple &TT) {
+    if (!TT.isOSLinux())
+        return ConstantInt::getTrue(M.getContext());
+    auto *ptr = PointerType::getUnqual(M.getContext());
+    return B.CreateICmpNE(elfDynamicWeakSymbol(M),
+                          ConstantPointerNull::get(ptr),
+                          "morok.antihook.dynamic.present");
+}
+
 bool useDirectDarwinSyscalls(const Triple &TT) {
     return TT.isOSDarwin() && TT.getArch() == Triple::x86_64;
 }
@@ -5782,14 +5800,30 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
     FunctionCallee exitFn = M.getOrInsertFunction(
         "exit", FunctionType::get(Type::getVoidTy(ctx), {i32}, false));
 
+    BasicBlock *guardBB = B.GetInsertBlock();
+    auto *dlsymBB = BasicBlock::Create(ctx, "morok.antihook.dlsym", ctor);
+    auto *afterDlsymBB =
+        BasicBlock::Create(ctx, "morok.antihook.after.dlsym", ctor);
+    B.CreateCondBr(emitElfDynamicPresent(B, M, tt), dlsymBB, afterDlsymBB);
+
+    IRBuilder<> DB(dlsymBB);
     // The probed symbol is cloaked inline — never a readable "MSHookFunction".
-    Value *sym = ir::emitCloakedSymbol(B, M, "MSHookFunction", rng);
+    Value *sym = ir::emitCloakedSymbol(DB, M, "MSHookFunction", rng);
     // RTLD_DEFAULT == (void*)-2; build it at pointer width so inttoptr does not
     // zero-extend a 32-bit value into the wrong handle.
     auto *i64 = Type::getInt64Ty(ctx);
-    Value *rtldDefault = B.CreateIntToPtr(ConstantInt::getSigned(i64, -2), ptr);
-    Value *found = B.CreateCall(dlsym, {rtldDefault, sym});
-    Value *hooked = B.CreateICmpNE(found, ConstantPointerNull::get(ptr));
+    Value *rtldDefault =
+        DB.CreateIntToPtr(ConstantInt::getSigned(i64, -2), ptr);
+    Value *found = DB.CreateCall(dlsym, {rtldDefault, sym});
+    Value *dynHooked =
+        DB.CreateICmpNE(found, ConstantPointerNull::get(ptr));
+    DB.CreateBr(afterDlsymBB);
+
+    B.SetInsertPoint(afterDlsymBB);
+    auto *hooked = B.CreatePHI(Type::getInt1Ty(ctx), 2,
+                               "morok.antihook.hooked");
+    hooked->addIncoming(ConstantInt::getFalse(ctx), guardBB);
+    hooked->addIncoming(dynHooked, dlsymBB);
     auto *score = B.CreateLoad(B.getInt64Ty(), corroboration,
                                "morok.corroborate.score.final");
     score->setVolatile(true);
