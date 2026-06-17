@@ -1185,6 +1185,16 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - IR-stage post-link contracts are emitted as retained `morok.postlink.*`
   manifests rather than implicit placeholder globals; downstream patchers should
   consume those records and update the referenced region/expected globals.
+- MisleadingMetadata runs near the final symbol-hygiene phase and plants a
+  bounded set of retained local decoy text symbols, internal aliases that create
+  duplicate apparent function starts, and contradictory-but-valid DWARF
+  subprogram ranges (debug names, source files, and line spans disagree with
+  the emitted local symbol).  ELF relies on LLVM's normal non-alloc DWARF
+  emission; Mach-O additionally gets a retained malformed debug-string bait
+  payload in `__TEXT,__debug_str` because linked executables may otherwise
+  discard standalone `__DWARF` sections unless a dSYM-oriented debug build is
+  requested.  The decoys are kept through `llvm.compiler.used` and do not
+  export ABI symbols or alter user code.
 - The high preset is bounded-aggressive by default: it enables small capped
   slices of VM lifting/hash self-decrypt, self-check constants, DFI, MQ,
   MicrocodeStress, and FunctionWrapper while keeping MutualGuardGraph,
@@ -1195,4 +1205,4 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 ## Scheduler order (to preserve semantics)
 AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → StringEnc → FCO(fn) → VTableIntegrity → Virtualization → HashSelfDecrypt → per-fn{ Split, BCF, OptAmp, Sub,
 MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → SensitiveHelperHardening → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
-FeatureElimination (strip debug/names) → cleanup marker decls.
+MisleadingMetadata → FeatureElimination (strip debug/names) → cleanup marker decls.

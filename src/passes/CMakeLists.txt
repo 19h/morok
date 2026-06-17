@@ -29,6 +29,7 @@ add_library(morok_passes STATIC
   StateOpaquePredicates.cpp
   InterproceduralFsm.cpp
   MicrocodeStress.cpp
+  MisleadingMetadata.cpp
   MqGate.cpp
   ChaosStateMachine.cpp
   OptimizerAmplification.cpp

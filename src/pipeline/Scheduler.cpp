@@ -32,6 +32,7 @@
 #include "morok/passes/InterproceduralFsm.hpp"
 #include "morok/passes/Mba.hpp"
 #include "morok/passes/MicrocodeStress.hpp"
+#include "morok/passes/MisleadingMetadata.hpp"
 #include "morok/passes/MqGate.hpp"
 #include "morok/passes/MutualGuardGraph.hpp"
 #include "morok/passes/NonInvertibleState.hpp"
@@ -873,6 +874,9 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
             config_.passes.per_build_polymorphism.max_anchors.value_or(16);
         changed |= passes::perBuildPolymorphismModule(M, p, rng);
     }
+
+    if (InitialModuleGrowthOk)
+        changed |= passes::misleadingMetadataModule(M, rng);
 
     // Final symbol hygiene: every generated `morok.*` helper still carries its
     // descriptive internal-linkage name (`morok.gf8mul`, `morok.strdec`, …),

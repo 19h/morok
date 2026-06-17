@@ -32,6 +32,7 @@
 #include "morok/passes/InterproceduralFsm.hpp"
 #include "morok/passes/Mba.hpp"
 #include "morok/passes/MicrocodeStress.hpp"
+#include "morok/passes/MisleadingMetadata.hpp"
 #include "morok/passes/MqGate.hpp"
 #include "morok/passes/MutualGuardGraph.hpp"
 #include "morok/passes/NonInvertibleState.hpp"
@@ -60,6 +61,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -214,6 +216,11 @@ std::size_t countFunctions(Module &M, StringRef prefix) {
         if (F.getName().starts_with(prefix))
             ++n;
     return n;
+}
+
+std::size_t countAliases(Module &M) {
+    return static_cast<std::size_t>(
+        std::distance(M.alias_begin(), M.alias_end()));
 }
 
 std::size_t countCallsTo(Function &F, StringRef name) {
@@ -642,6 +649,52 @@ TEST_CASE("MorokPass demotes generated symbols to private linkage") {
         CHECK(GV.hasPrivateLinkage());
     }
     CHECK(morokSyms >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("misleadingMetadataModule plants retained fake analysis anchors") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "arm64-apple-macosx13.0.0"
+
+define i32 @main(i32 %x) {
+entry:
+  %y = add i32 %x, 1
+  ret i32 %y
+}
+)ir");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x5EED);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::misleadingMetadataModule(*M, rng));
+
+    std::vector<Function *> decoys;
+    for (Function &F : *M) {
+        if (F.getName() == "main")
+            continue;
+        decoys.push_back(&F);
+        CHECK(F.hasInternalLinkage());
+        CHECK(F.hasFnAttribute(Attribute::OptimizeNone));
+        REQUIRE(F.getSubprogram() != nullptr);
+        CHECK(F.getSubprogram()->getName() != F.getName());
+    }
+
+    CHECK(decoys.size() == 5u);
+    CHECK(countAliases(*M) == 5u);
+    CHECK(M->getNamedMetadata("llvm.dbg.cu") != nullptr);
+    GlobalVariable *DebugStr = M->getGlobalVariable("morok.md.debug.str", true);
+    REQUIRE(DebugStr);
+    CHECK(DebugStr->getSection() == "__TEXT,__debug_str");
+
+    GlobalVariable *Used = M->getGlobalVariable("llvm.compiler.used");
+    REQUIRE(Used);
+    REQUIRE(Used->hasInitializer());
+    for (Function *F : decoys)
+        CHECK(constantReferencesGlobal(Used->getInitializer(), F));
+    for (GlobalAlias &Alias : M->aliases())
+        CHECK(constantReferencesGlobal(Used->getInitializer(), &Alias));
+    CHECK(constantReferencesGlobal(Used->getInitializer(), DebugStr));
+
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

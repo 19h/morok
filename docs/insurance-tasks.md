@@ -61,7 +61,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 - [x] Anti-DBI battery: code-cache return-address origin check, large-RWX-region scan, SMC tripwire, Frida thread/port/maps signatures (`gum-js-loop`, `27042`, `frida`/`gadget`) `[xplat · extends antihook]`
 - [x] Negative-space verification: assert the *absence* of tamper — no `0xCC` in `.text`, no extra modules, timing not slow, DR all zero `[xplat · new]`
 - [x] Multi-signal corroboration gate before any aggressive response, to avoid false-positive crashes on legitimate VMs/CI/new CPUs (anti-self-DoS) `[xplat · new]`
-- [ ] Misleading metadata: plant bogus symbol names, fake function boundaries, and malformed-but-tolerated DWARF to mislead the auto-analyzer `[xplat · extends SymbolCloak]`
+- [x] Misleading metadata: plant bogus symbol names, fake function boundaries, and malformed-but-tolerated DWARF to mislead the auto-analyzer `[xplat · extends SymbolCloak]`
 - [ ] Auto-analysis sabotage: computed `jmp` / oversized switch with runtime-only targets (no recoverable jump table), bogus `endbr64`, fake epilogues/prologues `[xplat · extends microstress/dispatchless]`
 - [ ] API-call-via-exception: replace `call <import>` with a deliberate fault whose handler resolves and invokes the API by hash (defeats IAT hook + call-site inline hook + static call-graph at once) `[xplat · extends fco]`
 - [ ] Anti-disasm control flow: signal/VEH-as-`goto`, `call $+5;pop` PIC, computed `jmp reg` `[xplat · new]`
