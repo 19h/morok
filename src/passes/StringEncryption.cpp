@@ -84,12 +84,12 @@ void emitStaticAnalysisBarrier(IRBuilderBase &B, const Module &M) {
     case Triple::aarch64:
     case Triple::aarch64_be:
         Asm = "ccmn wzr, #0, #4, eq";
-        Constraints = "~{cc}";
+        Constraints = "~{cc},~{memory}";
         break;
     case Triple::x86:
     case Triple::x86_64:
         Asm = "pause";
-        Constraints = "~{dirflag},~{fpsr},~{flags}";
+        Constraints = "~{dirflag},~{fpsr},~{flags},~{memory}";
         break;
     default:
         return;
@@ -99,6 +99,19 @@ void emitStaticAnalysisBarrier(IRBuilderBase &B, const Module &M) {
     InlineAsm *IA =
         InlineAsm::get(AsmTy, Asm, Constraints, /*hasSideEffects=*/true);
     B.CreateCall(AsmTy, IA);
+}
+
+Value *emitVolatileStableZero(IRBuilderBase &B, std::uint64_t Salt,
+                              StringRef Prefix) {
+    auto *I64 = B.getInt64Ty();
+    AllocaInst *Slot =
+        B.CreateAlloca(I64, nullptr, Twine(Prefix) + ".slot");
+    B.CreateStore(ConstantInt::get(I64, Salt), Slot, /*isVolatile=*/true);
+    LoadInst *A =
+        B.CreateLoad(I64, Slot, /*isVolatile=*/true, Twine(Prefix) + ".a");
+    LoadInst *Bv =
+        B.CreateLoad(I64, Slot, /*isVolatile=*/true, Twine(Prefix) + ".b");
+    return B.CreateSub(A, Bv, Twine(Prefix) + ".zero");
 }
 
 struct UseSite {
@@ -173,7 +186,12 @@ void emitDecryptUnrolled(IRBuilder<> &B, const Cipher &c, GlobalVariable *seed,
     auto *i64 = Type::getInt64Ty(B.getContext());
     LoadInst *seedLoad = B.CreateLoad(i64, seed, /*isVolatile=*/true);
     emitStaticAnalysisBarrier(B, *seed->getParent());
-    Value *rtKey = B.CreateXor(seedLoad, ConstantInt::get(i64, c.key));
+    Value *seedMix =
+        B.CreateAdd(seedLoad,
+                    emitVolatileStableZero(B, c.key ^ c.mul,
+                                           "morok.str.mix"),
+                    "morok.str.k.mix");
+    Value *rtKey = B.CreateXor(seedMix, ConstantInt::get(i64, c.key));
     for (std::uint64_t i = 0; i < n; ++i) {
         Value *ks = ir::emitKeystream(B, c.variant, rtKey,
                                       static_cast<std::uint32_t>(i), c.mul);
@@ -222,7 +240,12 @@ Function *createStackDecryptHelper(Module &M, const Cipher &C,
     LoadInst *SeedLoad =
         EB.CreateLoad(I64, Seed, /*isVolatile=*/true, "morok.str.stack.k");
     emitStaticAnalysisBarrier(EB, M);
-    Value *RtKey = EB.CreateXor(SeedLoad, ConstantInt::get(I64, C.key),
+    Value *SeedMix =
+        EB.CreateAdd(SeedLoad,
+                     emitVolatileStableZero(EB, C.key ^ C.mul,
+                                            "morok.str.stack.mix"),
+                     "morok.str.stack.k.mix");
+    Value *RtKey = EB.CreateXor(SeedMix, ConstantInt::get(I64, C.key),
                                 "morok.str.stack.k0");
     EB.CreateBr(Loop);
 
@@ -262,6 +285,7 @@ Value *emitStackString(Instruction *InsertBefore, const Cipher &C,
     auto *I64 = Type::getInt64Ty(B.getContext());
     AllocaInst *Buf = B.CreateAlloca(ArrTy, nullptr, "morok.str.stack.buf");
     B.CreateCall(Helper->getFunctionType(), Helper, {Buf});
+    emitStaticAnalysisBarrier(B, M);
     return B.CreateInBoundsGEP(
         ArrTy, Buf, {ConstantInt::get(I64, 0), ConstantInt::get(I64, 0)},
         "morok.str.stack.ptr");
@@ -419,8 +443,13 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
             LoadInst *seedLoad =
                 B.CreateLoad(i64, seed, /*isVolatile=*/true);
             emitStaticAnalysisBarrier(B, M);
+            Value *seedMix =
+                B.CreateAdd(seedLoad,
+                            emitVolatileStableZero(B, c.key ^ c.mul,
+                                                   "morok.str.loop.mix"),
+                            "morok.str.loop.k.mix");
             Value *rtKey =
-                B.CreateXor(seedLoad, ConstantInt::get(i64, c.key));
+                B.CreateXor(seedMix, ConstantInt::get(i64, c.key));
             B.CreateBr(loop);
 
             B.SetInsertPoint(loop);

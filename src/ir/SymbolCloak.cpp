@@ -43,12 +43,12 @@ void emitStaticAnalysisBarrier(IRBuilderBase &B, const Module &M) {
     case Triple::aarch64:
     case Triple::aarch64_be:
         Asm = "ccmn wzr, #0, #4, eq";
-        Constraints = "~{cc}";
+        Constraints = "~{cc},~{memory}";
         break;
     case Triple::x86:
     case Triple::x86_64:
         Asm = "pause";
-        Constraints = "~{dirflag},~{fpsr},~{flags}";
+        Constraints = "~{dirflag},~{fpsr},~{flags},~{memory}";
         break;
     default:
         return;
@@ -58,6 +58,19 @@ void emitStaticAnalysisBarrier(IRBuilderBase &B, const Module &M) {
     InlineAsm *IA =
         InlineAsm::get(AsmTy, Asm, Constraints, /*hasSideEffects=*/true);
     B.CreateCall(AsmTy, IA);
+}
+
+Value *emitVolatileStableZero(IRBuilderBase &B, std::uint64_t Salt,
+                              StringRef Prefix) {
+    auto *I64 = B.getInt64Ty();
+    AllocaInst *Slot =
+        B.CreateAlloca(I64, nullptr, Twine(Prefix) + ".slot");
+    B.CreateStore(ConstantInt::get(I64, Salt), Slot, /*isVolatile=*/true);
+    LoadInst *A =
+        B.CreateLoad(I64, Slot, /*isVolatile=*/true, Twine(Prefix) + ".a");
+    LoadInst *Bv =
+        B.CreateLoad(I64, Slot, /*isVolatile=*/true, Twine(Prefix) + ".b");
+    return B.CreateSub(A, Bv, Twine(Prefix) + ".zero");
 }
 
 // Shared finalizer: T already holds `K0 + (j+1)*mul`; spread it per variant.
@@ -189,7 +202,11 @@ Value *emitCloakedSymbol(IRBuilderBase &B, Module &M, StringRef symbol,
     LoadInst *SeedLoad =
         B.CreateLoad(I64, Seed, /*isVolatile=*/true, "morok.cloak.k");
     emitStaticAnalysisBarrier(B, M);
-    Value *RtKey = B.CreateXor(SeedLoad, ConstantInt::get(I64, SiteKey),
+    Value *SeedMix =
+        B.CreateAdd(SeedLoad,
+                    emitVolatileStableZero(B, rng.next(), "morok.cloak.mix"),
+                    "morok.cloak.k.mix");
+    Value *RtKey = B.CreateXor(SeedMix, ConstantInt::get(I64, SiteKey),
                                "morok.cloak.k0");
 
     for (std::uint32_t j = 0; j < Len; ++j) {
@@ -205,6 +222,7 @@ Value *emitCloakedSymbol(IRBuilderBase &B, Module &M, StringRef symbol,
             ArrTy, Buf, {ConstantInt::get(I64, 0), ConstantInt::get(I64, j)});
         B.CreateStore(Plain, BufPtr);
     }
+    emitStaticAnalysisBarrier(B, M);
     return B.CreateInBoundsGEP(
         ArrTy, Buf, {ConstantInt::get(I64, 0), ConstantInt::get(I64, 0)},
         "morok.cloak.sym");

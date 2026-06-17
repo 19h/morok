@@ -45,8 +45,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 ## String encryption — `ir/SymbolCloak` keystream
 - *Every* eligible private i8-array global is encrypted with its OWN cipher: a
   per-string keystream generator (murmur3 / splitmix64 / xorshift\*, chosen per
-  string), XOR- or ADD-combined, with per-string key material `k0 = seedVal ^
-  siteKey` and an odd multiplier.  No two strings share an encryption.
+  string), XOR- or ADD-combined, with per-string key material
+  `k0 = (seedVal + volatile-stable-zero) ^ siteKey` and an odd multiplier.  No
+  two strings share an encryption.
 - Recovery is stack-first and per use site for constant C strings whose uses are
   direct noncapturing call/invoke arguments.  Each such pointer operand gets a
   fresh `morok.str.stack.buf` alloca and a call to a private per-site
@@ -60,9 +61,13 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   that decrypts every string.
 - Keyed on the runtime-opaque module seed `morok.cloak.seed` (a private *mutable*
   i64 read with a volatile load), so the optimizer cannot fold ciphertext back to
-  text.  *Mutable* string globals (which the program may itself read/write or
-  decrypt in place) use exactly this in-place model so the program observes the
-  recovered plaintext.
+  text.  The runtime key path is perturbed through a volatile stack slot whose
+  two loads cancel at runtime; this preserves bytes exactly while avoiding a
+  single static `seed ^ key` signature.  Recovered stack pointers are separated
+  from the consuming call by a target inline-asm barrier with a memory clobber.
+  *Mutable* string globals (which the program may itself read/write or decrypt in
+  place) use exactly this in-place model so the program observes the recovered
+  plaintext.
 - Length hiding: read-only C strings are padded to a random multiple of a block
   size (16) with random trailing bytes before encryption.  The runtime consumer
   still stops at the original NUL, but the stored array size no longer reveals
@@ -983,9 +988,10 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - FunctionCallObfuscate: dlsym indirection; hard cap 256 call/invoke sites. The
   symbol name is never stored or recovered as a readable string: each site
   carries its own ciphertext (a `morok.cloak.c` byte global) and its own
-  unrolled per-site keystream, keyed on `k0 = (volatile load of the mutable
-  module seed `morok.cloak.seed`) ^ siteKey`. The recovered name is decrypted
-  into a stack buffer that feeds `dlsym`, so a decompiler sees
+  unrolled per-site keystream, keyed on `k0 = ((volatile load of the mutable
+  module seed `morok.cloak.seed`) + volatile-stable-zero) ^ siteKey`. The
+  recovered name is decrypted into a stack buffer, followed by a side-effecting
+  target barrier, then fed to `dlsym`, so a decompiler sees
   `dlsym(RTLD_DEFAULT, <computed buffer>)` with no symbol to annotate. The
   returned import pointer is then immediately encoded as an integer with
   per-site reversible math, stored only in a volatile `morok.fco.ptr.slot`, and

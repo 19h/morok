@@ -245,6 +245,15 @@ bool hasInlineAsmCall(Function &F) {
     return false;
 }
 
+std::size_t countInlineAsmCalls(Function &F) {
+    std::size_t n = 0;
+    for (Instruction &I : instructions(F))
+        if (auto *CB = dyn_cast<CallBase>(&I))
+            if (CB->isInlineAsm())
+                ++n;
+    return n;
+}
+
 bool hasReadableByteString(Module &M, StringRef needle) {
     for (GlobalVariable &GV : M.globals()) {
         if (!GV.hasInitializer())
@@ -8520,10 +8529,15 @@ TEST_CASE("stringEncryptModule materializes used strings on the stack") {
     CHECK(countNamedAllocas(*Caller, "morok.str.stack.buf") >= 1u);
     CHECK(countNamedInstructions(*Caller, "morok.str.stack.ptr") >= 1u);
     bool stackHelperHasBarrier = false;
+    bool stackHelperHasMixer = false;
     for (Function &F : *M)
-        if (F.getName().starts_with("morok.strsite"))
+        if (F.getName().starts_with("morok.strsite")) {
             stackHelperHasBarrier |= hasInlineAsmCall(F);
+            stackHelperHasMixer |=
+                countNamedAllocas(F, "morok.str.mix") >= 1u;
+        }
     CHECK(stackHelperHasBarrier);
+    CHECK(stackHelperHasMixer);
 
     bool callStillUsesGlobal = false;
     for (Instruction &I : instructions(*Caller))
@@ -8550,6 +8564,7 @@ TEST_CASE("stringEncryptModule uses stack decrypt loops for long callsite string
     CHECK(countFunctions(*M, "morok.strsite") >= 1u);
     bool sawStackLoop = false;
     bool sawStackPhi = false;
+    bool sawStackMixer = false;
     (void)Caller;
     for (Function &F : *M)
         if (F.getName().starts_with("morok.strsite"))
@@ -8558,9 +8573,12 @@ TEST_CASE("stringEncryptModule uses stack decrypt loops for long callsite string
                 for (Instruction &I : BB)
                     sawStackPhi |=
                         I.getName().starts_with("morok.str.stack.i");
+                sawStackMixer |=
+                    countNamedAllocas(F, "morok.str.stack.mix") >= 1u;
             }
     CHECK(sawStackLoop);
     CHECK(sawStackPhi);
+    CHECK(sawStackMixer);
     CHECK_FALSE(hasReadableByteString(*M, LargeText));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
@@ -8604,14 +8622,19 @@ TEST_CASE("stringEncryptModule falls back to per-string decryptors") {
     // not a fully unrolled chain.
     bool sawLoopDecryptor = false;
     bool sawStaticAnalysisBarrier = false;
+    bool sawDecryptorMixer = false;
     for (Function &F : *M)
         if (F.getName().starts_with("morok.strdec")) {
             sawStaticAnalysisBarrier |= hasInlineAsmCall(F);
+            sawDecryptorMixer |=
+                countNamedAllocas(F, "morok.str.mix") >= 1u ||
+                countNamedAllocas(F, "morok.str.loop.mix") >= 1u;
             for (Instruction &I : instructions(F))
                 sawLoopDecryptor |= isa<PHINode>(&I);
         }
     CHECK(sawLoopDecryptor);
     CHECK(sawStaticAnalysisBarrier);
+    CHECK(sawDecryptorMixer);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -8760,6 +8783,7 @@ define i32 @caller() {
   ret i32 %r
 }
 )ir");
+    M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
     auto engine = morok::core::Xoshiro256pp::fromSeed(4242);
     morok::ir::IRRandom rng(engine);
     CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
@@ -8807,6 +8831,8 @@ define i32 @caller() {
     CHECK(hasVolatileLoad);
     CHECK(dlsymTakesAlloca);
     CHECK(indirectUsesDecodedPointer);
+    CHECK(countInlineAsmCalls(*Caller) >= 2u);
+    CHECK(countNamedAllocas(*Caller, "morok.cloak.mix") >= 1u);
     CHECK(countNamedAllocas(*Caller, "morok.fco.ptr.slot") == 1u);
     CHECK(countNamedInstructions(*Caller, "morok.fco.ptr.enc") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
