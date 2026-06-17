@@ -381,6 +381,8 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         changed |= passes::antiHookingModule(M, rng);
     if (config_.passes.anti_class_dump.enabled.value_or(false))
         changed |= passes::antiClassDumpModule(M);
+    if (config_.passes.windows_pe_foundation.enabled.value_or(false))
+        changed |= passes::windowsPeFoundationModule(M, rng);
     if (config_.passes.anti_dbg.enabled.value_or(false))
         changed |= passes::antiDebuggingModule(
             M, rng, !config_.passes.trap_oracles.enabled.value_or(false));

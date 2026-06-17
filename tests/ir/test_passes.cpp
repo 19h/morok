@@ -10540,6 +10540,59 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("windowsPeFoundationModule emits PEB, PE, syscall, and VEH helpers") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-pc-windows-msvc"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8805);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::windowsPeFoundationModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.win.foundation");
+    Function *Probe = M->getFunction("morok.win.foundation.probe");
+    Function *Teb = M->getFunction("morok.win.teb");
+    Function *Peb = M->getFunction("morok.win.peb");
+    Function *Resolve = M->getFunction("morok.win.pe.resolve");
+    Function *Hash = M->getFunction("morok.win.pe.hash");
+    Function *Scan = M->getFunction("morok.win.sys.scan");
+    Function *Direct = M->getFunction("morok.win.sys.direct");
+    Function *Indirect = M->getFunction("morok.win.sys.indirect");
+    Function *Veh = M->getFunction("morok.win.veh.handler");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Probe != nullptr);
+    REQUIRE(Teb != nullptr);
+    REQUIRE(Peb != nullptr);
+    REQUIRE(Resolve != nullptr);
+    REQUIRE(Hash != nullptr);
+    REQUIRE(Scan != nullptr);
+    REQUIRE(Direct != nullptr);
+    REQUIRE(Indirect != nullptr);
+    REQUIRE(Veh != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.veh.handle", true) != nullptr);
+    CHECK(M->getFunction("AddVectoredExceptionHandler") != nullptr);
+    CHECK(hasInlineAsmCall(*Teb));
+    CHECK(hasInlineAsmCall(*Peb));
+    CHECK(hasInlineAsmCall(*Direct));
+    CHECK(hasInlineAsmCall(*Indirect));
+    CHECK(countNamedInstructions(*Probe, "morok.win.foundation.teb.peb") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.foundation.headers.ok") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.foundation.veh.handle") >=
+          1u);
+    CHECK(countNamedInstructions(*Resolve, "morok.win.pe.export.rva") >= 1u);
+    CHECK(countNamedInstructions(*Resolve, "morok.win.pe.hash.match") >= 1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.mov.eax") >= 1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.syscall.ret") >=
+          1u);
+    CHECK(countNamedInstructions(*Veh, "morok.win.veh.code") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("timingOracleModule emits x86 rdtscp and raw clock probes") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

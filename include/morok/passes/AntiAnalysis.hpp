@@ -9,6 +9,7 @@
 //   • AntiDebugging  — denies debugger attachment at startup.
 //   • AntiHooking    — checks a function prologue for inline-hook trampolines.
 //   • AntiClassDump  — scrambles Objective-C metadata (no-op on non-ObjC code).
+//   • WindowsPEFoundation — emits reusable Windows PEB/TEB, PE, syscall, VEH helpers.
 //   • TimingOracle   — samples independent clocks around short spans.
 //   • TrapOracle     — checks whether SIGTRAP/int3-style traps reach the app.
 //   • PageFaultTlbOracle — samples protected-page fault delivery and latency.
@@ -50,6 +51,12 @@ bool antiHookingModule(llvm::Module &M, morok::ir::IRRandom &rng);
 /// Scramble Objective-C metadata; a no-op (returns false) on modules without
 /// it.
 bool antiClassDumpModule(llvm::Module &M);
+
+/// Inject a Windows/PE foundation helper layer.  The emitted constructor and
+/// helpers expose GS-relative TEB/PEB readers, PE export-by-hash scanning,
+/// syscall-stub scanning/dispatch scaffolding, and VEH registration.  Returns
+/// true if code was added for the target.
+bool windowsPeFoundationModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
 /// Inject a runtime timing oracle.  The emitted helper samples independent
 /// clocks around short deterministic spans and folds distribution-level
@@ -108,6 +115,19 @@ class AntiClassDumpPass : public llvm::PassInfoMixin<AntiClassDumpPass> {
 public:
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
     static bool isRequired() { return true; }
+};
+
+class WindowsPEFoundationPass
+    : public llvm::PassInfoMixin<WindowsPEFoundationPass> {
+public:
+    explicit WindowsPEFoundationPass(std::uint64_t seed = 0x51D0BEEF)
+        : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
+
+    llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
+    static bool isRequired() { return true; }
+
+private:
+    core::Xoshiro256pp engine_;
 };
 
 class TimingOraclePass : public llvm::PassInfoMixin<TimingOraclePass> {

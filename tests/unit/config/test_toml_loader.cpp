@@ -269,6 +269,8 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     tf_const = 13
     nested_dispatch = true
     warmup = 128
+    [passes.windows_pe_foundation]
+    enabled = true
     [passes.timing_oracles]
     enabled = true
     [passes.trap_oracles]
@@ -427,6 +429,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.csm.tf_const == 13u);
     CHECK(r.config.passes.csm.nested_dispatch == true);
     CHECK(r.config.passes.csm.warmup == 128u);
+    CHECK(r.config.passes.windows_pe_foundation.enabled == true);
     CHECK(r.config.passes.timing_oracles.enabled == true);
     CHECK(r.config.passes.trap_oracles.enabled == true);
     CHECK(r.config.passes.page_fault_oracles.enabled == true);

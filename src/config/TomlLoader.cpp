@@ -450,6 +450,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseToggle(*t, pc.anti_dbg);
     if (auto *t = p["anti_class_dump"].as_table())
         parseToggle(*t, pc.anti_class_dump);
+    if (auto *t = p["windows_pe_foundation"].as_table())
+        parseToggle(*t, pc.windows_pe_foundation);
     if (auto *t = p["timing_oracles"].as_table())
         parseToggle(*t, pc.timing_oracles);
     if (auto *t = p["trap_oracles"].as_table())

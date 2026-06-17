@@ -89,7 +89,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 
 ## XL — new platform / major engines
 
-- [ ] **Windows/PE foundation:** add Windows as a target platform with a runtime helper layer (PEB/TEB access, indirect syscalls, SEH/VEH) — prerequisite for all Windows items below `[windows · new]`
+- [x] **Windows/PE foundation:** add Windows as a target platform with a runtime helper layer (PEB/TEB access, indirect syscalls, SEH/VEH) — prerequisite for all Windows items below `[windows · new]`
 - [ ] Windows PEB/heap debug-struct battery: `BeingDebugged`, `NtGlobalFlag`, `ProcessHeap` `Flags`/`ForceFlags`, via direct gs-relative reads (bypass API hooks) `[windows · new]`
 - [ ] Windows debug-object battery: `NtQueryInformationProcess` (`ProcessDebugPort`/`DebugObjectHandle`/`DebugFlags`) + `NtQueryObject` `ObjectTypesInformation` count `[windows · new]`
 - [ ] Windows `NtSetInformationThread(ThreadHideFromDebugger)` on all threads, then query it back to confirm it stuck `[windows · new]`

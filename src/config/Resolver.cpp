@@ -296,6 +296,8 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.anti_hook.enabled, src.anti_hook.enabled);
     mergeOpt(dst.anti_dbg.enabled, src.anti_dbg.enabled);
     mergeOpt(dst.anti_class_dump.enabled, src.anti_class_dump.enabled);
+    mergeOpt(dst.windows_pe_foundation.enabled,
+             src.windows_pe_foundation.enabled);
     mergeOpt(dst.timing_oracles.enabled, src.timing_oracles.enabled);
     mergeOpt(dst.trap_oracles.enabled, src.trap_oracles.enabled);
     mergeOpt(dst.page_fault_oracles.enabled, src.page_fault_oracles.enabled);

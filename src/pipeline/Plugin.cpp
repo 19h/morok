@@ -232,6 +232,10 @@ PassPluginLibraryInfo getPluginInfo() {
                             MPM.addPass(passes::AntiClassDumpPass());
                             return true;
                         }
+                        if (name == "morok-winpe") {
+                            MPM.addPass(passes::WindowsPEFoundationPass());
+                            return true;
+                        }
                         if (name == "morok-timing") {
                             MPM.addPass(passes::TimingOraclePass());
                             return true;

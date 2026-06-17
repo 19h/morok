@@ -367,6 +367,7 @@ struct PassConfig {
     ToggleConfig anti_hook;
     ToggleConfig anti_dbg;
     ToggleConfig anti_class_dump;
+    ToggleConfig windows_pe_foundation;
     ToggleConfig timing_oracles;
     ToggleConfig trap_oracles;
     ToggleConfig page_fault_oracles;

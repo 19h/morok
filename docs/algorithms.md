@@ -1113,9 +1113,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   performs the indirect call. Invokes and non-Linux-x86_64 targets avoid this
   exception path rather than guessing platform-specific exception-context
   offsets.
-- AntiClassDump / AntiDebugging / AntiHooking / TimingOracle / TrapOracle /
-  PageFaultTlbOracle / CacheTimingOracle / MicroarchitecturalCanary: platform
-  anti-analysis
+- AntiClassDump / WindowsPEFoundation / AntiDebugging / AntiHooking /
+  TimingOracle / TrapOracle / PageFaultTlbOracle / CacheTimingOracle /
+  MicroarchitecturalCanary: platform anti-analysis
   (module passes). AntiDebugging combines startup checks with a mutable hidden
   state word, platform-specific recheck helpers, pthread watchdogs where
   available, and once-gated randomized calls inserted into user functions so
@@ -1169,6 +1169,14 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   `csops`) are likewise emitted as inline Darwin syscall instructions. dyld
   symbol resolution such as `dlsym` is not a syscall; FunctionCallObfuscate's
   64-bit macOS path avoids that surface with the manual Mach-O hash resolver.
+  WindowsPEFoundation is an opt-in Windows x86_64 module pass that lays down the
+  shared runtime substrate for the Windows-specific checks: GS-relative TEB and
+  PEB readers, PE header/export-by-hash parsing, ntdll-style syscall-stub
+  scanning, direct and indirect syscall thunk scaffolding, and a vectored
+  exception handler registration path that folds exception records into
+  `morok.win.state`.  It is intentionally a foundation layer; the later Windows
+  PEB/debug-object/thread-hide/unhook tasks build on these helpers rather than
+  duplicating offsets and resolver logic.
   AntiHooking also emits a clean-copy byte-diff checker for POSIX targets.  The
   checker resolves the current executable path, maps a fresh read-only copy of
   the on-disk ELF or Mach-O image, applies the runtime load bias/slide, compares
@@ -1372,6 +1380,6 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   they can clone or generate dense IR.
 
 ## Scheduler order (to preserve semantics)
-Virtualization(user) → HashSelfDecrypt → AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → PageFaultTlbOracle → CacheTimingOracle → MicroarchitecturalCanary → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
+Virtualization(user) → HashSelfDecrypt → AntiHook → AntiClassDump → WindowsPEFoundation → AntiDebug → TimingOracle → TrapOracle → PageFaultTlbOracle → CacheTimingOracle → MicroarchitecturalCanary → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
 MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → ProtectionHelperVM → SensitiveHelperHardening → Nanomites → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 MisleadingMetadata → FeatureElimination (strip debug/names) → cleanup marker decls.
