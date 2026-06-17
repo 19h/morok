@@ -8887,7 +8887,16 @@ TEST_CASE("antiHookingModule emits Linux clean-copy byte diff with direct "
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 target triple = "x86_64-unknown-linux-gnu"
-define i32 @main() { ret i32 0 }
+define i32 @work(i32 %x) {
+entry:
+  %y = add i32 %x, 3
+  ret i32 %y
+}
+define i32 @main() {
+entry:
+  %v = call i32 @work(i32 39)
+  ret i32 %v
+}
 )ir");
     auto engine = morok::core::Xoshiro256pp::fromSeed(8801);
     morok::ir::IRRandom rng(engine);
@@ -8904,6 +8913,10 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Maps != nullptr);
     Function *Wx = M->getFunction("morok.antihook.wxorx.linux");
     REQUIRE(Wx != nullptr);
+    Function *Stack = M->getFunction("morok.antihook.stack.linux");
+    REQUIRE(Stack != nullptr);
+    Function *Work = M->getFunction("work");
+    REQUIRE(Work != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
     CHECK(hasInlineAsmCall(*Clean));
@@ -8928,6 +8941,9 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.rx") >= 1u);
     CHECK(countNamedInstructions(*Rx, "morok.antihook.got.map.seg.hit") >= 1u);
     CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.mprotect") >= 1u);
+    CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.rx") >= 1u);
+    CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
+    CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.rwx") >= 1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.anonymous.exec") >=
           1u);
@@ -8945,7 +8961,16 @@ TEST_CASE("antiHookingModule emits Darwin clean-copy checker without dlsym") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 target triple = "x86_64-apple-macosx13.0.0"
-define i32 @main() { ret i32 0 }
+define i32 @work(i32 %x) {
+entry:
+  %y = add i32 %x, 5
+  ret i32 %y
+}
+define i32 @main() {
+entry:
+  %v = call i32 @work(i32 37)
+  ret i32 %v
+}
 )ir");
     auto engine = morok::core::Xoshiro256pp::fromSeed(8802);
     morok::ir::IRRandom rng(engine);
@@ -8962,6 +8987,10 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Vm != nullptr);
     Function *Wx = M->getFunction("morok.antihook.wxorx.darwin");
     REQUIRE(Wx != nullptr);
+    Function *Stack = M->getFunction("morok.antihook.stack.darwin");
+    REQUIRE(Stack != nullptr);
+    Function *Work = M->getFunction("work");
+    REQUIRE(Work != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.mac.targets", true) != nullptr);
     CHECK(M->getFunction("morok.antihook.got.plt") == nullptr);
@@ -8984,6 +9013,9 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Text, "morok.antihook.macho.text.hit") >=
           1u);
     CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.mprotect") >= 1u);
+    CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.text") >= 1u);
+    CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
+    CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.vm.rwx") >= 1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.vm.private.exec") >= 1u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
@@ -9004,7 +9036,16 @@ TEST_CASE("antiHookingModule emits Windows VirtualQuery address-space census") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 target triple = "x86_64-pc-windows-msvc"
-define i32 @main() { ret i32 0 }
+define i32 @work(i32 %x) {
+entry:
+  %y = add i32 %x, 7
+  ret i32 %y
+}
+define i32 @main() {
+entry:
+  %v = call i32 @work(i32 35)
+  ret i32 %v
+}
 )ir");
     auto engine = morok::core::Xoshiro256pp::fromSeed(8804);
     morok::ir::IRRandom rng(engine);
@@ -9015,12 +9056,19 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Vm != nullptr);
     Function *Wx = M->getFunction("morok.antihook.wxorx.windows");
     REQUIRE(Wx != nullptr);
+    Function *Stack = M->getFunction("morok.antihook.stack.windows");
+    REQUIRE(Stack != nullptr);
+    Function *Work = M->getFunction("work");
+    REQUIRE(Work != nullptr);
     CHECK(M->getFunction("VirtualQuery") != nullptr);
     CHECK(M->getFunction("VirtualProtect") != nullptr);
     CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(M->getFunction("exit") == nullptr);
     CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.virtualprotect") >=
           1u);
+    CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.query") >= 1u);
+    CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
+    CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.win.rwx") >= 1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.win.private") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));

@@ -1084,6 +1084,15 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   uses `VirtualQuery`/`VirtualProtect` to downgrade committed RWX regions to
   execute-read.  Protection failures are folded into the same delayed anti-hook
   state instead of branching to an immediate exit.
+  Selected non-`main` user functions also get an entry-time stack-origin check:
+  the pass reads the function's immediate return address with
+  `llvm.returnaddress(0)` and verifies it against the platform executable-origin
+  model.  Linux reuses ELF program-header RX checks for the main executable,
+  macOS checks dyld executable image ranges, and Windows checks `VirtualQuery`
+  protection for committed executable, non-guard, non-RWX pages.  Failures are
+  folded into anti-hook state at the protected function entry, so suspicious
+  injected calls or DBI trampolines poison later state without a separable
+  immediate branch.
 - TimingOracle emits a private constructor helper that samples several short
   volatile spans with two clock sources.  x86 targets use serialized `rdtscp`
   paired with a raw OS clock; Darwin targets use `mach_absolute_time` and
