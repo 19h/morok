@@ -68,7 +68,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 
 ## L — new subsystems
 
-- [ ] Manual export-by-hash import resolver: walk ELF `.dynamic` (`DT_SYMTAB`/`DT_STRTAB`) and Mach-O chained fixups, match by hashed name, re-resolve+diff periodically — so no `dlsym`/GOT/`__la_symbol_ptr` entry exists to hook `[linux+macos · extends fco]`
+- [x] Manual export-by-hash import resolver: walk ELF `.dynamic` (`DT_SYMTAB`/`DT_STRTAB`) and Mach-O export-trie/symbol metadata, match by hashed name — so no `dlsym`/GOT/`__la_symbol_ptr` entry exists to hook for obfuscated call sites `[linux+macos · extends fco]`
 - [ ] Buddy/triad mutual protection: a 2–3 process ring that occupies the debugger slot (`PTRACE_ATTACH`) and cross-verifies code + liveness; killing one cascades, external attach is blocked `[posix · new]`
 - [ ] Watchdog orchestration thread/process: re-run the §2–§4 checks on a randomized cadence with a heartbeat; a missing heartbeat triggers entangled self-corruption (the backbone for "re-arm, don't one-shot") `[xplat · new]`
 - [ ] JIT self-decrypt with re-encrypt-on-exit and a polymorphic stub so a static dump + one breakpoint reveals only one slice (macOS needs `MAP_JIT`) `[xplat · extends selfdecrypt]`

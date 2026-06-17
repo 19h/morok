@@ -4,7 +4,11 @@
 //
 // morok/passes/FunctionCallObfuscate.cpp
 //
-// Each eligible direct call/invoke to an external function `f(args)` becomes
+// Each eligible direct call/invoke to an external function `f(args)` becomes a
+// hash-gated runtime resolution followed by an encoded indirect call.  On 64-bit
+// Linux/macOS, the resolver walks loaded ELF/Mach-O export tables by FNV-1a
+// symbol hash, so the call site carries no plaintext API name and imports no
+// dlsym edge.  Other targets keep the cloaked dlsym fallback:
 //   buf = <inline, per-site decryption of the encrypted symbol name>
 //   p   = dlsym(RTLD_DEFAULT, buf); p(args)
 // so the static import/call edge to `f` disappears.  The symbol name is never a
@@ -14,13 +18,15 @@
 // locally-defined functions stay direct, since dlsym would not resolve them.
 // On Linux x86_64 direct calls use an exception-mediated resolver: the site
 // publishes a hash-guarded pending request and deliberately faults; the SIGSEGV
-// handler resolves the pointer and resumes at the indirect-call continuation.
+// handler claims the request and resumes at the indirect-call continuation,
+// where the manual resolver runs outside the signal context.
 
 #include "morok/passes/FunctionCallObfuscate.hpp"
 
 #include "morok/core/KnuthHash.hpp"
 #include "morok/ir/SymbolCloak.hpp"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InlineAsm.h"
@@ -95,6 +101,30 @@ std::uint64_t hashName(StringRef Name) {
     return H ? H : kFnvPrime;
 }
 
+std::vector<std::uint64_t> darwinAliasHashes(StringRef Name) {
+    if (Name == "strlen")
+        return {hashName("_platform_strlen")};
+    if (Name == "strcpy")
+        return {hashName("_platform_strcpy")};
+    if (Name == "strcmp")
+        return {hashName("_platform_strcmp")};
+    if (Name == "strncmp")
+        return {hashName("_platform_strncmp")};
+    if (Name == "strchr")
+        return {hashName("_platform_strchr")};
+    if (Name == "strnlen")
+        return {hashName("_platform_strnlen")};
+    if (Name == "memset")
+        return {hashName("_platform_memset")};
+    if (Name == "memcpy" || Name == "memmove")
+        return {hashName("_platform_memmove")};
+    if (Name == "memcmp")
+        return {hashName("_platform_memcmp")};
+    if (Name == "memchr")
+        return {hashName("_platform_memchr")};
+    return {};
+}
+
 bool useExceptionCalls(const Triple &TT) {
     return TT.isOSLinux() && TT.getArch() == Triple::x86_64;
 }
@@ -144,12 +174,73 @@ FunctionCallee sigactionDecl(Module &M) {
         "sigaction", FunctionType::get(I32, {I32, Ptr, Ptr}, false));
 }
 
+FunctionCallee getauxvalDecl(Module &M) {
+    auto *IP = M.getDataLayout().getIntPtrType(M.getContext());
+    return M.getOrInsertFunction("getauxval",
+                                 FunctionType::get(IP, {IP}, false));
+}
+
+FunctionCallee dlIteratePhdrDecl(Module &M) {
+    auto *I32 = Type::getInt32Ty(M.getContext());
+    auto *Ptr = PointerType::getUnqual(M.getContext());
+    return M.getOrInsertFunction("dl_iterate_phdr",
+                                 FunctionType::get(I32, {Ptr, Ptr}, false));
+}
+
+FunctionCallee dyldImageCountDecl(Module &M) {
+    return M.getOrInsertFunction(
+        "_dyld_image_count",
+        FunctionType::get(Type::getInt32Ty(M.getContext()), false));
+}
+
+FunctionCallee dyldImageHeaderDecl(Module &M) {
+    auto *I32 = Type::getInt32Ty(M.getContext());
+    auto *Ptr = PointerType::getUnqual(M.getContext());
+    return M.getOrInsertFunction("_dyld_get_image_header",
+                                 FunctionType::get(Ptr, {I32}, false));
+}
+
+FunctionCallee dyldImageSlideDecl(Module &M) {
+    auto *I32 = Type::getInt32Ty(M.getContext());
+    auto *IP = M.getDataLayout().getIntPtrType(M.getContext());
+    return M.getOrInsertFunction("_dyld_get_image_vmaddr_slide",
+                                 FunctionType::get(IP, {I32}, false));
+}
+
 void zeroBytes(IRBuilder<> &B, Module &M, AllocaInst *Action,
                std::uint64_t Bytes) {
     auto *I8 = Type::getInt8Ty(M.getContext());
     for (std::uint64_t I = 0; I != Bytes; ++I)
         B.CreateStore(ConstantInt::get(I8, 0),
                       gepI8(B, M, Action, constIp(M, I)));
+}
+
+LoadInst *loadUnaligned(IRBuilder<> &B, Type *Ty, Value *Ptr,
+                        const Twine &Name = "") {
+    auto *LI = B.CreateLoad(Ty, Ptr, Name);
+    LI->setAlignment(Align(1));
+    return LI;
+}
+
+Value *loadAt(IRBuilder<> &B, Module &M, Type *Ty, Value *Base, Value *Offset,
+              const Twine &Name = "") {
+    return loadUnaligned(B, Ty, gepI8(B, M, Base, Offset, Name + ".ptr"), Name);
+}
+
+Value *loadAt(IRBuilder<> &B, Module &M, Type *Ty, Value *Base,
+              unsigned long long Offset, const Twine &Name = "") {
+    return loadAt(B, M, Ty, Base, constIp(M, static_cast<std::uint64_t>(Offset)),
+                  Name);
+}
+
+Value *normalizeElfAddress(IRBuilder<> &B, Module &M, Value *Base, Value *Addr,
+                           const Twine &Name) {
+    auto *IP = M.getDataLayout().getIntPtrType(M.getContext());
+    Value *NeedsBias = B.CreateAnd(
+        B.CreateICmpNE(Addr, ConstantInt::get(IP, 0)),
+        B.CreateAnd(B.CreateICmpNE(Base, ConstantInt::get(IP, 0)),
+                    B.CreateICmpULT(Addr, Base)));
+    return B.CreateSelect(NeedsBias, B.CreateAdd(Base, Addr), Addr, Name);
 }
 
 Value *runtimeHashName(IRBuilder<> &B, Module &M, Function *Fn, Value *Name) {
@@ -190,8 +281,1303 @@ Value *runtimeHashName(IRBuilder<> &B, Module &M, Function *Fn, Value *Name) {
     return Acc;
 }
 
+Function *elfModuleHashResolver(Module &M) {
+    if (auto *Existing = M.getFunction("morok.fco.resolve.elf.module"))
+        return Existing;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I8 = Type::getInt8Ty(Ctx);
+    auto *I16 = Type::getInt16Ty(Ctx);
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *IP = M.getDataLayout().getIntPtrType(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+
+    auto *FnTy = FunctionType::get(Ptr, {I64, IP, Ptr}, false);
+    auto *Fn = Function::Create(FnTy, GlobalValue::PrivateLinkage,
+                                "morok.fco.resolve.elf.module", M);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->setDSOLocal(true);
+    auto *Wanted = Fn->getArg(0);
+    Wanted->setName("wanted");
+    auto *Base = Fn->getArg(1);
+    Base->setName("base");
+    auto *Dyn = Fn->getArg(2);
+    Dyn->setName("dynamic");
+
+    auto *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    auto *DynLoop = BasicBlock::Create(Ctx, "dyn.loop", Fn);
+    auto *DynBody = BasicBlock::Create(Ctx, "dyn.body", Fn);
+    auto *DynNext = BasicBlock::Create(Ctx, "dyn.next", Fn);
+    auto *CountPrep = BasicBlock::Create(Ctx, "count.prep", Fn);
+    auto *HashCount = BasicBlock::Create(Ctx, "count.hash", Fn);
+    auto *LayoutCount = BasicBlock::Create(Ctx, "count.layout", Fn);
+    auto *ScanPrep = BasicBlock::Create(Ctx, "scan.prep", Fn);
+    auto *SymLoop = BasicBlock::Create(Ctx, "sym.loop", Fn);
+    auto *SymBody = BasicBlock::Create(Ctx, "sym.body", Fn);
+    auto *SymCheck = BasicBlock::Create(Ctx, "sym.check", Fn);
+    auto *SymNext = BasicBlock::Create(Ctx, "sym.next", Fn);
+    auto *RetFound = BasicBlock::Create(Ctx, "ret.found", Fn);
+    auto *RetNull = BasicBlock::Create(Ctx, "ret.null", Fn);
+
+    IRBuilder<> B(Entry);
+    AllocaInst *SymtabRaw = B.CreateAlloca(IP, nullptr, "morok.fco.elf.symtab.raw");
+    AllocaInst *StrtabRaw = B.CreateAlloca(IP, nullptr, "morok.fco.elf.strtab.raw");
+    AllocaInst *StrszSlot = B.CreateAlloca(IP, nullptr, "morok.fco.elf.strsz");
+    AllocaInst *SymentSlot = B.CreateAlloca(IP, nullptr, "morok.fco.elf.syment");
+    AllocaInst *HashRaw = B.CreateAlloca(IP, nullptr, "morok.fco.elf.hash.raw");
+    AllocaInst *SymtabSlot = B.CreateAlloca(IP, nullptr, "morok.fco.elf.symtab");
+    AllocaInst *StrtabSlot = B.CreateAlloca(IP, nullptr, "morok.fco.elf.strtab");
+    AllocaInst *CountSlot = B.CreateAlloca(IP, nullptr, "morok.fco.elf.count");
+    for (AllocaInst *Slot : {SymtabRaw, StrtabRaw, StrszSlot, SymentSlot,
+                             HashRaw, SymtabSlot, StrtabSlot, CountSlot})
+        B.CreateStore(ConstantInt::get(IP, 0), Slot);
+    B.CreateCondBr(B.CreateICmpNE(Dyn, ConstantPointerNull::get(Ptr)), DynLoop,
+                   RetNull);
+
+    IRBuilder<> DLB(DynLoop);
+    auto *DynIdx = DLB.CreatePHI(IP, 2, "morok.fco.elf.dyn.idx");
+    DynIdx->addIncoming(ConstantInt::get(IP, 0), Entry);
+    DLB.CreateCondBr(DLB.CreateICmpULT(DynIdx, ConstantInt::get(IP, 512)),
+                     DynBody, CountPrep);
+
+    IRBuilder<> DB(DynBody);
+    Value *DynEnt = gepI8(DB, M, Dyn, DB.CreateMul(DynIdx, ConstantInt::get(IP, 16)),
+                          "morok.fco.elf.dyn.ent");
+    Value *Tag = loadAt(DB, M, I64, DynEnt, 0ULL, "morok.fco.elf.dyn.tag");
+    Value *Val = loadAt(DB, M, IP, DynEnt, 8, "morok.fco.elf.dyn.val");
+    auto storeTag = [&](AllocaInst *Slot, std::uint64_t Want) {
+        Value *Old = DB.CreateLoad(IP, Slot);
+        DB.CreateStore(DB.CreateSelect(DB.CreateICmpEQ(Tag,
+                                                       ConstantInt::get(I64, Want)),
+                                       Val, Old),
+                       Slot);
+    };
+    storeTag(HashRaw, 4);    // DT_HASH
+    storeTag(StrtabRaw, 5);  // DT_STRTAB
+    storeTag(SymtabRaw, 6);  // DT_SYMTAB
+    storeTag(StrszSlot, 10); // DT_STRSZ
+    storeTag(SymentSlot, 11); // DT_SYMENT
+    DB.CreateCondBr(DB.CreateICmpEQ(Tag, ConstantInt::get(I64, 0)), CountPrep,
+                    DynNext);
+
+    IRBuilder<> DNB(DynNext);
+    Value *DynNextIdx =
+        DNB.CreateAdd(DynIdx, ConstantInt::get(IP, 1), "morok.fco.elf.dyn.next");
+    DNB.CreateBr(DynLoop);
+    DynIdx->addIncoming(DynNextIdx, DynNext);
+
+    IRBuilder<> CPB(CountPrep);
+    Value *HashAddr = normalizeElfAddress(
+        CPB, M, Base, CPB.CreateLoad(IP, HashRaw), "morok.fco.elf.hash.addr");
+    CPB.CreateCondBr(CPB.CreateICmpNE(HashAddr, ConstantInt::get(IP, 0)),
+                     HashCount, LayoutCount);
+
+    IRBuilder<> HCB(HashCount);
+    Value *HashPtr = HCB.CreateIntToPtr(HashAddr, Ptr, "morok.fco.elf.hash.ptr");
+    Value *NChain32 = loadAt(HCB, M, I32, HashPtr, 4, "morok.fco.elf.hash.nchain");
+    HCB.CreateStore(HCB.CreateZExt(NChain32, IP), CountSlot);
+    HCB.CreateBr(ScanPrep);
+
+    IRBuilder<> LCB(LayoutCount);
+    Value *SymtabAddr = normalizeElfAddress(
+        LCB, M, Base, LCB.CreateLoad(IP, SymtabRaw), "morok.fco.elf.symtab.addr");
+    Value *StrtabAddr = normalizeElfAddress(
+        LCB, M, Base, LCB.CreateLoad(IP, StrtabRaw), "morok.fco.elf.strtab.addr");
+    Value *Syment = LCB.CreateLoad(IP, SymentSlot, "morok.fco.elf.syment.v");
+    Value *Gap = LCB.CreateSub(StrtabAddr, SymtabAddr, "morok.fco.elf.sym.gap");
+    Value *LayoutOk = LCB.CreateAnd(
+        LCB.CreateICmpUGT(StrtabAddr, SymtabAddr),
+        LCB.CreateAnd(LCB.CreateICmpUGT(Syment, ConstantInt::get(IP, 0)),
+                      LCB.CreateICmpULT(Gap, ConstantInt::get(IP, 1 << 20))));
+    Value *LayoutCountV =
+        LCB.CreateUDiv(Gap, LCB.CreateSelect(LCB.CreateICmpNE(Syment,
+                                                              ConstantInt::get(IP, 0)),
+                                             Syment, ConstantInt::get(IP, 24)),
+                       "morok.fco.elf.layout.count");
+    LCB.CreateStore(LCB.CreateSelect(LayoutOk, LayoutCountV,
+                                     ConstantInt::get(IP, 4096)),
+                    CountSlot);
+    LCB.CreateBr(ScanPrep);
+
+    IRBuilder<> SPB(ScanPrep);
+    Value *FinalSymtab = normalizeElfAddress(
+        SPB, M, Base, SPB.CreateLoad(IP, SymtabRaw), "morok.fco.elf.symtab.final");
+    Value *FinalStrtab = normalizeElfAddress(
+        SPB, M, Base, SPB.CreateLoad(IP, StrtabRaw), "morok.fco.elf.strtab.final");
+    Value *FinalSyment = SPB.CreateLoad(IP, SymentSlot, "morok.fco.elf.syment.final");
+    Value *FinalCount = SPB.CreateLoad(IP, CountSlot, "morok.fco.elf.count.final");
+    SPB.CreateStore(FinalSymtab, SymtabSlot);
+    SPB.CreateStore(FinalStrtab, StrtabSlot);
+    Value *CanScan = SPB.CreateAnd(
+        SPB.CreateICmpNE(FinalSymtab, ConstantInt::get(IP, 0)),
+        SPB.CreateAnd(SPB.CreateICmpNE(FinalStrtab, ConstantInt::get(IP, 0)),
+                      SPB.CreateAnd(SPB.CreateICmpUGT(FinalSyment,
+                                                      ConstantInt::get(IP, 0)),
+                                    SPB.CreateICmpUGT(FinalCount,
+                                                      ConstantInt::get(IP, 0)))));
+    SPB.CreateCondBr(CanScan, SymLoop, RetNull);
+
+    IRBuilder<> SLB(SymLoop);
+    auto *SymIdx = SLB.CreatePHI(IP, 2, "morok.fco.elf.sym.idx");
+    SymIdx->addIncoming(ConstantInt::get(IP, 0), ScanPrep);
+    Value *Bound = SLB.CreateSelect(SLB.CreateICmpULT(FinalCount,
+                                                      ConstantInt::get(IP, 65536)),
+                                    FinalCount, ConstantInt::get(IP, 65536));
+    SLB.CreateCondBr(SLB.CreateICmpULT(SymIdx, Bound), SymBody, RetNull);
+
+    IRBuilder<> SBB(SymBody);
+    Value *SymBase = SBB.CreateLoad(IP, SymtabSlot, "morok.fco.elf.symtab.load");
+    Value *StrBase = SBB.CreateLoad(IP, StrtabSlot, "morok.fco.elf.strtab.load");
+    Value *SymEntSize = SBB.CreateLoad(IP, SymentSlot, "morok.fco.elf.syment.load");
+    Value *SymPtr = SBB.CreateIntToPtr(
+        SBB.CreateAdd(SymBase, SBB.CreateMul(SymIdx, SymEntSize)), Ptr,
+        "morok.fco.elf.sym.ptr");
+    Value *NameOff32 = loadAt(SBB, M, I32, SymPtr, 0ULL, "morok.fco.elf.st.name");
+    Value *Info = loadAt(SBB, M, I8, SymPtr, 4, "morok.fco.elf.st.info");
+    Value *Shndx = loadAt(SBB, M, I16, SymPtr, 6, "morok.fco.elf.st.shndx");
+    Value *SymValue = loadAt(SBB, M, IP, SymPtr, 8, "morok.fco.elf.st.value");
+    Value *NameOff = SBB.CreateZExt(NameOff32, IP, "morok.fco.elf.name.off");
+    Value *Strsz = SBB.CreateLoad(IP, StrszSlot, "morok.fco.elf.strsz.load");
+    Value *Type = SBB.CreateAnd(Info, ConstantInt::get(I8, 0x0f),
+                                "morok.fco.elf.st.type");
+    Value *TypeOk = SBB.CreateOr(
+        SBB.CreateICmpEQ(Type, ConstantInt::get(I8, 2)),
+        SBB.CreateOr(SBB.CreateICmpEQ(Type, ConstantInt::get(I8, 0)),
+                     SBB.CreateICmpEQ(Type, ConstantInt::get(I8, 10))));
+    Value *ValidSym = SBB.CreateAnd(
+        SBB.CreateICmpULT(NameOff, Strsz),
+        SBB.CreateAnd(SBB.CreateICmpNE(Shndx, ConstantInt::get(I16, 0)),
+                      SBB.CreateAnd(SBB.CreateICmpNE(SymValue,
+                                                     ConstantInt::get(IP, 0)),
+                                    TypeOk)));
+    Value *NamePtr =
+        SBB.CreateIntToPtr(SBB.CreateAdd(StrBase, NameOff), Ptr,
+                           "morok.fco.elf.name.ptr");
+    Value *TargetAddr =
+        SBB.CreateAdd(Base, SymValue, "morok.fco.elf.target.addr");
+    SBB.CreateCondBr(ValidSym, SymCheck, SymNext);
+
+    IRBuilder<> SCB(SymCheck);
+    Value *Computed = runtimeHashName(SCB, M, Fn, NamePtr);
+    SCB.CreateCondBr(SCB.CreateICmpEQ(Computed, Wanted,
+                                      "morok.fco.elf.hash.match"),
+                     RetFound, SymNext);
+
+    IRBuilder<> SNB(SymNext);
+    Value *SymNextIdx =
+        SNB.CreateAdd(SymIdx, ConstantInt::get(IP, 1), "morok.fco.elf.sym.next");
+    SNB.CreateBr(SymLoop);
+    SymIdx->addIncoming(SymNextIdx, SymNext);
+
+    IRBuilder<> RFB(RetFound);
+    RFB.CreateRet(RFB.CreateIntToPtr(TargetAddr, Ptr, "morok.fco.elf.target"));
+
+    IRBuilder<> RNB(RetNull);
+    RNB.CreateRet(ConstantPointerNull::get(Ptr));
+    return Fn;
+}
+
+Function *elfDlIterateCallback(Module &M) {
+    if (auto *Existing = M.getFunction("morok.fco.resolve.elf.iter.cb"))
+        return Existing;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I16 = Type::getInt16Ty(Ctx);
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *IP = M.getDataLayout().getIntPtrType(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    Function *ScanModule = elfModuleHashResolver(M);
+
+    auto *FnTy = FunctionType::get(I32, {Ptr, IP, Ptr}, false);
+    auto *Fn = Function::Create(FnTy, GlobalValue::PrivateLinkage,
+                                "morok.fco.resolve.elf.iter.cb", M);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->setDSOLocal(true);
+    auto *Info = Fn->getArg(0);
+    Info->setName("info");
+    auto *Data = Fn->getArg(2);
+    Data->setName("data");
+
+    auto *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    auto *PhLoop = BasicBlock::Create(Ctx, "ph.loop", Fn);
+    auto *PhBody = BasicBlock::Create(Ctx, "ph.body", Fn);
+    auto *FoundDyn = BasicBlock::Create(Ctx, "found.dynamic", Fn);
+    auto *PhNext = BasicBlock::Create(Ctx, "ph.next", Fn);
+    auto *RetStop = BasicBlock::Create(Ctx, "ret.stop", Fn);
+    auto *RetContinue = BasicBlock::Create(Ctx, "ret.continue", Fn);
+
+    IRBuilder<> B(Entry);
+    Value *Wanted = loadAt(B, M, I64, Data, 0ULL, "morok.fco.iter.wanted");
+    Value *Base = loadAt(B, M, IP, Info, 0ULL, "morok.fco.iter.base");
+    Value *Phdr = B.CreateLoad(
+        Ptr, gepI8(B, M, Info, ConstantInt::get(IP, 16),
+                   "morok.fco.iter.phdr.ptr"),
+        "morok.fco.iter.phdr");
+    Value *PhNum16 = loadAt(B, M, I16, Info, 24, "morok.fco.iter.phnum");
+    Value *PhNum = B.CreateZExt(PhNum16, IP, "morok.fco.iter.phnum.w");
+    B.CreateCondBr(B.CreateAnd(B.CreateICmpNE(Phdr, ConstantPointerNull::get(Ptr)),
+                               B.CreateICmpUGT(PhNum, ConstantInt::get(IP, 0))),
+                   PhLoop, RetContinue);
+
+    IRBuilder<> PLB(PhLoop);
+    auto *PhIdx = PLB.CreatePHI(IP, 2, "morok.fco.iter.ph.idx");
+    PhIdx->addIncoming(ConstantInt::get(IP, 0), Entry);
+    Value *PhActive =
+        PLB.CreateAnd(PLB.CreateICmpULT(PhIdx, PhNum),
+                      PLB.CreateICmpULT(PhIdx, ConstantInt::get(IP, 128)));
+    PLB.CreateCondBr(PhActive, PhBody, RetContinue);
+
+    IRBuilder<> PBB(PhBody);
+    Value *PhPtr =
+        gepI8(PBB, M, Phdr, PBB.CreateMul(PhIdx, ConstantInt::get(IP, 56)),
+              "morok.fco.iter.ph.ptr");
+    Value *PType = loadAt(PBB, M, I32, PhPtr, 0ULL, "morok.fco.iter.ph.type");
+    Value *PVaddr = loadAt(PBB, M, IP, PhPtr, 16, "morok.fco.iter.ph.vaddr");
+    PBB.CreateCondBr(PBB.CreateICmpEQ(PType, ConstantInt::get(I32, 2)),
+                     FoundDyn, PhNext);
+
+    IRBuilder<> FDB(FoundDyn);
+    Value *DynPtr = FDB.CreateIntToPtr(FDB.CreateAdd(Base, PVaddr), Ptr,
+                                       "morok.fco.iter.dynamic");
+    Value *Resolved =
+        FDB.CreateCall(ScanModule, {Wanted, Base, DynPtr},
+                       "morok.fco.iter.resolved");
+    Value *Found = FDB.CreateICmpNE(Resolved, ConstantPointerNull::get(Ptr));
+    Value *FoundAsInt = FDB.CreatePtrToInt(Resolved, I64,
+                                           "morok.fco.iter.resolved.int");
+    FDB.CreateStore(FoundAsInt,
+                    gepI8(FDB, M, Data, ConstantInt::get(IP, 8),
+                          "morok.fco.iter.found.slot"));
+    FDB.CreateCondBr(Found, RetStop, RetContinue);
+
+    IRBuilder<> PNB(PhNext);
+    Value *PhNextIdx =
+        PNB.CreateAdd(PhIdx, ConstantInt::get(IP, 1), "morok.fco.iter.ph.next");
+    PNB.CreateBr(PhLoop);
+    PhIdx->addIncoming(PhNextIdx, PhNext);
+
+    IRBuilder<> RSB(RetStop);
+    RSB.CreateRet(ConstantInt::get(I32, 1));
+
+    IRBuilder<> RCB(RetContinue);
+    RCB.CreateRet(ConstantInt::get(I32, 0));
+    return Fn;
+}
+
+Function *linuxHashResolver(Module &M) {
+    if (auto *Existing = M.getFunction("morok.fco.resolve.elf"))
+        return Existing;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *IP = M.getDataLayout().getIntPtrType(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    Function *ScanModule = elfModuleHashResolver(M);
+    Function *IterCallback = elfDlIterateCallback(M);
+
+    auto *Fn = Function::Create(FunctionType::get(Ptr, {I64}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.fco.resolve.elf", M);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->setDSOLocal(true);
+    auto *Wanted = Fn->getArg(0);
+    Wanted->setName("wanted");
+
+    auto *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    auto *PhLoop = BasicBlock::Create(Ctx, "ph.loop", Fn);
+    auto *PhBody = BasicBlock::Create(Ctx, "ph.body", Fn);
+    auto *PhNext = BasicBlock::Create(Ctx, "ph.next", Fn);
+    auto *MainScan = BasicBlock::Create(Ctx, "main.scan", Fn);
+    auto *DynLoop = BasicBlock::Create(Ctx, "dyn.loop", Fn);
+    auto *DynBody = BasicBlock::Create(Ctx, "dyn.body", Fn);
+    auto *DynNext = BasicBlock::Create(Ctx, "dyn.next", Fn);
+    auto *MapFirst = BasicBlock::Create(Ctx, "map.first", Fn);
+    auto *MapLoad = BasicBlock::Create(Ctx, "map.load", Fn);
+    auto *MapLoop = BasicBlock::Create(Ctx, "map.loop", Fn);
+    auto *MapBody = BasicBlock::Create(Ctx, "map.body", Fn);
+    auto *MapNext = BasicBlock::Create(Ctx, "map.next", Fn);
+    auto *AtBasePrep = BasicBlock::Create(Ctx, "atbase.prep", Fn);
+    auto *AtBaseLoad = BasicBlock::Create(Ctx, "atbase.load", Fn);
+    auto *AtBasePhLoop = BasicBlock::Create(Ctx, "atbase.ph.loop", Fn);
+    auto *AtBasePhBody = BasicBlock::Create(Ctx, "atbase.ph.body", Fn);
+    auto *AtBasePhNext = BasicBlock::Create(Ctx, "atbase.ph.next", Fn);
+    auto *AtBaseScan = BasicBlock::Create(Ctx, "atbase.scan", Fn);
+    auto *RetFound = BasicBlock::Create(Ctx, "ret.found", Fn);
+    auto *RetNull = BasicBlock::Create(Ctx, "ret.null", Fn);
+
+    IRBuilder<> B(Entry);
+    AllocaInst *BaseSlot = B.CreateAlloca(IP, nullptr, "morok.fco.elf.base");
+    AllocaInst *DynVaddrSlot =
+        B.CreateAlloca(IP, nullptr, "morok.fco.elf.dynamic.vaddr");
+    AllocaInst *DebugSlot = B.CreateAlloca(IP, nullptr, "morok.fco.elf.debug");
+    AllocaInst *AtBaseSlot = B.CreateAlloca(IP, nullptr, "morok.fco.elf.atbase");
+    AllocaInst *AtBaseDynSlot =
+        B.CreateAlloca(IP, nullptr, "morok.fco.elf.atbase.dynamic");
+    AllocaInst *FoundSlot = B.CreateAlloca(Ptr, nullptr, "morok.fco.elf.found");
+    auto *IterCtxTy = ArrayType::get(I64, 2);
+    AllocaInst *IterCtx =
+        B.CreateAlloca(IterCtxTy, nullptr, "morok.fco.elf.iter.ctx");
+    B.CreateStore(ConstantInt::get(IP, 0), BaseSlot);
+    B.CreateStore(ConstantInt::get(IP, 0), DynVaddrSlot);
+    B.CreateStore(ConstantInt::get(IP, 0), DebugSlot);
+    B.CreateStore(ConstantInt::get(IP, 0), AtBaseSlot);
+    B.CreateStore(ConstantInt::get(IP, 0), AtBaseDynSlot);
+    B.CreateStore(ConstantPointerNull::get(Ptr), FoundSlot);
+    B.CreateStore(Wanted,
+                  B.CreateInBoundsGEP(IterCtxTy, IterCtx,
+                                      {ConstantInt::get(IP, 0),
+                                       ConstantInt::get(IP, 0)},
+                                      "morok.fco.elf.iter.wanted.slot"));
+    B.CreateStore(ConstantInt::get(I64, 0),
+                  B.CreateInBoundsGEP(IterCtxTy, IterCtx,
+                                      {ConstantInt::get(IP, 0),
+                                       ConstantInt::get(IP, 1)},
+                                      "morok.fco.elf.iter.found.slot"));
+
+    Value *AtPhdr = B.CreateCall(getauxvalDecl(M), {ConstantInt::get(IP, 3)},
+                                 "morok.fco.elf.atphdr");
+    Value *PhEnt = B.CreateCall(getauxvalDecl(M), {ConstantInt::get(IP, 4)},
+                                "morok.fco.elf.phent");
+    Value *PhNum = B.CreateCall(getauxvalDecl(M), {ConstantInt::get(IP, 5)},
+                                "morok.fco.elf.phnum");
+    Value *ValidPhdr = B.CreateAnd(
+        B.CreateICmpNE(AtPhdr, ConstantInt::get(IP, 0)),
+        B.CreateAnd(B.CreateICmpUGE(PhEnt, ConstantInt::get(IP, 56)),
+                    B.CreateICmpUGT(PhNum, ConstantInt::get(IP, 0))));
+    B.CreateCondBr(ValidPhdr, PhLoop, RetNull);
+
+    IRBuilder<> PLB(PhLoop);
+    auto *PhIdx = PLB.CreatePHI(IP, 2, "morok.fco.elf.ph.idx");
+    PhIdx->addIncoming(ConstantInt::get(IP, 0), Entry);
+    Value *PhInRange =
+        PLB.CreateAnd(PLB.CreateICmpULT(PhIdx, PhNum),
+                      PLB.CreateICmpULT(PhIdx, ConstantInt::get(IP, 128)));
+    PLB.CreateCondBr(PhInRange, PhBody, MainScan);
+
+    IRBuilder<> PBB(PhBody);
+    Value *PhPtr = PBB.CreateIntToPtr(
+        PBB.CreateAdd(AtPhdr, PBB.CreateMul(PhIdx, PhEnt)), Ptr,
+        "morok.fco.elf.ph.ptr");
+    Value *PType = loadAt(PBB, M, I32, PhPtr, 0ULL, "morok.fco.elf.ph.type");
+    Value *POffset = loadAt(PBB, M, IP, PhPtr, 8, "morok.fco.elf.ph.offset");
+    Value *PVaddr = loadAt(PBB, M, IP, PhPtr, 16, "morok.fco.elf.ph.vaddr");
+    Value *OldBase = PBB.CreateLoad(IP, BaseSlot, "morok.fco.elf.base.old");
+    Value *PageMask =
+        ConstantInt::get(IP, ~static_cast<std::uint64_t>(0xfff));
+    Value *LoadBase = PBB.CreateSub(PBB.CreateAnd(AtPhdr, PageMask),
+                                    PBB.CreateAnd(PVaddr, PageMask),
+                                    "morok.fco.elf.load.base");
+    Value *LoadBaseOk = PBB.CreateAnd(
+        PBB.CreateICmpEQ(PType, ConstantInt::get(I32, 1)),
+        PBB.CreateAnd(PBB.CreateICmpEQ(POffset, ConstantInt::get(IP, 0)),
+                      PBB.CreateICmpEQ(OldBase, ConstantInt::get(IP, 0))));
+    Value *MaybeLoadBase = PBB.CreateSelect(LoadBaseOk, LoadBase, OldBase,
+                                            "morok.fco.elf.base.load");
+    Value *NewBase = PBB.CreateSelect(
+        PBB.CreateICmpEQ(PType, ConstantInt::get(I32, 6)),
+        PBB.CreateSub(AtPhdr, PVaddr), MaybeLoadBase,
+        "morok.fco.elf.base.new");
+    PBB.CreateStore(NewBase, BaseSlot);
+    Value *OldDyn =
+        PBB.CreateLoad(IP, DynVaddrSlot, "morok.fco.elf.dynamic.old");
+    Value *NewDyn = PBB.CreateSelect(
+        PBB.CreateICmpEQ(PType, ConstantInt::get(I32, 2)), PVaddr, OldDyn,
+        "morok.fco.elf.dynamic.new");
+    PBB.CreateStore(NewDyn, DynVaddrSlot);
+    PBB.CreateBr(PhNext);
+
+    IRBuilder<> PNB(PhNext);
+    Value *PhNextIdx =
+        PNB.CreateAdd(PhIdx, ConstantInt::get(IP, 1), "morok.fco.elf.ph.next");
+    PNB.CreateBr(PhLoop);
+    PhIdx->addIncoming(PhNextIdx, PhNext);
+
+    IRBuilder<> MSB(MainScan);
+    Value *MainBase = MSB.CreateLoad(IP, BaseSlot, "morok.fco.elf.main.base");
+    Value *MainDynVaddr =
+        MSB.CreateLoad(IP, DynVaddrSlot, "morok.fco.elf.main.dynamic.vaddr");
+    Value *MainDynAddr =
+        MSB.CreateAdd(MainBase, MainDynVaddr, "morok.fco.elf.main.dynamic.addr");
+    Value *MainDynOk =
+        MSB.CreateICmpNE(MainDynVaddr, ConstantInt::get(IP, 0));
+    Value *MainDynPtrRaw =
+        MSB.CreateIntToPtr(MainDynAddr, Ptr, "morok.fco.elf.main.dynamic.ptr");
+    Value *MainDynPtr =
+        MSB.CreateSelect(MainDynOk, MainDynPtrRaw,
+                         ConstantPointerNull::get(Ptr),
+                         "morok.fco.elf.main.dynamic.sel");
+    Value *MainResolved =
+        MSB.CreateCall(ScanModule, {Wanted, MainBase, MainDynPtr},
+                       "morok.fco.elf.main.resolved");
+    MSB.CreateStore(MainResolved, FoundSlot);
+    MSB.CreateCondBr(
+        MSB.CreateAnd(MainDynOk, MSB.CreateICmpNE(MainResolved,
+                                                  ConstantPointerNull::get(Ptr))),
+        RetFound, DynLoop);
+
+    IRBuilder<> DLB(DynLoop);
+    auto *DynIdx = DLB.CreatePHI(IP, 2, "morok.fco.elf.main.dyn.idx");
+    DynIdx->addIncoming(ConstantInt::get(IP, 0), MainScan);
+    Value *Base = DLB.CreateLoad(IP, BaseSlot, "morok.fco.elf.base.final");
+    Value *DynVaddr =
+        DLB.CreateLoad(IP, DynVaddrSlot, "morok.fco.elf.dynamic.final");
+    Value *DynAddr = DLB.CreateAdd(Base, DynVaddr, "morok.fco.elf.dynamic.addr");
+    Value *DynActive =
+        DLB.CreateAnd(DLB.CreateICmpNE(DynVaddr, ConstantInt::get(IP, 0)),
+                      DLB.CreateICmpULT(DynIdx, ConstantInt::get(IP, 512)));
+    DLB.CreateCondBr(DynActive, DynBody, MapFirst);
+
+    IRBuilder<> DB(DynBody);
+    Value *DynEnt = DB.CreateIntToPtr(
+        DB.CreateAdd(DynAddr, DB.CreateMul(DynIdx, ConstantInt::get(IP, 16))),
+        Ptr, "morok.fco.elf.main.dyn.ptr");
+    Value *Tag = loadAt(DB, M, I64, DynEnt, 0ULL, "morok.fco.elf.main.dyn.tag");
+    Value *Val = loadAt(DB, M, IP, DynEnt, 8, "morok.fco.elf.main.dyn.val");
+    Value *OldDebug = DB.CreateLoad(IP, DebugSlot, "morok.fco.elf.debug.old");
+    DB.CreateStore(DB.CreateSelect(DB.CreateICmpEQ(Tag, ConstantInt::get(I64, 21)),
+                                   Val, OldDebug),
+                   DebugSlot);
+    DB.CreateCondBr(DB.CreateICmpEQ(Tag, ConstantInt::get(I64, 0)), MapFirst,
+                    DynNext);
+
+    IRBuilder<> DNB(DynNext);
+    Value *DynNextIdx =
+        DNB.CreateAdd(DynIdx, ConstantInt::get(IP, 1), "morok.fco.elf.main.dyn.next");
+    DNB.CreateBr(DynLoop);
+    DynIdx->addIncoming(DynNextIdx, DynNext);
+
+    IRBuilder<> MFB(MapFirst);
+    Value *DebugAddr = MFB.CreateLoad(IP, DebugSlot, "morok.fco.elf.debug.final");
+    MFB.CreateCondBr(MFB.CreateICmpNE(DebugAddr, ConstantInt::get(IP, 0)),
+                     MapLoad, AtBasePrep);
+
+    IRBuilder<> MLoadB(MapLoad);
+    Value *DebugPtr =
+        MLoadB.CreateIntToPtr(DebugAddr, Ptr, "morok.fco.elf.debug.ptr");
+    Value *FirstMap = MLoadB.CreateLoad(
+        Ptr, gepI8(MLoadB, M, DebugPtr, ConstantInt::get(IP, 8),
+                   "morok.fco.elf.rdebug.map.ptr"),
+        "morok.fco.elf.rdebug.map");
+    MLoadB.CreateBr(MapLoop);
+
+    IRBuilder<> MLB(MapLoop);
+    auto *Map = MLB.CreatePHI(Ptr, 2, "morok.fco.elf.map");
+    auto *MapCount = MLB.CreatePHI(IP, 2, "morok.fco.elf.map.count");
+    Map->addIncoming(FirstMap, MapLoad);
+    MapCount->addIncoming(ConstantInt::get(IP, 0), MapLoad);
+    Value *MapActive =
+        MLB.CreateAnd(MLB.CreateICmpNE(Map, ConstantPointerNull::get(Ptr)),
+                      MLB.CreateICmpULT(MapCount, ConstantInt::get(IP, 128)));
+    MLB.CreateCondBr(MapActive, MapBody, AtBasePrep);
+
+    IRBuilder<> MBB(MapBody);
+    Value *MapBase = loadAt(MBB, M, IP, Map, 0ULL, "morok.fco.elf.map.base");
+    Value *MapDyn = MBB.CreateLoad(
+        Ptr, gepI8(MBB, M, Map, ConstantInt::get(IP, 16),
+                   "morok.fco.elf.map.dyn.ptr"),
+        "morok.fco.elf.map.dyn");
+    Value *NextMap = MBB.CreateLoad(
+        Ptr, gepI8(MBB, M, Map, ConstantInt::get(IP, 24),
+                   "morok.fco.elf.map.next.ptr"),
+        "morok.fco.elf.map.next");
+    Value *Resolved =
+        MBB.CreateCall(ScanModule, {Wanted, MapBase, MapDyn},
+                       "morok.fco.elf.map.resolved");
+    MBB.CreateStore(Resolved, FoundSlot);
+    MBB.CreateCondBr(MBB.CreateICmpNE(Resolved, ConstantPointerNull::get(Ptr)),
+                     RetFound, MapNext);
+
+    IRBuilder<> MNB(MapNext);
+    Value *NextMapCount =
+        MNB.CreateAdd(MapCount, ConstantInt::get(IP, 1),
+                      "morok.fco.elf.map.count.next");
+    MNB.CreateBr(MapLoop);
+    Map->addIncoming(NextMap, MapNext);
+    MapCount->addIncoming(NextMapCount, MapNext);
+
+    IRBuilder<> ABP(AtBasePrep);
+    Value *AtBase = ABP.CreateCall(getauxvalDecl(M), {ConstantInt::get(IP, 7)},
+                                   "morok.fco.elf.atbase.v");
+    ABP.CreateStore(AtBase, AtBaseSlot);
+    ABP.CreateCondBr(ABP.CreateICmpNE(AtBase, ConstantInt::get(IP, 0)),
+                     AtBaseLoad, RetNull);
+
+    IRBuilder<> ABL(AtBaseLoad);
+    Value *AtBasePtr =
+        ABL.CreateIntToPtr(AtBase, Ptr, "morok.fco.elf.atbase.ptr");
+    Value *AtBaseMagic =
+        loadAt(ABL, M, I32, AtBasePtr, 0ULL, "morok.fco.elf.atbase.magic");
+    Value *AtBasePhOff =
+        loadAt(ABL, M, I64, AtBasePtr, 32, "morok.fco.elf.atbase.phoff");
+    Value *AtBasePhEntRaw =
+        loadAt(ABL, M, Type::getInt16Ty(Ctx), AtBasePtr, 54,
+               "morok.fco.elf.atbase.phentsize");
+    Value *AtBasePhNumRaw =
+        loadAt(ABL, M, Type::getInt16Ty(Ctx), AtBasePtr, 56,
+               "morok.fco.elf.atbase.phnum");
+    Value *AtBasePhEnt =
+        ABL.CreateZExt(AtBasePhEntRaw, IP, "morok.fco.elf.atbase.phent");
+    Value *AtBasePhNum =
+        ABL.CreateZExt(AtBasePhNumRaw, IP, "morok.fco.elf.atbase.phnum");
+    ABL.CreateCondBr(
+        ABL.CreateAnd(ABL.CreateICmpEQ(AtBaseMagic, ConstantInt::get(I32, 0x464C457F)),
+                      ABL.CreateAnd(ABL.CreateICmpUGE(AtBasePhEnt,
+                                                      ConstantInt::get(IP, 56)),
+                                    ABL.CreateICmpUGT(AtBasePhNum,
+                                                      ConstantInt::get(IP, 0)))),
+        AtBasePhLoop, RetNull);
+
+    IRBuilder<> ABPL(AtBasePhLoop);
+    auto *AtBasePhIdx =
+        ABPL.CreatePHI(IP, 2, "morok.fco.elf.atbase.ph.idx");
+    AtBasePhIdx->addIncoming(ConstantInt::get(IP, 0), AtBaseLoad);
+    Value *AtBasePhActive =
+        ABPL.CreateAnd(ABPL.CreateICmpULT(AtBasePhIdx, AtBasePhNum),
+                       ABPL.CreateICmpULT(AtBasePhIdx, ConstantInt::get(IP, 128)));
+    ABPL.CreateCondBr(AtBasePhActive, AtBasePhBody, AtBaseScan);
+
+    IRBuilder<> ABPB(AtBasePhBody);
+    Value *AtBasePhPtr = ABPB.CreateIntToPtr(
+        ABPB.CreateAdd(AtBase, ABPB.CreateAdd(
+                                   AtBasePhOff,
+                                   ABPB.CreateMul(AtBasePhIdx, AtBasePhEnt))),
+        Ptr, "morok.fco.elf.atbase.ph.ptr");
+    Value *AtBasePType =
+        loadAt(ABPB, M, I32, AtBasePhPtr, 0ULL, "morok.fco.elf.atbase.ph.type");
+    Value *AtBasePVaddr =
+        loadAt(ABPB, M, IP, AtBasePhPtr, 16, "morok.fco.elf.atbase.ph.vaddr");
+    Value *OldAtBaseDyn =
+        ABPB.CreateLoad(IP, AtBaseDynSlot, "morok.fco.elf.atbase.dyn.old");
+    ABPB.CreateStore(
+        ABPB.CreateSelect(ABPB.CreateICmpEQ(AtBasePType, ConstantInt::get(I32, 2)),
+                          ABPB.CreateAdd(AtBase, AtBasePVaddr), OldAtBaseDyn),
+        AtBaseDynSlot);
+    ABPB.CreateBr(AtBasePhNext);
+
+    IRBuilder<> ABPN(AtBasePhNext);
+    Value *AtBaseNextIdx =
+        ABPN.CreateAdd(AtBasePhIdx, ConstantInt::get(IP, 1),
+                       "morok.fco.elf.atbase.ph.next");
+    ABPN.CreateBr(AtBasePhLoop);
+    AtBasePhIdx->addIncoming(AtBaseNextIdx, AtBasePhNext);
+
+    IRBuilder<> ABS(AtBaseScan);
+    Value *AtBaseDyn =
+        ABS.CreateLoad(IP, AtBaseDynSlot, "morok.fco.elf.atbase.dyn.final");
+    Value *AtBaseDynPtr =
+        ABS.CreateIntToPtr(AtBaseDyn, Ptr, "morok.fco.elf.atbase.dyn.ptr");
+    Value *AtBaseResolved =
+        ABS.CreateCall(ScanModule, {Wanted, AtBase, AtBaseDynPtr},
+                       "morok.fco.elf.atbase.resolved");
+    ABS.CreateStore(AtBaseResolved, FoundSlot);
+    ABS.CreateCondBr(ABS.CreateICmpNE(AtBaseResolved,
+                                      ConstantPointerNull::get(Ptr)),
+                     RetFound, RetNull);
+
+    IRBuilder<> RFB(RetFound);
+    RFB.CreateRet(RFB.CreateLoad(Ptr, FoundSlot, "morok.fco.elf.ret"));
+
+    IRBuilder<> RNB(RetNull);
+    Value *CtxPtr = RNB.CreateInBoundsGEP(
+        IterCtxTy, IterCtx, {ConstantInt::get(IP, 0), ConstantInt::get(IP, 0)},
+        "morok.fco.elf.iter.ctx.ptr");
+    RNB.CreateCall(dlIteratePhdrDecl(M), {IterCallback, CtxPtr});
+    Value *IterFoundInt = RNB.CreateLoad(
+        I64,
+        RNB.CreateInBoundsGEP(IterCtxTy, IterCtx,
+                              {ConstantInt::get(IP, 0), ConstantInt::get(IP, 1)},
+                              "morok.fco.elf.iter.ret.slot"),
+        "morok.fco.elf.iter.ret");
+    RNB.CreateRet(RNB.CreateIntToPtr(IterFoundInt, Ptr,
+                                     "morok.fco.elf.iter.ret.ptr"));
+    return Fn;
+}
+
+Function *machoReadUleb(Module &M) {
+    if (auto *Existing = M.getFunction("morok.fco.macho.uleb"))
+        return Existing;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I8 = Type::getInt8Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *IP = M.getDataLayout().getIntPtrType(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+
+    auto *Fn = Function::Create(FunctionType::get(I64, {Ptr, IP, Ptr, Ptr},
+                                                  false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.fco.macho.uleb", M);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->setDSOLocal(true);
+    auto *Base = Fn->getArg(0);
+    Base->setName("base");
+    auto *Size = Fn->getArg(1);
+    Size->setName("size");
+    auto *CursorSlot = Fn->getArg(2);
+    CursorSlot->setName("cursor");
+    auto *OkSlot = Fn->getArg(3);
+    OkSlot->setName("ok");
+
+    auto *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    auto *Loop = BasicBlock::Create(Ctx, "loop", Fn);
+    auto *Body = BasicBlock::Create(Ctx, "body", Fn);
+    auto *Cont = BasicBlock::Create(Ctx, "cont", Fn);
+    auto *Done = BasicBlock::Create(Ctx, "done", Fn);
+    auto *Fail = BasicBlock::Create(Ctx, "fail", Fn);
+
+    IRBuilder<> B(Entry);
+    AllocaInst *ResSlot = B.CreateAlloca(I64, nullptr, "morok.fco.uleb.res");
+    AllocaInst *ShiftSlot = B.CreateAlloca(IP, nullptr, "morok.fco.uleb.shift");
+    AllocaInst *IterSlot = B.CreateAlloca(IP, nullptr, "morok.fco.uleb.iter");
+    B.CreateStore(ConstantInt::get(I64, 0), ResSlot);
+    B.CreateStore(ConstantInt::get(IP, 0), ShiftSlot);
+    B.CreateStore(ConstantInt::get(IP, 0), IterSlot);
+    B.CreateStore(ConstantInt::get(I8, 1), OkSlot);
+    B.CreateBr(Loop);
+
+    IRBuilder<> LB(Loop);
+    Value *Iter = LB.CreateLoad(IP, IterSlot, "morok.fco.uleb.iter.v");
+    Value *Off = LB.CreateLoad(IP, CursorSlot, "morok.fco.uleb.off");
+    Value *Active = LB.CreateAnd(
+        LB.CreateICmpULT(Iter, ConstantInt::get(IP, 10)),
+        LB.CreateICmpULT(Off, Size), "morok.fco.uleb.active");
+    LB.CreateCondBr(Active, Body, Fail);
+
+    IRBuilder<> BB(Body);
+    Value *Byte = loadUnaligned(
+        BB, I8, gepI8(BB, M, Base, Off, "morok.fco.uleb.byte.ptr"),
+        "morok.fco.uleb.byte");
+    Value *Payload = BB.CreateZExt(
+        BB.CreateAnd(Byte, ConstantInt::get(I8, 0x7f)), I64,
+        "morok.fco.uleb.payload");
+    Value *Shift = BB.CreateLoad(IP, ShiftSlot, "morok.fco.uleb.shift.v");
+    Value *Part = BB.CreateShl(Payload, BB.CreateZExtOrTrunc(Shift, I64),
+                               "morok.fco.uleb.part");
+    Value *Res = BB.CreateOr(BB.CreateLoad(I64, ResSlot), Part,
+                             "morok.fco.uleb.res.next");
+    BB.CreateStore(Res, ResSlot);
+    Value *NextOff = BB.CreateAdd(Off, ConstantInt::get(IP, 1),
+                                  "morok.fco.uleb.off.next");
+    BB.CreateStore(NextOff, CursorSlot);
+    Value *DoneByte =
+        BB.CreateICmpEQ(BB.CreateAnd(Byte, ConstantInt::get(I8, 0x80)),
+                        ConstantInt::get(I8, 0));
+    BB.CreateCondBr(DoneByte, Done, Cont);
+
+    IRBuilder<> CB(Cont);
+    CB.CreateStore(CB.CreateAdd(Shift, ConstantInt::get(IP, 7)), ShiftSlot);
+    CB.CreateStore(CB.CreateAdd(Iter, ConstantInt::get(IP, 1)), IterSlot);
+    CB.CreateBr(Loop);
+
+    IRBuilder<> DB(Done);
+    DB.CreateStore(ConstantInt::get(I8, 1), OkSlot);
+    DB.CreateRet(DB.CreateLoad(I64, ResSlot));
+
+    IRBuilder<> FB(Fail);
+    FB.CreateStore(ConstantInt::get(I8, 0), OkSlot);
+    FB.CreateRet(FB.CreateLoad(I64, ResSlot));
+    return Fn;
+}
+
+Function *machoTrieHashResolver(Module &M) {
+    if (auto *Existing = M.getFunction("morok.fco.resolve.macho.trie"))
+        return Existing;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I8 = Type::getInt8Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *IP = M.getDataLayout().getIntPtrType(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    Function *ReadUleb = machoReadUleb(M);
+
+    constexpr std::uint64_t FnvOffset = 14695981039346656037ull;
+    constexpr std::uint64_t FnvPrime = 1099511628211ull;
+    constexpr std::uint64_t StackCap = 4096;
+    constexpr std::uint64_t StepCap = 262144;
+
+    auto *Fn = Function::Create(FunctionType::get(Ptr, {I64, Ptr, IP, IP},
+                                                  false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.fco.resolve.macho.trie", M);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->setDSOLocal(true);
+    auto *Wanted = Fn->getArg(0);
+    Wanted->setName("wanted");
+    auto *Trie = Fn->getArg(1);
+    Trie->setName("trie");
+    auto *Size = Fn->getArg(2);
+    Size->setName("size");
+    auto *ImageBase = Fn->getArg(3);
+    ImageBase->setName("image.base");
+
+    auto *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    auto *Loop = BasicBlock::Create(Ctx, "loop", Fn);
+    auto *Node = BasicBlock::Create(Ctx, "node", Fn);
+    auto *ReadTerm = BasicBlock::Create(Ctx, "term.read", Fn);
+    auto *TermDispatch = BasicBlock::Create(Ctx, "term.dispatch", Fn);
+    auto *Terminal = BasicBlock::Create(Ctx, "terminal", Fn);
+    auto *TerminalAddr = BasicBlock::Create(Ctx, "terminal.addr", Fn);
+    auto *AfterTerm = BasicBlock::Create(Ctx, "after.term", Fn);
+    auto *ChildPrep = BasicBlock::Create(Ctx, "child.prep", Fn);
+    auto *ChildLoop = BasicBlock::Create(Ctx, "child.loop", Fn);
+    auto *ChildStart = BasicBlock::Create(Ctx, "child.start", Fn);
+    auto *SuffixLoop = BasicBlock::Create(Ctx, "suffix.loop", Fn);
+    auto *SuffixByte = BasicBlock::Create(Ctx, "suffix.byte", Fn);
+    auto *SuffixHash = BasicBlock::Create(Ctx, "suffix.hash", Fn);
+    auto *ChildOffset = BasicBlock::Create(Ctx, "child.offset", Fn);
+    auto *Push = BasicBlock::Create(Ctx, "push", Fn);
+    auto *ChildNext = BasicBlock::Create(Ctx, "child.next", Fn);
+    auto *RetFound = BasicBlock::Create(Ctx, "ret.found", Fn);
+    auto *RetNull = BasicBlock::Create(Ctx, "ret.null", Fn);
+
+    IRBuilder<> B(Entry);
+    AllocaInst *StackOff = B.CreateAlloca(
+        IP, ConstantInt::get(IP, StackCap), "morok.fco.trie.stack.off");
+    AllocaInst *StackHash = B.CreateAlloca(
+        I64, ConstantInt::get(IP, StackCap), "morok.fco.trie.stack.hash");
+    AllocaInst *StackPrefix = B.CreateAlloca(
+        I8, ConstantInt::get(IP, StackCap), "morok.fco.trie.stack.prefix");
+    AllocaInst *SpSlot = B.CreateAlloca(IP, nullptr, "morok.fco.trie.sp");
+    AllocaInst *StepSlot = B.CreateAlloca(IP, nullptr, "morok.fco.trie.steps");
+    AllocaInst *CurSlot = B.CreateAlloca(IP, nullptr, "morok.fco.trie.cur");
+    AllocaInst *TermEndSlot =
+        B.CreateAlloca(IP, nullptr, "morok.fco.trie.term.end");
+    AllocaInst *OkSlot = B.CreateAlloca(I8, nullptr, "morok.fco.trie.ok");
+    AllocaInst *NodeHashSlot =
+        B.CreateAlloca(I64, nullptr, "morok.fco.trie.node.hash");
+    AllocaInst *NodePrefixSlot =
+        B.CreateAlloca(I8, nullptr, "morok.fco.trie.node.prefix");
+    AllocaInst *ChildHashSlot =
+        B.CreateAlloca(I64, nullptr, "morok.fco.trie.child.hash");
+    AllocaInst *ChildPrefixSlot =
+        B.CreateAlloca(I8, nullptr, "morok.fco.trie.child.prefix");
+    AllocaInst *ChildIdxSlot =
+        B.CreateAlloca(IP, nullptr, "morok.fco.trie.child.idx");
+    AllocaInst *ChildCountSlot =
+        B.CreateAlloca(IP, nullptr, "morok.fco.trie.child.count");
+    AllocaInst *FlagsSlot = B.CreateAlloca(I64, nullptr, "morok.fco.trie.flags");
+    AllocaInst *FoundSlot = B.CreateAlloca(Ptr, nullptr, "morok.fco.trie.found");
+
+    auto gepIpStack = [&](IRBuilder<> &IB, AllocaInst *Base, Value *Idx,
+                          const Twine &Name) {
+        return IB.CreateInBoundsGEP(IP, Base, Idx, Name);
+    };
+    auto gepI64Stack = [&](IRBuilder<> &IB, AllocaInst *Base, Value *Idx,
+                           const Twine &Name) {
+        return IB.CreateInBoundsGEP(I64, Base, Idx, Name);
+    };
+    auto gepI8Stack = [&](IRBuilder<> &IB, AllocaInst *Base, Value *Idx,
+                          const Twine &Name) {
+        return IB.CreateInBoundsGEP(I8, Base, Idx, Name);
+    };
+
+    Value *Zero = ConstantInt::get(IP, 0);
+    B.CreateStore(Zero, gepIpStack(B, StackOff, Zero,
+                                   "morok.fco.trie.stack.off.0"));
+    B.CreateStore(ConstantInt::get(I64, FnvOffset),
+                  gepI64Stack(B, StackHash, Zero,
+                              "morok.fco.trie.stack.hash.0"));
+    B.CreateStore(ConstantInt::get(I8, 0),
+                  gepI8Stack(B, StackPrefix, Zero,
+                             "morok.fco.trie.stack.prefix.0"));
+    B.CreateStore(ConstantInt::get(IP, 1), SpSlot);
+    B.CreateStore(Zero, StepSlot);
+    B.CreateStore(ConstantPointerNull::get(Ptr), FoundSlot);
+    Value *CanStart = B.CreateAnd(B.CreateICmpNE(Trie,
+                                                ConstantPointerNull::get(Ptr)),
+                                  B.CreateICmpUGT(Size, Zero));
+    B.CreateCondBr(CanStart, Loop, RetNull);
+
+    IRBuilder<> LB(Loop);
+    Value *Sp = LB.CreateLoad(IP, SpSlot, "morok.fco.trie.sp.v");
+    Value *Steps = LB.CreateLoad(IP, StepSlot, "morok.fco.trie.steps.v");
+    Value *Active = LB.CreateAnd(
+        LB.CreateICmpUGT(Sp, Zero),
+        LB.CreateICmpULT(Steps, ConstantInt::get(IP, StepCap)),
+        "morok.fco.trie.active");
+    LB.CreateCondBr(Active, Node, RetNull);
+
+    IRBuilder<> NB(Node);
+    Value *NodeSp = NB.CreateLoad(IP, SpSlot, "morok.fco.trie.node.sp");
+    Value *NodeIdx = NB.CreateSub(NodeSp, ConstantInt::get(IP, 1),
+                                  "morok.fco.trie.node.idx");
+    NB.CreateStore(NodeIdx, SpSlot);
+    NB.CreateStore(NB.CreateAdd(NB.CreateLoad(IP, StepSlot),
+                                ConstantInt::get(IP, 1)),
+                   StepSlot);
+    Value *NodeOff = NB.CreateLoad(
+        IP, gepIpStack(NB, StackOff, NodeIdx, "morok.fco.trie.node.off.ptr"),
+        "morok.fco.trie.node.off");
+    Value *NodeHash = NB.CreateLoad(
+        I64, gepI64Stack(NB, StackHash, NodeIdx,
+                         "morok.fco.trie.node.hash.ptr"),
+        "morok.fco.trie.node.hash.v");
+    Value *NodePrefix = NB.CreateLoad(
+        I8, gepI8Stack(NB, StackPrefix, NodeIdx,
+                       "morok.fco.trie.node.prefix.ptr"),
+        "morok.fco.trie.node.prefix.v");
+    NB.CreateStore(NodeHash, NodeHashSlot);
+    NB.CreateStore(NodePrefix, NodePrefixSlot);
+    NB.CreateStore(NodeOff, CurSlot);
+    NB.CreateStore(ConstantInt::get(I8, 1), OkSlot);
+    NB.CreateCondBr(NB.CreateICmpULT(NodeOff, Size), ReadTerm, Loop);
+
+    IRBuilder<> RTB(ReadTerm);
+    Value *TermSize =
+        RTB.CreateCall(ReadUleb, {Trie, Size, CurSlot, OkSlot},
+                       "morok.fco.trie.term.size");
+    Value *TermStart = RTB.CreateLoad(IP, CurSlot, "morok.fco.trie.term.start");
+    Value *TermEnd = RTB.CreateAdd(TermStart, TermSize,
+                                   "morok.fco.trie.term.end.v");
+    RTB.CreateStore(TermEnd, TermEndSlot);
+    Value *TermOk = RTB.CreateAnd(
+        RTB.CreateICmpNE(RTB.CreateLoad(I8, OkSlot), ConstantInt::get(I8, 0)),
+        RTB.CreateAnd(RTB.CreateICmpUGE(TermEnd, TermStart),
+                      RTB.CreateICmpULE(TermEnd, Size)));
+    RTB.CreateCondBr(TermOk, TermDispatch, Loop);
+
+    IRBuilder<> TDB(TermDispatch);
+    TDB.CreateCondBr(TDB.CreateICmpNE(TermSize, ConstantInt::get(I64, 0)),
+                     Terminal, AfterTerm);
+
+    IRBuilder<> TB(Terminal);
+    Value *Flags = TB.CreateCall(ReadUleb, {Trie, Size, CurSlot, OkSlot},
+                                 "morok.fco.trie.flags.v");
+    TB.CreateStore(Flags, FlagsSlot);
+    Value *FlagsOk =
+        TB.CreateICmpNE(TB.CreateLoad(I8, OkSlot), ConstantInt::get(I8, 0));
+    Value *Reexport = TB.CreateICmpNE(TB.CreateAnd(Flags,
+                                                   ConstantInt::get(I64, 0x08)),
+                                      ConstantInt::get(I64, 0));
+    TB.CreateCondBr(TB.CreateAnd(FlagsOk, TB.CreateNot(Reexport)),
+                    TerminalAddr, AfterTerm);
+
+    IRBuilder<> TAB(TerminalAddr);
+    Value *Addr = TAB.CreateCall(ReadUleb, {Trie, Size, CurSlot, OkSlot},
+                                 "morok.fco.trie.addr");
+    Value *AddrOk =
+        TAB.CreateICmpNE(TAB.CreateLoad(I8, OkSlot), ConstantInt::get(I8, 0));
+    Value *Kind = TAB.CreateAnd(TAB.CreateLoad(I64, FlagsSlot),
+                                ConstantInt::get(I64, 0x03),
+                                "morok.fco.trie.kind");
+    Value *RuntimeAddr = TAB.CreateSelect(
+        TAB.CreateICmpEQ(Kind, ConstantInt::get(I64, 0x02)), Addr,
+        TAB.CreateAdd(ImageBase, TAB.CreateZExtOrTrunc(Addr, IP)),
+        "morok.fco.trie.runtime.addr");
+    TAB.CreateStore(TAB.CreateIntToPtr(RuntimeAddr, Ptr), FoundSlot);
+    Value *HashMatch =
+        TAB.CreateICmpEQ(TAB.CreateLoad(I64, NodeHashSlot), Wanted,
+                         "morok.fco.trie.hash.match");
+    TAB.CreateCondBr(TAB.CreateAnd(AddrOk, HashMatch), RetFound, AfterTerm);
+
+    IRBuilder<> ATB(AfterTerm);
+    Value *TermEndFinal =
+        ATB.CreateLoad(IP, TermEndSlot, "morok.fco.trie.term.end.final");
+    ATB.CreateStore(TermEndFinal, CurSlot);
+    ATB.CreateCondBr(ATB.CreateICmpULT(TermEndFinal, Size), ChildPrep, Loop);
+
+    IRBuilder<> CPB(ChildPrep);
+    Value *ChildCountByte = loadUnaligned(
+        CPB, I8, gepI8(CPB, M, Trie, CPB.CreateLoad(IP, CurSlot),
+                       "morok.fco.trie.child.count.ptr"),
+        "morok.fco.trie.child.count.byte");
+    CPB.CreateStore(CPB.CreateZExt(ChildCountByte, IP), ChildCountSlot);
+    CPB.CreateStore(CPB.CreateAdd(CPB.CreateLoad(IP, CurSlot),
+                                  ConstantInt::get(IP, 1)),
+                    CurSlot);
+    CPB.CreateStore(Zero, ChildIdxSlot);
+    CPB.CreateBr(ChildLoop);
+
+    IRBuilder<> CLB(ChildLoop);
+    Value *ChildIdx =
+        CLB.CreateLoad(IP, ChildIdxSlot, "morok.fco.trie.child.idx.v");
+    Value *ChildCount =
+        CLB.CreateLoad(IP, ChildCountSlot, "morok.fco.trie.child.count.v");
+    Value *ChildCur = CLB.CreateLoad(IP, CurSlot, "morok.fco.trie.child.cur");
+    Value *ChildActive = CLB.CreateAnd(
+        CLB.CreateICmpULT(ChildIdx, ChildCount),
+        CLB.CreateICmpULT(ChildCur, Size), "morok.fco.trie.child.active");
+    CLB.CreateCondBr(ChildActive, ChildStart, Loop);
+
+    IRBuilder<> CSB(ChildStart);
+    CSB.CreateStore(CSB.CreateLoad(I64, NodeHashSlot), ChildHashSlot);
+    CSB.CreateStore(CSB.CreateLoad(I8, NodePrefixSlot), ChildPrefixSlot);
+    CSB.CreateBr(SuffixLoop);
+
+    IRBuilder<> SLB(SuffixLoop);
+    SLB.CreateCondBr(SLB.CreateICmpULT(SLB.CreateLoad(IP, CurSlot), Size),
+                     SuffixByte, Loop);
+
+    IRBuilder<> SBB(SuffixByte);
+    Value *SuffixChar = loadUnaligned(
+        SBB, I8, gepI8(SBB, M, Trie, SBB.CreateLoad(IP, CurSlot),
+                       "morok.fco.trie.suffix.ptr"),
+        "morok.fco.trie.suffix.c");
+    SBB.CreateStore(SBB.CreateAdd(SBB.CreateLoad(IP, CurSlot),
+                                  ConstantInt::get(IP, 1)),
+                    CurSlot);
+    SBB.CreateCondBr(SBB.CreateICmpEQ(SuffixChar, ConstantInt::get(I8, 0)),
+                     ChildOffset, SuffixHash);
+
+    IRBuilder<> SHB(SuffixHash);
+    Value *NeedPrefixDecision =
+        SHB.CreateICmpEQ(SHB.CreateLoad(I8, ChildPrefixSlot),
+                         ConstantInt::get(I8, 0));
+    Value *SkipPlatformUnderscore =
+        SHB.CreateAnd(NeedPrefixDecision,
+                      SHB.CreateICmpEQ(SuffixChar, ConstantInt::get(I8, '_')));
+    Value *OldHash = SHB.CreateLoad(I64, ChildHashSlot,
+                                    "morok.fco.trie.child.hash.old");
+    Value *NewHash = SHB.CreateMul(
+        SHB.CreateXor(OldHash, SHB.CreateZExt(SuffixChar, I64)),
+        ConstantInt::get(I64, FnvPrime), "morok.fco.trie.child.hash.next");
+    SHB.CreateStore(SHB.CreateSelect(SkipPlatformUnderscore, OldHash, NewHash),
+                    ChildHashSlot);
+    SHB.CreateStore(ConstantInt::get(I8, 1), ChildPrefixSlot);
+    SHB.CreateBr(SuffixLoop);
+
+    IRBuilder<> COB(ChildOffset);
+    Value *ChildOff =
+        COB.CreateCall(ReadUleb, {Trie, Size, CurSlot, OkSlot},
+                       "morok.fco.trie.child.off");
+    Value *ChildOffOk = COB.CreateAnd(
+        COB.CreateICmpNE(COB.CreateLoad(I8, OkSlot), ConstantInt::get(I8, 0)),
+        COB.CreateICmpULT(COB.CreateZExtOrTrunc(ChildOff, IP), Size));
+    Value *PushOk = COB.CreateAnd(
+        ChildOffOk, COB.CreateICmpULT(COB.CreateLoad(IP, SpSlot),
+                                      ConstantInt::get(IP, StackCap)));
+    COB.CreateCondBr(PushOk, Push, ChildNext);
+
+    IRBuilder<> PB(Push);
+    Value *PushIdx = PB.CreateLoad(IP, SpSlot, "morok.fco.trie.push.idx");
+    PB.CreateStore(PB.CreateZExtOrTrunc(ChildOff, IP),
+                   gepIpStack(PB, StackOff, PushIdx,
+                              "morok.fco.trie.push.off.ptr"));
+    PB.CreateStore(PB.CreateLoad(I64, ChildHashSlot),
+                   gepI64Stack(PB, StackHash, PushIdx,
+                               "morok.fco.trie.push.hash.ptr"));
+    PB.CreateStore(PB.CreateLoad(I8, ChildPrefixSlot),
+                   gepI8Stack(PB, StackPrefix, PushIdx,
+                              "morok.fco.trie.push.prefix.ptr"));
+    PB.CreateStore(PB.CreateAdd(PushIdx, ConstantInt::get(IP, 1)), SpSlot);
+    PB.CreateBr(ChildNext);
+
+    IRBuilder<> CNB(ChildNext);
+    CNB.CreateStore(CNB.CreateAdd(CNB.CreateLoad(IP, ChildIdxSlot),
+                                  ConstantInt::get(IP, 1)),
+                    ChildIdxSlot);
+    CNB.CreateBr(ChildLoop);
+
+    IRBuilder<> RFB(RetFound);
+    RFB.CreateRet(RFB.CreateLoad(Ptr, FoundSlot, "morok.fco.trie.ret"));
+
+    IRBuilder<> RNB(RetNull);
+    RNB.CreateRet(ConstantPointerNull::get(Ptr));
+    return Fn;
+}
+
+Function *darwinHashResolver(Module &M) {
+    if (auto *Existing = M.getFunction("morok.fco.resolve.macho"))
+        return Existing;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I8 = Type::getInt8Ty(Ctx);
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *IP = M.getDataLayout().getIntPtrType(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    Function *TrieResolver = machoTrieHashResolver(M);
+
+    auto *Fn = Function::Create(FunctionType::get(Ptr, {I64}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.fco.resolve.macho", M);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->setDSOLocal(true);
+    auto *Wanted = Fn->getArg(0);
+    Wanted->setName("wanted");
+
+    auto *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    auto *ImageLoop = BasicBlock::Create(Ctx, "image.loop", Fn);
+    auto *ImageBody = BasicBlock::Create(Ctx, "image.body", Fn);
+    auto *CmdLoop = BasicBlock::Create(Ctx, "cmd.loop", Fn);
+    auto *CmdBody = BasicBlock::Create(Ctx, "cmd.body", Fn);
+    auto *CmdNext = BasicBlock::Create(Ctx, "cmd.next", Fn);
+    auto *ScanPrep = BasicBlock::Create(Ctx, "scan.prep", Fn);
+    auto *TrieScan = BasicBlock::Create(Ctx, "trie.scan", Fn);
+    auto *TrieMiss = BasicBlock::Create(Ctx, "trie.miss", Fn);
+    auto *SymLoop = BasicBlock::Create(Ctx, "sym.loop", Fn);
+    auto *SymBody = BasicBlock::Create(Ctx, "sym.body", Fn);
+    auto *SymCheck = BasicBlock::Create(Ctx, "sym.check", Fn);
+    auto *SymNext = BasicBlock::Create(Ctx, "sym.next", Fn);
+    auto *ImageNext = BasicBlock::Create(Ctx, "image.next", Fn);
+    auto *RetFound = BasicBlock::Create(Ctx, "ret.found", Fn);
+    auto *RetNull = BasicBlock::Create(Ctx, "ret.null", Fn);
+
+    IRBuilder<> B(Entry);
+    AllocaInst *LinkVm = B.CreateAlloca(IP, nullptr, "morok.fco.macho.link.vm");
+    AllocaInst *LinkFile =
+        B.CreateAlloca(IP, nullptr, "morok.fco.macho.link.file");
+    AllocaInst *Symoff = B.CreateAlloca(IP, nullptr, "morok.fco.macho.symoff");
+    AllocaInst *Nsyms = B.CreateAlloca(IP, nullptr, "morok.fco.macho.nsyms");
+    AllocaInst *Stroff = B.CreateAlloca(IP, nullptr, "morok.fco.macho.stroff");
+    AllocaInst *Strsize = B.CreateAlloca(IP, nullptr, "morok.fco.macho.strsize");
+    AllocaInst *ExportOff =
+        B.CreateAlloca(IP, nullptr, "morok.fco.macho.export.off");
+    AllocaInst *ExportSize =
+        B.CreateAlloca(IP, nullptr, "morok.fco.macho.export.size");
+    AllocaInst *Symtab = B.CreateAlloca(IP, nullptr, "morok.fco.macho.symtab");
+    AllocaInst *Strtab = B.CreateAlloca(IP, nullptr, "morok.fco.macho.strtab");
+    AllocaInst *FoundSlot = B.CreateAlloca(Ptr, nullptr, "morok.fco.macho.found");
+    for (AllocaInst *Slot : {LinkVm, LinkFile, Symoff, Nsyms, Stroff, Strsize,
+                             ExportOff, ExportSize, Symtab, Strtab})
+        B.CreateStore(ConstantInt::get(IP, 0), Slot);
+    B.CreateStore(ConstantPointerNull::get(Ptr), FoundSlot);
+    Value *ImageCount = B.CreateCall(dyldImageCountDecl(M), {},
+                                     "morok.fco.macho.image.count");
+    B.CreateBr(ImageLoop);
+
+    IRBuilder<> ILB(ImageLoop);
+    auto *ImageIdx = ILB.CreatePHI(I32, 2, "morok.fco.macho.image.idx");
+    ImageIdx->addIncoming(ConstantInt::get(I32, 0), Entry);
+    Value *ImageInRange =
+        ILB.CreateAnd(ILB.CreateICmpULT(ImageIdx, ImageCount),
+                      ILB.CreateICmpULT(ImageIdx, ConstantInt::get(I32, 128)));
+    ILB.CreateCondBr(ImageInRange, ImageBody, RetNull);
+
+    IRBuilder<> IBB(ImageBody);
+    Value *Hdr = IBB.CreateCall(dyldImageHeaderDecl(M), {ImageIdx},
+                                "morok.fco.macho.hdr");
+    Value *Slide = IBB.CreateCall(dyldImageSlideDecl(M), {ImageIdx},
+                                  "morok.fco.macho.slide");
+    Value *Magic = loadAt(IBB, M, I32, Hdr, 0ULL, "morok.fco.macho.magic");
+    Value *NCmds = loadAt(IBB, M, I32, Hdr, 16, "morok.fco.macho.ncmds");
+    for (AllocaInst *Slot : {LinkVm, LinkFile, Symoff, Nsyms, Stroff, Strsize,
+                             ExportOff, ExportSize, Symtab, Strtab})
+        IBB.CreateStore(ConstantInt::get(IP, 0), Slot);
+    Value *ValidImage = IBB.CreateAnd(
+        IBB.CreateICmpNE(Hdr, ConstantPointerNull::get(Ptr)),
+        IBB.CreateICmpEQ(Magic, ConstantInt::get(I32, 0xFEEDFACF)));
+    IBB.CreateCondBr(ValidImage, CmdLoop, ImageNext);
+
+    IRBuilder<> CLB(CmdLoop);
+    auto *CmdIdx = CLB.CreatePHI(I32, 2, "morok.fco.macho.cmd.idx");
+    auto *CmdOff = CLB.CreatePHI(IP, 2, "morok.fco.macho.cmd.off");
+    CmdIdx->addIncoming(ConstantInt::get(I32, 0), ImageBody);
+    CmdOff->addIncoming(ConstantInt::get(IP, 32), ImageBody);
+    Value *CmdInRange =
+        CLB.CreateAnd(CLB.CreateICmpULT(CmdIdx, NCmds),
+                      CLB.CreateICmpULT(CmdIdx, ConstantInt::get(I32, 256)));
+    CLB.CreateCondBr(CmdInRange, CmdBody, ScanPrep);
+
+    IRBuilder<> CBB(CmdBody);
+    Value *CmdPtr = gepI8(CBB, M, Hdr, CmdOff, "morok.fco.macho.cmd.ptr");
+    Value *Cmd = loadAt(CBB, M, I32, CmdPtr, 0ULL, "morok.fco.macho.cmd");
+    Value *CmdSize32 = loadAt(CBB, M, I32, CmdPtr, 4,
+                              "morok.fco.macho.cmd.size");
+    Value *CmdSize = CBB.CreateZExt(CmdSize32, IP,
+                                    "morok.fco.macho.cmd.size.w");
+    Value *IsSymtab = CBB.CreateICmpEQ(Cmd, ConstantInt::get(I32, 0x2),
+                                       "morok.fco.macho.cmd.symtab");
+    Value *IsSegment64 = CBB.CreateICmpEQ(Cmd, ConstantInt::get(I32, 0x19),
+                                          "morok.fco.macho.cmd.segment64");
+    Value *IsDyldInfo = CBB.CreateOr(
+        CBB.CreateICmpEQ(Cmd, ConstantInt::get(I32, 0x22)),
+        CBB.CreateICmpEQ(Cmd, ConstantInt::get(I32, 0x80000022u)),
+        "morok.fco.macho.cmd.dyld.info");
+    Value *IsExportsTrie =
+        CBB.CreateICmpEQ(Cmd, ConstantInt::get(I32, 0x80000033u),
+                         "morok.fco.macho.cmd.exports.trie");
+    Value *IsExportCmd = CBB.CreateOr(IsDyldInfo, IsExportsTrie,
+                                      "morok.fco.macho.cmd.export");
+    Value *SegVm = loadAt(CBB, M, I64, CmdPtr, 24, "morok.fco.macho.seg.vm");
+    Value *SegFile = loadAt(CBB, M, I64, CmdPtr, 40,
+                            "morok.fco.macho.seg.file");
+    Value *Symoff32 = loadAt(CBB, M, I32, CmdPtr, 8,
+                             "morok.fco.macho.symoff.raw");
+    Value *Nsyms32 = loadAt(CBB, M, I32, CmdPtr, 12,
+                            "morok.fco.macho.nsyms.raw");
+    Value *Stroff32 = loadAt(CBB, M, I32, CmdPtr, 16,
+                             "morok.fco.macho.stroff.raw");
+    Value *Strsize32 = loadAt(CBB, M, I32, CmdPtr, 20,
+                              "morok.fco.macho.strsize.raw");
+    Value *DyldExportOff32 = loadAt(CBB, M, I32, CmdPtr, 40,
+                                    "morok.fco.macho.dyld.export.off.raw");
+    Value *DyldExportSize32 = loadAt(CBB, M, I32, CmdPtr, 44,
+                                     "morok.fco.macho.dyld.export.size.raw");
+    Value *TrieExportOff32 = loadAt(CBB, M, I32, CmdPtr, 8,
+                                    "morok.fco.macho.trie.export.off.raw");
+    Value *TrieExportSize32 = loadAt(CBB, M, I32, CmdPtr, 12,
+                                     "morok.fco.macho.trie.export.size.raw");
+    auto storeSelect = [&](AllocaInst *Slot, Value *Cond, Value *Val) {
+        Value *Old = CBB.CreateLoad(IP, Slot);
+        CBB.CreateStore(CBB.CreateSelect(Cond, Val, Old), Slot);
+    };
+    storeSelect(LinkVm, IsSegment64, CBB.CreateZExtOrTrunc(SegVm, IP));
+    storeSelect(LinkFile, IsSegment64, CBB.CreateZExtOrTrunc(SegFile, IP));
+    storeSelect(Symoff, IsSymtab, CBB.CreateZExt(Symoff32, IP));
+    storeSelect(Nsyms, IsSymtab, CBB.CreateZExt(Nsyms32, IP));
+    storeSelect(Stroff, IsSymtab, CBB.CreateZExt(Stroff32, IP));
+    storeSelect(Strsize, IsSymtab, CBB.CreateZExt(Strsize32, IP));
+    storeSelect(ExportOff, IsExportCmd,
+                CBB.CreateSelect(IsExportsTrie, CBB.CreateZExt(TrieExportOff32, IP),
+                                 CBB.CreateZExt(DyldExportOff32, IP)));
+    storeSelect(ExportSize, IsExportCmd,
+                CBB.CreateSelect(IsExportsTrie,
+                                 CBB.CreateZExt(TrieExportSize32, IP),
+                                 CBB.CreateZExt(DyldExportSize32, IP)));
+    CBB.CreateBr(CmdNext);
+
+    IRBuilder<> CNB(CmdNext);
+    Value *CmdNextIdx =
+        CNB.CreateAdd(CmdIdx, ConstantInt::get(I32, 1),
+                      "morok.fco.macho.cmd.next");
+    Value *CmdNextOff =
+        CNB.CreateAdd(CmdOff, CmdSize, "morok.fco.macho.cmd.off.next");
+    CNB.CreateBr(CmdLoop);
+    CmdIdx->addIncoming(CmdNextIdx, CmdNext);
+    CmdOff->addIncoming(CmdNextOff, CmdNext);
+
+    IRBuilder<> SPB(ScanPrep);
+    Value *LinkBase = SPB.CreateAdd(
+        Slide,
+        SPB.CreateSub(SPB.CreateLoad(IP, LinkVm), SPB.CreateLoad(IP, LinkFile)),
+        "morok.fco.macho.link.base");
+    Value *SymtabAddr =
+        SPB.CreateAdd(LinkBase, SPB.CreateLoad(IP, Symoff),
+                      "morok.fco.macho.symtab.addr");
+    Value *StrtabAddr =
+        SPB.CreateAdd(LinkBase, SPB.CreateLoad(IP, Stroff),
+                      "morok.fco.macho.strtab.addr");
+    Value *SymCount = SPB.CreateLoad(IP, Nsyms, "morok.fco.macho.nsyms.final");
+    Value *StringSize =
+        SPB.CreateLoad(IP, Strsize, "morok.fco.macho.strsize.final");
+    Value *ExportOffset =
+        SPB.CreateLoad(IP, ExportOff, "morok.fco.macho.export.off.final");
+    Value *ExportBytes =
+        SPB.CreateLoad(IP, ExportSize, "morok.fco.macho.export.size.final");
+    Value *ExportAddr =
+        SPB.CreateAdd(LinkBase, ExportOffset, "morok.fco.macho.export.addr");
+    SPB.CreateStore(SymtabAddr, Symtab);
+    SPB.CreateStore(StrtabAddr, Strtab);
+    Value *CanScan = SPB.CreateAnd(
+        SPB.CreateICmpNE(SymtabAddr, ConstantInt::get(IP, 0)),
+        SPB.CreateAnd(SPB.CreateICmpNE(StrtabAddr, ConstantInt::get(IP, 0)),
+                      SPB.CreateAnd(SPB.CreateICmpUGT(SymCount,
+                                                      ConstantInt::get(IP, 0)),
+                                    SPB.CreateICmpUGT(StringSize,
+                                                      ConstantInt::get(IP, 0)))));
+    Value *CanTrieScan = SPB.CreateAnd(
+        SPB.CreateICmpNE(LinkBase, ConstantInt::get(IP, 0)),
+        SPB.CreateAnd(SPB.CreateICmpUGT(ExportOffset, ConstantInt::get(IP, 0)),
+                      SPB.CreateICmpUGT(ExportBytes, ConstantInt::get(IP, 0))),
+        "morok.fco.macho.trie.can.scan");
+    SPB.CreateCondBr(CanTrieScan, TrieScan, TrieMiss);
+
+    IRBuilder<> TSB(TrieScan);
+    Value *TriePtr = TSB.CreateIntToPtr(ExportAddr, Ptr,
+                                        "morok.fco.macho.trie.ptr");
+    Value *TrieResolved =
+        TSB.CreateCall(TrieResolver,
+                       {Wanted, TriePtr, ExportBytes,
+                        TSB.CreatePtrToInt(Hdr, IP,
+                                           "morok.fco.macho.image.base")},
+                       "morok.fco.macho.trie.resolved");
+    TSB.CreateStore(TrieResolved, FoundSlot);
+    TSB.CreateCondBr(TSB.CreateICmpNE(TrieResolved,
+                                      ConstantPointerNull::get(Ptr)),
+                     RetFound, TrieMiss);
+
+    IRBuilder<> TMB(TrieMiss);
+    TMB.CreateCondBr(CanScan, SymLoop, ImageNext);
+
+    IRBuilder<> SLB(SymLoop);
+    auto *SymIdx = SLB.CreatePHI(IP, 2, "morok.fco.macho.sym.idx");
+    SymIdx->addIncoming(ConstantInt::get(IP, 0), TrieMiss);
+    Value *Bound = SLB.CreateSelect(SLB.CreateICmpULT(SymCount,
+                                                      ConstantInt::get(IP, 65536)),
+                                    SymCount, ConstantInt::get(IP, 65536));
+    SLB.CreateCondBr(SLB.CreateICmpULT(SymIdx, Bound), SymBody, ImageNext);
+
+    IRBuilder<> SBB(SymBody);
+    Value *SymBase = SBB.CreateLoad(IP, Symtab, "morok.fco.macho.symtab.load");
+    Value *StrBase = SBB.CreateLoad(IP, Strtab, "morok.fco.macho.strtab.load");
+    Value *SymPtr = SBB.CreateIntToPtr(
+        SBB.CreateAdd(SymBase, SBB.CreateMul(SymIdx, ConstantInt::get(IP, 16))),
+        Ptr, "morok.fco.macho.sym.ptr");
+    Value *NameOff32 = loadAt(SBB, M, I32, SymPtr, 0ULL,
+                              "morok.fco.macho.n.strx");
+    Value *NType = loadAt(SBB, M, I8, SymPtr, 4, "morok.fco.macho.n.type");
+    Value *NValue = loadAt(SBB, M, IP, SymPtr, 8, "morok.fco.macho.n.value");
+    Value *NameOff = SBB.CreateZExt(NameOff32, IP, "morok.fco.macho.name.off");
+    Value *NamePtrRaw =
+        SBB.CreateIntToPtr(SBB.CreateAdd(StrBase, NameOff), Ptr,
+                           "morok.fco.macho.name.raw");
+    Value *First = loadAt(SBB, M, I8, NamePtrRaw, 0ULL,
+                          "morok.fco.macho.name.first");
+    Value *NamePtr = SBB.CreateSelect(
+        SBB.CreateICmpEQ(First, ConstantInt::get(I8, '_')),
+        gepI8(SBB, M, NamePtrRaw, ConstantInt::get(IP, 1),
+              "morok.fco.macho.name.skip"),
+        NamePtrRaw, "morok.fco.macho.name.ptr");
+    Value *TypeBits = SBB.CreateAnd(NType, ConstantInt::get(I8, 0x0e),
+                                    "morok.fco.macho.n.typebits");
+    Value *ValidSym = SBB.CreateAnd(
+        SBB.CreateICmpULT(NameOff, StringSize),
+        SBB.CreateAnd(SBB.CreateICmpEQ(TypeBits, ConstantInt::get(I8, 0x0e)),
+                      SBB.CreateICmpNE(NValue, ConstantInt::get(IP, 0))));
+    Value *TargetAddr =
+        SBB.CreateAdd(Slide, NValue, "morok.fco.macho.target.addr");
+    SBB.CreateCondBr(ValidSym, SymCheck, SymNext);
+
+    IRBuilder<> SCB(SymCheck);
+    Value *Computed = runtimeHashName(SCB, M, Fn, NamePtr);
+    SCB.CreateStore(SCB.CreateIntToPtr(TargetAddr, Ptr), FoundSlot);
+    SCB.CreateCondBr(SCB.CreateICmpEQ(Computed, Wanted,
+                                      "morok.fco.macho.hash.match"),
+                     RetFound, SymNext);
+
+    IRBuilder<> SNB(SymNext);
+    Value *SymNextIdx =
+        SNB.CreateAdd(SymIdx, ConstantInt::get(IP, 1),
+                      "morok.fco.macho.sym.next");
+    SNB.CreateBr(SymLoop);
+    SymIdx->addIncoming(SymNextIdx, SymNext);
+
+    IRBuilder<> INB(ImageNext);
+    Value *ImageNextIdx =
+        INB.CreateAdd(ImageIdx, ConstantInt::get(I32, 1),
+                      "morok.fco.macho.image.next");
+    INB.CreateBr(ImageLoop);
+    ImageIdx->addIncoming(ImageNextIdx, ImageNext);
+
+    IRBuilder<> RFB(RetFound);
+    RFB.CreateRet(RFB.CreateLoad(Ptr, FoundSlot, "morok.fco.macho.target"));
+
+    IRBuilder<> RNB(RetNull);
+    RNB.CreateRet(ConstantPointerNull::get(Ptr));
+    return Fn;
+}
+
+bool useManualHashResolver(Module &M, const Triple &TT) {
+    if (M.getDataLayout().getPointerSizeInBits(0) != 64)
+        return false;
+    return TT.isOSLinux() || TT.isOSDarwin();
+}
+
+Function *manualHashResolver(Module &M, const Triple &TT) {
+    if (TT.isOSLinux())
+        return linuxHashResolver(M);
+    if (TT.isOSDarwin())
+        return darwinHashResolver(M);
+    return nullptr;
+}
+
 Function *exceptionHandler(Module &M, ExceptionRuntime &Rt,
-                           FunctionCallee Dlsym, int RtldDefaultVal) {
+                           FunctionCallee Resolver, bool ManualResolver,
+                           int RtldDefaultVal) {
     if (auto *Existing =
             M.getFunction("morok.fco.ex.handler"))
         return Existing;
@@ -223,26 +1609,37 @@ Function *exceptionHandler(Module &M, ExceptionRuntime &Rt,
     Value *Out = B.CreateLoad(Ptr, Rt.out, "morok.fco.ex.out.load");
     Value *Cont = B.CreateLoad(Ptr, Rt.cont, "morok.fco.ex.cont.load");
     Value *Hash = B.CreateLoad(I64, Rt.hash, "morok.fco.ex.hash.load");
+    Value *NameOk = ManualResolver
+                        ? ConstantInt::getTrue(Ctx)
+                        : B.CreateICmpNE(Name, ConstantPointerNull::get(Ptr));
     Value *HasRequest = B.CreateAnd(
-        B.CreateICmpNE(Name, ConstantPointerNull::get(Ptr)),
-        B.CreateAnd(B.CreateICmpNE(Out, ConstantPointerNull::get(Ptr)),
-                    B.CreateAnd(B.CreateICmpNE(Cont,
-                                               ConstantPointerNull::get(Ptr)),
-                                B.CreateICmpNE(Hash,
-                                               ConstantInt::get(I64, 0)))));
+        NameOk, B.CreateAnd(B.CreateICmpNE(Out, ConstantPointerNull::get(Ptr)),
+                            B.CreateAnd(B.CreateICmpNE(Cont,
+                                                       ConstantPointerNull::get(Ptr)),
+                                        B.CreateICmpNE(Hash,
+                                                       ConstantInt::get(I64, 0)))));
     B.CreateCondBr(B.CreateAnd(IsSegv, HasRequest, "morok.fco.ex.claim"),
                    HashCheck, Done);
 
     IRBuilder<> HB(HashCheck);
-    Value *Computed = runtimeHashName(HB, M, Fn, Name);
-    HB.CreateCondBr(HB.CreateICmpEQ(Computed, Hash, "morok.fco.ex.hash.match"),
-                    Resolve, Done);
+    if (ManualResolver) {
+        HB.CreateBr(Resolve);
+    } else {
+        Value *Computed = runtimeHashName(HB, M, Fn, Name);
+        HB.CreateCondBr(HB.CreateICmpEQ(Computed, Hash, "morok.fco.ex.hash.match"),
+                        Resolve, Done);
+    }
 
     IRBuilder<> RB(Resolve);
-    Value *Rtld = RB.CreateIntToPtr(ConstantInt::getSigned(I64, RtldDefaultVal),
-                                    Ptr);
-    Value *Resolved = RB.CreateCall(Dlsym, {Rtld, Name},
-                                    "morok.fco.ex.resolved");
+    Value *Resolved = nullptr;
+    if (ManualResolver) {
+        Resolved = ConstantPointerNull::get(Ptr);
+    } else {
+        Value *Rtld = RB.CreateIntToPtr(
+            ConstantInt::getSigned(I64, RtldDefaultVal), Ptr);
+        Resolved = RB.CreateCall(Resolver, {Rtld, Name},
+                                 "morok.fco.ex.resolved");
+    }
     RB.CreateStore(Resolved, Out);
     RB.CreateStore(ConstantPointerNull::get(Ptr), Rt.name);
     RB.CreateStore(ConstantPointerNull::get(Ptr), Rt.out);
@@ -275,8 +1672,8 @@ void storeSigaction(IRBuilder<> &B, Module &M, AllocaInst *Action,
                         "morok.fco.ex.sa.flags"));
 }
 
-ExceptionRuntime ensureExceptionRuntime(Module &M, FunctionCallee Dlsym,
-                                        int RtldDefaultVal) {
+ExceptionRuntime ensureExceptionRuntime(Module &M, FunctionCallee Resolver,
+                                        bool ManualResolver, int RtldDefaultVal) {
     ExceptionRuntime Rt;
     Rt.hash = i64Global(M, "morok.fco.ex.pending.hash");
     Rt.name = ptrGlobal(M, "morok.fco.ex.pending.name");
@@ -291,7 +1688,8 @@ ExceptionRuntime ensureExceptionRuntime(Module &M, FunctionCallee Dlsym,
     auto *I8 = Type::getInt8Ty(Ctx);
     auto *I32 = Type::getInt32Ty(Ctx);
     auto *Ptr = PointerType::getUnqual(Ctx);
-    Function *Handler = exceptionHandler(M, Rt, Dlsym, RtldDefaultVal);
+    Function *Handler =
+        exceptionHandler(M, Rt, Resolver, ManualResolver, RtldDefaultVal);
     auto *Ctor = Function::Create(FunctionType::get(Void, false),
                                   GlobalValue::InternalLinkage,
                                   "morok.fco.ex.install", M);
@@ -339,6 +1737,7 @@ Value *encodeResolvedPointer(IRBuilder<> &B, Module &M, Value *Resolved,
                              ir::IRRandom &rng);
 
 Value *emitResolvedViaException(CallInst *CI, Module &M, ExceptionRuntime &Rt,
+                                FunctionCallee Resolver, bool ManualResolver,
                                 Value *Name, std::uint64_t Hash,
                                 ir::IRRandom &rng) {
     Function *Parent = CI->getFunction();
@@ -353,21 +1752,87 @@ Value *emitResolvedViaException(CallInst *CI, Module &M, ExceptionRuntime &Rt,
 
     B.CreateStore(ConstantPointerNull::get(Ptr), Slot);
     B.CreateStore(ConstantInt::get(I64, Hash), Rt.hash);
-    B.CreateStore(Name, Rt.name);
+    B.CreateStore(Name ? Name : ConstantPointerNull::get(Ptr), Rt.name);
     B.CreateStore(Slot, Rt.out);
     B.CreateStore(BlockAddress::get(Parent, Cont), Rt.cont);
     emitFault(B);
 
     IRBuilder<> CB(CI);
-    LoadInst *Resolved =
-        CB.CreateLoad(Ptr, Slot, "morok.fco.ex.resolved.reload");
-    Resolved->setVolatile(true);
+    Value *Resolved = nullptr;
+    if (ManualResolver) {
+        Resolved = CB.CreateCall(Resolver, {ConstantInt::get(I64, Hash)},
+                                 "morok.fco.hash.resolved");
+    } else {
+        LoadInst *Reload =
+            CB.CreateLoad(Ptr, Slot, "morok.fco.ex.resolved.reload");
+        Reload->setVolatile(true);
+        Resolved = Reload;
+    }
     return encodeResolvedPointer(CB, M, Resolved, rng);
 }
 
 AllocaInst *entryAlloca(Function &F, Type *Ty, StringRef Name) {
     IRBuilder<> EntryB(&*F.getEntryBlock().getFirstInsertionPt());
     return EntryB.CreateAlloca(Ty, nullptr, Name);
+}
+
+Value *emitCachedManualResolved(CallInst *CI, Module &M,
+                                FunctionCallee Resolver,
+                                const std::vector<std::uint64_t> &Hashes,
+                                ir::IRRandom &rng) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    const unsigned Variant = rng.range(ir::kKeystreamVariants);
+    const std::uint64_t SiteKey = rng.next();
+    const std::uint64_t Mul = rng.next() | 1ull;
+    const std::uint64_t Mask = rng.next();
+
+    auto *Cache = new GlobalVariable(
+        M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I64, 0), "morok.fco.cache");
+    Cache->setAlignment(Align(8));
+
+    Function *F = CI->getFunction();
+    BasicBlock *HitBB = CI->getParent();
+    BasicBlock *ContBB = HitBB->splitBasicBlock(CI, "morok.fco.cache.cont");
+    HitBB->getTerminator()->eraseFromParent();
+    BasicBlock *MissBB =
+        BasicBlock::Create(Ctx, "morok.fco.cache.miss", F, ContBB);
+
+    IRBuilder<> HB(HitBB);
+    LoadInst *Cached =
+        HB.CreateLoad(I64, Cache, "morok.fco.cache.encoded.load");
+    Cached->setVolatile(true);
+    HB.CreateCondBr(HB.CreateICmpNE(Cached, ConstantInt::get(I64, 0)),
+                    ContBB, MissBB);
+
+    IRBuilder<> MB(MissBB);
+    Value *Resolved =
+        MB.CreateCall(Resolver, {ConstantInt::get(I64, Hashes.front())},
+                      "morok.fco.hash.resolved");
+    for (std::uint64_t AliasHash : ArrayRef(Hashes).drop_front()) {
+        Value *AliasResolved =
+            MB.CreateCall(Resolver, {ConstantInt::get(I64, AliasHash)},
+                          "morok.fco.hash.alias.resolved");
+        Resolved = MB.CreateSelect(
+            MB.CreateICmpEQ(Resolved, ConstantPointerNull::get(Ptr)),
+            AliasResolved, Resolved, "morok.fco.hash.resolved.alias.sel");
+    }
+    Value *MissKey = pointerKey(MB, M, rng, SiteKey, Variant, Mul, Mask);
+    Value *NewEncoded = MB.CreateXor(MB.CreatePtrToInt(Resolved, I64),
+                                     MissKey, "morok.fco.cache.encoded");
+    StoreInst *CacheStore = MB.CreateStore(NewEncoded, Cache);
+    CacheStore->setVolatile(true);
+    MB.CreateBr(ContBB);
+
+    IRBuilder<> CB(CI);
+    PHINode *Encoded = CB.CreatePHI(I64, 2, "morok.fco.cache.encoded.phi");
+    Encoded->addIncoming(Cached, HitBB);
+    Encoded->addIncoming(NewEncoded, MissBB);
+    Value *HitKey = pointerKey(CB, M, rng, SiteKey, Variant, Mul, Mask);
+    Value *Raw = CB.CreateXor(Encoded, HitKey, "morok.fco.cache.raw");
+    return CB.CreateIntToPtr(Raw, Ptr, "morok.fco.cache.ptr");
 }
 
 Value *encodeResolvedPointer(IRBuilder<> &B, Module &M, Value *Resolved,
@@ -466,11 +1931,19 @@ bool functionCallObfuscateModule(Module &M, const FcoParams &params,
     const Triple tt(M.getTargetTriple());
     const int rtldDefaultVal = tt.isOSDarwin() ? -2 : 0; // RTLD_DEFAULT
 
-    FunctionCallee dlsym = dlsymDecl(M);
+    const bool manualResolver = useManualHashResolver(M, tt);
+    FunctionCallee resolver;
+    if (manualResolver) {
+        Function *Fn = manualHashResolver(M, tt);
+        resolver = FunctionCallee(Fn->getFunctionType(), Fn);
+    } else {
+        resolver = dlsymDecl(M);
+    }
     const bool exceptionCalls = useExceptionCalls(tt);
     ExceptionRuntime exceptionRt;
     if (exceptionCalls)
-        exceptionRt = ensureExceptionRuntime(M, dlsym, rtldDefaultVal);
+        exceptionRt =
+            ensureExceptionRuntime(M, resolver, manualResolver, rtldDefaultVal);
 
     bool changed = false;
     for (CallBase *cb : targets) {
@@ -484,16 +1957,43 @@ bool functionCallObfuscateModule(Module &M, const FcoParams &params,
         StringRef dlName = callee->getName();
         if (dlName.consume_front(StringRef("\x01", 1)) && tt.isOSDarwin())
             dlName.consume_front("_");
-        Value *name = ir::emitCloakedSymbol(B, M, dlName, rng);
+        const std::uint64_t symHash = hashName(dlName);
+        std::vector<std::uint64_t> resolverHashes{symHash};
+        if (manualResolver && tt.isOSDarwin()) {
+            std::vector<std::uint64_t> Aliases = darwinAliasHashes(dlName);
+            resolverHashes.insert(resolverHashes.end(), Aliases.begin(),
+                                  Aliases.end());
+        }
+        Value *name = manualResolver ? nullptr
+                                     : ir::emitCloakedSymbol(B, M, dlName, rng);
         Value *decoded = nullptr;
         if (exceptionCalls && isa<CallInst>(cb)) {
             decoded = emitResolvedViaException(cast<CallInst>(cb), M,
-                                               exceptionRt, name,
-                                               hashName(dlName), rng);
+                                               exceptionRt, resolver,
+                                               manualResolver, name,
+                                               symHash, rng);
+        } else if (manualResolver && isa<CallInst>(cb)) {
+            decoded = emitCachedManualResolved(cast<CallInst>(cb), M, resolver,
+                                               resolverHashes, rng);
+        } else if (manualResolver) {
+            Value *resolved = B.CreateCall(
+                resolver, {ConstantInt::get(i64, symHash)},
+                "morok.fco.hash.resolved");
+            for (std::uint64_t AliasHash :
+                 ArrayRef(resolverHashes).drop_front()) {
+                Value *AliasResolved = B.CreateCall(
+                    resolver, {ConstantInt::get(i64, AliasHash)},
+                    "morok.fco.hash.alias.resolved");
+                resolved = B.CreateSelect(
+                    B.CreateICmpEQ(resolved, ConstantPointerNull::get(ptr)),
+                    AliasResolved, resolved,
+                    "morok.fco.hash.resolved.alias.sel");
+            }
+            decoded = encodeResolvedPointer(B, M, resolved, rng);
         } else {
             Value *rtld = B.CreateIntToPtr(
                 ConstantInt::getSigned(i64, rtldDefaultVal), ptr);
-            Value *resolved = B.CreateCall(dlsym, {rtld, name});
+            Value *resolved = B.CreateCall(resolver, {rtld, name});
             decoded = encodeResolvedPointer(B, M, resolved, rng);
         }
 

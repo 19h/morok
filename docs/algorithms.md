@@ -1030,27 +1030,37 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - ShamirShare: selected scalar literals reconstructed from volatile GF(2^8) threshold shares.
 - VectorObfuscation: scalar op/cast/compare/select → SIMD lifting; width 128/256/512, shuffle, lift_comparisons.
 - FunctionWrapper: polymorphic proxies including concrete variadic call/invoke sites; prob/times/max_wrappers/hard cap 256.
-- FunctionCallObfuscate: dlsym indirection; hard cap 256 call/invoke sites. The
-  symbol name is never stored or recovered as a readable string: each site
-  carries its own ciphertext (a `morok.cloak.c` byte global) and its own
-  unrolled per-site keystream, keyed on `k0 = ((volatile load of the mutable
-  module seed `morok.cloak.seed`) + volatile-stable-zero) ^ siteKey`. The
-  recovered name is decrypted into a stack buffer, followed by a side-effecting
-  target barrier, then fed to `dlsym`, so a decompiler sees
-  `dlsym(RTLD_DEFAULT, <computed buffer>)` with no symbol to annotate. The
-  returned import pointer is then immediately encoded as an integer with
-  per-site reversible math, stored only in a volatile `morok.fco.ptr.slot`, and
-  decoded with a fresh volatile key load immediately before the indirect
-  call/invoke.  There is no reusable plaintext function-pointer slot for static
-  IAT-style recovery.
-  On Linux x86_64 direct call sites take the stronger exception-mediated path:
-  the site stores a pending request `(FNV-1a(symbol), stack-name, out-slot,
-  continuation blockaddress)`, deliberately faults through inline asm, and a
-  `SIGSEGV` `SA_SIGINFO` handler validates the runtime hash, calls `dlsym`, writes
-  the resolved pointer, and rewrites the saved RIP to the continuation block.
-  The continuation reloads and re-encodes the pointer before the indirect call.
-  Invokes and non-Linux-x86_64 targets keep the normal cloaked `dlsym` path
-  rather than guessing platform-specific exception-context offsets.
+- FunctionCallObfuscate: per-site import indirection; hard cap 256 call/invoke
+  sites. On 64-bit Linux and macOS the target symbol name is not emitted at all:
+  each site carries only `FNV-1a(symbol)` and calls a private manual resolver.
+  Linux walks the loaded ELF program headers and `.dynamic` data, scans
+  `DT_HASH`/`DT_SYMTAB`/`DT_STRTAB`, handles direct-loader musl images without
+  `PT_PHDR`, then falls back through `DT_DEBUG`, `AT_BASE`, and
+  `dl_iterate_phdr` when needed. macOS walks `_dyld_*` images, reads
+  `LC_SEGMENT_64`, `LC_DYLD_INFO(_ONLY)` / `LC_DYLD_EXPORTS_TRIE`, and
+  `LC_SYMTAB` metadata, hashing exported names after stripping the Mach-O ABI
+  underscore. Common libSystem fast-path aliases such as `_platform_strlen`,
+  `_platform_memmove`, and `_platform_memcmp` are tried by hash as fallbacks,
+  so dyld shared-cache private exports do not force a plaintext `dlsym` path.
+  Unsupported targets keep the old cloaked `dlsym`
+  path: each site carries its own ciphertext (`morok.cloak.c`) and unrolled
+  per-site keystream, decrypts into a stack buffer, then feeds the computed name
+  to `dlsym`.
+  Direct call sites cache the resolved pointer lazily in a private
+  per-callsite `morok.fco.cache` global, but only after XOR-encoding it with a
+  volatile module seed and per-site key material; invoke sites keep the older
+  volatile stack slot form.  In both cases the raw pointer exists only as SSA
+  immediately before the indirect call/invoke.  There is no reusable plaintext
+  function-pointer slot for static IAT-style recovery.
+  On Linux x86_64 direct call sites also take the exception-mediated path: the
+  site stores a pending request `(FNV-1a(symbol), null-name, out-slot,
+  continuation blockaddress)` and deliberately faults through inline asm. A
+  `SIGSEGV` `SA_SIGINFO` handler validates the pending hash request, clears it,
+  and rewrites the saved RIP to the continuation block. The continuation runs
+  the manual resolver outside the signal context, encodes the pointer, and then
+  performs the indirect call. Invokes and non-Linux-x86_64 targets avoid this
+  exception path rather than guessing platform-specific exception-context
+  offsets.
 - AntiClassDump / AntiDebugging / AntiHooking / TimingOracle / TrapOracle:
   platform anti-analysis
   (module passes). AntiDebugging combines startup checks with a mutable hidden
@@ -1081,9 +1091,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   `openat`/`read`/`close` for `/proc` probes, Landlock, and seccomp install)
   are emitted as inline `syscall` instructions instead of libc imports.
   On x86_64 macOS, BSD anti-debug probes (`ptrace`, `getpid`, `sysctl`,
-  `csops`) are likewise emitted as inline Darwin syscall instructions.  dyld
-  symbol resolution such as `dlsym` is not a syscall; replacing that surface is
-  handled by the later manual export-by-hash resolver.
+  `csops`) are likewise emitted as inline Darwin syscall instructions. dyld
+  symbol resolution such as `dlsym` is not a syscall; FunctionCallObfuscate's
+  64-bit macOS path avoids that surface with the manual Mach-O hash resolver.
   AntiHooking also emits a clean-copy byte-diff checker for POSIX targets.  The
   checker resolves the current executable path, maps a fresh read-only copy of
   the on-disk ELF or Mach-O image, applies the runtime load bias/slide, compares
