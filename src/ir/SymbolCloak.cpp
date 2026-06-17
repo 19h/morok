@@ -11,7 +11,9 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Module.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include "llvm/ADT/SmallVector.h"
 
@@ -33,34 +35,30 @@ constexpr std::uint64_t kSplit1 = 0xBF58476D1CE4E5B9ULL;
 constexpr std::uint64_t kSplit2 = 0x94D049BB133111EBULL;
 constexpr std::uint64_t kXorMul = 0x2545F4914F6CDD1DULL;
 
-} // namespace
-
-std::uint64_t keystreamValue(unsigned variant, std::uint64_t k0,
-                             std::uint32_t j, std::uint64_t mul) {
-    std::uint64_t t = k0 + static_cast<std::uint64_t>(j + 1) * mul;
-    switch (variant) {
-    case 1: // splitmix64 finalizer
-        t = (t ^ (t >> 30)) * kSplit1;
-        t = (t ^ (t >> 27)) * kSplit2;
-        t = t ^ (t >> 31);
-        return t;
-    case 2: // xorshift*
-        t ^= t << 13;
-        t ^= t >> 7;
-        t ^= t << 17;
-        t *= kXorMul;
-        return t;
-    default: // MurmurHash3 finalizer
-        t ^= t >> 33;
-        t *= kMurmur1;
-        t ^= t >> 33;
-        t *= kMurmur2;
-        t ^= t >> 33;
-        return t;
+void emitStaticAnalysisBarrier(IRBuilderBase &B, const Module &M) {
+    const Triple TT(M.getTargetTriple());
+    StringRef Asm;
+    StringRef Constraints;
+    switch (TT.getArch()) {
+    case Triple::aarch64:
+    case Triple::aarch64_be:
+        Asm = "ccmn wzr, #0, #4, eq";
+        Constraints = "~{cc}";
+        break;
+    case Triple::x86:
+    case Triple::x86_64:
+        Asm = "pause";
+        Constraints = "~{dirflag},~{fpsr},~{flags}";
+        break;
+    default:
+        return;
     }
-}
 
-namespace {
+    auto *AsmTy = FunctionType::get(Type::getVoidTy(B.getContext()), false);
+    InlineAsm *IA =
+        InlineAsm::get(AsmTy, Asm, Constraints, /*hasSideEffects=*/true);
+    B.CreateCall(AsmTy, IA);
+}
 
 // Shared finalizer: T already holds `K0 + (j+1)*mul`; spread it per variant.
 Value *emitFinalizer(IRBuilderBase &B, unsigned variant, Value *T) {
@@ -91,6 +89,31 @@ Value *emitFinalizer(IRBuilderBase &B, unsigned variant, Value *T) {
 }
 
 } // namespace
+
+std::uint64_t keystreamValue(unsigned variant, std::uint64_t k0,
+                             std::uint32_t j, std::uint64_t mul) {
+    std::uint64_t t = k0 + static_cast<std::uint64_t>(j + 1) * mul;
+    switch (variant) {
+    case 1: // splitmix64 finalizer
+        t = (t ^ (t >> 30)) * kSplit1;
+        t = (t ^ (t >> 27)) * kSplit2;
+        t = t ^ (t >> 31);
+        return t;
+    case 2: // xorshift*
+        t ^= t << 13;
+        t ^= t >> 7;
+        t ^= t << 17;
+        t *= kXorMul;
+        return t;
+    default: // MurmurHash3 finalizer
+        t ^= t >> 33;
+        t *= kMurmur1;
+        t ^= t >> 33;
+        t *= kMurmur2;
+        t ^= t >> 33;
+        return t;
+    }
+}
 
 Value *emitKeystream(IRBuilderBase &B, unsigned variant, Value *K0,
                      std::uint32_t j, std::uint64_t mul) {
@@ -165,6 +188,7 @@ Value *emitCloakedSymbol(IRBuilderBase &B, Module &M, StringRef symbol,
     AllocaInst *Buf = B.CreateAlloca(ArrTy, nullptr, "morok.cloak.buf");
     LoadInst *SeedLoad =
         B.CreateLoad(I64, Seed, /*isVolatile=*/true, "morok.cloak.k");
+    emitStaticAnalysisBarrier(B, M);
     Value *RtKey = B.CreateXor(SeedLoad, ConstantInt::get(I64, SiteKey),
                                "morok.cloak.k0");
 

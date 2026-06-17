@@ -305,19 +305,20 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
     if (config_.passes.decoy_strings.enabled.value_or(false))
         changed |= passes::decoyStringsModule(M, rng);
 
-    // Hide library imports behind dlsym.
-    if (InitialModuleGrowthOk && config_.passes.fco.enabled.value_or(false)) {
-        passes::FcoParams fp;
-        changed |= passes::functionCallObfuscateModule(M, fp, rng);
-    }
-
-    // Module-level string encryption (its decryptor constructor and key globals
-    // are independent of the per-function transforms).
+    // Module-level string encryption runs before import rewriting, while the
+    // original direct call sites still expose argument attributes/use shapes.
     if (InitialModuleGrowthOk &&
         config_.passes.str_enc.enabled.value_or(false)) {
         passes::StrEncParams sp;
         sp.probability = config_.passes.str_enc.probability.value_or(100);
         changed |= passes::stringEncryptModule(M, sp, rng);
+    }
+
+    // Hide library imports behind dlsym after strings/import names have been
+    // cloaked at their call sites.
+    if (InitialModuleGrowthOk && config_.passes.fco.enabled.value_or(false)) {
+        passes::FcoParams fp;
+        changed |= passes::functionCallObfuscateModule(M, fp, rng);
     }
 
     // VM lifting must run before block splitting / flattening make

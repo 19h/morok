@@ -1062,6 +1062,6 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   they can clone or generate dense IR.
 
 ## Scheduler order (to preserve semantics)
-AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → FCO(fn) → StringEnc → Virtualization → HashSelfDecrypt → per-fn{ Split, BCF, OptAmp, Sub,
+AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → StringEnc → FCO(fn) → Virtualization → HashSelfDecrypt → per-fn{ Split, BCF, OptAmp, Sub,
 MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → SensitiveHelperHardening → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 FeatureElimination (strip debug/names) → cleanup marker decls.

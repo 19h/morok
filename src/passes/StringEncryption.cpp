@@ -24,8 +24,10 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <cstdint>
@@ -54,7 +56,10 @@ bool eligible(const GlobalVariable &gv) {
     // other threads would observe ciphertext.  Leave thread-locals alone.
     if (gv.isThreadLocal())
         return false;
-    if (gv.getName().starts_with("llvm.") || gv.getName().starts_with("morok."))
+    if (gv.getName().starts_with("llvm."))
+        return false;
+    if (gv.getName().starts_with("morok.") &&
+        !gv.getName().starts_with("morok.decoy.str."))
         return false;
     if (gv.getSection() == "llvm.metadata")
         return false;
@@ -70,6 +75,31 @@ struct Cipher {
     std::uint64_t key = 0; // per-string xor into the module seed
     std::uint64_t mul = 1; // per-string odd multiplier
 };
+
+void emitStaticAnalysisBarrier(IRBuilderBase &B, const Module &M) {
+    const Triple TT(M.getTargetTriple());
+    StringRef Asm;
+    StringRef Constraints;
+    switch (TT.getArch()) {
+    case Triple::aarch64:
+    case Triple::aarch64_be:
+        Asm = "ccmn wzr, #0, #4, eq";
+        Constraints = "~{cc}";
+        break;
+    case Triple::x86:
+    case Triple::x86_64:
+        Asm = "pause";
+        Constraints = "~{dirflag},~{fpsr},~{flags}";
+        break;
+    default:
+        return;
+    }
+
+    auto *AsmTy = FunctionType::get(Type::getVoidTy(B.getContext()), false);
+    InlineAsm *IA =
+        InlineAsm::get(AsmTy, Asm, Constraints, /*hasSideEffects=*/true);
+    B.CreateCall(AsmTy, IA);
+}
 
 struct UseSite {
     Instruction *inst = nullptr;
@@ -141,8 +171,9 @@ void emitDecryptUnrolled(IRBuilder<> &B, const Cipher &c, GlobalVariable *seed,
                          std::uint64_t n) {
     auto *i8 = Type::getInt8Ty(B.getContext());
     auto *i64 = Type::getInt64Ty(B.getContext());
-    Value *rtKey = B.CreateXor(B.CreateLoad(i64, seed, /*isVolatile=*/true),
-                               ConstantInt::get(i64, c.key));
+    LoadInst *seedLoad = B.CreateLoad(i64, seed, /*isVolatile=*/true);
+    emitStaticAnalysisBarrier(B, *seed->getParent());
+    Value *rtKey = B.CreateXor(seedLoad, ConstantInt::get(i64, c.key));
     for (std::uint64_t i = 0; i < n; ++i) {
         Value *ks = ir::emitKeystream(B, c.variant, rtKey,
                                       static_cast<std::uint32_t>(i), c.mul);
@@ -190,6 +221,7 @@ Function *createStackDecryptHelper(Module &M, const Cipher &C,
     IRBuilder<> EB(Entry);
     LoadInst *SeedLoad =
         EB.CreateLoad(I64, Seed, /*isVolatile=*/true, "morok.str.stack.k");
+    emitStaticAnalysisBarrier(EB, M);
     Value *RtKey = EB.CreateXor(SeedLoad, ConstantInt::get(I64, C.key),
                                 "morok.str.stack.k0");
     EB.CreateBr(Loop);
@@ -373,6 +405,8 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
         auto *decFn =
             Function::Create(FunctionType::get(voidTy, false),
                              GlobalValue::InternalLinkage, "morok.strdec", &M);
+        decFn->addFnAttr(Attribute::NoInline);
+        decFn->addFnAttr(Attribute::OptimizeNone);
         if (storedLen <= kUnrollThreshold) {
             IRBuilder<> B(BasicBlock::Create(ctx, "entry", decFn));
             emitDecryptUnrolled(B, c, seed, target, target, arrTy, storedLen);
@@ -382,9 +416,11 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
             auto *loop = BasicBlock::Create(ctx, "loop", decFn);
             auto *exit = BasicBlock::Create(ctx, "exit", decFn);
             IRBuilder<> B(entry);
+            LoadInst *seedLoad =
+                B.CreateLoad(i64, seed, /*isVolatile=*/true);
+            emitStaticAnalysisBarrier(B, M);
             Value *rtKey =
-                B.CreateXor(B.CreateLoad(i64, seed, /*isVolatile=*/true),
-                            ConstantInt::get(i64, c.key));
+                B.CreateXor(seedLoad, ConstantInt::get(i64, c.key));
             B.CreateBr(loop);
 
             B.SetInsertPoint(loop);

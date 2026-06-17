@@ -71,6 +71,7 @@
 #include "llvm/Support/ModRef.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -8410,6 +8411,7 @@ entry:
 TEST_CASE("stringEncryptModule materializes used strings on the stack") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("stack-strings", ctx);
+    M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
     GlobalVariable *Text =
         makePrivateString(*M, "msg.str", "callsite-secret");
     Function *Caller = makeExternalCallFunction(*M, Text);
@@ -8425,6 +8427,11 @@ TEST_CASE("stringEncryptModule materializes used strings on the stack") {
     CHECK(countFunctions(*M, "morok.strdec") == 0u);
     CHECK(countNamedAllocas(*Caller, "morok.str.stack.buf") >= 1u);
     CHECK(countNamedInstructions(*Caller, "morok.str.stack.ptr") >= 1u);
+    bool stackHelperHasBarrier = false;
+    for (Function &F : *M)
+        if (F.getName().starts_with("morok.strsite"))
+            stackHelperHasBarrier |= hasInlineAsmCall(F);
+    CHECK(stackHelperHasBarrier);
 
     bool callStillUsesGlobal = false;
     for (Instruction &I : instructions(*Caller))
@@ -8469,6 +8476,7 @@ TEST_CASE("stringEncryptModule uses stack decrypt loops for long callsite string
 TEST_CASE("stringEncryptModule falls back to per-string decryptors") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("strings", ctx);
+    M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
     makePrivateString(*M, "small.str", "small");
     const std::string LargeText(2048, 'x');
     makePrivateString(*M, "large.str", LargeText);
@@ -8503,11 +8511,39 @@ TEST_CASE("stringEncryptModule falls back to per-string decryptors") {
     // The long string's decryptor is a loop (has a PHI induction variable),
     // not a fully unrolled chain.
     bool sawLoopDecryptor = false;
+    bool sawStaticAnalysisBarrier = false;
     for (Function &F : *M)
-        if (F.getName().starts_with("morok.strdec"))
+        if (F.getName().starts_with("morok.strdec")) {
+            sawStaticAnalysisBarrier |= hasInlineAsmCall(F);
             for (Instruction &I : instructions(F))
                 sawLoopDecryptor |= isa<PHINode>(&I);
+        }
     CHECK(sawLoopDecryptor);
+    CHECK(sawStaticAnalysisBarrier);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("stringEncryptModule encrypts decoy string globals") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("decoy-strings", ctx);
+    M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+    makePrivateString(*M, "morok.decoy.str.test", "decoy-visible");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(308);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, {/*probability=*/100}, rng));
+
+    GlobalVariable *Decoy = M->getGlobalVariable("morok.decoy.str.test", true);
+    REQUIRE(Decoy);
+    CHECK_FALSE(Decoy->isConstant());
+    CHECK_FALSE(hasReadableByteString(*M, "decoy-visible"));
+    CHECK(countFunctions(*M, "morok.strdec") == 1u);
+    Function *Dec = nullptr;
+    for (Function &F : *M)
+        if (F.getName().starts_with("morok.strdec"))
+            Dec = &F;
+    REQUIRE(Dec);
+    CHECK(hasInlineAsmCall(*Dec));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -8547,10 +8583,14 @@ define i32 @caller() {
   ret i32 %r
 }
 )ir");
+    M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
     auto engine = morok::core::Xoshiro256pp::fromSeed(27);
     morok::ir::IRRandom rng(engine);
     CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
     CHECK(M->getFunction("dlsym") != nullptr);
+    Function *Caller = M->getFunction("caller");
+    REQUIRE(Caller);
+    CHECK(hasInlineAsmCall(*Caller));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
