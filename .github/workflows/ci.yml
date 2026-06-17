@@ -131,6 +131,10 @@ jobs:
             triple="$(gcc -dumpmachine)"
             gccdir="/usr/lib/gcc/${triple}/${ver}"
             cxxinc="--gcc-install-dir=${gccdir} -isystem /usr/include/c++/${ver} -isystem /usr/include/${triple}/c++/${ver} -isystem /usr/include/c++/${ver}/backward"
+            # The doctest test TUs use braced-init that needs std::initializer_list
+            # but rely on libc++ (macOS) pulling it in transitively; libstdc++
+            # does not, so force-include it.
+            cxxinc="${cxxinc} -include initializer_list"
             args+=(
               -DCMAKE_C_FLAGS="--gcc-install-dir=${gccdir}"
               -DCMAKE_CXX_FLAGS="${cxxinc}"
@@ -147,9 +151,11 @@ jobs:
             IFS=';' read -ra _paths <<< "${EXTERNAL_INCLUDE:-${INCLUDE:-}}" || true
             for _d in "${_paths[@]}"; do
               _d="${_d//\\//}"
-              [ -n "$_d" ] && imsvc="$imsvc -imsvc \"$_d\""
+              [ -n "$_d" ] && imsvc="$imsvc -isystem \"$_d\""
             done
-            args+=( -DCMAKE_CXX_FLAGS="-Wno-c++11-narrowing $imsvc" )
+            # Also force-include <initializer_list> (the doctest TUs rely on it
+            # being pulled in transitively, which the MSVC STL does not do).
+            args+=( -DCMAKE_CXX_FLAGS="-Wno-c++11-narrowing -include initializer_list $imsvc" )
           fi
           cmake "${args[@]}"
 
