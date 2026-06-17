@@ -435,12 +435,24 @@ DelayedSample delayedSample(IRBuilder<NoFolder> &B, GlobalVariable *Latent,
     auto *Loaded = B.CreateLoad(I64, Latent, "morok.trace.delay.load");
     Loaded->setVolatile(true);
     Loaded->setAlignment(Align(8));
+    Value *LoadedKey = Loaded;
+    if (Module *M = B.GetInsertBlock()->getModule()) {
+        if (auto *Crypto = M->getGlobalVariable("morok.watchdog.crypto",
+                                                /*AllowInternal=*/true)) {
+            auto *CryptoLoad =
+                B.CreateLoad(I64, Crypto, "morok.trace.watchdog.crypto");
+            CryptoLoad->setVolatile(true);
+            CryptoLoad->setAlignment(Align(8));
+            LoadedKey = B.CreateXor(LoadedKey, CryptoLoad,
+                                    "morok.trace.crypto.latent");
+        }
+    }
 
     const std::uint64_t Tag = Rng.next();
     const std::uint64_t Salt = Rng.next();
     Value *TagValue = ConstantInt::get(I64, Tag);
     Value *Sample =
-        mix64(B, Loaded, TagValue, Salt, "morok.trace.delay.mix");
+        mix64(B, LoadedKey, TagValue, Salt, "morok.trace.delay.mix");
 
     const std::uint64_t ValidLow =
         mix64Const(0, Tag, Salt) & kDelayedProbeMask;

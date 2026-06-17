@@ -65,6 +65,7 @@ struct Runtime {
     GlobalVariable *region = nullptr;
     GlobalVariable *expected = nullptr;
     GlobalVariable *code_size = nullptr;
+    GlobalVariable *heartbeat_crypto = nullptr;
     std::uint64_t expected_hash = 0;
     std::uint64_t seed = 0;
 };
@@ -372,6 +373,7 @@ Value *codePtr(Builder &B, Function *Target, Value *Idx) {
 Function *createDiffFunction(Module &M, StringRef Suffix,
                              GlobalVariable *Region, GlobalVariable *Expected,
                              GlobalVariable *CodeSize, Function *Target,
+                             GlobalVariable *HeartbeatCrypto,
                              std::uint64_t Seed) {
     LLVMContext &Ctx = M.getContext();
     auto *I8 = Type::getInt8Ty(Ctx);
@@ -449,6 +451,13 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
     ExpectedLoad->setVolatile(true);
     ExpectedLoad->setAlignment(Align(8));
     Value *Diff = XB.CreateXor(FinalH, ExpectedLoad, "morok.sc.diff");
+    if (HeartbeatCrypto) {
+        auto *Crypto =
+            XB.CreateLoad(I64, HeartbeatCrypto, "morok.sc.watchdog.crypto");
+        Crypto->setVolatile(true);
+        Crypto->setAlignment(Align(8));
+        Diff = XB.CreateXor(Diff, Crypto, "morok.sc.crypto.diff");
+    }
     XB.CreateRet(Diff);
     return Fn;
 }
@@ -468,10 +477,12 @@ Runtime createRuntime(Function &F, const SelfChecksumParams &Params,
     R.region = createRegion(M, Suffix, Bytes);
     R.expected = createExpected(M, Suffix, R.expected_hash);
     R.code_size = createCodeSize(M, Suffix);
+    R.heartbeat_crypto =
+        M.getGlobalVariable("morok.watchdog.crypto", /*AllowInternal=*/true);
     createPostlinkManifest(M, F, Suffix, R.region, R.expected, R.code_size,
                            RegionSize, R.seed, R.expected_hash);
     R.diff = createDiffFunction(M, Suffix, R.region, R.expected, R.code_size,
-                                &F, Seed);
+                                &F, R.heartbeat_crypto, Seed);
     return R;
 }
 

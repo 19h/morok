@@ -76,7 +76,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 - [x] Run the anti-debug/anti-hook/integrity checkers themselves through the VM so the protection logic is never plaintext (highest-leverage composition) `[xplat · extends vm]`
 - [x] Stolen-code: physically remove critical instructions from the on-disk image and execute them only inside the VM `[xplat · extends vm]`
 - [x] Environmental keying / anti-transplant: code-block decryption key = `H(expected image bytes ∥ CPUID/RDTSCP fingerprint ∥ volume-serial/MAC)` (local fingerprint; the server-nonce variant is out of scope) `[xplat · extends selfdecrypt]`
-- [ ] Heartbeat-entangled crypto: continuously re-derive the live session key from the running code-checksum + watchdog liveness, so stopping/patching either drifts the key and corrupts later crypto `[xplat · extends selfcheck/tracekey]`
+- [x] Heartbeat-entangled crypto: continuously re-derive the live session key from the running code-checksum + watchdog liveness, so stopping/patching either drifts the key and corrupts later crypto `[xplat · extends selfcheck/tracekey]`
 - [ ] Disassembler desync via raw byte sleds (junk after unconditional jumps, overlapping/aliased instructions, jump-into-mid-instruction) emitted through inline asm `[xplat · new]`
 - [ ] Execute from `memfd` only: re-exec self from `memfd_create` + `execveat` so the running image is unbacked by an on-disk file `[linux · new]`
 - [ ] Schrödinger pages: keep code `NOACCESS`, made readable only by a fault handler that validates the faulting RIP is legitimate code; any external reader faults and trips a tripwire `[xplat · new]`

@@ -88,6 +88,19 @@ GlobalVariable *antiDebugWatchdogHeartbeat(Module &M, ir::IRRandom &rng) {
     return gv;
 }
 
+GlobalVariable *watchdogCryptoState(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.watchdog.crypto",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, 0), "morok.watchdog.crypto");
+    gv->setAlignment(Align(8));
+    return gv;
+}
+
 GlobalVariable *antiHookState(Module &M, ir::IRRandom &rng) {
     if (auto *existing =
             M.getGlobalVariable("morok.antihook.state", /*AllowInternal=*/true))
@@ -1793,7 +1806,8 @@ Function *probeWatchThread(Module &M, Function *Probe, GlobalVariable *Heartbeat
 }
 
 Function *heartbeatWatchThread(Module &M, GlobalVariable *State,
-                               GlobalVariable *Heartbeat, ir::IRRandom &rng) {
+                               GlobalVariable *Heartbeat,
+                               GlobalVariable *Crypto, ir::IRRandom &rng) {
     if (Function *existing = M.getFunction("morok.watchdog.heartbeat.watch"))
         return existing;
 
@@ -1849,6 +1863,21 @@ Function *heartbeatWatchThread(Module &M, GlobalVariable *State,
               "morok.watchdog.heartbeat.sample");
     foldFlag(BB, State, missing, 0xC7D2841AF09B53E6ULL,
              "morok.watchdog.heartbeat.missing");
+    auto *cryptoOld =
+        BB.CreateLoad(i64, Crypto, "morok.watchdog.crypto.old");
+    cryptoOld->setVolatile(true);
+    cryptoOld->setAlignment(Align(8));
+    Value *cryptoDrift = BB.CreateXor(
+        BB.CreateMul(cur, ConstantInt::get(i64, rng.next() | 1ULL)),
+        BB.CreateAdd(BB.CreateZExt(staleNext, i64),
+                     ConstantInt::get(i64, rng.next())),
+        "morok.watchdog.crypto.drift");
+    Value *cryptoNext = BB.CreateSelect(
+        missing, BB.CreateXor(cryptoOld, cryptoDrift),
+        cryptoOld, "morok.watchdog.crypto.next");
+    auto *cryptoStore = BB.CreateStore(cryptoNext, Crypto);
+    cryptoStore->setVolatile(true);
+    cryptoStore->setAlignment(Align(8));
     Value *next = BB.CreateAdd(iter, ConstantInt::get(i32, 1));
     BB.CreateBr(loopBB);
     iter->addIncoming(next, bodyBB);
@@ -1865,8 +1894,10 @@ void emitAntiDebugWatchdogStart(Module &M, Function *Probe, GlobalVariable *Stat
     if (!TT.isOSLinux() && !TT.isOSDarwin())
         return;
     GlobalVariable *heartbeat = antiDebugWatchdogHeartbeat(M, rng);
+    GlobalVariable *crypto = watchdogCryptoState(M);
     Function *probeWatch = probeWatchThread(M, Probe, heartbeat, rng);
-    Function *heartbeatWatch = heartbeatWatchThread(M, State, heartbeat, rng);
+    Function *heartbeatWatch = heartbeatWatchThread(M, State, heartbeat,
+                                                    crypto, rng);
     Function *ctor = makeCtorShell(M, "morok.watchdog");
     IRBuilder<> B(&ctor->getEntryBlock());
     emitLinuxWatcherStart(B, M, probeWatch);

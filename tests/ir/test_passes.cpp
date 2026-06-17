@@ -845,6 +845,11 @@ entry:
     Function *ProbeVm = M->getFunction("morok.vm.morok.antidbg.probe.exec");
     REQUIRE(Probe);
     REQUIRE(ProbeVm);
+    CHECK(M->getGlobalVariable("morok.watchdog.crypto", true) != nullptr);
+    Function *HeartbeatWatch = M->getFunction("morok.watchdog.heartbeat.watch");
+    REQUIRE(HeartbeatWatch);
+    CHECK(countNamedInstructions(*HeartbeatWatch,
+                                 "morok.watchdog.crypto.drift") >= 1u);
     CHECK(countCallsTo(*Probe, "morok.vm.morok.antidbg.probe.exec") == 1u);
     CHECK(countNamedInstructions(*Probe, "morok.watchdog.heartbeat.beat") ==
           0u);
@@ -6719,6 +6724,11 @@ entry:
 )ir");
     Function *F = M->getFunction("selfcheck");
     REQUIRE(F);
+    auto *I64 = Type::getInt64Ty(ctx);
+    auto *Crypto = new GlobalVariable(
+        *M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I64, 0), "morok.watchdog.crypto");
+    Crypto->setAlignment(Align(8));
     auto engine = morok::core::Xoshiro256pp::fromSeed(181);
     morok::ir::IRRandom rng(engine);
 
@@ -6785,9 +6795,12 @@ entry:
     bool hasVolatileExpectedLoad = false;
     bool hasVolatileCodeSizeLoad = false;
     bool hasVolatileCodeByteLoad = false;
+    bool hasVolatileWatchdogCryptoLoad = false;
     bool hasDiffValue = false;
+    bool hasCryptoDiff = false;
     for (Instruction &I : instructions(*Diff)) {
         hasDiffValue |= I.getName().starts_with("morok.sc.diff");
+        hasCryptoDiff |= I.getName().starts_with("morok.sc.crypto.diff");
         if (auto *CI = dyn_cast<CallInst>(&I))
             if (Function *Callee = CI->getCalledFunction())
                 hasTrap |= Callee->getName() == "llvm.trap";
@@ -6807,6 +6820,10 @@ entry:
             hasVolatileCodeByteLoad |=
                 LI->isVolatile() &&
                 LI->getName().starts_with("morok.sc.code.byte");
+            hasVolatileWatchdogCryptoLoad |=
+                LI->isVolatile() &&
+                LI->getPointerOperand()->getName().starts_with(
+                    "morok.watchdog.crypto");
         }
     }
 
@@ -6817,7 +6834,9 @@ entry:
     CHECK(hasVolatileExpectedLoad);
     CHECK(hasVolatileCodeSizeLoad);
     CHECK(hasVolatileCodeByteLoad);
+    CHECK(hasVolatileWatchdogCryptoLoad);
     CHECK(hasDiffValue);
+    CHECK(hasCryptoDiff);
     CHECK_FALSE(hasTrap);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
@@ -7822,6 +7841,11 @@ no:
 )ir");
     Function *F = M->getFunction("trace");
     REQUIRE(F);
+    auto *I64 = Type::getInt64Ty(ctx);
+    auto *Crypto = new GlobalVariable(
+        *M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I64, 0), "morok.watchdog.crypto");
+    Crypto->setAlignment(Align(8));
     auto engine = morok::core::Xoshiro256pp::fromSeed(161);
     morok::ir::IRRandom rng(engine);
 
@@ -7842,6 +7866,8 @@ no:
     std::size_t delayedBranchKeys = 0;
     std::size_t delayedReturnKeys = 0;
     std::size_t delayedSwitchKeys = 0;
+    std::size_t watchdogCryptoLoads = 0;
+    std::size_t watchdogCryptoMixes = 0;
     std::size_t edgeMixes = 0;
     std::size_t valueTerms = 0;
     for (BasicBlock &BB : *F) {
@@ -7856,10 +7882,17 @@ no:
                 ++edgeMixes;
             if (I.getName().starts_with("morok.trace.delay.fire"))
                 ++delayedFires;
+            if (I.getName().starts_with("morok.trace.crypto.latent"))
+                ++watchdogCryptoMixes;
             if (I.getName().starts_with("morok.trace.value.bits"))
                 ++valueTerms;
-            if (auto *LI = dyn_cast<LoadInst>(&I))
+            if (auto *LI = dyn_cast<LoadInst>(&I)) {
                 volatileLoads += LI->isVolatile() ? 1u : 0u;
+                if (LI->isVolatile() &&
+                    LI->getPointerOperand()->getName().starts_with(
+                        "morok.watchdog.crypto"))
+                    ++watchdogCryptoLoads;
+            }
             if (auto *SI = dyn_cast<StoreInst>(&I))
                 volatileStores += SI->isVolatile() ? 1u : 0u;
             if (auto *BI = dyn_cast<BranchInst>(&I))
@@ -7885,6 +7918,8 @@ no:
     CHECK(recordBlocks >= 4u);
     CHECK(delayedFires >= 1u);
     CHECK(delayedBranchKeys + delayedReturnKeys + delayedSwitchKeys >= 1u);
+    CHECK(watchdogCryptoLoads >= 1u);
+    CHECK(watchdogCryptoMixes >= 1u);
     CHECK(edgeMixes >= 3u);
     CHECK(valueTerms >= 3u);
     CHECK_FALSE(verifyModule(*M, &errs()));

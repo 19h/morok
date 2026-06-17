@@ -1109,9 +1109,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   start a separate watchdog constructor: one pthread re-runs the anti-debug
   probe on a per-build jittered sleep cadence and advances a volatile heartbeat,
   while a second pthread samples that heartbeat and folds repeated staleness into
-  `morok.antidbg.state`.  A stopped checker therefore poisons delayed hidden
-  state instead of exposing a single branch to patch.  On Linux, the startup path
-  also applies a Landlock ruleset, when the kernel supports it, to
+  `morok.antidbg.state`.  Confirmed staleness also mutates a volatile
+  `morok.watchdog.crypto` drift word.  `SelfChecksumConstants` xors that word
+  into its checksum-derived constant key and `TraceKeying` xors it into delayed
+  latent samples, so a stopped heartbeat changes later data/branch keys instead
+  of exposing a single branch to patch.  On Linux, the startup path also applies
+  a Landlock ruleset, when the kernel supports it, to
   deny destructive filesystem rights (writes, creates, removes, renames,
   truncates, and device ioctls by ABI level) while keeping reads/exec available.
   It then installs a seccomp-BPF filter that kills `ptrace` requests and
