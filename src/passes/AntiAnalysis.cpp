@@ -43,6 +43,23 @@ Function *makeCtorShell(Module &M, const char *name) {
     return fn;
 }
 
+Function *makeLinuxArgCtorShell(Module &M, const char *name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(
+        FunctionType::get(Type::getVoidTy(ctx), {i32, ptr, ptr}, false),
+        GlobalValue::InternalLinkage, name, &M);
+    fn->setDSOLocal(true);
+    BasicBlock::Create(ctx, "entry", fn);
+    return fn;
+}
+
+GlobalVariable *environGlobal(Module &M) {
+    auto *ptr = PointerType::getUnqual(M.getContext());
+    return cast<GlobalVariable>(M.getOrInsertGlobal("environ", ptr));
+}
+
 IntegerType *intPtrTy(Module &M) {
     unsigned bits = M.getDataLayout().getPointerSizeInBits(0);
     if (bits == 0)
@@ -804,6 +821,244 @@ ReadFileIR emitReadSmallFile(IRBuilder<> &B, Module &M, Function *Fn,
     }
     out.afterRead = readBB;
     return out;
+}
+
+void emitLinuxMemfdReexecCtor(Module &M, ir::IRRandom &rng, const Triple &TT) {
+    if (!useDirectLinuxSyscalls(TT) ||
+        M.getFunction("morok.antidbg.memfd"))
+        return;
+
+    constexpr std::uint32_t kRead = 0;
+    constexpr std::uint32_t kWrite = 1;
+    constexpr std::uint32_t kClose = 3;
+    constexpr std::uint32_t kExecve = 59;
+    constexpr std::uint32_t kReadlink = 89;
+    constexpr std::uint32_t kOpenAt = 257;
+    constexpr std::uint32_t kDup3 = 292;
+    constexpr std::uint32_t kMemfdCreate = 319;
+    constexpr std::uint32_t kExecveat = 322;
+    constexpr std::int64_t kAtFdcwd = -100;
+    constexpr std::uint64_t kAtEmptyPath = 0x1000;
+    constexpr std::uint64_t kOCloexec = 0x80000;
+    constexpr std::uint64_t kMfdCloexec = 0x1;
+    constexpr std::uint64_t kBufBytes = 4096;
+    constexpr std::uint64_t kFallbackFd = 200;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *ip = intPtrTy(M);
+
+    Function *fn = makeLinuxArgCtorShell(M, "morok.antidbg.memfd");
+    fn->getArg(0)->setName("argc");
+    Argument *argv = fn->getArg(1);
+    Argument *envp = fn->getArg(2);
+    argv->setName("argv");
+    envp->setName("envp");
+
+    auto *entry = &fn->getEntryBlock();
+    auto *scanInitBB = BasicBlock::Create(ctx, "scan.init", fn);
+    auto *scanBB = BasicBlock::Create(ctx, "scan", fn);
+    auto *scanBodyBB = BasicBlock::Create(ctx, "scan.body", fn);
+    auto *scanNextBB = BasicBlock::Create(ctx, "scan.next", fn);
+    auto *openBB = BasicBlock::Create(ctx, "open", fn);
+    auto *memfdBB = BasicBlock::Create(ctx, "memfd", fn);
+    auto *copyBB = BasicBlock::Create(ctx, "copy", fn);
+    auto *readDoneBB = BasicBlock::Create(ctx, "read.done", fn);
+    auto *writeBB = BasicBlock::Create(ctx, "write", fn);
+    auto *writeContBB = BasicBlock::Create(ctx, "write.cont", fn);
+    auto *execBB = BasicBlock::Create(ctx, "exec", fn);
+    auto *execProcFdBB = BasicBlock::Create(ctx, "exec.procfd", fn);
+    auto *closeSrcRetBB = BasicBlock::Create(ctx, "close.src.ret", fn);
+    auto *closeBothRetBB = BasicBlock::Create(ctx, "close.both.ret", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    auto *pathTy = ArrayType::get(i8, kBufBytes);
+    auto *bufTy = ArrayType::get(i8, kBufBytes);
+    auto *emptyTy = ArrayType::get(i8, 1);
+    auto *fallbackArgvTy = ArrayType::get(PointerType::getUnqual(ctx), 2);
+    AllocaInst *path =
+        B.CreateAlloca(pathTy, nullptr, "morok.antidbg.memfd.path");
+    AllocaInst *buf = B.CreateAlloca(bufTy, nullptr,
+                                     "morok.antidbg.memfd.copybuf");
+    AllocaInst *empty =
+        B.CreateAlloca(emptyTy, nullptr, "morok.antidbg.memfd.empty");
+    AllocaInst *fallbackArgv = B.CreateAlloca(
+        fallbackArgvTy, nullptr, "morok.antidbg.memfd.argv.fallback");
+    Value *pathBuf = B.CreateInBoundsGEP(
+        pathTy, path, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antidbg.memfd.path.buf");
+    Value *copyBuf = B.CreateInBoundsGEP(
+        bufTy, buf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antidbg.memfd.copy.buf");
+    Value *emptyPath = B.CreateInBoundsGEP(
+        emptyTy, empty, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antidbg.memfd.empty.path");
+    B.CreateStore(ConstantInt::get(i8, 0), emptyPath);
+    Value *fallbackArgv0 = B.CreateInBoundsGEP(
+        fallbackArgvTy, fallbackArgv,
+        {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antidbg.memfd.argv0.slot");
+    Value *fallbackArgv1 = B.CreateInBoundsGEP(
+        fallbackArgvTy, fallbackArgv,
+        {ConstantInt::get(ip, 0), ConstantInt::get(ip, 1)},
+        "morok.antidbg.memfd.argv1.slot");
+    B.CreateStore(pathBuf, fallbackArgv0);
+    B.CreateStore(ConstantPointerNull::get(PointerType::getUnqual(ctx)),
+                  fallbackArgv1);
+
+    Value *selfPath = ir::emitCloakedSymbol(B, M, "/proc/self/exe", rng);
+    Value *pathLen = emitLinuxSyscall(
+        B, M, TT, kReadlink,
+        {selfPath, pathBuf, ConstantInt::get(ip, kBufBytes - 1)});
+    pathLen->setName("morok.antidbg.memfd.readlink");
+    Value *pathOk = B.CreateAnd(
+        B.CreateICmpSGT(pathLen, ConstantInt::get(ip, 0)),
+        B.CreateICmpULT(pathLen, ConstantInt::get(ip, kBufBytes - 1)),
+        "morok.antidbg.memfd.path.ok");
+    B.CreateCondBr(pathOk, scanInitBB, retBB);
+
+    IRBuilder<> SIB(scanInitBB);
+    Value *scanEnough = SIB.CreateICmpUGE(
+        pathLen, ConstantInt::get(ip, 6), "morok.antidbg.memfd.scan.enough");
+    SIB.CreateCondBr(scanEnough, scanBB, openBB);
+
+    IRBuilder<> SB(scanBB);
+    auto *scanIdx = SB.CreatePHI(ip, 2, "morok.antidbg.memfd.scan.idx");
+    scanIdx->addIncoming(ConstantInt::get(ip, 0), scanInitBB);
+    Value *last = SB.CreateSub(pathLen, ConstantInt::get(ip, 6),
+                               "morok.antidbg.memfd.scan.last");
+    Value *scanRange =
+        SB.CreateICmpULE(scanIdx, last, "morok.antidbg.memfd.scan.range");
+    SB.CreateCondBr(scanRange, scanBodyBB, openBB);
+
+    IRBuilder<> SBB(scanBodyBB);
+    constexpr std::array<unsigned char, 6> marker = {'m', 'e', 'm',
+                                                     'f', 'd', ':'};
+    Value *match = ConstantInt::get(i1, true);
+    for (std::uint32_t i = 0; i < marker.size(); ++i) {
+        Value *off = SBB.CreateAdd(scanIdx, ConstantInt::get(ip, i));
+        Value *ch = SBB.CreateLoad(i8, gepI8(SBB, M, pathBuf, off,
+                                             "morok.antidbg.memfd.scan.ch"));
+        Value *eq = SBB.CreateICmpEQ(ch, ConstantInt::get(i8, marker[i]));
+        match = SBB.CreateAnd(match, eq);
+    }
+    SBB.CreateCondBr(match, retBB, scanNextBB);
+
+    IRBuilder<> SNB(scanNextBB);
+    Value *scanNext = SNB.CreateAdd(scanIdx, ConstantInt::get(ip, 1),
+                                    "morok.antidbg.memfd.scan.next");
+    SNB.CreateBr(scanBB);
+    scanIdx->addIncoming(scanNext, scanNextBB);
+
+    IRBuilder<> OB(openBB);
+    OB.CreateStore(ConstantInt::get(i8, 0),
+                   gepI8(OB, M, pathBuf, pathLen,
+                         "morok.antidbg.memfd.path.nul"));
+    Value *srcFd = emitLinuxSyscall(
+        OB, M, TT, kOpenAt,
+        {ConstantInt::getSigned(ip, kAtFdcwd), pathBuf,
+         ConstantInt::get(ip, kOCloexec), ConstantInt::get(ip, 0)});
+    srcFd->setName("morok.antidbg.memfd.open");
+    Value *srcOk = OB.CreateICmpSGE(srcFd, ConstantInt::get(ip, 0),
+                                    "morok.antidbg.memfd.open.ok");
+    OB.CreateCondBr(srcOk, memfdBB, retBB);
+
+    IRBuilder<> MB(memfdBB);
+    Value *name = ir::emitCloakedSymbol(MB, M, ".nscd-cache", rng);
+    Value *memFd = emitLinuxSyscall(
+        MB, M, TT, kMemfdCreate, {name, ConstantInt::get(ip, kMfdCloexec)});
+    memFd->setName("morok.antidbg.memfd.create");
+    Value *memOk = MB.CreateICmpSGE(memFd, ConstantInt::get(ip, 0),
+                                    "morok.antidbg.memfd.create.ok");
+    MB.CreateCondBr(memOk, copyBB, closeSrcRetBB);
+
+    IRBuilder<> CB(copyBB);
+    Value *nread = emitLinuxSyscall(
+        CB, M, TT, kRead, {srcFd, copyBuf, ConstantInt::get(ip, kBufBytes)});
+    nread->setName("morok.antidbg.memfd.read");
+    Value *readOk = CB.CreateICmpSGE(nread, ConstantInt::get(ip, 0),
+                                     "morok.antidbg.memfd.read.ok");
+    Value *readMore = CB.CreateICmpSGT(nread, ConstantInt::get(ip, 0),
+                                       "morok.antidbg.memfd.read.more");
+    CB.CreateCondBr(CB.CreateAnd(readOk, readMore), writeBB, readDoneBB);
+
+    IRBuilder<> RDB(readDoneBB);
+    RDB.CreateCondBr(readOk, execBB, closeBothRetBB);
+
+    IRBuilder<> WB(writeBB);
+    auto *written = WB.CreatePHI(ip, 2, "morok.antidbg.memfd.written");
+    written->addIncoming(ConstantInt::get(ip, 0), copyBB);
+    Value *remaining =
+        WB.CreateSub(nread, written, "morok.antidbg.memfd.write.remaining");
+    Value *writePtr = gepI8(WB, M, copyBuf, written,
+                            "morok.antidbg.memfd.write.ptr");
+    Value *nwrite =
+        emitLinuxSyscall(WB, M, TT, kWrite, {memFd, writePtr, remaining});
+    nwrite->setName("morok.antidbg.memfd.write");
+    Value *writeOk = WB.CreateICmpSGT(nwrite, ConstantInt::get(ip, 0),
+                                      "morok.antidbg.memfd.write.ok");
+    WB.CreateCondBr(writeOk, writeContBB, closeBothRetBB);
+
+    IRBuilder<> WCB(writeContBB);
+    Value *writtenNext =
+        WCB.CreateAdd(written, nwrite, "morok.antidbg.memfd.written.next");
+    Value *chunkDone = WCB.CreateICmpUGE(
+        writtenNext, nread, "morok.antidbg.memfd.chunk.done");
+    WCB.CreateCondBr(chunkDone, copyBB, writeBB);
+    written->addIncoming(writtenNext, writeContBB);
+
+    IRBuilder<> EB(execBB);
+    emitLinuxSyscall(EB, M, TT, kClose, {srcFd});
+    Value *execRc =
+        emitLinuxSyscall(EB, M, TT, kExecveat,
+                         {memFd, emptyPath, argv, envp,
+                          ConstantInt::get(ip, kAtEmptyPath)});
+    execRc->setName("morok.antidbg.memfd.execveat");
+    Value *fallbackArgvPtr = EB.CreateInBoundsGEP(
+        fallbackArgvTy, fallbackArgv,
+        {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antidbg.memfd.argv.fallback.ptr");
+    Value *fallbackEnvp =
+        EB.CreateLoad(PointerType::getUnqual(ctx), environGlobal(M),
+                      "morok.antidbg.memfd.environ");
+    Value *retryRc =
+        emitLinuxSyscall(EB, M, TT, kExecveat,
+                         {memFd, emptyPath, fallbackArgvPtr, fallbackEnvp,
+                          ConstantInt::get(ip, kAtEmptyPath)});
+    retryRc->setName("morok.antidbg.memfd.execveat.retry");
+    Value *dupFd =
+        emitLinuxSyscall(EB, M, TT, kDup3,
+                         {memFd, ConstantInt::get(ip, kFallbackFd),
+                          ConstantInt::get(ip, kOCloexec)});
+    dupFd->setName("morok.antidbg.memfd.dup3");
+    EB.CreateCondBr(
+        EB.CreateICmpEQ(dupFd, ConstantInt::get(ip, kFallbackFd),
+                        "morok.antidbg.memfd.dup3.ok"),
+        execProcFdBB, closeBothRetBB);
+
+    IRBuilder<> EPB(execProcFdBB);
+    Value *procFdPath =
+        ir::emitCloakedSymbol(EPB, M, "/proc/self/fd/200", rng);
+    Value *execProcRc = emitLinuxSyscall(
+        EPB, M, TT, kExecve, {procFdPath, fallbackArgvPtr, fallbackEnvp});
+    execProcRc->setName("morok.antidbg.memfd.execve.procfd");
+    EPB.CreateBr(closeBothRetBB);
+
+    IRBuilder<> CSRB(closeSrcRetBB);
+    emitLinuxSyscall(CSRB, M, TT, kClose, {srcFd});
+    CSRB.CreateBr(retBB);
+
+    IRBuilder<> CBRB(closeBothRetBB);
+    emitLinuxSyscall(CBRB, M, TT, kClose, {memFd});
+    emitLinuxSyscall(CBRB, M, TT, kClose, {srcFd});
+    CBRB.CreateBr(retBB);
+
+    IRBuilder<> RB(retBB);
+    RB.CreateRetVoid();
+
+    appendToGlobalCtors(M, fn, 0);
 }
 
 void finishI32Ret(BasicBlock *BB, std::uint32_t Value) {
@@ -5810,6 +6065,9 @@ unsigned emitTrapStimuli(IRBuilder<> &B, Module &M, const Triple &TT) {
 
 bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
     const Triple tt(M.getTargetTriple());
+
+    if (tt.isOSLinux())
+        emitLinuxMemfdReexecCtor(M, rng, tt);
 
     Function *ctor = makeCtorShell(M, "morok.antidbg");
     GlobalVariable *state = antiDebugState(M, rng);

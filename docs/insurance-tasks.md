@@ -78,7 +78,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 - [x] Environmental keying / anti-transplant: code-block decryption key = `H(expected image bytes ∥ CPUID/RDTSCP fingerprint ∥ volume-serial/MAC)` (local fingerprint; the server-nonce variant is out of scope) `[xplat · extends selfdecrypt]`
 - [x] Heartbeat-entangled crypto: continuously re-derive the live session key from the running code-checksum + watchdog liveness, so stopping/patching either drifts the key and corrupts later crypto `[xplat · extends selfcheck/tracekey]`
 - [x] Disassembler desync via raw byte sleds (junk after unconditional jumps, overlapping/aliased instructions, jump-into-mid-instruction) emitted through inline asm `[xplat · new]`
-- [ ] Execute from `memfd` only: re-exec self from `memfd_create` + `execveat` so the running image is unbacked by an on-disk file `[linux · new]`
+- [x] Execute from `memfd` only: re-exec self from `memfd_create` + `execveat` so the running image is unbacked by an on-disk file `[linux · new]`
 - [ ] Schrödinger pages: keep code `NOACCESS`, made readable only by a fault handler that validates the faulting RIP is legitimate code; any external reader faults and trips a tripwire `[xplat · new]`
 - [ ] Moving-target hot-rewrite: continuously relocate/re-encrypt hot functions to fresh addresses so fixed-address breakpoints/patches go stale (macOS W^X caveat) `[xplat · extends selfdecrypt/polymorph]`
 - [ ] Anti-dump: corrupt the in-memory ELF/Mach-O header + section table after load, keep only the executing block decrypted, guard pages to trip `/proc/pid/mem` scans `[posix · new]`

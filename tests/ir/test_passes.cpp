@@ -10167,28 +10167,44 @@ entry:
     CHECK(M->getGlobalVariable("morok.antidbg.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.antidbg.buddy.pid", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.watchdog.heartbeat", true) != nullptr);
+    CHECK(M->getGlobalVariable("environ") != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.status") != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.stat4") != nullptr);
+    Function *Memfd = M->getFunction("morok.antidbg.memfd");
     Function *Watch = M->getFunction("morok.antidbg.linux.watch");
     Function *Sentinel = M->getFunction("morok.antidbg.linux.dr.sentinel");
     Function *Scrub = M->getFunction("morok.antidbg.linux.dr.scrub");
     Function *ProbeWatch = M->getFunction("morok.antidbg.probe.watch");
     Function *HeartbeatWatch = M->getFunction("morok.watchdog.heartbeat.watch");
+    REQUIRE(Memfd != nullptr);
     CHECK(Watch != nullptr);
     CHECK(Sentinel != nullptr);
     CHECK(Scrub != nullptr);
     CHECK(ProbeWatch != nullptr);
     CHECK(HeartbeatWatch != nullptr);
+    CHECK(Memfd->arg_size() == 3);
     CHECK(M->getFunction("morok.watchdog") != nullptr);
     CHECK(M->getFunction("morok.antidbg.probe") != nullptr);
     CHECK(countUserCallsTo(*M, "morok.antidbg.probe") >= 1u);
     CHECK(M->getFunction("ptrace") == nullptr);
     CHECK(M->getFunction("prctl") == nullptr);
     CHECK(M->getFunction("syscall") == nullptr);
+    CHECK(hasInlineAsmCall(*Memfd));
     CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg")));
     CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.status")));
     CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.stat4")));
     CHECK(hasInlineAsmCall(*Watch));
+    CHECK(countNamedInstructions(*Memfd, "morok.antidbg.memfd.readlink") >=
+          1u);
+    CHECK(countNamedInstructions(*Memfd, "morok.antidbg.memfd.create") >= 1u);
+    CHECK(countNamedInstructions(*Memfd, "morok.antidbg.memfd.execveat") >=
+          1u);
+    CHECK(countNamedInstructions(*Memfd,
+                                 "morok.antidbg.memfd.execveat.retry") >= 1u);
+    CHECK(countNamedInstructions(*Memfd, "morok.antidbg.memfd.dup3") >= 1u);
+    CHECK(countNamedInstructions(*Memfd,
+                                 "morok.antidbg.memfd.execve.procfd") >= 1u);
+    CHECK(countNamedInstructions(*Memfd, "morok.antidbg.memfd.write") >= 1u);
     CHECK(countNamedInstructions(*Watch, "morok.antidbg.buddy.kill") >= 1u);
     CHECK(countNamedInstructions(*Watch, "morok.antidbg.buddy.wait") >= 1u);
     CHECK(hasInlineAsmCall(*Scrub));
@@ -10218,13 +10234,17 @@ entry:
     CHECK(M->getFunction("pthread_detach") != nullptr);
     CHECK(M->getFunction("open") == nullptr);
     CHECK(M->getFunction("read") == nullptr);
+    CHECK(M->getFunction("readlink") == nullptr);
     CHECK(M->getFunction("close") == nullptr);
     CHECK(M->getFunction("sleep") != nullptr);
 
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/self/exe"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/self/fd/200"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/status"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/stat"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/task"));
     CHECK_FALSE(hasReadableByteString(*M, "TracerPid"));
+    CHECK_FALSE(hasReadableByteString(*M, ".nscd-cache"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

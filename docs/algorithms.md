@@ -1145,7 +1145,16 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   releases the returned thread array with `vm_deallocate`.
   On x86_64 Linux, sensitive anti-debug syscalls (`ptrace`, `prctl`,
   `openat`/`read`/`close` for `/proc` probes, Landlock, and seccomp install)
-  are emitted as inline `syscall` instructions instead of libc imports.
+  are emitted as inline `syscall` instructions instead of libc imports.  A
+  Linux init-array shim also runs before those hardening checks: when
+  `/proc/self/exe` is not already a memfd, it opens the current image, streams
+  it into `memfd_create`, and re-execs it with `execveat(..., AT_EMPTY_PATH)`
+  using init-array `argv`/`envp` when the libc supplies them.  If that form is
+  rejected, the shim retries with a local `argv[0]` and the process `environ`
+  global, then falls back to `execve` through a fixed `/proc/self/fd/<memfd>`
+  duplicate.  The second pass sees the memfd executable path and skips the copy,
+  leaving the running image detached from the on-disk file on kernels that
+  support the syscalls.
   On x86_64 macOS, BSD anti-debug probes (`ptrace`, `getpid`, `sysctl`,
   `csops`) are likewise emitted as inline Darwin syscall instructions. dyld
   symbol resolution such as `dlsym` is not a syscall; FunctionCallObfuscate's
