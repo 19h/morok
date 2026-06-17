@@ -8638,7 +8638,7 @@ TEST_CASE("stringEncryptModule falls back to per-string decryptors") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("stringEncryptModule encrypts decoy string globals") {
+TEST_CASE("stringEncryptModule leaves generated decoy strings as plaintext bait") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("decoy-strings", ctx);
     M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
@@ -8646,19 +8646,14 @@ TEST_CASE("stringEncryptModule encrypts decoy string globals") {
 
     auto engine = morok::core::Xoshiro256pp::fromSeed(308);
     morok::ir::IRRandom rng(engine);
-    CHECK(morok::passes::stringEncryptModule(*M, {/*probability=*/100}, rng));
+    CHECK_FALSE(
+        morok::passes::stringEncryptModule(*M, {/*probability=*/100}, rng));
 
     GlobalVariable *Decoy = M->getGlobalVariable("morok.decoy.str.test", true);
     REQUIRE(Decoy);
-    CHECK_FALSE(Decoy->isConstant());
-    CHECK_FALSE(hasReadableByteString(*M, "decoy-visible"));
-    CHECK(countFunctions(*M, "morok.strdec") == 1u);
-    Function *Dec = nullptr;
-    for (Function &F : *M)
-        if (F.getName().starts_with("morok.strdec"))
-            Dec = &F;
-    REQUIRE(Dec);
-    CHECK(hasInlineAsmCall(*Dec));
+    CHECK(Decoy->isConstant());
+    CHECK(hasReadableByteString(*M, "decoy-visible"));
+    CHECK(countFunctions(*M, "morok.strdec") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

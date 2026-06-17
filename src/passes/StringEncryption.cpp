@@ -58,8 +58,9 @@ bool eligible(const GlobalVariable &gv) {
         return false;
     if (gv.getName().starts_with("llvm."))
         return false;
-    if (gv.getName().starts_with("morok.") &&
-        !gv.getName().starts_with("morok.decoy.str."))
+    // Decoy string globals are deliberate bait: they must remain discoverable
+    // by cheap triage such as `strings` while real user strings are encrypted.
+    if (gv.getName().starts_with("morok."))
         return false;
     if (gv.getSection() == "llvm.metadata")
         return false;
