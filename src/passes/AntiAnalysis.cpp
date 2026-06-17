@@ -7394,6 +7394,180 @@ Function *pageFaultTlbProbe(Module &M, GlobalVariable *State,
     return fn;
 }
 
+GlobalVariable *cacheTimingState(Module &M, ir::IRRandom &rng) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.cachetime.state", /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, rng.next()), "morok.cachetime.state");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+Value *selectCacheTimingTarget(IRBuilder<> &B, Module &M,
+                               const std::vector<Function *> &Targets,
+                               Value *Index, const Twine &Name) {
+    auto *ip = intPtrTy(M);
+    Value *selected =
+        B.CreatePtrToInt(Targets.front(), ip, Name + ".target0");
+    for (std::size_t i = 1; i < Targets.size(); ++i) {
+        Value *candidate = B.CreatePtrToInt(Targets[i], ip, Name + ".target");
+        selected = B.CreateSelect(
+            B.CreateICmpEQ(Index, ConstantInt::get(Index->getType(), i),
+                           Name + ".is.target"),
+            candidate, selected, Name + ".selected");
+    }
+    return selected;
+}
+
+LoadInst *loadDynamicCodeByte(IRBuilder<> &B, Module &M, Value *Addr,
+                              const Twine &Name) {
+    auto *LI = B.CreateLoad(Type::getInt8Ty(M.getContext()),
+                            B.CreateIntToPtr(
+                                Addr, PointerType::getUnqual(M.getContext()),
+                                Name + ".ptr"),
+                            Name);
+    LI->setVolatile(true);
+    LI->setAlignment(Align(1));
+    return LI;
+}
+
+Value *emitCacheTimingChase(IRBuilder<> &B, Module &M,
+                            const std::vector<Function *> &Targets,
+                            Value *Seed, ir::IRRandom &rng) {
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *ip = intPtrTy(M);
+    Value *state = B.CreateXor(Seed, ConstantInt::get(i64, rng.next()),
+                               "morok.cachetime.seed");
+    Value *mix = ConstantInt::get(i64, rng.next());
+    constexpr unsigned kSteps = 32;
+    for (unsigned step = 0; step < kSteps; ++step) {
+        Value *scrambled = B.CreateXor(
+            state,
+            B.CreateLShr(state, ConstantInt::get(i64, (step % 19) + 1)),
+            "morok.cachetime.idx.scramble");
+        Value *idx64 =
+            B.CreateURem(scrambled, ConstantInt::get(i64, Targets.size()),
+                         "morok.cachetime.target.idx");
+        Value *base64 =
+            selectCacheTimingTarget(B, M, Targets, idx64, "morok.cachetime");
+        Value *base = B.CreateZExtOrTrunc(base64, ip, "morok.cachetime.base");
+        Value *offset = B.CreateAnd(
+            B.CreateLShr(state, ConstantInt::get(i64, (step % 13) + 3)),
+            ConstantInt::get(i64, 63), "morok.cachetime.offset");
+        Value *addr = B.CreateAdd(base, B.CreateZExtOrTrunc(offset, ip),
+                                  "morok.cachetime.addr");
+        LoadInst *byte = loadDynamicCodeByte(B, M, addr, "morok.cachetime.byte");
+        Value *wideByte = B.CreateZExt(byte, i64, "morok.cachetime.byte.wide");
+        state = B.CreateXor(
+            B.CreateMul(B.CreateAdd(state, wideByte),
+                        ConstantInt::get(i64, rng.next() | 1ULL)),
+            B.CreateAdd(base64, ConstantInt::get(i64, step + 1)),
+            "morok.cachetime.next");
+        mix = B.CreateXor(
+            B.CreateAdd(mix,
+                        B.CreateMul(wideByte,
+                                    ConstantInt::get(i64, rng.next() | 1ULL))),
+            B.CreateShl(state, ConstantInt::get(i64, step % 7)),
+            "morok.cachetime.mix");
+    }
+    return B.CreateXor(mix, state, "morok.cachetime.chase.mix");
+}
+
+Function *cacheTimingProbe(Module &M, GlobalVariable *State,
+                           ir::IRRandom &rng, const Triple &TT,
+                           const std::vector<Function *> &Targets) {
+    if (Targets.empty())
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.cachetime.oracle"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.cachetime.oracle", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    Value *badSamples = ConstantInt::get(i32, 0);
+    Value *divergentSamples = ConstantInt::get(i32, 0);
+    Value *mix = ConstantInt::get(i64, rng.next());
+    const bool hasCycleClock = isX86Target(TT);
+    const std::uint64_t primaryThreshold =
+        hasCycleClock ? 30000000ULL : 20000000ULL;
+    constexpr std::uint64_t secondaryThreshold = 20000000ULL;
+
+    for (unsigned sample = 0; sample < 4; ++sample) {
+        Value *primaryStart =
+            emitTimingPrimaryClock(B, M, TT, "morok.cachetime.primary.start");
+        Value *secondaryStart =
+            emitTimingSecondaryClock(B, M, TT,
+                                     "morok.cachetime.secondary.start");
+        Value *seed = B.CreateXor(
+            B.CreateAdd(primaryStart,
+                        ConstantInt::get(i64, rng.next() ^ sample)),
+            secondaryStart, "morok.cachetime.sample.seed");
+        Value *chase = emitCacheTimingChase(B, M, Targets, seed, rng);
+        Value *primaryEnd =
+            emitTimingPrimaryClock(B, M, TT, "morok.cachetime.primary.end");
+        Value *secondaryEnd =
+            emitTimingSecondaryClock(B, M, TT, "morok.cachetime.secondary.end");
+
+        Value *primaryDelta =
+            B.CreateSub(primaryEnd, primaryStart,
+                        "morok.cachetime.primary.delta");
+        Value *secondaryDelta =
+            B.CreateSub(secondaryEnd, secondaryStart,
+                        "morok.cachetime.secondary.delta");
+        Value *primarySlow =
+            B.CreateICmpUGT(primaryDelta, ConstantInt::get(i64, primaryThreshold),
+                            "morok.cachetime.primary.slow");
+        Value *secondarySlow = B.CreateICmpUGT(
+            secondaryDelta, ConstantInt::get(i64, secondaryThreshold),
+            "morok.cachetime.secondary.slow");
+        Value *sampleSlow = B.CreateOr(primarySlow, secondarySlow,
+                                       "morok.cachetime.sample.slow");
+        Value *sampleDiverged =
+            B.CreateXor(primarySlow, secondarySlow,
+                        "morok.cachetime.sample.diverged");
+        badSamples =
+            B.CreateAdd(badSamples, B.CreateZExt(sampleSlow, i32),
+                        "morok.cachetime.bad.n");
+        divergentSamples =
+            B.CreateAdd(divergentSamples, B.CreateZExt(sampleDiverged, i32),
+                        "morok.cachetime.divergent.n");
+        mix = B.CreateXor(
+            B.CreateAdd(mix,
+                        B.CreateMul(primaryDelta,
+                                    ConstantInt::get(i64, rng.next() | 1ULL))),
+            B.CreateXor(chase,
+                        B.CreateMul(secondaryDelta,
+                                    ConstantInt::get(i64, rng.next() | 1ULL))),
+            "morok.cachetime.total.mix");
+    }
+
+    foldState(B, State, mix, 0xD7C3A91E5B4062F8ULL, "morok.cachetime.mix");
+    foldState(B, State, badSamples, 0x82F16D4C0A9B753EULL,
+              "morok.cachetime.bad.samples");
+    foldState(B, State, divergentSamples, 0x3E49C807D2A6519BULL,
+              "morok.cachetime.divergent.samples");
+    foldFlag(B, State,
+             B.CreateICmpUGE(badSamples, ConstantInt::get(i32, 2)),
+             0xB6417D0ECA52893FULL, "morok.cachetime.bad.distribution");
+    foldFlag(B, State,
+             B.CreateICmpUGE(divergentSamples, ConstantInt::get(i32, 2)),
+             0x59A3E7D14C2068BFULL,
+             "morok.cachetime.divergent.distribution");
+    B.CreateRetVoid();
+    return fn;
+}
+
 } // namespace
 
 bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
@@ -7510,6 +7684,33 @@ bool pageFaultTlbOracleModule(Module &M, ir::IRRandom &rng) {
         return false;
 
     Function *ctor = makeCtorShell(M, "morok.pftlb");
+    IRBuilder<> B(&ctor->getEntryBlock());
+    B.CreateCall(oracle);
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, ctor, 0);
+    return true;
+}
+
+bool cacheTimingOracleModule(Module &M, ir::IRRandom &rng) {
+    const Triple tt(M.getTargetTriple());
+    constexpr std::uint32_t kMaxTargets = 16;
+    std::vector<Function *> targets;
+    targets.reserve(kMaxTargets);
+    for (Function &F : M) {
+        if (targets.size() >= kMaxTargets)
+            break;
+        if (isPrologueProbeCandidate(F))
+            targets.push_back(&F);
+    }
+    if (targets.empty())
+        return false;
+
+    GlobalVariable *state = cacheTimingState(M, rng);
+    Function *oracle = cacheTimingProbe(M, state, rng, tt, targets);
+    if (!oracle)
+        return false;
+
+    Function *ctor = makeCtorShell(M, "morok.cachetime");
     IRBuilder<> B(&ctor->getEntryBlock());
     B.CreateCall(oracle);
     B.CreateRetVoid();
@@ -7810,6 +8011,13 @@ PreservedAnalyses PageFaultTlbOraclePass::run(Module &M,
     ir::IRRandom rng(engine_);
     return pageFaultTlbOracleModule(M, rng) ? PreservedAnalyses::none()
                                             : PreservedAnalyses::all();
+}
+
+PreservedAnalyses CacheTimingOraclePass::run(Module &M,
+                                             ModuleAnalysisManager &) {
+    ir::IRRandom rng(engine_);
+    return cacheTimingOracleModule(M, rng) ? PreservedAnalyses::none()
+                                           : PreservedAnalyses::all();
 }
 
 } // namespace morok::passes

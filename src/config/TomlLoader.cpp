@@ -456,6 +456,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseToggle(*t, pc.trap_oracles);
     if (auto *t = p["page_fault_oracles"].as_table())
         parseToggle(*t, pc.page_fault_oracles);
+    if (auto *t = p["cache_timing_oracles"].as_table())
+        parseToggle(*t, pc.cache_timing_oracles);
     if (auto *t = p["decoy_strings"].as_table())
         parseToggle(*t, pc.decoy_strings);
     if (auto *t = p["vtable_integrity"].as_table())

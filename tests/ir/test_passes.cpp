@@ -10679,6 +10679,72 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("cacheTimingOracleModule emits x86 code pointer chase") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define internal i32 @hot(i32 %x) {
+entry:
+  %a = add i32 %x, 11
+  %b = xor i32 %a, 27
+  ret i32 %b
+}
+define i32 @main() {
+entry:
+  %v = call i32 @hot(i32 5)
+  ret i32 %v
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(889);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::cacheTimingOracleModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.cachetime");
+    Function *Oracle = M->getFunction("morok.cachetime.oracle");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Oracle != nullptr);
+    CHECK(M->getGlobalVariable("morok.cachetime.state", true) != nullptr);
+    CHECK(M->getFunction("clock_gettime") != nullptr);
+    CHECK(hasInlineAsmCall(*Oracle));
+    CHECK(countNamedInstructions(*Oracle, "morok.cachetime.byte") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.cachetime.target.idx") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.cachetime.primary.delta") >=
+          1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("cacheTimingOracleModule emits Darwin mach code chase") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "arm64-apple-macosx13.0.0"
+define internal i32 @hot(i32 %x) {
+entry:
+  %a = mul i32 %x, 3
+  %b = add i32 %a, 9
+  ret i32 %b
+}
+define i32 @main() {
+entry:
+  %v = call i32 @hot(i32 7)
+  ret i32 %v
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(890);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::cacheTimingOracleModule(*M, rng));
+
+    Function *Oracle = M->getFunction("morok.cachetime.oracle");
+    REQUIRE(Oracle != nullptr);
+    CHECK(M->getFunction("mach_absolute_time") != nullptr);
+    CHECK(M->getFunction("clock_gettime") != nullptr);
+    CHECK_FALSE(hasInlineAsmCall(*Oracle));
+    CHECK(countNamedInstructions(*Oracle, "morok.cachetime.sample.slow") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.cachetime.byte") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("nanomitesModule lowers conditional branches to trap-mediated "
           "indirectbr") {
     LLVMContext ctx;

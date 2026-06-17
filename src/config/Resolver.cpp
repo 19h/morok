@@ -299,6 +299,8 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.timing_oracles.enabled, src.timing_oracles.enabled);
     mergeOpt(dst.trap_oracles.enabled, src.trap_oracles.enabled);
     mergeOpt(dst.page_fault_oracles.enabled, src.page_fault_oracles.enabled);
+    mergeOpt(dst.cache_timing_oracles.enabled,
+             src.cache_timing_oracles.enabled);
     mergeOpt(dst.decoy_strings.enabled, src.decoy_strings.enabled);
     mergeOpt(dst.vtable_integrity.enabled, src.vtable_integrity.enabled);
     // FuncWrap

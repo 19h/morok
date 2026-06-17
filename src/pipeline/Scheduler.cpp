@@ -390,6 +390,8 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         changed |= passes::trapOracleModule(M, rng);
     if (config_.passes.page_fault_oracles.enabled.value_or(false))
         changed |= passes::pageFaultTlbOracleModule(M, rng);
+    if (config_.passes.cache_timing_oracles.enabled.value_or(false))
+        changed |= passes::cacheTimingOracleModule(M, rng);
 
     // Honeypot: distribute plausible plaintext diagnostics across user code.
     if (config_.passes.decoy_strings.enabled.value_or(false))

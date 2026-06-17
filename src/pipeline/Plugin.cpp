@@ -244,6 +244,10 @@ PassPluginLibraryInfo getPluginInfo() {
                             MPM.addPass(passes::PageFaultTlbOraclePass());
                             return true;
                         }
+                        if (name == "morok-cachetime") {
+                            MPM.addPass(passes::CacheTimingOraclePass());
+                            return true;
+                        }
                         if (name == "morok-nanomites") {
                             MPM.addPass(passes::NanomitesPass());
                             return true;

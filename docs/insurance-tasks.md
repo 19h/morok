@@ -84,7 +84,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 - [x] Anti-dump: corrupt the in-memory ELF/Mach-O header + section table after load, keep only the executing block decrypted, guard pages to trip `/proc/pid/mem` scans `[posix · new]`
 - [x] Nanomites: replace conditional branches with `int3`; an encrypted address→branch table held only by the self-debugger interprets them at runtime (needs the buddy/self-debugger infra) `[posix · new]`
 - [x] Page-fault/TLB-timing single-step oracle: spread code over many pages and detect anomalous fault pattern/latency under single-stepping incl. EPT (low confidence, FP-prone) `[xplat · new]`
-- [ ] Cache-timing self-attestation: pseudo-random pointer-chase over own code per run under a cumulative-cycle bound (low confidence) `[xplat · new]`
+- [x] Cache-timing self-attestation: pseudo-random pointer-chase over own code per run under a cumulative-cycle bound (low confidence) `[xplat · new]`
 - [ ] Microarchitectural/speculative single-step canaries via branch-predictor/speculation side effects (unreliable, CPU-specific — not a primary control) `[xplat · new]`
 
 ## XL — new platform / major engines

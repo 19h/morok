@@ -12,6 +12,7 @@
 //   • TimingOracle   — samples independent clocks around short spans.
 //   • TrapOracle     — checks whether SIGTRAP/int3-style traps reach the app.
 //   • PageFaultTlbOracle — samples protected-page fault delivery and latency.
+//   • CacheTimingOracle — pointer-chases over own code under clock bounds.
 // AntiHooking also folds decoy-grade VM/sandbox heuristics into delayed state.
 // All are module passes that add code/metadata without altering the
 // program's observable behaviour in an un-instrumented run.
@@ -64,6 +65,12 @@ bool trapOracleModule(llvm::Module &M, morok::ir::IRRandom &rng);
 /// folds abnormal latency/fault patterns into hidden state.  Returns true if
 /// code was added for the target.
 bool pageFaultTlbOracleModule(llvm::Module &M, morok::ir::IRRandom &rng);
+
+/// Inject a cache-timing self-attestation oracle.  The emitted constructor
+/// performs a pseudo-random pointer chase over code bytes from selected user
+/// functions and folds cumulative timing anomalies into hidden state.  Returns
+/// true if code was added.
+bool cacheTimingOracleModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
 class AntiDebuggingPass : public llvm::PassInfoMixin<AntiDebuggingPass> {
 public:
@@ -123,6 +130,19 @@ class PageFaultTlbOraclePass
     : public llvm::PassInfoMixin<PageFaultTlbOraclePass> {
 public:
     explicit PageFaultTlbOraclePass(std::uint64_t seed = 0x9A6EF17Du)
+        : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
+
+    llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
+    static bool isRequired() { return true; }
+
+private:
+    core::Xoshiro256pp engine_;
+};
+
+class CacheTimingOraclePass
+    : public llvm::PassInfoMixin<CacheTimingOraclePass> {
+public:
+    explicit CacheTimingOraclePass(std::uint64_t seed = 0xCACE710Cu)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);

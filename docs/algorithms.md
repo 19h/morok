@@ -1114,7 +1114,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   exception path rather than guessing platform-specific exception-context
   offsets.
 - AntiClassDump / AntiDebugging / AntiHooking / TimingOracle / TrapOracle /
-  PageFaultTlbOracle: platform anti-analysis
+  PageFaultTlbOracle / CacheTimingOracle: platform anti-analysis
   (module passes). AntiDebugging combines startup checks with a mutable hidden
   state word, platform-specific recheck helpers, pthread watchdogs where
   available, and once-gated randomized calls inserted into user functions so
@@ -1304,6 +1304,15 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   `morok.pftlb.state`.  The previous handlers are restored and the pages are
   unmapped before the constructor returns; this is deliberately a
   distribution-level signal rather than an immediate kill switch.
+- CacheTimingOracle is an opt-in constructor that samples a per-run
+  pseudo-random pointer chase over code bytes from a bounded set of user
+  function entries.  Each volatile code-byte read feeds the next target/offset
+  selection, so DBI code caches, breakpoint rewriting, or unusual I-cache/TLB
+  perturbation must preserve both the byte stream and the cumulative timing
+  envelope.  The probe uses the existing primary/secondary clock pair, folds
+  slow or divergent sample distributions into `morok.cachetime.state`, and does
+  not branch to an immediate response because the signal is low-confidence and
+  platform-noisy.
 - Nanomites lower selected conditional branches to a volatile predicate
   materialization followed by a synchronous `SIGTRAP` site.  The original
   condition no longer controls a direct branch; a `sigaction` `SA_SIGINFO`
@@ -1353,6 +1362,6 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   they can clone or generate dense IR.
 
 ## Scheduler order (to preserve semantics)
-Virtualization(user) → HashSelfDecrypt → AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → PageFaultTlbOracle → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
+Virtualization(user) → HashSelfDecrypt → AntiHook → AntiClassDump → AntiDebug → TimingOracle → TrapOracle → PageFaultTlbOracle → CacheTimingOracle → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
 MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → ProtectionHelperVM → SensitiveHelperHardening → Nanomites → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 MisleadingMetadata → FeatureElimination (strip debug/names) → cleanup marker decls.
