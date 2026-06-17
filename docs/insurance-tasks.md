@@ -72,7 +72,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 - [x] Buddy/triad mutual protection: a 2–3 process ring that occupies the debugger slot (`PTRACE_ATTACH`) and cross-verifies code + liveness; killing one cascades, external attach is blocked `[posix · new]`
 - [x] Watchdog orchestration thread/process: re-run the §2–§4 checks on a randomized cadence with a heartbeat; a missing heartbeat triggers entangled self-corruption (the backbone for "re-arm, don't one-shot") `[xplat · new]`
 - [x] JIT self-decrypt with re-encrypt-on-exit and a polymorphic stub so a static dump + one breakpoint reveals only one slice (macOS needs `MAP_JIT`) `[xplat · extends selfdecrypt]`
-- [ ] Per-build-randomized VM ISA: permuted/duplicated handler tables, opaque dispatcher, optional nested VMs `[xplat · extends vm]`
+- [x] Per-build-randomized VM ISA: permuted/duplicated handler tables, opaque dispatcher, optional nested VMs `[xplat · extends vm]`
 - [ ] Run the anti-debug/anti-hook/integrity checkers themselves through the VM so the protection logic is never plaintext (highest-leverage composition) `[xplat · extends vm]`
 - [ ] Stolen-code: physically remove critical instructions from the on-disk image and execute them only inside the VM `[xplat · extends vm]`
 - [ ] Environmental keying / anti-transplant: code-block decryption key = `H(expected image bytes ∥ CPUID/RDTSCP fingerprint ∥ volume-serial/MAC)` (local fingerprint; the server-nonce variant is out of scope) `[xplat · extends selfdecrypt]`

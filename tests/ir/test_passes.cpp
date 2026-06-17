@@ -5570,6 +5570,62 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("virtualizeModule uses seed-diverse VM handler layout") {
+    struct Snapshot {
+        std::vector<std::string> handlers;
+        std::string bytecode;
+    };
+
+    auto render = [](std::uint64_t Seed) {
+        LLVMContext ctx;
+        auto M = parse(ctx, R"ir(
+define i32 @vm_seeded(i32 %a, i32 %b) {
+entry:
+  %x = add i32 %a, %b
+  %y = xor i32 %x, 1515870810
+  %z = mul i32 %y, %a
+  ret i32 %z
+}
+)ir");
+        auto engine = morok::core::Xoshiro256pp::fromSeed(Seed);
+        morok::ir::IRRandom rng(engine);
+        CHECK(morok::passes::virtualizeModule(
+            *M,
+            {/*probability=*/100, /*max_functions=*/1,
+             /*max_instructions=*/16, /*max_registers=*/32},
+            rng));
+
+        Snapshot Out;
+        Function *Helper = M->getFunction("morok.vm.vm_seeded.exec");
+        REQUIRE(Helper);
+        for (BasicBlock &BB : *Helper)
+            if (BB.getName().starts_with("morok.vm.h."))
+                Out.handlers.push_back(BB.getName().str());
+
+        GlobalVariable *Bytecode = nullptr;
+        for (GlobalVariable &GV : M->globals())
+            if (GV.getName().starts_with("morok.vm.bytecode"))
+                Bytecode = &GV;
+        REQUIRE(Bytecode);
+        auto *Data = dyn_cast<ConstantDataArray>(Bytecode->getInitializer());
+        REQUIRE(Data);
+        StringRef Raw = Data->getRawDataValues();
+        Out.bytecode.assign(Raw.begin(), Raw.end());
+        CHECK_FALSE(verifyModule(*M, &errs()));
+        return Out;
+    };
+
+    Snapshot A = render(15101);
+    Snapshot B = render(15101);
+    Snapshot C = render(15102);
+
+    CHECK(A.handlers == B.handlers);
+    CHECK(A.bytecode == B.bytecode);
+    const bool SeedDiverse =
+        A.handlers != C.handlers || A.bytecode != C.bytecode;
+    CHECK(SeedDiverse);
+}
+
 TEST_CASE("virtualizeModule lifts integer comparisons, zext, and select idioms") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
