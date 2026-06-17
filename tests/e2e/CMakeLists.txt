@@ -105,6 +105,25 @@ if(EXISTS "${PROJECT_SOURCE_DIR}/programs")
     LABELS "e2e;programs;max"
     REQUIRED_FILES "$<TARGET_FILE:morok_plugin>"
     TIMEOUT 900)
+
+  # Runtime correctness gate: a curated set of deterministic programs must
+  # produce identical output clean vs obfuscated at the `max` preset.  Catches
+  # miscompilations that compile cleanly but run wrong (the compile sweep above
+  # cannot see these).
+  set(_program_run "${CMAKE_CURRENT_SOURCE_DIR}/run_programs.sh")
+  add_test(NAME "e2e/programs_maxpreset_run"
+    COMMAND bash "${_program_run}"
+            "${CMAKE_C_COMPILER}"
+            "${CMAKE_CXX_COMPILER}"
+            "$<TARGET_FILE:morok_plugin>"
+            "${_sysroot}"
+            "${PROJECT_SOURCE_DIR}/programs"
+            "max"
+            4242)
+  set_tests_properties("e2e/programs_maxpreset_run" PROPERTIES
+    LABELS "e2e;programs;max"
+    REQUIRED_FILES "$<TARGET_FILE:morok_plugin>"
+    TIMEOUT 900)
 else()
   message(STATUS "e2e programs sweep skipped (no programs/ corpus in this tree).")
 endif()
