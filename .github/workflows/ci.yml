@@ -165,11 +165,13 @@ jobs:
               _d="${_d//\\//}"
               [ -n "$_d" ] && imsvc="$imsvc -isystem \"$_d\""
             done
-            # Force-include the headers neither the MSVC STL pulls in transitively
+            # Force-include the headers the MSVC STL does not pull in transitively
             # (initializer_list, ostream — the doctest TUs rely on libc++ doing
-            # so) nor toml++ declares before using SSE2 intrinsics under clang
-            # (immintrin.h; otherwise _mm_* are emitted as undefined calls).
-            args+=( -DCMAKE_CXX_FLAGS="-Wno-c++11-narrowing -include initializer_list -include ostream -include immintrin.h $imsvc" )
+            # so). And disable toml++'s SSE2 fast-path: clang-targeting-Windows
+            # emits its _mm_* intrinsics as undefined external calls (lld-link
+            # error), and the scalar scanner is more than fast enough for the tiny
+            # Morok config files.
+            args+=( -DCMAKE_CXX_FLAGS="-Wno-c++11-narrowing -include initializer_list -include ostream -DTOML_ENABLE_SIMD=0 $imsvc" )
           fi
           cmake "${args[@]}"
 
