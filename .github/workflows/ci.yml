@@ -92,7 +92,7 @@ jobs:
           echo "SCCACHE_CACHE_SIZE=3G" >> "$GITHUB_ENV"
 
       - name: Restore sccache cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ env.SCCACHE_DIR }}
           # Key on the LLVM recipe (composite action) so any recipe change busts
@@ -186,7 +186,7 @@ jobs:
       # if the tests below fail.
       - name: Save sccache cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-llvm/action.yml', '.github/workflows/ci.yml') }}-${{ github.run_id }}
