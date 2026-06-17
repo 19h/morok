@@ -33,6 +33,15 @@ TEST_CASE("global section is parsed") {
     CHECK(r.config.demangle_names == false);
 }
 
+TEST_CASE("decoy_strings toggle is parsed") {
+    const auto r = loadFromString(R"(
+    [passes.decoy_strings]
+    enabled = true
+  )");
+    REQUIRE(r.ok);
+    CHECK(r.config.passes.decoy_strings.enabled == true);
+}
+
 TEST_CASE("a tuning section does not disable a preset-enabled pass") {
     // Regression: a [passes.X] section that only tunes a parameter must NOT
     // reset the pass's other preset-provided fields (notably `enabled`).  The

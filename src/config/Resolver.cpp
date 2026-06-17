@@ -294,6 +294,7 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.anti_class_dump.enabled, src.anti_class_dump.enabled);
     mergeOpt(dst.timing_oracles.enabled, src.timing_oracles.enabled);
     mergeOpt(dst.trap_oracles.enabled, src.trap_oracles.enabled);
+    mergeOpt(dst.decoy_strings.enabled, src.decoy_strings.enabled);
     // FuncWrap
     mergeOpt(dst.func_wrap.enabled, src.func_wrap.enabled);
     mergeOpt(dst.func_wrap.probability, src.func_wrap.probability);

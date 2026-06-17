@@ -206,6 +206,7 @@ TEST_CASE("merge handles every pass family") {
     src.anti_dbg.enabled = true;
     src.timing_oracles.enabled = true;
     src.trap_oracles.enabled = true;
+    src.decoy_strings.enabled = true;
     merge(dst, src);
     CHECK(dst.split.splits == 8u);
     CHECK(dst.stack_coalesce.enabled == true);
@@ -347,4 +348,5 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.anti_dbg.enabled == true);
     CHECK(dst.timing_oracles.enabled == true);
     CHECK(dst.trap_oracles.enabled == true);
+    CHECK(dst.decoy_strings.enabled == true);
 }

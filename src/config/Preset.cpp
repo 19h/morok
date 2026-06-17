@@ -249,6 +249,7 @@ PassConfig makeLow() {
     c.anti_class_dump.enabled = false;
     c.timing_oracles.enabled = false;
     c.trap_oracles.enabled = false;
+    c.decoy_strings.enabled = true;
     return c;
 }
 
@@ -463,6 +464,7 @@ PassConfig makeMid() {
     c.anti_class_dump.enabled = false;
     c.timing_oracles.enabled = false;
     c.trap_oracles.enabled = false;
+    c.decoy_strings.enabled = true;
     return c;
 }
 
@@ -684,6 +686,7 @@ PassConfig makeHigh() {
     c.anti_class_dump.enabled = false;
     c.timing_oracles.enabled = false;
     c.trap_oracles.enabled = false;
+    c.decoy_strings.enabled = true;
     return c;
 }
 
@@ -910,6 +913,7 @@ PassConfig makeMax() {
     c.anti_class_dump.enabled = true;
     c.timing_oracles.enabled = true;
     c.trap_oracles.enabled = true;
+    c.decoy_strings.enabled = true;
     return c;
 }
 

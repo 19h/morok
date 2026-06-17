@@ -36,6 +36,20 @@ TEST_CASE("a matching policy overrides the global config") {
     CHECK(resolve(cfg, "src/net.c", "do_encrypt").bcf.probability == 50u);
 }
 
+TEST_CASE("policy overrides decoy_strings toggle") {
+    Config cfg;
+    cfg.passes.decoy_strings.enabled = false;
+
+    Policy p;
+    p.module_regex = ".*";
+    p.func_regex = "^hot$";
+    p.overrides.decoy_strings.enabled = true;
+    cfg.policies.push_back(p);
+
+    CHECK(resolve(cfg, "m", "hot").decoy_strings.enabled == true);
+    CHECK(resolve(cfg, "m", "cold").decoy_strings.enabled == false);
+}
+
 TEST_CASE("module-wide policy (empty function regex) matches every function") {
     Config cfg;
     Policy p;

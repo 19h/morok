@@ -49,7 +49,8 @@ add_library(morok_passes STATIC
   VectorObfuscation.cpp
   IndirectBranch.cpp
   FunctionCallObfuscate.cpp
-  AntiAnalysis.cpp)
+  AntiAnalysis.cpp
+  DecoyStrings.cpp)
 add_library(morok::passes ALIAS morok_passes)
 
 target_compile_features(morok_passes PUBLIC cxx_std_23)

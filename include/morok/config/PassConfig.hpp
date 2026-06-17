@@ -362,6 +362,7 @@ struct PassConfig {
     ToggleConfig anti_class_dump;
     ToggleConfig timing_oracles;
     ToggleConfig trap_oracles;
+    ToggleConfig decoy_strings;
 
     struct FuncWrapConfig {
         Opt<bool> enabled;

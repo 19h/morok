@@ -21,6 +21,7 @@
 #include "morok/passes/ConstantEncryption.hpp"
 #include "morok/passes/DataEntangledFlattening.hpp"
 #include "morok/passes/DataFlowIntegrity.hpp"
+#include "morok/passes/DecoyStrings.hpp"
 #include "morok/passes/DispatcherlessRouting.hpp"
 #include "morok/passes/ExternalOpaquePredicates.hpp"
 #include "morok/passes/Flattening.hpp"
@@ -300,6 +301,9 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
     if (config_.passes.trap_oracles.enabled.value_or(false))
         changed |= passes::trapOracleModule(M, rng);
 
+    // Honeypot: distribute plausible plaintext diagnostics across user code.
+    if (config_.passes.decoy_strings.enabled.value_or(false))
+        changed |= passes::decoyStringsModule(M, rng);
 
     // Hide library imports behind dlsym.
     if (InitialModuleGrowthOk && config_.passes.fco.enabled.value_or(false)) {

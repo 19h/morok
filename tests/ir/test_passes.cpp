@@ -21,6 +21,7 @@
 #include "morok/passes/ConstantEncryption.hpp"
 #include "morok/passes/DataEntangledFlattening.hpp"
 #include "morok/passes/DataFlowIntegrity.hpp"
+#include "morok/passes/DecoyStrings.hpp"
 #include "morok/passes/DispatcherlessRouting.hpp"
 #include "morok/passes/ExternalOpaquePredicates.hpp"
 #include "morok/passes/Flattening.hpp"
@@ -217,6 +218,20 @@ std::size_t countUserCallsTo(Module &M, StringRef name) {
     for (Function &F : M)
         if (!F.isDeclaration() && !F.getName().starts_with("morok."))
             n += countCallsTo(F, name);
+    return n;
+}
+
+std::size_t countUserCallsToPrefix(Module &M, StringRef prefix) {
+    std::size_t n = 0;
+    for (Function &F : M) {
+        if (F.isDeclaration() || F.getName().starts_with("morok."))
+            continue;
+        for (Instruction &I : instructions(F))
+            if (auto *CB = dyn_cast<CallBase>(&I))
+                if (Function *Callee = CB->getCalledFunction())
+                    if (Callee->getName().starts_with(prefix))
+                        ++n;
+    }
     return n;
 }
 
@@ -685,6 +700,65 @@ TEST_CASE("MorokPass hardens sensitive generated decryptor helpers") {
     CHECK(hasBcfJunk);
     CHECK(countNamedInstructions(*Dec, "morok.extop.pred") >= 1u);
     CHECK(M->getFunction("morok.extop.context") != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("decoyStringsModule emits volatile decoy logging infrastructure") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+
+define i32 @main(i32 %x) {
+entry:
+  %y = add i32 %x, 1
+  ret i32 %y
+}
+
+define void @worker() {
+entry:
+  ret void
+}
+)ir");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0xDEC0);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::decoyStringsModule(*M, rng));
+
+    const std::size_t decoyGlobals = countGlobals(*M, "morok.decoy.str.");
+    CHECK(decoyGlobals >= 6u);
+    CHECK(countFunctions(*M, "morok.dbglog.") == 5u);
+    CHECK(countGlobals(*M, "morok.dbglog.state.") == 5u);
+    CHECK(countUserCallsToPrefix(*M, "morok.dbglog.") == decoyGlobals);
+    CHECK_FALSE(hasReadableByteString(*M, "__TARGET_TRIPLE__"));
+
+    for (Function &F : *M)
+        if (F.getName().starts_with("morok.dbglog."))
+            CHECK(countVolatileAccesses(F) == 2u);
+
+    for (GlobalVariable &GV : M->globals()) {
+        if (!GV.getName().starts_with("morok.dbglog.state."))
+            continue;
+        auto *StateTy = dyn_cast<StructType>(GV.getValueType());
+        REQUIRE(StateTy != nullptr);
+        REQUIRE(StateTy->getNumElements() == 2u);
+        CHECK(StateTy->getElementType(0)->isPointerTy());
+        CHECK(StateTy->getElementType(1)->isIntegerTy(32));
+    }
+
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("decoyStringsModule skips modules without user bodies") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+declare void @puts(ptr)
+)ir");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0xDEC1);
+    morok::ir::IRRandom rng(engine);
+    CHECK_FALSE(morok::passes::decoyStringsModule(*M, rng));
+    CHECK(countFunctions(*M, "morok.dbglog.") == 0u);
+    CHECK(countGlobals(*M, "morok.decoy.str.") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

@@ -26,6 +26,7 @@
 #include "morok/passes/ConstantEncryption.hpp"
 #include "morok/passes/DataEntangledFlattening.hpp"
 #include "morok/passes/DataFlowIntegrity.hpp"
+#include "morok/passes/DecoyStrings.hpp"
 #include "morok/passes/DispatcherlessRouting.hpp"
 #include "morok/passes/ExternalOpaquePredicates.hpp"
 #include "morok/passes/Flattening.hpp"
@@ -235,6 +236,10 @@ PassPluginLibraryInfo getPluginInfo() {
                         }
                         if (name == "morok-trap") {
                             MPM.addPass(passes::TrapOraclePass());
+                            return true;
+                        }
+                        if (name == "morok-decoystr") {
+                            MPM.addPass(passes::DecoyStringsPass());
                             return true;
                         }
                         return false;
