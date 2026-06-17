@@ -75,7 +75,7 @@ jobs:
           arch: x64
 
       - name: Install sccache
-        uses: mozilla/sccache-action@v0.0.6
+        uses: mozilla/sccache-action@v0.0.10
 
       - name: Configure sccache (local disk)
         shell: bash
