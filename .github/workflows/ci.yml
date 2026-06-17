@@ -133,8 +133,10 @@ jobs:
             cxxinc="--gcc-install-dir=${gccdir} -isystem /usr/include/c++/${ver} -isystem /usr/include/${triple}/c++/${ver} -isystem /usr/include/c++/${ver}/backward"
             # The doctest test TUs use braced-init that needs std::initializer_list
             # but rely on libc++ (macOS) pulling it in transitively; libstdc++
-            # does not, so force-include it.
-            cxxinc="${cxxinc} -include initializer_list"
+            # does not, so force-include it. Also pin LLVM_ENABLE_ABI_BREAKING_
+            # CHECKS=0 to match the (assertions-off) LLVM libs, so Morok references
+            # the same ilist_iterator type the libs export.
+            cxxinc="${cxxinc} -include initializer_list -DLLVM_ENABLE_ABI_BREAKING_CHECKS=0"
             args+=(
               -DCMAKE_C_FLAGS="--gcc-install-dir=${gccdir}"
               -DCMAKE_CXX_FLAGS="${cxxinc}"
@@ -153,9 +155,10 @@ jobs:
               _d="${_d//\\//}"
               [ -n "$_d" ] && imsvc="$imsvc -isystem \"$_d\""
             done
-            # Also force-include <initializer_list> (the doctest TUs rely on it
-            # being pulled in transitively, which the MSVC STL does not do).
-            args+=( -DCMAKE_CXX_FLAGS="-Wno-c++11-narrowing -include initializer_list $imsvc" )
+            # Force-include the headers the MSVC STL does not pull in transitively
+            # (the doctest TUs rely on libc++ doing so), and pin ABI-breaking
+            # checks off to match the LLVM libs (see the Linux branch).
+            args+=( -DCMAKE_CXX_FLAGS="-Wno-c++11-narrowing -include initializer_list -include ostream -DLLVM_ENABLE_ABI_BREAKING_CHECKS=0 $imsvc" )
           fi
           cmake "${args[@]}"
 
