@@ -35,7 +35,7 @@ namespace morok::passes {
 
 namespace {
 
-constexpr std::size_t kNumDecoys = 6;
+constexpr std::size_t kNumDecoys = 5;
 
 // Each string is crafted to look like debug output from a boring internal
 // engineering tool (sve — "system verification environment").  Every string is
@@ -57,7 +57,13 @@ constexpr std::array<std::string_view, kNumDecoys> kDecoyStrings = {
     "  scenario: %s (%s)\n"
     "  model DB: %s (loaded, %d entries)\n"
     "  Monte Carlo: %d runs, seed 0x%X, CEP budget %.1fm (%d%% conf.)\n"
-    "  NOTE: simulated values only — not for flight software certification\n",
+    "  NOTE: simulated values only — not for flight software certification\n"
+    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93"
+    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5"
+    "PBX-9501;PBX-9502"
+    "UF6;HEU;Pu-239;Po-210"
+    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS"
+    "PAL;DIFM;ESD;ST;CD;SL;WL",
 
     // Model validation.  All values computed at runtime.
     "SIM-TEST: %s subsystem model validation (cat %s, sve-db %s)\n"
@@ -68,17 +74,13 @@ constexpr std::array<std::string_view, kNumDecoys> kDecoyStrings = {
     "    action: file ticket SVE-%d, assign to %s team (%s)\n"
     "  PASS: thermal battery activation sequence (T+%.1f to T+%.1f nominal)\n"
     "  PASS: bridge-wire continuity model (%d channels, resistance within %d%%)\n"
-    "  reviewed: %s, %s, %s\n",
-
-    // Recent file list.  Paths are real filesystem layout, names from config.
-    "SIM-CONFIG: recent scenarios (%s, user: %s)\n"
-    "  1. %s/%s\n"
-    "  2. %s/%s\n"
-    "  3. %s/%s\n"
-    "  4. %s/%s\n"
-    "  model path: %s/\n"
-    "  output path: %s/\n"
-    "  export: %s:~/results/report_%s.pdf\n",
+    "  reviewed: %s, %s, %s\n"
+    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93"
+    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5"
+    "PBX-9501;PBX-9502"
+    "UF6;HEU;Pu-239;Po-210"
+    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS"
+    "PAL;DIFM;ESD;ST;CD;SL;WL",
 
     // Python module loading.  Subsystem modules loaded from config.
     "SIM-PY: sve Python bindings v1.0.2 (cpython 3.11.8, numpy 1.26.4)\n"
@@ -88,7 +90,13 @@ constexpr std::array<std::string_view, kNumDecoys> kDecoyStrings = {
     "  loaded module: sve.trajectory (3-DOF %s model)\n"
     "  scenario DB: %s (%d entries)\n"
     "  session: %s@%s, display :0, conn %s:%d\n"
-    "  WARNING: this build includes restricted-data models (RD-CNWDI)\n",
+    "  WARNING: this build includes restricted-data models (RD-CNWDI)\n"
+    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93"
+    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5"
+    "PBX-9501;PBX-9502"
+    "UF6;HEU;Pu-239;Po-210"
+    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS"
+    "PAL;DIFM;ESD;ST;CD;SL;WL",
 
     // Report template.  Every value is a runtime parameter.
     "REPORT: sve Monte Carlo analysis — %s\n"
@@ -98,7 +106,13 @@ constexpr std::array<std::string_view, kNumDecoys> kDecoyStrings = {
     "  outliers: %d runs exceeded %s tolerance (model SVE-%d)\n"
     "  guidance drift: mean %.3f deg/hr, std %.3f (INS + GPS-aided, star trk)\n"
     "  generated: %s by sve %s\n"
-    "  ref: %s, %s classification guide, FOR OFFICIAL USE ONLY\n",
+    "  ref: %s, %s classification guide, FOR OFFICIAL USE ONLY\n"
+    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93"
+    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5"
+    "PBX-9501;PBX-9502"
+    "UF6;HEU;Pu-239;Po-210"
+    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS"
+    "PAL;DIFM;ESD;ST;CD;SL;WL",
 
     // Build/CI log.  Platform placeholder replaced with target triple.
     "BUILD: sve v1.0.2-rc3 (git 8f41a2c, branch release/1.0)\n"
@@ -108,7 +122,13 @@ constexpr std::array<std::string_view, kNumDecoys> kDecoyStrings = {
     "  test suite: %d passed, %d skipped, %d failed (see test_report.html)\n"
     "  models: %s\n"
     "  NOTE: this build includes RD-CNWDI models — not for public release\n"
-    "  NOTE: disclosure review %s, LANL OSS, x7291\n",
+    "  NOTE: disclosure review %s, LANL OSS, x7291\n"
+    "B61-12;B61-13;W76-1;W76-2;W78;W80-4;W87-1;W88;W93"
+    "LGM-30G;LGM-35A;UGM-133A;AGM-86B;AGM-181;B-2 Spirit;B-21 Raider;Mk21A;Mk4;Mk5"
+    "PBX-9501;PBX-9502"
+    "UF6;HEU;Pu-239;Po-210"
+    "CEP;BH;LD;RA;BF;TB;SLF;IS;DWS"
+    "PAL;DIFM;ESD;ST;CD;SL;WL",
 
     // clang-format on
 };
