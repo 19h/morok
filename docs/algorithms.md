@@ -47,11 +47,17 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   per-string keystream generator (murmur3 / splitmix64 / xorshift\*, chosen per
   string), XOR- or ADD-combined, with per-string key material `k0 = seedVal ^
   siteKey` and an odd multiplier.  No two strings share an encryption.
-- Recovery is distributed: each string has its OWN global constructor that
-  recovers just that string in place, with the keystream inlined (no shared
-  multiply/decrypt helper) — short strings unrolled, long strings looped — at a
-  randomized constructor priority.  There is no single place that decrypts every
-  string.
+- Recovery is stack-first and per use site for constant C strings whose uses are
+  direct noncapturing call/invoke arguments.  Each such pointer operand gets a
+  fresh `morok.str.stack.buf` alloca and a call to a private per-site
+  `morok.strsite` helper that fills the buffer immediately before the use.
+  Short helpers are unrolled; long helpers run a local `morok.str.stack.loop`.
+  No global constructor or shared decrypt helper is emitted for those sites.
+- If a string has unsupported uses where address identity or global mutation may
+  matter, the pass falls back to the old distributed constructor model: one
+  private `morok.strdec` constructor for that string only, with the keystream
+  inlined and randomized constructor priority.  There is still no single place
+  that decrypts every string.
 - Keyed on the runtime-opaque module seed `morok.cloak.seed` (a private *mutable*
   i64 read with a volatile load), so the optimizer cannot fold ciphertext back to
   text.  *Mutable* string globals (which the program may itself read/write or

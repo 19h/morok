@@ -4,11 +4,10 @@
 //
 // morok/passes/StringEncryption.hpp — encrypt string literals at rest.
 //
-// Each eligible private byte-array global is encrypted with the Vernam-GF8
-// cipher (morok/core/Galois8.hpp): per-byte one-time-pad XOR followed by a
-// GF(2^8) multiply.  The literal is stored as ciphertext in a now-mutable
-// global; a generated constructor decrypts it in place before `main` runs.  The
-// decryptor's GF(2^8) multiply mirrors the tested core arithmetic exactly.
+// Each eligible private byte-array global is encrypted at rest.  Constant
+// C-string uses that can be safely rewritten materialize into a fresh stack
+// buffer at the use site; globals with unsupported address-identity or mutation
+// uses fall back to a private per-string constructor decryptor.
 
 #ifndef MOROK_PASSES_STRING_ENCRYPTION_HPP
 #define MOROK_PASSES_STRING_ENCRYPTION_HPP

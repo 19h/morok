@@ -32,7 +32,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 
 ## M — new passes / substantial extensions
 
-- [ ] Per-callsite stack-string materialization: decrypt each string lazily at its use site (never one ctor, never a readable global), unique cipher per string `[xplat · extends strenc]`
+- [x] Per-callsite stack-string materialization: decrypt each string lazily at its use site (never one ctor, never a readable global), unique cipher per string `[xplat · extends strenc]`
 - [ ] Insert anti-debug detectors at many randomized call sites and from multiple threads instead of a single startup check `[xplat · extends antidbg]`
 - [ ] Emit timing oracles: bracket short spans with serialized `RDTSCP` / `CLOCK_MONOTONIC_RAW` / `mach_absolute_time`, compare two independent clocks, judge by distribution; inflated Δ ⇒ single-step/DBI/EPT-step `[xplat · new]`
 - [ ] Embed `int3`/`icebp`/`INT 2Dh` traps and a single-step (TF) trap with your own SEH/VEH/`SIGTRAP`/Mach `EXC_BREAKPOINT` handler — handler not firing ⇒ a debugger swallowed it `[xplat · new]`

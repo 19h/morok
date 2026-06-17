@@ -67,6 +67,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/ModRef.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -426,6 +427,8 @@ Function *makeExternalCallFunction(Module &M, GlobalVariable *Text) {
     auto *PutsTy = FunctionType::get(I32, {Ptr}, false);
     Function *Puts =
         Function::Create(PutsTy, GlobalValue::ExternalLinkage, "puts", M);
+    Puts->addParamAttr(
+        0, Attribute::getWithCaptureInfo(Ctx, CaptureInfo::none()));
 
     auto *FT = FunctionType::get(I32, false);
     auto *F =
@@ -8314,14 +8317,73 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("stringEncryptModule encrypts in place with per-string decryptors") {
+TEST_CASE("stringEncryptModule materializes used strings on the stack") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("stack-strings", ctx);
+    GlobalVariable *Text =
+        makePrivateString(*M, "msg.str", "callsite-secret");
+    Function *Caller = makeExternalCallFunction(*M, Text);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(305);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, {/*probability=*/100}, rng));
+
+    GlobalVariable *Msg = M->getGlobalVariable("msg.str", true);
+    REQUIRE(Msg);
+    CHECK(Msg->isConstant());
+    CHECK_FALSE(hasReadableByteString(*M, "callsite-secret"));
+    CHECK(countFunctions(*M, "morok.strdec") == 0u);
+    CHECK(countNamedAllocas(*Caller, "morok.str.stack.buf") >= 1u);
+    CHECK(countNamedInstructions(*Caller, "morok.str.stack.ptr") >= 1u);
+
+    bool callStillUsesGlobal = false;
+    for (Instruction &I : instructions(*Caller))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            for (Value *Arg : CI->args())
+                if (auto *C = dyn_cast<Constant>(Arg))
+                    callStillUsesGlobal |= constantReferencesGlobal(C, Msg);
+    CHECK_FALSE(callStillUsesGlobal);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("stringEncryptModule uses stack decrypt loops for long callsite strings") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("stack-long-strings", ctx);
+    const std::string LargeText(256, 'z');
+    GlobalVariable *Text = makePrivateString(*M, "long.str", LargeText);
+    Function *Caller = makeExternalCallFunction(*M, Text);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(306);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, {/*probability=*/100}, rng));
+
+    CHECK(countFunctions(*M, "morok.strdec") == 0u);
+    CHECK(countFunctions(*M, "morok.strsite") >= 1u);
+    bool sawStackLoop = false;
+    bool sawStackPhi = false;
+    (void)Caller;
+    for (Function &F : *M)
+        if (F.getName().starts_with("morok.strsite"))
+            for (BasicBlock &BB : F) {
+                sawStackLoop |= BB.getName().starts_with("morok.str.stack.loop");
+                for (Instruction &I : BB)
+                    sawStackPhi |=
+                        I.getName().starts_with("morok.str.stack.i");
+            }
+    CHECK(sawStackLoop);
+    CHECK(sawStackPhi);
+    CHECK_FALSE(hasReadableByteString(*M, LargeText));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("stringEncryptModule falls back to per-string decryptors") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("strings", ctx);
     makePrivateString(*M, "small.str", "small");
     const std::string LargeText(2048, 'x');
     makePrivateString(*M, "large.str", LargeText);
 
-    auto engine = morok::core::Xoshiro256pp::fromSeed(305);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(307);
     morok::ir::IRRandom rng(engine);
     CHECK(morok::passes::stringEncryptModule(*M, {/*probability=*/100}, rng));
 
@@ -8331,8 +8393,9 @@ TEST_CASE("stringEncryptModule encrypts in place with per-string decryptors") {
     REQUIRE(Small);
     REQUIRE(Large);
 
-    // EVERY string is encrypted — readable strings are toxic — the small one
-    // with an unrolled decryptor, the long one with a compact loop decryptor.
+    // EVERY string is encrypted — readable strings are toxic.  With no safe
+    // instruction use to rewrite, the pass keeps the per-string constructor
+    // fallback: the small one unrolled, the long one loop-based.
     CHECK_FALSE(Small->isConstant());
     CHECK_FALSE(Large->isConstant());
     // The small string's stored size is padded past its true length (6).
