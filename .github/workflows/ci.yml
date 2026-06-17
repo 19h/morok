@@ -1,7 +1,8 @@
 name: CI
 
-# Build + test the Morok LLVM-IR obfuscator against upstream LLVM trunk on every
-# platform, and publish per-platform release archives for tags.
+# Build + test the Morok LLVM-IR obfuscator against the official prebuilt LLVM
+# release toolchain on every platform, and publish per-platform release archives
+# for tags.
 on:
   push:
     branches: [master]
@@ -14,34 +15,31 @@ on:
 permissions:
   contents: read
 
-# Cancel superseded runs on PR branches; never cancel pushes to master/tags
-# (a half-finished cached LLVM build is wasteful to abandon).
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Single source of truth for the pinned LLVM trunk commit.
+  # Single source of truth for the pinned LLVM release version.
   prep:
     runs-on: ubuntu-latest
     outputs:
-      llvm_ref: ${{ steps.read.outputs.ref }}
+      llvm_version: ${{ steps.read.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - id: read
         shell: bash
         run: |
           set -euo pipefail
-          source .github/llvm-trunk.env
-          echo "ref=${LLVM_REF}" >> "$GITHUB_OUTPUT"
-          echo "Pinned LLVM trunk: ${LLVM_REF}"
+          source .github/llvm-version.env
+          echo "version=${LLVM_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Pinned LLVM release: ${LLVM_VERSION}"
 
   build:
     needs: prep
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    # Cold LLVM builds are long; cached runs are minutes. Bound generously.
-    timeout-minutes: 360
+    timeout-minutes: 60
     permissions:
       contents: write # attach archives to the release on tags
     strategy:
@@ -55,11 +53,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build prerequisites (Linux)
+      - name: Install Ninja (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ninja-build lld
+          sudo apt-get install -y --no-install-recommends ninja-build
 
       - name: Install CMake + Ninja
         if: runner.os != 'Linux'
@@ -71,72 +69,25 @@ jobs:
         with:
           arch: x64
 
-      - name: Set up sccache
-        uses: mozilla/sccache-action@v0.0.6
-
-      - name: Configure sccache (local disk)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # sccache's GitHub Actions cache *backend* is unreliable: its storage
-          # endpoint intermittently returns service-unavailable, and because
-          # sccache is the compiler launcher that fails every compile (even
-          # CMake's compiler probe). Use a local-disk cache persisted by
-          # actions/cache instead — the same aggressive object caching, but no
-          # flaky network backend in the compile hot path.
-          # Kill any server the install action may have started with the GHA
-          # backend so the next compile starts one bound to local disk.
-          sccache --stop-server >/dev/null 2>&1 || true
-          dir="${RUNNER_TEMP//\\//}/sccache"
-          mkdir -p "$dir"
-          echo "SCCACHE_DIR=$dir" >> "$GITHUB_ENV"
-          # sccache validates this strictly: it must be a real boolean, not empty.
-          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
-          # Bound per-platform sccache so the install caches + 4 platforms of
-          # object cache stay within the repo's 10 GB Actions-cache budget.
-          echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
-
-      - name: Cache sccache objects
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ needs.prep.outputs.llvm_ref }}-${{ github.sha }}
-          restore-keys: |
-            sccache-${{ runner.os }}-${{ runner.arch }}-${{ needs.prep.outputs.llvm_ref }}-
-            sccache-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Setup LLVM trunk
+      - name: Setup LLVM (prebuilt)
         id: llvm
         uses: ./.github/actions/setup-llvm
         with:
-          llvm-ref: ${{ needs.prep.outputs.llvm_ref }}
+          llvm-version: ${{ needs.prep.outputs.llvm_version }}
 
       - name: Configure Morok
         shell: bash
-        env:
-          CMAKE_C_COMPILER_LAUNCHER: sccache
-          CMAKE_CXX_COMPILER_LAUNCHER: sccache
         run: |
           set -euo pipefail
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DCMAKE_C_COMPILER="${{ steps.llvm.outputs.clang }}" \
             -DCMAKE_CXX_COMPILER="${{ steps.llvm.outputs.clangxx }}" \
-            -DLLVM_DIR="${{ steps.llvm.outputs.llvm-dir }}" \
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+            -DLLVM_DIR="${{ steps.llvm.outputs.llvm-dir }}"
 
       - name: Build Morok
         shell: bash
-        env:
-          CMAKE_C_COMPILER_LAUNCHER: sccache
-          CMAKE_CXX_COMPILER_LAUNCHER: sccache
         run: cmake --build build --parallel
-
-      - name: sccache stats
-        if: always()
-        shell: bash
-        run: sccache --show-stats || true
 
       - name: Run tests
         shell: bash

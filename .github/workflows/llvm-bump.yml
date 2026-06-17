@@ -1,16 +1,15 @@
-name: Bump LLVM trunk pin
+name: Bump LLVM release pin
 
-# Track upstream LLVM trunk on a cadence instead of on every push: resolve the
-# latest llvm/llvm-project main commit and, if it moved, open a PR updating
-# .github/llvm-trunk.env. Pinning keeps the expensive LLVM build caches warm
-# between bumps; this job is what advances the pin so CI keeps building trunk.
+# Follow new official LLVM releases: resolve the latest stable llvmorg-* release
+# that ships the prebuilt toolchains we use and, if it moved, open a PR updating
+# .github/llvm-version.env.
 on:
   schedule:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
   workflow_dispatch:
     inputs:
-      ref:
-        description: "Explicit llvm-project commit SHA (default: latest main)."
+      version:
+        description: "Explicit LLVM version (e.g. 22.1.8); default: latest stable."
         required: false
 
 permissions:
@@ -23,53 +22,55 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve target LLVM commit
+      - name: Resolve target LLVM release
         id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ -n "${{ github.event.inputs.ref }}" ]; then
-            new="${{ github.event.inputs.ref }}"
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            new="${{ github.event.inputs.version }}"
           else
-            new="$(git ls-remote https://github.com/llvm/llvm-project.git refs/heads/main | cut -f1)"
+            tag="$(gh api repos/llvm/llvm-project/releases/latest --jq '.tag_name')"
+            new="${tag#llvmorg-}"
           fi
-          if [ -z "$new" ]; then
-            echo "::error::could not resolve LLVM main HEAD"; exit 1
+          if [ -z "$new" ]; then echo "::error::could not resolve latest LLVM release"; exit 1; fi
+          # Sanity: the release must actually carry the prebuilt toolchains we need.
+          have="$(gh api "repos/llvm/llvm-project/releases/tags/llvmorg-${new}" \
+            --jq '[.assets[].name] | map(select(test("^LLVM-.*-Linux-X64|windows-msvc"))) | length')"
+          if [ "${have:-0}" -lt 2 ]; then
+            echo "::error::release llvmorg-${new} is missing expected prebuilt toolchains"; exit 1
           fi
-          source .github/llvm-trunk.env
-          echo "old=${LLVM_REF}" >> "$GITHUB_OUTPUT"
+          source .github/llvm-version.env
+          echo "old=${LLVM_VERSION}" >> "$GITHUB_OUTPUT"
           echo "new=${new}" >> "$GITHUB_OUTPUT"
-          if [ "${LLVM_REF}" = "${new}" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-          echo "Current: ${LLVM_REF}"
-          echo "Latest : ${new}"
+          [ "${LLVM_VERSION}" = "${new}" ] && echo "changed=false" >> "$GITHUB_OUTPUT" || echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Current: ${LLVM_VERSION} / Latest: ${new}"
 
       - name: Update pin
         if: steps.resolve.outputs.changed == 'true'
         shell: bash
-        run: |
-          set -euo pipefail
-          sed -i "s/^LLVM_REF=.*/LLVM_REF=${{ steps.resolve.outputs.new }}/" .github/llvm-trunk.env
+        run: sed -i "s/^LLVM_VERSION=.*/LLVM_VERSION=${{ steps.resolve.outputs.new }}/" .github/llvm-version.env
 
       - name: Open pull request
         if: steps.resolve.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
-          branch: chore/bump-llvm-trunk
+          branch: chore/bump-llvm-release
           delete-branch: true
-          title: "ci: bump LLVM trunk pin to ${{ steps.resolve.outputs.new }}"
-          commit-message: "ci: bump LLVM trunk pin to ${{ steps.resolve.outputs.new }}"
+          title: "ci: bump LLVM toolchain to ${{ steps.resolve.outputs.new }}"
+          commit-message: "ci: bump LLVM toolchain to ${{ steps.resolve.outputs.new }}"
           body: |
-            Advances the pinned upstream LLVM trunk commit that Morok builds against.
+            Advances the pinned official LLVM release whose prebuilt toolchain CI
+            downloads.
 
             - From: `${{ steps.resolve.outputs.old }}`
             - To:   `${{ steps.resolve.outputs.new }}`
 
-            CI will build LLVM trunk at the new commit on first run (cold cache),
-            then cache it keyed by SHA. Merge once the matrix is green.
+            Merge once the matrix is green. If a new major (e.g. 23.x) breaks the
+            build, it usually means Morok adopted a newer-LLVM API; pin to the
+            previous release until the source is updated.
           labels: |
             dependencies
             llvm
