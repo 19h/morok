@@ -397,6 +397,8 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         changed |= passes::windowsSyscallsModule(M, rng);
     if (config_.passes.windows_unhook.enabled.value_or(false))
         changed |= passes::windowsUnhookModule(M, rng);
+    if (config_.passes.windows_veh_audit.enabled.value_or(false))
+        changed |= passes::windowsVehAuditModule(M, rng);
     if (config_.passes.anti_dbg.enabled.value_or(false))
         changed |= passes::antiDebuggingModule(
             M, rng, !config_.passes.trap_oracles.enabled.value_or(false));

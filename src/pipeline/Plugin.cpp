@@ -264,6 +264,10 @@ PassPluginLibraryInfo getPluginInfo() {
                             MPM.addPass(passes::WindowsUnhookPass());
                             return true;
                         }
+                        if (name == "morok-winveh") {
+                            MPM.addPass(passes::WindowsVehAuditPass());
+                            return true;
+                        }
                         if (name == "morok-timing") {
                             MPM.addPass(passes::TimingOraclePass());
                             return true;

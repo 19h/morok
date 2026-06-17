@@ -215,6 +215,7 @@ TEST_CASE("merge handles every pass family") {
     src.windows_kernel_debugger.enabled = true;
     src.windows_syscalls.enabled = true;
     src.windows_unhook.enabled = true;
+    src.windows_veh_audit.enabled = true;
     src.timing_oracles.enabled = true;
     src.trap_oracles.enabled = true;
     src.page_fault_oracles.enabled = true;
@@ -372,6 +373,7 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.windows_kernel_debugger.enabled == true);
     CHECK(dst.windows_syscalls.enabled == true);
     CHECK(dst.windows_unhook.enabled == true);
+    CHECK(dst.windows_veh_audit.enabled == true);
     CHECK(dst.timing_oracles.enabled == true);
     CHECK(dst.trap_oracles.enabled == true);
     CHECK(dst.page_fault_oracles.enabled == true);

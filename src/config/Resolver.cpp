@@ -307,6 +307,7 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.windows_kernel_debugger.enabled);
     mergeOpt(dst.windows_syscalls.enabled, src.windows_syscalls.enabled);
     mergeOpt(dst.windows_unhook.enabled, src.windows_unhook.enabled);
+    mergeOpt(dst.windows_veh_audit.enabled, src.windows_veh_audit.enabled);
     mergeOpt(dst.timing_oracles.enabled, src.timing_oracles.enabled);
     mergeOpt(dst.trap_oracles.enabled, src.trap_oracles.enabled);
     mergeOpt(dst.page_fault_oracles.enabled, src.page_fault_oracles.enabled);

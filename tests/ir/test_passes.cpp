@@ -10946,6 +10946,65 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("windowsVehAuditModule emits encoded VEH list audit probes") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-pc-windows-msvc"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(7149);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::windowsVehAuditModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.win.veh.audit");
+    Function *Probe = M->getFunction("morok.win.veh.probe");
+    Function *Scan = M->getFunction("morok.win.veh.scan.list");
+    Function *Audit = M->getFunction("morok.win.veh.audit.list");
+    Function *Readable = M->getFunction("morok.win.veh.readable");
+    Function *Contains = M->getFunction("morok.win.ldr.contains");
+    Function *ImageSize = M->getFunction("morok.win.pe.image.size");
+    Function *Peb = M->getFunction("morok.win.peb");
+    Function *Resolve = M->getFunction("morok.win.pe.resolve");
+    Function *Ldr = M->getFunction("morok.win.ldr.module");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Probe != nullptr);
+    REQUIRE(Scan != nullptr);
+    REQUIRE(Audit != nullptr);
+    REQUIRE(Readable != nullptr);
+    REQUIRE(Contains != nullptr);
+    REQUIRE(ImageSize != nullptr);
+    REQUIRE(Peb != nullptr);
+    REQUIRE(Resolve != nullptr);
+    REQUIRE(Ldr != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
+    CHECK(M->getFunction("RtlAddVectoredExceptionHandler") == nullptr);
+    CHECK(M->getFunction("RtlRemoveVectoredExceptionHandler") == nullptr);
+    CHECK(M->getFunction("RtlDecodePointer") == nullptr);
+    CHECK(M->getFunction("NtQueryVirtualMemory") == nullptr);
+    CHECK(hasInlineAsmCall(*Peb));
+    CHECK(countNamedInstructions(*Probe, "morok.win.veh.rtladd") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.veh.rtlremove") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.veh.rtldecode") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.veh.ntqueryvm") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.veh.list.from.add") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.veh.audit.primary") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.veh.audit.shifted") >= 1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.veh.scan.riprel") >= 1u);
+    CHECK(countNamedInstructions(*Scan, "morok.win.veh.scan.candidate.ok") >=
+          1u);
+    CHECK(countNamedInstructions(*Readable, "morok.win.veh.ntqueryvm.status") >=
+          1u);
+    CHECK(countNamedInstructions(*Audit, "morok.win.veh.head.readable") >= 1u);
+    CHECK(countNamedInstructions(*Audit, "morok.win.veh.decoded.20") >= 1u);
+    CHECK(countNamedInstructions(*Audit, "morok.win.veh.handler.foreign") >=
+          1u);
+    CHECK(countNamedInstructions(*Audit, "morok.win.veh.remove.status") >= 1u);
+    CHECK(countNamedInstructions(*Contains, "morok.win.ldr.contains.match") >=
+          1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("timingOracleModule emits x86 rdtscp and raw clock probes") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
