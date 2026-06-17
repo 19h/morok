@@ -1017,7 +1017,17 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   configurations without TrapOracle, the filter can allow Morok's own
   `PTRACE_TRACEME` re-arm.  When TrapOracle is enabled, Linux self-tracing is
   omitted so `SIGTRAP` stimuli are delivered to Morok's handler instead of
-  job-stopping under the parent shell.
+  job-stopping under the parent shell.  On Linux x86_64, Morok can instead fork
+  a bounded DR sentinel helper before the seccomp filter is installed, authorize
+  that child with `PR_SET_PTRACER`, enumerate `/proc/<pid>/task`, and use
+  direct `PTRACE_SEIZE`/`PTRACE_INTERRUPT`/`PTRACE_POKEUSER` syscalls to zero
+  the verified `u_debugreg[0..7]` slots for every thread.  When that helper is
+  present it replaces the self-trace re-arm path, because a process cannot be
+  simultaneously self-traced and scrubbed by a helper tracer.  On macOS
+  x86_64/arm64, a pthread watchdog enumerates Mach threads with `task_threads`,
+  reads the architecture debug state, clears the x86 DR slots or ARM
+  breakpoint/watchpoint/MDSCR state, writes it back with `thread_set_state`, and
+  releases the returned thread array with `vm_deallocate`.
   On x86_64 Linux, sensitive anti-debug syscalls (`ptrace`, `prctl`,
   `openat`/`read`/`close` for `/proc` probes, Landlock, and seccomp install)
   are emitted as inline `syscall` instructions instead of libc imports.

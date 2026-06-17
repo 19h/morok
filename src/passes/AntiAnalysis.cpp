@@ -946,9 +946,340 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
     return fn;
 }
 
-void emitLinuxHardening(IRBuilder<> &B, Module &M, const Triple &TT) {
+bool linuxDrSentinelSyscalls(const Triple &TT, std::uint32_t &Fork,
+                             std::uint32_t &Getppid, std::uint32_t &Getdents64,
+                             std::uint32_t &Wait4, std::uint32_t &Nanosleep,
+                             std::uint32_t &Exit) {
+    if (TT.getArch() != Triple::x86_64)
+        return false;
+    Fork = 57;
+    Getppid = 110;
+    Getdents64 = 217;
+    Wait4 = 61;
+    Nanosleep = 35;
+    Exit = 60;
+    return true;
+}
+
+Value *emitLinuxPtraceRaw(IRBuilder<> &B, Module &M, const Triple &TT,
+                          std::uint64_t Request, Value *Pid, Value *Addr,
+                          Value *Data, const Twine &Name) {
+    std::uint32_t ptraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    auto *ip = intPtrTy(M);
+    if (!linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr))
+        return ConstantInt::getSigned(ip, -1);
+    Value *rc = emitLinuxSyscall(
+        B, M, TT, ptraceNr, {ConstantInt::get(ip, Request), Pid, Addr, Data});
+    rc->setName(Name);
+    return rc;
+}
+
+Function *linuxDrScrubThread(Module &M, const Triple &TT) {
+    if (Function *existing = M.getFunction("morok.antidbg.linux.dr.scrub"))
+        return existing;
+    std::uint32_t forkNr = 0;
+    std::uint32_t getppidNr = 0;
+    std::uint32_t getdentsNr = 0;
+    std::uint32_t wait4Nr = 0;
+    std::uint32_t nanosleepNr = 0;
+    std::uint32_t exitNr = 0;
+    if (!linuxDrSentinelSyscalls(TT, forkNr, getppidNr, getdentsNr, wait4Nr,
+                                 nanosleepNr, exitNr))
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, {ip}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antidbg.linux.dr.scrub", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *tid = fn->getArg(0);
+    tid->setName("tid");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *seizeBB = BasicBlock::Create(ctx, "seize", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+    IRBuilder<> B(entry);
+    B.CreateCondBr(B.CreateICmpSGT(tid, ConstantInt::get(ip, 1)), seizeBB,
+                   retBB);
+
+    IRBuilder<> SB(seizeBB);
+    Value *seize =
+        emitLinuxPtraceRaw(SB, M, TT, 0x4206, tid, ConstantInt::get(ip, 0),
+                           ConstantInt::get(ip, 0), "morok.antidbg.dr.seize");
+    Value *interrupt = emitLinuxPtraceRaw(SB, M, TT, 0x4207, tid,
+                                          ConstantInt::get(ip, 0),
+                                          ConstantInt::get(ip, 0),
+                                          "morok.antidbg.dr.interrupt");
+    auto *pokeBB = BasicBlock::Create(ctx, "poke", fn);
+    SB.CreateCondBr(SB.CreateICmpEQ(interrupt, ConstantInt::get(ip, 0)), pokeBB,
+                    retBB);
+
+    IRBuilder<> PB(pokeBB);
+    auto *status = PB.CreateAlloca(i32, nullptr, "morok.antidbg.dr.status");
+    Value *waitRc = emitLinuxSyscall(
+        PB, M, TT, wait4Nr,
+        {tid, status, ConstantInt::get(ip, 0), ConstantPointerNull::get(ptr)});
+    waitRc->setName("morok.antidbg.dr.wait");
+    Value *acc = PB.CreateXor(PB.CreateZExtOrTrunc(waitRc, i64),
+                              PB.CreateZExtOrTrunc(seize, i64),
+                              "morok.antidbg.dr.acc");
+    acc = PB.CreateXor(acc, PB.CreateZExtOrTrunc(interrupt, i64),
+                       "morok.antidbg.dr.acc.interrupt");
+    constexpr std::uint64_t kDebugReg0Offset = 848;
+    for (std::uint64_t i = 0; i < 8; ++i) {
+        Value *rc = emitLinuxPtraceRaw(
+            PB, M, TT, 6, tid, ConstantInt::get(ip, kDebugReg0Offset + i * 8),
+            ConstantInt::get(ip, 0), "morok.antidbg.dr.poke");
+        acc = PB.CreateXor(acc, PB.CreateZExtOrTrunc(rc, i64),
+                           "morok.antidbg.dr.acc.poke");
+    }
+    Value *cont =
+        emitLinuxPtraceRaw(PB, M, TT, 7, tid, ConstantInt::get(ip, 0),
+                           ConstantInt::get(ip, 0), "morok.antidbg.dr.cont");
+    acc = PB.CreateXor(acc, PB.CreateZExtOrTrunc(cont, i64),
+                       "morok.antidbg.dr.acc.cont");
+    PB.CreateRet(acc);
+
+    IRBuilder<> RB(retBB);
+    RB.CreateRet(ConstantInt::get(i64, 0));
+    return fn;
+}
+
+Function *linuxDrSentinelProcess(Module &M, ir::IRRandom &rng,
+                                 const Triple &TT) {
+    if (Function *existing = M.getFunction("morok.antidbg.linux.dr.sentinel"))
+        return existing;
+    std::uint32_t forkNr = 0;
+    std::uint32_t getppidNr = 0;
+    std::uint32_t getdentsNr = 0;
+    std::uint32_t wait4Nr = 0;
+    std::uint32_t nanosleepNr = 0;
+    std::uint32_t exitNr = 0;
+    if (!linuxDrSentinelSyscalls(TT, forkNr, getppidNr, getdentsNr, wait4Nr,
+                                 nanosleepNr, exitNr))
+        return nullptr;
+    Function *scrub = linuxDrScrubThread(M, TT);
+    if (!scrub)
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antidbg.linux.dr.sentinel", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
+    auto *openOkBB = BasicBlock::Create(ctx, "open.ok", fn);
+    auto *readBB = BasicBlock::Create(ctx, "read", fn);
+    auto *scanLoopBB = BasicBlock::Create(ctx, "scan.loop", fn);
+    auto *scanBodyBB = BasicBlock::Create(ctx, "scan.body", fn);
+    auto *scanNextBB = BasicBlock::Create(ctx, "scan.next", fn);
+    auto *closeBB = BasicBlock::Create(ctx, "close", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    auto *pathTy = ArrayType::get(i8, 96);
+    auto *dirTy = ArrayType::get(i8, 4096);
+    auto *tsTy = StructType::get(ctx, {i64, i64});
+    AllocaInst *path = B.CreateAlloca(pathTy, nullptr, "morok.antidbg.dr.path");
+    AllocaInst *dirBuf =
+        B.CreateAlloca(dirTy, nullptr, "morok.antidbg.dr.dirents");
+    AllocaInst *ts = B.CreateAlloca(tsTy, nullptr, "morok.antidbg.dr.sleep");
+    B.CreateStore(ConstantInt::get(i64, 0), B.CreateStructGEP(tsTy, ts, 0));
+    B.CreateStore(ConstantInt::get(i64, 200000000),
+                  B.CreateStructGEP(tsTy, ts, 1));
+    Value *ppid = emitLinuxSyscall(B, M, TT, getppidNr, {});
+    ppid->setName("morok.antidbg.dr.ppid");
+    Value *pathPtr = B.CreateInBoundsGEP(
+        pathTy, path, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)});
+    Value *fmt = ir::emitCloakedSymbol(B, M, "/proc/%ld/task", rng);
+    FunctionCallee snprintfFn = M.getOrInsertFunction(
+        "snprintf", FunctionType::get(i32, {ptr, ip, ptr}, true));
+    B.CreateCall(snprintfFn, {pathPtr, ConstantInt::get(ip, 96), fmt, ppid},
+                 "morok.antidbg.dr.path.n");
+    B.CreateBr(loopBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *iter = LB.CreatePHI(i32, 2, "morok.antidbg.dr.iter");
+    iter->addIncoming(ConstantInt::get(i32, 0), entry);
+    LB.CreateCondBr(LB.CreateICmpULT(iter, ConstantInt::get(i32, 8)), bodyBB,
+                    retBB);
+
+    IRBuilder<> BB(bodyBB);
+    std::uint32_t ptraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr);
+    Value *fdLong = emitLinuxSyscall(BB, M, TT, openatNr,
+                                     {ConstantInt::getSigned(ip, -100), pathPtr,
+                                      ConstantInt::get(ip, 0x10000),
+                                      ConstantInt::get(ip, 0)});
+    fdLong->setName("morok.antidbg.dr.fd");
+    BB.CreateCondBr(BB.CreateICmpSGE(fdLong, ConstantInt::get(ip, 0)), openOkBB,
+                    nextBB);
+
+    IRBuilder<> OKB(openOkBB);
+    OKB.CreateBr(readBB);
+
+    IRBuilder<> RB(readBB);
+    Value *bufPtr = RB.CreateInBoundsGEP(
+        dirTy, dirBuf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)});
+    Value *nread = emitLinuxSyscall(
+        RB, M, TT, getdentsNr, {fdLong, bufPtr, ConstantInt::get(ip, 4096)});
+    nread->setName("morok.antidbg.dr.getdents");
+    RB.CreateCondBr(RB.CreateICmpSGT(nread, ConstantInt::get(ip, 0)),
+                    scanLoopBB, closeBB);
+
+    IRBuilder<> SLB(scanLoopBB);
+    auto *off = SLB.CreatePHI(ip, 2, "morok.antidbg.dr.dir.off");
+    off->addIncoming(ConstantInt::get(ip, 0), readBB);
+    SLB.CreateCondBr(SLB.CreateICmpULT(off, nread), scanBodyBB, readBB);
+
+    IRBuilder<> SB(scanBodyBB);
+    Value *reclenOff = SB.CreateAdd(off, ConstantInt::get(ip, 16),
+                                    "morok.antidbg.dr.reclen.off");
+    Value *reclen =
+        loadAt(SB, M, i16, dirBuf, reclenOff, "morok.antidbg.dr.reclen");
+    Value *nameBase = SB.CreateAdd(off, ConstantInt::get(ip, 19),
+                                   "morok.antidbg.dr.name.off");
+    Value *tid = ConstantInt::get(ip, 0);
+    Value *active = ConstantInt::getTrue(ctx);
+    Value *any = ConstantInt::getFalse(ctx);
+    for (std::uint64_t i = 0; i < 12; ++i) {
+        Value *ch = loadAt(SB, M, i8, dirBuf,
+                           SB.CreateAdd(nameBase, ConstantInt::get(ip, i)),
+                           "morok.antidbg.dr.name.ch");
+        Value *ge0 = SB.CreateICmpUGE(ch, ConstantInt::get(i8, '0'));
+        Value *le9 = SB.CreateICmpULE(ch, ConstantInt::get(i8, '9'));
+        Value *digit = SB.CreateAnd(active, SB.CreateAnd(ge0, le9),
+                                    "morok.antidbg.dr.name.digit");
+        Value *dval = SB.CreateZExt(SB.CreateSub(ch, ConstantInt::get(i8, '0')),
+                                    ip, "morok.antidbg.dr.name.dval");
+        Value *nextTid =
+            SB.CreateAdd(SB.CreateMul(tid, ConstantInt::get(ip, 10)), dval,
+                         "morok.antidbg.dr.name.tid.next");
+        tid = SB.CreateSelect(digit, nextTid, tid, "morok.antidbg.dr.name.tid");
+        any = SB.CreateOr(any, digit, "morok.antidbg.dr.name.any");
+        active = digit;
+    }
+    Value *validTid = SB.CreateAnd(any, SB.CreateICmpUGE(tid, ppid),
+                                   "morok.antidbg.dr.tid.valid");
+    Value *scrubTid = SB.CreateSelect(validTid, tid, ConstantInt::get(ip, 0),
+                                      "morok.antidbg.dr.tid");
+    SB.CreateCall(scrub->getFunctionType(), scrub, {scrubTid});
+    SB.CreateBr(scanNextBB);
+
+    IRBuilder<> SNB(scanNextBB);
+    Value *safeReclen = SNB.CreateSelect(
+        SNB.CreateICmpUGT(reclen, ConstantInt::get(i16, 0)),
+        SNB.CreateZExt(reclen, ip), nread, "morok.antidbg.dr.reclen.safe");
+    Value *nextOff =
+        SNB.CreateAdd(off, safeReclen, "morok.antidbg.dr.dir.next");
+    SNB.CreateBr(scanLoopBB);
+    off->addIncoming(nextOff, scanNextBB);
+
+    IRBuilder<> CB(closeBB);
+    emitLinuxSyscall(CB, M, TT, closeNr, {fdLong});
+    CB.CreateBr(nextBB);
+
+    IRBuilder<> NB(nextBB);
+    emitLinuxSyscall(NB, M, TT, nanosleepNr,
+                     {ts, ConstantPointerNull::get(ptr)});
+    Value *next =
+        NB.CreateAdd(iter, ConstantInt::get(i32, 1), "morok.antidbg.dr.next");
+    NB.CreateBr(loopBB);
+    iter->addIncoming(next, nextBB);
+
+    IRBuilder<> RetB(retBB);
+    RetB.CreateRetVoid();
+    return fn;
+}
+
+bool emitLinuxDrSentinelStart(IRBuilder<> &B, Module &M, GlobalVariable *State,
+                              ir::IRRandom &rng, const Triple &TT) {
+    std::uint32_t forkNr = 0;
+    std::uint32_t getppidNr = 0;
+    std::uint32_t getdentsNr = 0;
+    std::uint32_t wait4Nr = 0;
+    std::uint32_t nanosleepNr = 0;
+    std::uint32_t exitNr = 0;
+    if (!linuxDrSentinelSyscalls(TT, forkNr, getppidNr, getdentsNr, wait4Nr,
+                                 nanosleepNr, exitNr))
+        return false;
+    Function *helper = linuxDrSentinelProcess(M, rng, TT);
+    if (!helper)
+        return false;
+
+    LLVMContext &ctx = M.getContext();
+    auto *ip = intPtrTy(M);
+    Function *ctor = B.GetInsertBlock()->getParent();
+    Value *pid = emitLinuxSyscall(B, M, TT, forkNr, {});
+    pid->setName("morok.antidbg.dr.fork");
+    foldState(B, State, pid, 0xD8A18F4C2E7B6A95ULL, "morok.antidbg.dr.fork");
+
+    auto *childBB = BasicBlock::Create(ctx, "morok.antidbg.dr.child", ctor);
+    auto *parentBB = BasicBlock::Create(ctx, "morok.antidbg.dr.parent", ctor);
+    auto *setPtracerBB =
+        BasicBlock::Create(ctx, "morok.antidbg.dr.ptracer", ctor);
+    auto *contBB = BasicBlock::Create(ctx, "morok.antidbg.dr.cont", ctor);
+    B.CreateCondBr(B.CreateICmpEQ(pid, ConstantInt::get(ip, 0)), childBB,
+                   parentBB);
+
+    IRBuilder<> ChildB(childBB);
+    ChildB.CreateCall(helper->getFunctionType(), helper, {});
+    emitLinuxSyscall(ChildB, M, TT, exitNr, {ConstantInt::get(ip, 0)});
+    ChildB.CreateUnreachable();
+
+    IRBuilder<> ParentB(parentBB);
+    ParentB.CreateCondBr(ParentB.CreateICmpSGT(pid, ConstantInt::get(ip, 0)),
+                         setPtracerBB, contBB);
+
+    IRBuilder<> PB(setPtracerBB);
+    std::uint32_t ptraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr);
+    Value *prctlRc = emitLinuxSyscall(
+        PB, M, TT, prctlNr,
+        {ConstantInt::get(ip, 0x59616D61), pid, ConstantInt::get(ip, 0),
+         ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)});
+    prctlRc->setName("morok.antidbg.dr.ptracer.rc");
+    foldState(PB, State, prctlRc, 0x419C75EF62D3A80BULL,
+              "morok.antidbg.dr.ptracer");
+    PB.CreateBr(contBB);
+
+    B.SetInsertPoint(contBB);
+    return true;
+}
+
+void emitLinuxHardening(IRBuilder<> &B, Module &M, const Triple &TT,
+                        bool PreservePtracer = false) {
     emitLinuxPrctl(B, M, TT, 4, 0, 0, 0, 0);          // PR_SET_DUMPABLE
-    emitLinuxPrctl(B, M, TT, 0x59616D61, 0, 0, 0, 0); // PR_SET_PTRACER
+    if (!PreservePtracer)
+        emitLinuxPrctl(B, M, TT, 0x59616D61, 0, 0, 0, 0); // PR_SET_PTRACER
     emitLinuxPrctl(B, M, TT, 38, 1, 0, 0, 0);         // PR_SET_NO_NEW_PRIVS
 }
 
@@ -1255,8 +1586,9 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
     auto *i32 = Type::getInt32Ty(ctx);
     IRBuilder<> B(&Ctor->getEntryBlock());
 
-    emitLinuxHardening(B, M, TT);
-    if (AllowSelfTrace) {
+    bool drSentinel = emitLinuxDrSentinelStart(B, M, State, rng, TT);
+    emitLinuxHardening(B, M, TT, drSentinel);
+    if (AllowSelfTrace && !drSentinel) {
         Value *traceRc = emitLinuxPtrace(B, M, TT, 0);
         foldFlag(B, State,
                  B.CreateICmpSLT(traceRc, ConstantInt::getSigned(i32, 0)),
@@ -1271,10 +1603,10 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
              0xA4756E49F2D31219ULL, "morok.antidbg.status");
     foldState(B, State, stat4, 0xDA942042E4DD58B5ULL, "morok.antidbg.stat4");
     emitLinuxLandlockSandbox(B, M, State, TT);
-    emitLinuxSeccompFilter(B, M, TT, AllowSelfTrace);
+    emitLinuxSeccompFilter(B, M, TT, AllowSelfTrace && !drSentinel);
 
-    Function *watch =
-        linuxWatchThread(M, statusFn, statFn, State, TT, AllowSelfTrace);
+    Function *watch = linuxWatchThread(M, statusFn, statFn, State, TT,
+                                       AllowSelfTrace && !drSentinel);
     emitLinuxWatcherStart(B, M, watch);
     B.CreateRetVoid();
 }
@@ -1377,6 +1709,192 @@ void emitDarwinDyldCensus(IRBuilder<> &B, Module &M, GlobalVariable *State,
     }
 }
 
+bool darwinDebugStateShape(const Triple &TT, std::uint32_t &Flavor,
+                           std::uint32_t &Count32, std::uint32_t &Words64) {
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        Flavor = 11;  // x86_DEBUG_STATE64
+        Count32 = 16; // sizeof(x86_debug_state64_t) / sizeof(int)
+        Words64 = 8;
+        return true;
+    case Triple::aarch64:
+        Flavor = 15;   // ARM_DEBUG_STATE64
+        Count32 = 130; // sizeof(arm_debug_state64_t) / sizeof(uint32_t)
+        Words64 = 65;
+        return true;
+    default:
+        return false;
+    }
+}
+
+Function *darwinDrScrubThread(Module &M, const Triple &TT) {
+    if (Function *existing = M.getFunction("morok.antidbg.darwin.dr.scrub"))
+        return existing;
+    std::uint32_t flavor = 0;
+    std::uint32_t count32 = 0;
+    std::uint32_t words64 = 0;
+    if (!darwinDebugStateShape(TT, flavor, count32, words64))
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *stateTy = ArrayType::get(i64, words64);
+    auto *fn = Function::Create(FunctionType::get(i32, {i32}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antidbg.darwin.dr.scrub", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *thread = fn->getArg(0);
+    thread->setName("thread");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *clearBB = BasicBlock::Create(ctx, "clear", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+    IRBuilder<> B(entry);
+    AllocaInst *state =
+        B.CreateAlloca(stateTy, nullptr, "morok.antidbg.dr.state");
+    AllocaInst *count = B.CreateAlloca(i32, nullptr, "morok.antidbg.dr.count");
+    B.CreateStore(ConstantInt::get(i32, count32), count);
+    Value *statePtr = B.CreateInBoundsGEP(
+        stateTy, state, {ConstantInt::get(i32, 0), ConstantInt::get(i32, 0)},
+        "morok.antidbg.dr.state.ptr");
+    FunctionCallee getState = M.getOrInsertFunction(
+        "thread_get_state",
+        FunctionType::get(i32, {i32, i32, ptr, ptr}, false));
+    FunctionCallee setState = M.getOrInsertFunction(
+        "thread_set_state",
+        FunctionType::get(i32, {i32, i32, ptr, i32}, false));
+    Value *getRc = B.CreateCall(
+        getState, {thread, ConstantInt::get(i32, flavor), statePtr, count},
+        "morok.antidbg.dr.thread.get");
+    B.CreateCondBr(B.CreateICmpEQ(getRc, ConstantInt::get(i32, 0)), clearBB,
+                   retBB);
+
+    IRBuilder<> CB(clearBB);
+    for (std::uint32_t i = 0; i < words64; ++i) {
+        Value *slot = CB.CreateInBoundsGEP(
+            stateTy, state,
+            {ConstantInt::get(i32, 0), ConstantInt::get(i32, i)},
+            "morok.antidbg.dr.slot");
+        auto *store = CB.CreateStore(ConstantInt::get(i64, 0), slot);
+        store->setVolatile(true);
+    }
+    Value *setRc = CB.CreateCall(setState,
+                                 {thread, ConstantInt::get(i32, flavor),
+                                  statePtr, ConstantInt::get(i32, count32)},
+                                 "morok.antidbg.dr.thread.set");
+    CB.CreateBr(retBB);
+
+    IRBuilder<> RB(retBB);
+    auto *rc = RB.CreatePHI(i32, 2, "morok.antidbg.dr.rc");
+    rc->addIncoming(getRc, entry);
+    rc->addIncoming(setRc, clearBB);
+    RB.CreateRet(rc);
+    return fn;
+}
+
+Function *darwinDrWatchThread(Module &M, const Triple &TT) {
+    if (Function *existing = M.getFunction("morok.antidbg.darwin.dr.watch"))
+        return existing;
+    Function *scrub = darwinDrScrubThread(M, TT);
+    if (!scrub)
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(ptr, {ptr}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antidbg.darwin.dr.watch", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
+    auto *scanBB = BasicBlock::Create(ctx, "scan", fn);
+    auto *threadBB = BasicBlock::Create(ctx, "thread", fn);
+    auto *threadNextBB = BasicBlock::Create(ctx, "thread.next", fn);
+    auto *deallocBB = BasicBlock::Create(ctx, "dealloc", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *threads =
+        B.CreateAlloca(ptr, nullptr, "morok.antidbg.dr.threads");
+    AllocaInst *count =
+        B.CreateAlloca(i32, nullptr, "morok.antidbg.dr.thread.count");
+    B.CreateStore(ConstantPointerNull::get(ptr), threads);
+    B.CreateStore(ConstantInt::get(i32, 0), count);
+    B.CreateBr(loopBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *iter = LB.CreatePHI(i32, 2, "morok.antidbg.dr.iter");
+    iter->addIncoming(ConstantInt::get(i32, 0), entry);
+    LB.CreateCondBr(LB.CreateICmpULT(iter, ConstantInt::get(i32, 8)), bodyBB,
+                    retBB);
+
+    IRBuilder<> BB(bodyBB);
+    FunctionCallee sleepFn =
+        M.getOrInsertFunction("sleep", FunctionType::get(i32, {i32}, false));
+    BB.CreateCall(sleepFn, {ConstantInt::get(i32, 1)});
+    GlobalVariable *selfGV =
+        cast<GlobalVariable>(M.getOrInsertGlobal("mach_task_self_", i32));
+    Value *task = BB.CreateLoad(i32, selfGV, "morok.antidbg.dr.task");
+    FunctionCallee taskThreads = M.getOrInsertFunction(
+        "task_threads", FunctionType::get(i32, {i32, ptr, ptr}, false));
+    Value *taskRc = BB.CreateCall(taskThreads, {task, threads, count},
+                                  "morok.antidbg.dr.task.threads");
+    BB.CreateCondBr(BB.CreateICmpEQ(taskRc, ConstantInt::get(i32, 0)), scanBB,
+                    nextBB);
+
+    IRBuilder<> SB(scanBB);
+    Value *nthreads = SB.CreateLoad(i32, count, "morok.antidbg.dr.thread.n");
+    Value *threadArray =
+        SB.CreateLoad(ptr, threads, "morok.antidbg.dr.thread.array");
+    SB.CreateCondBr(SB.CreateICmpNE(threadArray, ConstantPointerNull::get(ptr)),
+                    threadBB, nextBB);
+
+    IRBuilder<> TB(threadBB);
+    auto *idx = TB.CreatePHI(i32, 2, "morok.antidbg.dr.thread.idx");
+    idx->addIncoming(ConstantInt::get(i32, 0), scanBB);
+    TB.CreateCondBr(TB.CreateICmpULT(idx, nthreads), threadNextBB, deallocBB);
+
+    IRBuilder<> TNB(threadNextBB);
+    Value *threadSlot =
+        TNB.CreateGEP(i32, threadArray, {idx}, "morok.antidbg.dr.thread.ptr");
+    Value *thread = TNB.CreateLoad(i32, threadSlot, "morok.antidbg.dr.thread");
+    TNB.CreateCall(scrub->getFunctionType(), scrub, {thread});
+    Value *nextThread = TNB.CreateAdd(idx, ConstantInt::get(i32, 1),
+                                      "morok.antidbg.dr.thread.next");
+    TNB.CreateBr(threadBB);
+    idx->addIncoming(nextThread, threadNextBB);
+
+    IRBuilder<> DB(deallocBB);
+    FunctionCallee vmDeallocate = M.getOrInsertFunction(
+        "vm_deallocate", FunctionType::get(i32, {i32, ip, ip}, false));
+    Value *bytes =
+        DB.CreateMul(DB.CreateZExt(nthreads, ip), ConstantInt::get(ip, 4),
+                     "morok.antidbg.dr.thread.bytes");
+    DB.CreateCall(vmDeallocate,
+                  {task, DB.CreatePtrToInt(threadArray, ip), bytes},
+                  "morok.antidbg.dr.vm.deallocate");
+    DB.CreateBr(nextBB);
+
+    IRBuilder<> NB(nextBB);
+    Value *next =
+        NB.CreateAdd(iter, ConstantInt::get(i32, 1), "morok.antidbg.dr.next");
+    NB.CreateBr(loopBB);
+    iter->addIncoming(next, nextBB);
+
+    IRBuilder<> RB(retBB);
+    RB.CreateRet(ConstantPointerNull::get(ptr));
+    return fn;
+}
+
 void emitDarwinAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
                          ir::IRRandom &rng, const Triple &TT) {
     IRBuilder<> B(&Ctor->getEntryBlock());
@@ -1384,6 +1902,8 @@ void emitDarwinAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
     emitDarwinSysctlCheck(B, M, State, TT);
     emitDarwinCsopsCheck(B, M, State, TT);
     emitDarwinDyldCensus(B, M, State, rng);
+    if (Function *drWatch = darwinDrWatchThread(M, TT))
+        emitLinuxWatcherStart(B, M, drWatch);
     B.CreateRetVoid();
 }
 

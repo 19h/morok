@@ -9031,6 +9031,8 @@ entry:
     CHECK(M->getFunction("morok.antidbg.linux.status") != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.stat4") != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.watch") != nullptr);
+    CHECK(M->getFunction("morok.antidbg.linux.dr.sentinel") != nullptr);
+    CHECK(M->getFunction("morok.antidbg.linux.dr.scrub") != nullptr);
     CHECK(M->getFunction("morok.antidbg.probe") != nullptr);
     CHECK(countUserCallsTo(*M, "morok.antidbg.probe") >= 1u);
     CHECK(M->getFunction("ptrace") == nullptr);
@@ -9039,7 +9041,19 @@ entry:
     CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg")));
     CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.status")));
     CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.stat4")));
-    CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.watch")));
+    CHECK_FALSE(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.watch")));
+    CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.dr.scrub")));
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg.linux.dr.scrub"),
+                                 "morok.antidbg.dr.seize") >= 1u);
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg.linux.dr.scrub"),
+                                 "morok.antidbg.dr.interrupt") >= 1u);
+    CHECK(
+        countNamedInstructions(*M->getFunction("morok.antidbg.linux.dr.scrub"),
+                               "morok.antidbg.dr.poke") == 8u);
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
+                                 "morok.antidbg.dr.fork") >= 1u);
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
+                                 "morok.antidbg.ptrace.init") == 0u);
     CHECK(M->getFunction("pthread_create") != nullptr);
     CHECK(M->getFunction("pthread_detach") != nullptr);
     CHECK(M->getFunction("open") == nullptr);
@@ -9049,6 +9063,7 @@ entry:
 
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/status"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/stat"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/task"));
     CHECK_FALSE(hasReadableByteString(*M, "TracerPid"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
@@ -9072,6 +9087,8 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Watch != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.status") != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.stat4") != nullptr);
+    CHECK(M->getFunction("morok.antidbg.linux.dr.sentinel") != nullptr);
+    CHECK(M->getFunction("morok.antidbg.linux.dr.scrub") != nullptr);
     CHECK(countNamedInstructions(*Ctor, "morok.antidbg.ptrace.init") == 0u);
     CHECK_FALSE(hasInlineAsmCall(*Watch));
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -9102,6 +9119,8 @@ entry:
     Function *Probe = M->getFunction("morok.antidbg.probe");
     REQUIRE(Ctor != nullptr);
     REQUIRE(Probe != nullptr);
+    CHECK(M->getFunction("morok.antidbg.darwin.dr.watch") != nullptr);
+    CHECK(M->getFunction("morok.antidbg.darwin.dr.scrub") != nullptr);
     CHECK(hasInlineAsmCall(*Ctor));
     CHECK(hasInlineAsmCall(*Probe));
     CHECK(M->getFunction("ptrace") == nullptr);
@@ -9110,6 +9129,14 @@ entry:
     CHECK(M->getFunction("getpid") == nullptr);
     CHECK(M->getFunction("syscall") == nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
+    CHECK(M->getFunction("task_threads") != nullptr);
+    CHECK(M->getFunction("thread_get_state") != nullptr);
+    CHECK(M->getFunction("thread_set_state") != nullptr);
+    CHECK(M->getFunction("vm_deallocate") != nullptr);
+    CHECK(M->getGlobalVariable("mach_task_self_") != nullptr);
+    CHECK(
+        countNamedInstructions(*M->getFunction("morok.antidbg.darwin.dr.scrub"),
+                               "morok.antidbg.dr.thread.set") >= 1u);
     CHECK(M->getFunction("pthread_create") != nullptr);
     CHECK(M->getFunction("pthread_detach") != nullptr);
     CHECK(M->getFunction("sleep") != nullptr);
@@ -9146,6 +9173,16 @@ entry:
     CHECK(M->getFunction("getenv") != nullptr);
     CHECK(M->getFunction("morok.antidbg.probe") != nullptr);
     CHECK(M->getFunction("morok.antidbg.probe.watch") != nullptr);
+    CHECK(M->getFunction("morok.antidbg.darwin.dr.watch") != nullptr);
+    CHECK(M->getFunction("morok.antidbg.darwin.dr.scrub") != nullptr);
+    CHECK(M->getFunction("task_threads") != nullptr);
+    CHECK(M->getFunction("thread_get_state") != nullptr);
+    CHECK(M->getFunction("thread_set_state") != nullptr);
+    CHECK(M->getFunction("vm_deallocate") != nullptr);
+    CHECK(M->getGlobalVariable("mach_task_self_") != nullptr);
+    CHECK(
+        countNamedInstructions(*M->getFunction("morok.antidbg.darwin.dr.scrub"),
+                               "morok.antidbg.dr.thread.set") >= 1u);
     CHECK(M->getFunction("pthread_create") != nullptr);
     CHECK(M->getFunction("pthread_detach") != nullptr);
     CHECK(M->getFunction("sleep") != nullptr);

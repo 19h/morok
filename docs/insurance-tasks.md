@@ -46,7 +46,7 @@ Tags: `[platform · extends <pass> | new]`. All `XL` Windows items presume the
 - [x] Mach-O `__got`/`__la_symbol_ptr` fixup validator: verify each pointer lands in the expected dylib `__TEXT` `[macos · new]`
 - [x] VTable integrity: store expected vptr + per-vtable hash and verify before virtual dispatch `[xplat C++ · new]`
 - [x] Keep critical function pointers / imports XOR-/encode-obfuscated and decrypt only at the call site `[xplat · extends fco/constenc]`
-- [ ] DR-register sentinel thread: scan and continuously zero `Dr0–7` on all threads (detects HW breakpoints and wipes DR-based hooks) `[xplat · new]`
+- [x] DR-register sentinel thread: scan and continuously zero `Dr0–7` on all threads (detects HW breakpoints and wipes DR-based hooks) `[xplat · new]`
 - [ ] Address-space / module census: parse `/proc/self/maps` / `vm_region` / `VirtualQuery`, flag RWX or W^X-violating / `NOACCESS` / guard / unbacked pages, `.text` not RX, manually-mapped images absent from the loader list, and unexpected `LD_PRELOAD`/injected `.so` `[xplat · new]`
 - [ ] Self-enforce W^X on own pages (`mprotect` to RX, ban RWX) `[xplat · new]`
 - [ ] Call-stack origin validation at sensitive functions: every return frame must lie in a known module's executable range, never in private/unbacked RWX (defeats ROP / injected calls / DBI trampolines) `[xplat · new]`
