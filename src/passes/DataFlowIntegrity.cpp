@@ -20,10 +20,13 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
@@ -80,6 +83,41 @@ struct Target {
 
 bool generatedFunction(const Function &F) {
     return F.getName().starts_with("morok.");
+}
+
+bool directlyRecursive(Function &F) {
+    for (Instruction &I : instructions(F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (CB && CB->getCalledFunction() == &F)
+            return true;
+    }
+    return false;
+}
+
+SmallPtrSet<BasicBlock *, 32> naturalLoopBlocks(Function &F) {
+    DominatorTree DT(F);
+    SmallPtrSet<BasicBlock *, 32> Blocks;
+    for (BasicBlock &BB : F) {
+        for (BasicBlock *Succ : successors(&BB)) {
+            if (!DT.dominates(Succ, &BB))
+                continue;
+
+            Blocks.insert(Succ);
+            SmallVector<BasicBlock *, 16> Worklist;
+            if (&BB != Succ) {
+                Worklist.push_back(&BB);
+                Blocks.insert(&BB);
+            }
+            while (!Worklist.empty()) {
+                BasicBlock *Cur = Worklist.pop_back_val();
+                for (BasicBlock *Pred : predecessors(Cur)) {
+                    if (Blocks.insert(Pred).second && Pred != Succ)
+                        Worklist.push_back(Pred);
+                }
+            }
+        }
+    }
+    return Blocks;
 }
 
 bool supportedOpcode(unsigned Opcode) {
@@ -664,6 +702,8 @@ bool dataFlowIntegrityFunction(Function &F,
     if (F.isDeclaration() || generatedFunction(F) || Params.probability == 0 ||
         Params.max_tables == 0 || Params.region_bytes == 0)
         return false;
+    if (directlyRecursive(F))
+        return false;
     // Inserted integrity-diff calls in a funclet-colored block would need a
     // funclet operand bundle; skip WinEH functions entirely (no-op elsewhere).
     if (ir::usesFuncletEH(F))
@@ -676,9 +716,12 @@ bool dataFlowIntegrityFunction(Function &F,
     const std::uint32_t Limit =
         std::min(Params.max_tables, kMaxTablesPerInvocation);
     SmallVector<Target, 8> Selected;
+    SmallPtrSet<BasicBlock *, 32> LoopBlocks = naturalLoopBlocks(F);
     for (BasicBlock &BB : F) {
         if (Selected.size() >= Limit)
             break;
+        if (LoopBlocks.contains(&BB))
+            continue;
         for (Instruction &I : BB) {
             if (Selected.size() >= Limit)
                 break;

@@ -36,8 +36,10 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -195,18 +197,18 @@ bool generatedProtectionFunction(const Function &F) {
     // Keep fault/page-protection choreography native; VM lifting can disturb
     // the exact signal and mprotect edge these probes rely on.
     if (Name == "morok.antihook" ||
+        Name.starts_with("morok.antihook.clean.") ||
+        Name.starts_with("morok.antihook.elf.") ||
+        Name.starts_with("morok.antihook.got.") ||
+        Name.starts_with("morok.antihook.mac.") ||
         Name.starts_with("morok.antihook.schro") ||
         Name.starts_with("morok.antihook.antidump"))
         return false;
-    return Name.starts_with("morok.antidbg") ||
-           Name.starts_with("morok.antihook") ||
-           Name.starts_with("morok.timing") ||
-           Name.starts_with("morok.trap") ||
-           Name.starts_with("morok.sc.diff.") ||
-           Name.starts_with("morok.mg.node.") ||
-           Name.starts_with("morok.mg.diff.") ||
-           Name.starts_with("morok.dfi.hash.") ||
-           Name.starts_with("morok.vti.");
+    // Generated protection helpers are already hardened natively by the
+    // scheduler.  Lifting startup checkers into the threaded VM makes normal
+    // launches pay interpreter cost before user code runs, and can perturb
+    // timing/trap probes enough to trip the very checks they implement.
+    return false;
 }
 
 bool candidateFunctionAllowed(const Function &F,
@@ -217,6 +219,33 @@ bool candidateFunctionAllowed(const Function &F,
     if (!generatedFunction(F))
         return true;
     return Params.include_protection_helpers && generatedProtectionFunction(F);
+}
+
+bool hasNaturalLoop(Function &F) {
+    DominatorTree DT(F);
+    for (BasicBlock &BB : F)
+        for (BasicBlock *Succ : successors(&BB))
+            if (DT.dominates(Succ, &BB))
+                return true;
+    return false;
+}
+
+bool hasRuntimeUsers(const Function &F) {
+    for (const User *U : F.users()) {
+        if (isa<CallBase>(U))
+            return true;
+        if (isa<GlobalValue>(U) || isa<ConstantExpr>(U))
+            return true;
+    }
+    return false;
+}
+
+bool loopLikelyHot(Function &F) {
+    if (generatedProtectionFunction(F))
+        return false;
+    if (!hasNaturalLoop(F))
+        return false;
+    return F.getName() == "main" || hasRuntimeUsers(F);
 }
 
 std::uint64_t widthMask(unsigned Width) {
@@ -589,6 +618,8 @@ bool isEligible(Function &F, const VirtualizationParams &Params) {
     if (Params.max_instructions == 0 || Params.max_registers == 0)
         return false;
     if (!classifySignature(F))
+        return false;
+    if (!generatedFunction(F) && loopLikelyHot(F))
         return false;
     if (F.size() > kMaxLiftBlocks)
         return false;

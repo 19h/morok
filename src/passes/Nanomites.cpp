@@ -13,11 +13,14 @@
 #include "morok/passes/Nanomites.hpp"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -224,10 +227,109 @@ bool generatedFunction(const Function &F) {
            F.getName().starts_with("llvm.");
 }
 
-bool eligibleFunction(const Function &F) {
+SmallPtrSet<BasicBlock *, 32> naturalLoopBlocks(Function &F) {
+    DominatorTree DT(F);
+    SmallPtrSet<BasicBlock *, 32> blocks;
+    for (BasicBlock &BB : F) {
+        for (BasicBlock *Succ : successors(&BB)) {
+            if (!DT.dominates(Succ, &BB))
+                continue;
+
+            blocks.insert(Succ);
+            SmallVector<BasicBlock *, 16> worklist;
+            if (&BB != Succ) {
+                worklist.push_back(&BB);
+                blocks.insert(&BB);
+            }
+            while (!worklist.empty()) {
+                BasicBlock *Cur = worklist.pop_back_val();
+                for (BasicBlock *Pred : predecessors(Cur)) {
+                    if (blocks.insert(Pred).second && Pred != Succ)
+                        worklist.push_back(Pred);
+                }
+            }
+        }
+    }
+    return blocks;
+}
+
+bool functionAddressEscapes(const Function &F) {
+    SmallVector<const Value *, 8> worklist;
+    SmallPtrSet<const Value *, 16> seen;
+    worklist.push_back(&F);
+
+    while (!worklist.empty()) {
+        const Value *V = worklist.pop_back_val();
+        if (!seen.insert(V).second)
+            continue;
+
+        for (const User *U : V->users()) {
+            if (auto *CB = dyn_cast<CallBase>(U)) {
+                if (CB->getCalledOperand()->stripPointerCasts() == &F)
+                    continue;
+                return true;
+            }
+
+            if (auto *SI = dyn_cast<StoreInst>(U)) {
+                if (SI->getValueOperand()->stripPointerCasts() == &F)
+                    return true;
+            }
+
+            if (isa<ConstantExpr>(U) || isa<CastInst>(U) ||
+                isa<GetElementPtrInst>(U) || isa<PHINode>(U) ||
+                isa<SelectInst>(U)) {
+                worklist.push_back(U);
+                continue;
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool calledFromNaturalLoop(Function &Target) {
+    SmallVector<const Value *, 8> worklist;
+    SmallPtrSet<const Value *, 16> seen;
+    worklist.push_back(&Target);
+
+    while (!worklist.empty()) {
+        const Value *V = worklist.pop_back_val();
+        if (!seen.insert(V).second)
+            continue;
+
+        for (const User *U : V->users()) {
+            if (auto *CB = dyn_cast<CallBase>(U)) {
+                if (CB->getCalledOperand()->stripPointerCasts() != &Target)
+                    continue;
+                const BasicBlock *ConstBB = CB->getParent();
+                BasicBlock *BB = const_cast<BasicBlock *>(ConstBB);
+                Function *Caller = BB ? BB->getParent() : nullptr;
+                if (!Caller || Caller == &Target)
+                    continue;
+                SmallPtrSet<BasicBlock *, 32> loopBlocks =
+                    naturalLoopBlocks(*Caller);
+                if (loopBlocks.contains(BB))
+                    return true;
+                continue;
+            }
+
+            if (isa<ConstantExpr>(U) || isa<CastInst>(U)) {
+                worklist.push_back(U);
+                continue;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool eligibleFunction(Function &F) {
     return !F.isDeclaration() && !generatedFunction(F) && !F.hasPersonalityFn() &&
            !F.hasFnAttribute(Attribute::Naked) &&
-           !F.hasFnAttribute(Attribute::OptimizeNone);
+           !F.hasFnAttribute(Attribute::OptimizeNone) &&
+           !functionAddressEscapes(F) && !calledFromNaturalLoop(F);
 }
 
 bool eligibleBranchShape(BranchInst &BI) {
@@ -643,11 +745,15 @@ bool nanomitesModule(Module &M, const NanomiteParams &Params,
     for (Function &F : M) {
         if (!eligibleFunction(F))
             continue;
+        SmallPtrSet<BasicBlock *, 32> loopBlocks = naturalLoopBlocks(F);
         DenseMap<const BasicBlock *, unsigned> order = blockOrder(F);
-        for (BasicBlock &BB : F)
+        for (BasicBlock &BB : F) {
+            if (loopBlocks.contains(&BB))
+                continue;
             if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator()))
                 if (forwardBranch(*BI, order))
                     candidates.push_back(BI);
+        }
     }
     if (candidates.empty())
         return false;

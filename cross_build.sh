@@ -226,7 +226,7 @@ build_linux() {
   echo ">> linux $LINUX_TARGET -> $out"
   "$COMPILER" "--target=$LINUX_TARGET" "--sysroot=$sysroot" \
     "-B$tool_bin" "-B$gcc_lib_dir" "-B$crt_dir" "-L$gcc_lib_dir" \
-    "${static_flag[@]}" "${morok_cfg[@]}" "${COMMON[@]}" -o "$out"
+    -D_GNU_SOURCE "${static_flag[@]}" "${morok_cfg[@]}" "${COMMON[@]}" -o "$out"
   strip_linux "$out"
   OUTPUTS+=("$out")
 }

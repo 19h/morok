@@ -239,6 +239,16 @@ std::size_t countCallsTo(Function &F, StringRef name) {
     return n;
 }
 
+std::size_t countCallsTo(BasicBlock &BB, StringRef name) {
+    std::size_t n = 0;
+    for (Instruction &I : BB)
+        if (auto *CB = dyn_cast<CallBase>(&I))
+            if (Function *Callee = CB->getCalledFunction())
+                if (Callee->getName() == name)
+                    ++n;
+    return n;
+}
+
 std::size_t countCallsThroughOperand(Function &F, const Value *Target) {
     std::size_t n = 0;
     for (Instruction &I : instructions(F))
@@ -904,7 +914,7 @@ TEST_CASE("MorokPass hardens sensitive generated decryptor helpers") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("MorokPass virtualizes generated protection helpers") {
+TEST_CASE("MorokPass keeps anti-debug and checksum helpers native") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 target triple = "x86_64-unknown-linux-gnu"
@@ -945,25 +955,21 @@ entry:
     Function *Probe = M->getFunction("morok.antidbg.probe");
     Function *ProbeVm = M->getFunction("morok.vm.morok.antidbg.probe.exec");
     REQUIRE(Probe);
-    REQUIRE(ProbeVm);
+    CHECK(ProbeVm == nullptr);
     CHECK(M->getGlobalVariable("morok.watchdog.crypto", true) != nullptr);
     Function *HeartbeatWatch = M->getFunction("morok.watchdog.heartbeat.watch");
     REQUIRE(HeartbeatWatch);
     CHECK(countNamedInstructions(*HeartbeatWatch,
                                  "morok.watchdog.crypto.drift") >= 1u);
-    CHECK(countCallsTo(*Probe, "morok.vm.morok.antidbg.probe.exec") == 1u);
-    CHECK(countNamedInstructions(*Probe, "morok.watchdog.heartbeat.beat") ==
-          0u);
-    CHECK(countGlobals(*M, "morok.vm.bytecode.morok.antidbg.probe") == 1u);
+    CHECK(countCallsTo(*Probe, "morok.vm.morok.antidbg.probe.exec") == 0u);
+    CHECK(countGlobals(*M, "morok.vm.bytecode.morok.antidbg.probe") == 0u);
 
     Function *ScDiff = M->getFunction("morok.sc.diff.work");
     Function *ScVm = M->getFunction("morok.vm.morok.sc.diff.work.exec");
     REQUIRE(ScDiff);
-    REQUIRE(ScVm);
-    CHECK(countCallsTo(*ScDiff, "morok.vm.morok.sc.diff.work.exec") == 1u);
-    CHECK(countNamedInstructions(*ScDiff, "morok.sc.hash.mix") == 0u);
-    CHECK(countGlobals(*M, "morok.vm.bytecode.morok.sc.diff.work") == 1u);
-    CHECK(countGlobals(*M, "morok.vm.ptrs.morok.sc.diff.work") == 1u);
+    CHECK(ScVm == nullptr);
+    CHECK(countCallsTo(*ScDiff, "morok.vm.morok.sc.diff.work.exec") == 0u);
+    CHECK(countGlobals(*M, "morok.vm.bytecode.morok.sc.diff.work") == 0u);
 
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
@@ -5446,6 +5452,34 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("dataFlowIntegrityFunction skips direct recursion") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i8 @rec(i8 %x) {
+entry:
+  %done = icmp eq i8 %x, 0
+  br i1 %done, label %base, label %step
+step:
+  %next = add i8 %x, 255
+  %r = call i8 @rec(i8 %next)
+  %out = xor i8 %r, 7
+  ret i8 %out
+base:
+  ret i8 1
+}
+)ir");
+    Function *F = M->getFunction("rec");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(5179);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::dataFlowIntegrityFunction(
+        *F, {/*probability=*/100, /*max_tables=*/4, /*region_bytes=*/16},
+        rng));
+    CHECK(M->getFunction("morok.dfi.hash.rec") == nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("dataFlowIntegrityFunction honors zero probability") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -5843,16 +5877,16 @@ entry:
     CHECK(SeedDiverse);
 }
 
-TEST_CASE("virtualizeModule lifts allowlisted generated protection helpers") {
+TEST_CASE("virtualizeModule keeps generated protection helpers native") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 target triple = "x86_64-unknown-linux-gnu"
 
-@morok.sc.seed = private global i64 17, align 8
+@morok.antihook.seed = private global i64 17, align 8
 
-define private i64 @morok.sc.diff.fake(i64 %x) {
+define private i64 @morok.antihook.dbi.fake(i64 %x) {
 entry:
-  %seed = load volatile i64, ptr @morok.sc.seed, align 8
+  %seed = load volatile i64, ptr @morok.antihook.seed, align 8
   %tick = call i64 asm sideeffect "xorq $0, $0", "=r,~{dirflag},~{fpsr},~{flags}"()
   %mix = xor i64 %seed, %x
   %out = add i64 %mix, %tick
@@ -5874,18 +5908,53 @@ entry:
                                            /*max_registers=*/64};
     P.include_protection_helpers = true;
     P.protection_helpers_only = true;
-    CHECK(morok::passes::virtualizeModule(*M, P, rng));
+    CHECK_FALSE(morok::passes::virtualizeModule(*M, P, rng));
 
-    Function *Diff = M->getFunction("morok.sc.diff.fake");
-    Function *Helper = M->getFunction("morok.vm.morok.sc.diff.fake.exec");
+    Function *Diff = M->getFunction("morok.antihook.dbi.fake");
     REQUIRE(Diff);
-    REQUIRE(Helper);
+    CHECK(M->getFunction("morok.vm.morok.antihook.dbi.fake.exec") == nullptr);
     CHECK(M->getFunction("morok.vm.user.exec") == nullptr);
-    CHECK(countCallsTo(*Diff, "morok.vm.morok.sc.diff.fake.exec") == 1u);
-    CHECK(countNamedInstructions(*Diff, "mix") == 0u);
-    CHECK(countGlobals(*M, "morok.vm.ptrs.morok.sc.diff.fake") == 1u);
-    CHECK(countNamedInstructions(*Helper, "morok.vm.ptr.load") >= 1u);
-    CHECK(hasInlineAsmCall(*Helper));
+    CHECK(countCallsTo(*Diff, "morok.vm.morok.antihook.dbi.fake.exec") == 0u);
+    CHECK(countNamedInstructions(*Diff, "mix") == 1u);
+    CHECK(countGlobals(*M, "morok.vm.ptrs.morok.antihook.dbi.fake") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("virtualizeModule keeps heavy anti-hook scanners native") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+
+define private i64 @morok.antihook.elf.rx(i64 %x) {
+entry:
+  %y = xor i64 %x, 170
+  ret i64 %y
+}
+
+define private i64 @morok.antihook.dbi.smc.target(i64 %x) {
+entry:
+  %y = xor i64 %x, 85
+  ret i64 %y
+}
+)ir");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(15104);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::VirtualizationParams P{/*probability=*/100,
+                                           /*max_functions=*/4,
+                                           /*max_instructions=*/64,
+                                           /*max_registers=*/64};
+    P.include_protection_helpers = true;
+    P.protection_helpers_only = true;
+    CHECK_FALSE(morok::passes::virtualizeModule(*M, P, rng));
+
+    CHECK(M->getFunction("morok.vm.morok.antihook.elf.rx.exec") == nullptr);
+    CHECK(M->getFunction("morok.vm.morok.antihook.dbi.smc.target.exec") ==
+          nullptr);
+    CHECK(countGlobals(*M, "morok.vm.bytecode.morok.antihook.elf.rx") == 0u);
+    CHECK(countGlobals(*M,
+                       "morok.vm.bytecode.morok.antihook.dbi.smc.target") ==
+          0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -6340,6 +6409,55 @@ done:
     }
     CHECK(wrapperPhis == 0u);
     CHECK(wrapperCalls == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("virtualizeModule leaves called hot loops native") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define internal i32 @hot_loop(i32 %n) {
+entry:
+  br label %head
+head:
+  %i = phi i32 [ 0, %entry ], [ %i2, %body ]
+  %acc = phi i32 [ 0, %entry ], [ %acc2, %body ]
+  %cond = icmp slt i32 %i, %n
+  br i1 %cond, label %body, label %done
+body:
+  %acc2 = add i32 %acc, %i
+  %i2 = add i32 %i, 1
+  br label %head
+done:
+  ret i32 %acc
+}
+
+define internal i32 @leaf(i32 %x) {
+entry:
+  %a = xor i32 %x, 85
+  %b = add i32 %a, 7
+  ret i32 %b
+}
+
+define i32 @caller(i32 %n) {
+entry:
+  %a = call i32 @hot_loop(i32 %n)
+  %b = call i32 @leaf(i32 %a)
+  ret i32 %b
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8103);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::virtualizeModule(
+        *M,
+        {/*probability=*/100, /*max_functions=*/4,
+         /*max_instructions=*/128, /*max_registers=*/96},
+        rng));
+
+    CHECK(M->getFunction("morok.vm.hot_loop.exec") == nullptr);
+    CHECK(M->getFunction("morok.vm.leaf.exec") != nullptr);
+    CHECK(countGlobals(*M, "morok.vm.bytecode.hot_loop") == 0u);
+    CHECK(countGlobals(*M, "morok.vm.bytecode.leaf") == 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -7433,6 +7551,71 @@ join:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("selfChecksumConstantsFunction keeps diff calls out of hot loops") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @selfcheck_hot(i32 %n) {
+entry:
+  %seed = add i32 %n, 7
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %acc = phi i32 [ %seed, %entry ], [ %hot, %loop ]
+  %hot = add i32 %acc, 3
+  %next = add i32 %i, 1
+  %keep = icmp slt i32 %next, %n
+  br i1 %keep, label %loop, label %done
+done:
+  ret i32 %acc
+}
+)ir");
+    Function *F = M->getFunction("selfcheck_hot");
+    REQUIRE(F);
+    BasicBlock *Loop = nullptr;
+    for (BasicBlock &BB : *F)
+        if (BB.getName() == "loop")
+            Loop = &BB;
+    REQUIRE(Loop);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(19191);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::selfChecksumConstantsFunction(
+        *F, {/*probability=*/100, /*max_constants=*/4, /*region_bytes=*/32},
+        rng));
+    CHECK(M->getFunction("morok.sc.diff.selfcheck_hot") != nullptr);
+    CHECK(countCallsTo(*F, "morok.sc.diff.selfcheck_hot") >= 1u);
+    CHECK(countCallsTo(*Loop, "morok.sc.diff.selfcheck_hot") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("selfChecksumConstantsFunction skips direct recursion") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @selfcheck_rec(i32 %n) {
+entry:
+  %done = icmp eq i32 %n, 0
+  br i1 %done, label %base, label %step
+step:
+  %next = add i32 %n, -1
+  %r = call i32 @selfcheck_rec(i32 %next)
+  %out = add i32 %r, 7
+  ret i32 %out
+base:
+  ret i32 1
+}
+)ir");
+    Function *F = M->getFunction("selfcheck_rec");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(19192);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::selfChecksumConstantsFunction(
+        *F, {/*probability=*/100, /*max_constants=*/4, /*region_bytes=*/32},
+        rng));
+    CHECK(M->getFunction("morok.sc.diff.selfcheck_rec") == nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("selfChecksumConstantsFunction honors zero probability") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -7699,6 +7882,35 @@ entry:
     CHECK(hasDoubleCarrier);
     CHECK(M->getFunction("morok.mg.diff.mg_float") != nullptr);
     CHECK(M->getFunction("morok.mg.diff.mg_double") != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("mutualGuardGraphFunction skips direct recursion") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @mutual_rec(i32 %n) {
+entry:
+  %done = icmp eq i32 %n, 0
+  br i1 %done, label %base, label %step
+step:
+  %next = add i32 %n, -1
+  %r = call i32 @mutual_rec(i32 %next)
+  ret i32 %r
+base:
+  ret i32 1
+}
+)ir");
+    Function *F = M->getFunction("mutual_rec");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(20404);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::mutualGuardGraphFunction(
+        *F,
+        {/*probability=*/100, /*nodes=*/3, /*region_bytes=*/16,
+         /*max_returns=*/2},
+        rng));
+    CHECK(M->getFunction("morok.mg.diff.mutual_rec") == nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -8723,8 +8935,53 @@ entry:
     CHECK(countInlineAsmConstraints(*Caller, "{x19}") == 4u);
     CHECK(countInlineAsmConstraints(*Caller, "~{x19}") == 0u);
     CHECK(countGlobals(*M, "morok.ckd.enc") == 2u);
+    CHECK(countGlobals(*M, "morok.ckd.cache") == 2u);
     CHECK(M->getGlobalVariable("llvm.global_ctors") != nullptr);
     CHECK(countCallsTo(*Init, "morok.ckd.dispatch") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("callerKeyedDispatchModule leaves variadic call ABI untouched") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-musl"
+define internal i32 @fixed(i32 %x) {
+entry:
+  %r = add i32 %x, 7
+  ret i32 %r
+}
+
+define internal i32 @vsum(i32 %count, ...) {
+entry:
+  ret i32 %count
+}
+
+define i32 @caller(i32 %x) {
+entry:
+  %a = call i32 @fixed(i32 %x)
+  %b = call i32 (i32, ...) @vsum(i32 1, i32 %a)
+  ret i32 %b
+}
+)ir");
+    Function *Caller = M->getFunction("caller");
+    REQUIRE(Caller);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(954);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::CallerKeyedDispatchParams params;
+    params.probability = 100;
+    params.max_calls = 16;
+    params.region_bytes = 8;
+
+    CHECK(morok::passes::callerKeyedDispatchModule(*M, params, rng));
+
+    Function *Dispatch = M->getFunction("morok.ckd.dispatch");
+    REQUIRE(Dispatch != nullptr);
+    CHECK(countCallsTo(*Caller, "fixed") == 0u);
+    CHECK(countCallsTo(*Caller, "vsum") == 1u);
+    CHECK(countCallsThroughOperand(*Caller, Dispatch) == 1u);
+    CHECK(countGlobals(*M, "morok.ckd.enc") == 1u);
+    CHECK(countGlobals(*M, "morok.ckd.cache") == 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -10565,6 +10822,7 @@ entry:
     CHECK(countNamedInstructions(*Memfd, "morok.antidbg.memfd.write") >= 1u);
     CHECK(countNamedInstructions(*Watch, "morok.antidbg.buddy.kill") >= 1u);
     CHECK(countNamedInstructions(*Watch, "morok.antidbg.buddy.wait") >= 1u);
+    CHECK(countNamedInstructions(*Watch, "morok.antidbg.watch.keep") >= 1u);
     CHECK(hasInlineAsmCall(*Scrub));
     CHECK(countNamedInstructions(*Scrub, "morok.antidbg.dr.seize") >= 1u);
     CHECK(countNamedInstructions(*Scrub, "morok.antidbg.dr.interrupt") >= 1u);
@@ -10573,6 +10831,7 @@ entry:
     CHECK(countNamedInstructions(*Scrub, "morok.antidbg.buddy.peek") == 4u);
     CHECK(countNamedInstructions(*Scrub,
                                  "morok.antidbg.buddy.mirror.bad") >= 1u);
+    CHECK(countNamedInstructions(*Sentinel, "morok.antidbg.dr.keep") >= 1u);
     CHECK(countNamedInstructions(*Sentinel,
                                  "morok.antidbg.buddy.scrub") >= 1u);
     CHECK(countNamedInstructions(*Sentinel,
@@ -10603,6 +10862,31 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/task"));
     CHECK_FALSE(hasReadableByteString(*M, "TracerPid"));
     CHECK_FALSE(hasReadableByteString(*M, ".nscd-cache"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("antiDebuggingModule skips callsite probes in direct recursion") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @rec(i32 %n) {
+entry:
+  %done = icmp eq i32 %n, 0
+  br i1 %done, label %base, label %step
+step:
+  %next = add i32 %n, -1
+  %r = call i32 @rec(i32 %next)
+  ret i32 %r
+base:
+  ret i32 1
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(9303);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::antiDebuggingModule(*M, rng));
+    CHECK(M->getFunction("morok.antidbg.probe") != nullptr);
+    CHECK(countGlobals(*M, "morok.antidbg.site") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -10683,6 +10967,43 @@ entry:
         countStoresToBaseWithOpaqueSource(*M, "morok.cloak.buf");
     CHECK(cloakStores >= 8u);
     CHECK(opaqueCloakStores == cloakStores);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("antiDebuggingModule avoids live watchdog threads for fork and "
+          "signal owners") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+declare i32 @fork()
+declare i32 @sigaction(i32, ptr, ptr)
+define i32 @main(ptr %sa) {
+entry:
+  %pid = call i32 @fork()
+  %rc = call i32 @sigaction(i32 10, ptr %sa, ptr null)
+  %mix = add i32 %pid, %rc
+  ret i32 %mix
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(884);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::antiDebuggingModule(*M, rng));
+
+    CHECK(M->getGlobalVariable("morok.antidbg.state", true) != nullptr);
+    CHECK(M->getFunction("morok.antidbg") != nullptr);
+    CHECK(M->getFunction("morok.antidbg.probe") != nullptr);
+    CHECK(M->getFunction("morok.antidbg.linux.status") != nullptr);
+    CHECK(M->getFunction("morok.antidbg.linux.stat4") != nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.buddy.pid", true) == nullptr);
+    CHECK(M->getFunction("morok.antidbg.linux.dr.sentinel") == nullptr);
+    CHECK(M->getFunction("morok.antidbg.linux.dr.scrub") == nullptr);
+    CHECK(M->getFunction("morok.antidbg.linux.watch") == nullptr);
+    CHECK(M->getFunction("morok.watchdog") == nullptr);
+    CHECK(M->getFunction("morok.antidbg.probe.watch") == nullptr);
+    CHECK(M->getFunction("morok.watchdog.heartbeat.watch") == nullptr);
+    CHECK(M->getFunction("pthread_create") == nullptr);
+    CHECK(M->getFunction("pthread_detach") == nullptr);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -11537,6 +11858,196 @@ else:
     CHECK(M->getFunction("morok.nanomite.handler") != nullptr);
     CHECK(M->getFunction("morok.nanomite.install") != nullptr);
     CHECK(M->getFunction("sigaction") != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("nanomitesModule skips address-taken callback bodies") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@slot = global ptr null
+define void @handler(i32 %sig) {
+entry:
+  %cmp = icmp eq i32 %sig, 0
+  br i1 %cmp, label %then, label %else
+then:
+  ret void
+else:
+  ret void
+}
+define void @install() {
+entry:
+  store ptr @handler, ptr @slot
+  ret void
+}
+define i32 @pick(i32 %x, i32 %y) {
+entry:
+  %cmp = icmp sgt i32 %x, 0
+  br i1 %cmp, label %then, label %else
+then:
+  %tv = phi i32 [ %x, %entry ]
+  ret i32 %tv
+else:
+  %fv = phi i32 [ %y, %entry ]
+  ret i32 %fv
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(889);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::NanomiteParams params;
+    params.probability = 100;
+    params.max_sites = 8;
+
+    CHECK(morok::passes::nanomitesModule(*M, params, rng));
+
+    Function *Handler = M->getFunction("handler");
+    Function *Pick = M->getFunction("pick");
+    REQUIRE(Handler != nullptr);
+    REQUIRE(Pick != nullptr);
+
+    std::size_t handlerConditionalBranches = 0;
+    std::size_t pickIndirectBranches = 0;
+    for (Instruction &I : instructions(Handler))
+        if (auto *BI = dyn_cast<BranchInst>(&I))
+            handlerConditionalBranches += BI->isConditional() ? 1u : 0u;
+    for (Instruction &I : instructions(Pick))
+        pickIndirectBranches += isa<IndirectBrInst>(&I) ? 1u : 0u;
+
+    CHECK(handlerConditionalBranches == 1u);
+    CHECK_FALSE(hasInlineAsmCall(*Handler));
+    CHECK(pickIndirectBranches == 1u);
+    CHECK(hasInlineAsmCall(*Pick));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("nanomitesModule skips natural loop bodies") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @loopy(i32 %n) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %latch ]
+  %acc = phi i32 [ 0, %entry ], [ %merged, %latch ]
+  %bit = and i32 %i, 1
+  %is_odd = icmp eq i32 %bit, 0
+  br i1 %is_odd, label %then, label %else
+then:
+  %a = add i32 %acc, %i
+  br label %latch
+else:
+  %b = sub i32 %acc, %i
+  br label %latch
+latch:
+  %merged = phi i32 [ %a, %then ], [ %b, %else ]
+  %next = add i32 %i, 1
+  %keep = icmp slt i32 %next, %n
+  br i1 %keep, label %loop, label %exit
+exit:
+  ret i32 %merged
+}
+define i32 @pick(i32 %x, i32 %y) {
+entry:
+  %cmp = icmp sgt i32 %x, 0
+  br i1 %cmp, label %then, label %else
+then:
+  %tv = phi i32 [ %x, %entry ]
+  ret i32 %tv
+else:
+  %fv = phi i32 [ %y, %entry ]
+  ret i32 %fv
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(890);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::NanomiteParams params;
+    params.probability = 100;
+    params.max_sites = 8;
+
+    CHECK(morok::passes::nanomitesModule(*M, params, rng));
+
+    Function *Loopy = M->getFunction("loopy");
+    Function *Pick = M->getFunction("pick");
+    REQUIRE(Loopy != nullptr);
+    REQUIRE(Pick != nullptr);
+
+    std::size_t loopIndirectBranches = 0;
+    std::size_t pickIndirectBranches = 0;
+    for (Instruction &I : instructions(Loopy))
+        loopIndirectBranches += isa<IndirectBrInst>(&I) ? 1u : 0u;
+    for (Instruction &I : instructions(Pick))
+        pickIndirectBranches += isa<IndirectBrInst>(&I) ? 1u : 0u;
+
+    CHECK(loopIndirectBranches == 0u);
+    CHECK_FALSE(hasInlineAsmCall(*Loopy));
+    CHECK(pickIndirectBranches == 1u);
+    CHECK(hasInlineAsmCall(*Pick));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("nanomitesModule skips callees reached from natural loops") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @helper(i32 %x) {
+entry:
+  %cmp = icmp sgt i32 %x, 0
+  br i1 %cmp, label %then, label %else
+then:
+  ret i32 %x
+else:
+  %neg = sub i32 0, %x
+  ret i32 %neg
+}
+define i32 @driver(i32 %n) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %v = call i32 @helper(i32 %i)
+  %next = add i32 %i, 1
+  %keep = icmp slt i32 %next, %n
+  br i1 %keep, label %loop, label %exit
+exit:
+  ret i32 %v
+}
+define i32 @pick(i32 %x, i32 %y) {
+entry:
+  %cmp = icmp sgt i32 %x, 0
+  br i1 %cmp, label %then, label %else
+then:
+  %tv = phi i32 [ %x, %entry ]
+  ret i32 %tv
+else:
+  %fv = phi i32 [ %y, %entry ]
+  ret i32 %fv
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(891);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::NanomiteParams params;
+    params.probability = 100;
+    params.max_sites = 8;
+
+    CHECK(morok::passes::nanomitesModule(*M, params, rng));
+
+    Function *Helper = M->getFunction("helper");
+    Function *Pick = M->getFunction("pick");
+    REQUIRE(Helper != nullptr);
+    REQUIRE(Pick != nullptr);
+
+    std::size_t helperIndirectBranches = 0;
+    std::size_t pickIndirectBranches = 0;
+    for (Instruction &I : instructions(Helper))
+        helperIndirectBranches += isa<IndirectBrInst>(&I) ? 1u : 0u;
+    for (Instruction &I : instructions(Pick))
+        pickIndirectBranches += isa<IndirectBrInst>(&I) ? 1u : 0u;
+
+    CHECK(helperIndirectBranches == 0u);
+    CHECK_FALSE(hasInlineAsmCall(*Helper));
+    CHECK(pickIndirectBranches == 1u);
+    CHECK(hasInlineAsmCall(*Pick));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

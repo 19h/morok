@@ -21,6 +21,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
@@ -59,6 +60,15 @@ struct GraphRuntime {
 
 bool generatedFunction(const Function &F) {
     return F.getName().starts_with("morok.");
+}
+
+bool directlyRecursive(Function &F) {
+    for (Instruction &I : instructions(F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (CB && CB->getCalledFunction() == &F)
+            return true;
+    }
+    return false;
 }
 
 std::string suffixFor(Function &F) { return F.getName().str(); }
@@ -441,6 +451,8 @@ bool mutualGuardGraphFunction(Function &F, const MutualGuardGraphParams &Params,
                               ir::IRRandom &Rng) {
     if (F.isDeclaration() || generatedFunction(F) || Params.probability == 0 ||
         Params.nodes < 2 || Params.region_bytes == 0 || Params.max_returns == 0)
+        return false;
+    if (directlyRecursive(F))
         return false;
 
     const std::string DiffName = "morok.mg.diff." + suffixFor(F);

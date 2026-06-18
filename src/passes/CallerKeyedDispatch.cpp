@@ -6,8 +6,9 @@
 //
 // Direct internal calls are rewritten to call a shared native dispatcher.  The
 // original callee address is carried in a callee-saved register and is decoded
-// from a per-site encoded dispatcher-relative delta.  The key is a volatile
-// hash over bytes at the split call-site block, sealed by a startup constructor.
+// from a per-site encoded dispatcher-relative delta.  The first hit at each
+// site computes the volatile caller-byte hash and then caches the recovered
+// target locally so hot loops do not replay the hash on every iteration.
 //
 // This is the strongest construction available at the IR layer without a
 // post-link byte/RVA manifest: the hash is over final in-memory code bytes at
@@ -65,6 +66,7 @@ struct Site {
     Function *callee = nullptr;
     BasicBlock *block = nullptr;
     GlobalVariable *encoded = nullptr;
+    GlobalVariable *cache = nullptr;
     std::uint64_t salt = 0;
     std::uint64_t mul = 0;
     std::uint64_t add = 0;
@@ -96,6 +98,8 @@ bool eligible(CallInst &CI) {
         return false;
     Function *Callee = CI.getCalledFunction();
     if (!Callee || Callee->isIntrinsic() || Callee->isDeclaration())
+        return false;
+    if (Callee->isVarArg())
         return false;
     if (Callee->getName().starts_with("morok."))
         return false;
@@ -196,6 +200,16 @@ GlobalVariable *makeEncodedSlot(Module &M, ir::IRRandom &Rng) {
     return GV;
 }
 
+GlobalVariable *makeCacheSlot(Module &M) {
+    auto *I64 = Type::getInt64Ty(M.getContext());
+    auto *GV = new GlobalVariable(
+        M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I64, 0), "morok.ckd.cache");
+    GV->setAlignment(Align(8));
+    appendToCompilerUsed(M, {GV});
+    return GV;
+}
+
 Value *emitCarrierDefine(IRBuilder<> &B, Value *Target,
                          const ArchLayout &Layout) {
     auto *FTy = FunctionType::get(Target->getType(), {Target->getType()},
@@ -248,15 +262,46 @@ void emitInit(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
 void rewriteSite(Module &M, Function *Dispatcher, const Site &S,
                  const ArchLayout &Layout, std::uint32_t RegionBytes) {
     CallInst *Old = S.call;
-    Builder B(Old);
-    Value *H = emitSiteHash(B, M, Dispatcher, S.caller, S.block, S,
+    BasicBlock *EntryBB = Old->getParent();
+    BasicBlock *JoinBB = SplitBlock(EntryBB, Old);
+    JoinBB->setName(EntryBB->getName() + ".ckd.call");
+    EntryBB->getTerminator()->eraseFromParent();
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *HitBB =
+        BasicBlock::Create(Ctx, "morok.ckd.cache.hit", S.caller, JoinBB);
+    auto *MissBB =
+        BasicBlock::Create(Ctx, "morok.ckd.cache.miss", S.caller, JoinBB);
+
+    Builder EntryB(EntryBB);
+    LoadInst *Cached = EntryB.CreateLoad(I64, S.cache, /*isVolatile=*/true,
+                                         "morok.ckd.cache");
+    Value *CachedReady =
+        EntryB.CreateICmpNE(Cached, ConstantInt::get(I64, 0),
+                            "morok.ckd.cache.ready");
+    EntryB.CreateCondBr(CachedReady, HitBB, MissBB);
+
+    Builder HitB(HitBB);
+    HitB.CreateBr(JoinBB);
+
+    Builder MissB(MissBB);
+    Value *H = emitSiteHash(MissB, M, Dispatcher, S.caller, S.block, S,
                             RegionBytes);
-    LoadInst *Encoded = B.CreateLoad(B.getInt64Ty(), S.encoded,
-                                     /*isVolatile=*/true, "morok.ckd.enc");
-    Value *Delta = B.CreateSub(Encoded, H, "morok.ckd.target.delta");
-    Value *Base = ptrToI64(B, Dispatcher);
-    Value *TargetInt = B.CreateAdd(Base, Delta, "morok.ckd.target.int");
-    Value *Target = B.CreateIntToPtr(
+    LoadInst *Encoded = MissB.CreateLoad(I64, S.encoded,
+                                         /*isVolatile=*/true, "morok.ckd.enc");
+    Value *Delta = MissB.CreateSub(Encoded, H, "morok.ckd.target.delta");
+    Value *Base = ptrToI64(MissB, Dispatcher);
+    Value *DecodedTarget =
+        MissB.CreateAdd(Base, Delta, "morok.ckd.target.decoded");
+    MissB.CreateStore(DecodedTarget, S.cache, /*isVolatile=*/true);
+    MissB.CreateBr(JoinBB);
+
+    Builder CallB(Old);
+    PHINode *TargetInt = CallB.CreatePHI(I64, 2, "morok.ckd.target.int");
+    TargetInt->addIncoming(Cached, HitBB);
+    TargetInt->addIncoming(DecodedTarget, MissBB);
+    Value *Target = CallB.CreateIntToPtr(
         TargetInt, PointerType::getUnqual(M.getContext()), "morok.ckd.target");
 
     IRBuilder<> SideB(Old);
@@ -340,6 +385,7 @@ bool callerKeyedDispatchModule(Module &M,
         S.callee = Callee;
         S.block = SiteBlock;
         S.encoded = makeEncodedSlot(M, rng);
+        S.cache = makeCacheSlot(M);
         S.salt = rng.next();
         S.mul = rng.next() | 1ULL;
         S.add = rng.next();

@@ -28,9 +28,9 @@ struct CallerKeyedDispatchParams {
 
 /// Collapse eligible direct internal calls through one native dispatcher.  The
 /// carried target is sealed at startup as a dispatcher-relative delta keyed by
-/// a volatile hash over the call site's own native bytes.  A later inline patch
-/// or software breakpoint in the hashed window decodes a wrong target and the
-/// dispatcher diverges without a branchy check to remove.
+/// a volatile hash over the call site's own native bytes.  The first execution
+/// at a site decodes and caches the target locally, keeping hot loops practical
+/// while preserving the caller-keyed dispatch shape.
 bool callerKeyedDispatchModule(llvm::Module &M,
                                const CallerKeyedDispatchParams &params,
                                morok::ir::IRRandom &rng);

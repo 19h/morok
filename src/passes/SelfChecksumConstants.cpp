@@ -16,10 +16,13 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
@@ -72,6 +75,15 @@ struct Runtime {
 
 bool generatedFunction(const Function &F) {
     return F.getName().starts_with("morok.");
+}
+
+bool directlyRecursive(Function &F) {
+    for (Instruction &I : instructions(F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (CB && CB->getCalledFunction() == &F)
+            return true;
+    }
+    return false;
 }
 
 bool eligibleWidth(unsigned Bits) {
@@ -207,13 +219,43 @@ std::vector<std::uint8_t> randomRegion(std::uint32_t Size, ir::IRRandom &Rng) {
 
 std::string suffixFor(Function &F) { return F.getName().str(); }
 
+SmallPtrSet<BasicBlock *, 32> naturalLoopBlocks(Function &F) {
+    DominatorTree DT(F);
+    SmallPtrSet<BasicBlock *, 32> Blocks;
+    for (BasicBlock &BB : F) {
+        for (BasicBlock *Succ : successors(&BB)) {
+            if (!DT.dominates(Succ, &BB))
+                continue;
+
+            Blocks.insert(Succ);
+            SmallVector<BasicBlock *, 16> Worklist;
+            if (&BB != Succ && Blocks.insert(&BB).second)
+                Worklist.push_back(&BB);
+
+            while (!Worklist.empty()) {
+                BasicBlock *Cur = Worklist.pop_back_val();
+                for (BasicBlock *Pred : predecessors(Cur)) {
+                    if (Blocks.insert(Pred).second && Pred != Succ)
+                        Worklist.push_back(Pred);
+                }
+            }
+        }
+    }
+    return Blocks;
+}
+
 std::vector<Target> collectTargets(Function &F) {
     std::vector<Target> Targets;
-    for (BasicBlock &BB : F)
+    SmallPtrSet<BasicBlock *, 32> LoopBlocks = naturalLoopBlocks(F);
+    for (BasicBlock &BB : F) {
+        if (LoopBlocks.contains(&BB))
+            continue;
         for (Instruction &I : BB) {
             if (auto *PN = dyn_cast<PHINode>(&I)) {
                 for (unsigned Op = 0; Op < PN->getNumIncomingValues(); ++Op) {
                     if (!eligiblePhiIncoming(*PN, Op))
+                        continue;
+                    if (LoopBlocks.contains(PN->getIncomingBlock(Op)))
                         continue;
                     Targets.push_back({&I, Op,
                                        cast<Constant>(PN->getIncomingValue(Op)),
@@ -248,6 +290,7 @@ std::vector<Target> collectTargets(Function &F) {
                 }
             }
         }
+    }
     return Targets;
 }
 
@@ -537,6 +580,8 @@ bool selfChecksumConstantsFunction(Function &F,
                                    ir::IRRandom &Rng) {
     if (F.isDeclaration() || generatedFunction(F) || Params.probability == 0 ||
         Params.max_constants == 0 || Params.region_bytes == 0)
+        return false;
+    if (directlyRecursive(F))
         return false;
 
     const std::string DiffName = "morok.sc.diff." + suffixFor(F);

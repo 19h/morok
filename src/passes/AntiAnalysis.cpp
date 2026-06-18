@@ -11,13 +11,18 @@
 
 #include "morok/ir/SymbolCloak.hpp"
 
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Alignment.h"
@@ -35,6 +40,62 @@ using namespace llvm;
 namespace morok::passes {
 
 namespace {
+
+constexpr std::uint32_t kWatchdogMaxIterations = 4;
+
+SmallPtrSet<BasicBlock *, 32> naturalLoopBlocks(Function &F) {
+    DominatorTree DT(F);
+    SmallPtrSet<BasicBlock *, 32> Blocks;
+    for (BasicBlock &BB : F) {
+        for (BasicBlock *Succ : successors(&BB)) {
+            if (!DT.dominates(Succ, &BB))
+                continue;
+
+            Blocks.insert(Succ);
+            SmallVector<BasicBlock *, 16> Worklist;
+            if (&BB != Succ) {
+                Worklist.push_back(&BB);
+                Blocks.insert(&BB);
+            }
+            while (!Worklist.empty()) {
+                BasicBlock *Cur = Worklist.pop_back_val();
+                for (BasicBlock *Pred : predecessors(Cur)) {
+                    if (Blocks.insert(Pred).second && Pred != Succ)
+                        Worklist.push_back(Pred);
+                }
+            }
+        }
+    }
+    return Blocks;
+}
+
+bool directlyRecursive(Function &F) {
+    for (Instruction &I : instructions(F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (CB && CB->getCalledFunction() == &F)
+            return true;
+    }
+    return false;
+}
+
+bool isForkOrSignalApiName(StringRef Name) {
+    return Name == "fork" || Name == "vfork" || Name == "clone" ||
+           Name == "sigaction" || Name == "signal" ||
+           Name == "sigprocmask" || Name == "pthread_sigmask" ||
+           Name == "sigsuspend" || Name == "sigwait" ||
+           Name == "sigwaitinfo" || Name == "sigtimedwait" ||
+           Name == "sigpending" || Name == "sigfillset" ||
+           Name == "sigemptyset" || Name == "sigaddset" ||
+           Name == "sigdelset" || Name == "raise" || Name == "kill" ||
+           Name == "alarm" || Name == "pause";
+}
+
+bool moduleUsesForkOrSignalApis(Module &M) {
+    for (Function &F : M)
+        if (!F.use_empty() && isForkOrSignalApiName(F.getName()))
+            return true;
+    return false;
+}
 
 Function *makeCtorShell(Module &M, const char *name) {
     auto *fn = Function::Create(
@@ -1325,11 +1386,11 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
     IRBuilder<> LB(loopBB);
     auto *iter = LB.CreatePHI(i32, 2, "morok.antidbg.iter");
     iter->addIncoming(ConstantInt::get(i32, 0), entry);
-    if (watchBuddy)
-        LB.CreateBr(bodyBB);
-    else
-        LB.CreateCondBr(LB.CreateICmpULT(iter, ConstantInt::get(i32, 8)), bodyBB,
-                        retBB);
+    const std::uint32_t limit = watchBuddy ? kWatchdogMaxIterations : 8u;
+    LB.CreateCondBr(
+        LB.CreateICmpULT(iter, ConstantInt::get(i32, limit),
+                         "morok.antidbg.watch.keep"),
+        bodyBB, retBB);
 
     IRBuilder<> BB(bodyBB);
     FunctionCallee sleepFn =
@@ -1614,7 +1675,10 @@ Function *linuxDrSentinelProcess(Module &M, ir::IRRandom &rng,
     IRBuilder<> LB(loopBB);
     auto *iter = LB.CreatePHI(i32, 2, "morok.antidbg.dr.iter");
     iter->addIncoming(ConstantInt::get(i32, 0), entry);
-    LB.CreateBr(bodyBB);
+    LB.CreateCondBr(
+        LB.CreateICmpULT(iter, ConstantInt::get(i32, kWatchdogMaxIterations),
+                         "morok.antidbg.dr.keep"),
+        bodyBB, retBB);
 
     IRBuilder<> BB(bodyBB);
     std::uint32_t ptraceNr = 0;
@@ -2081,7 +2145,9 @@ Function *probeWatchThread(Module &M, Function *Probe, GlobalVariable *Heartbeat
     IRBuilder<> LB(loopBB);
     auto *iter = LB.CreatePHI(i32, 2, "morok.antidbg.probe.iter");
     iter->addIncoming(ConstantInt::get(i32, 0), entry);
-    LB.CreateBr(bodyBB);
+    LB.CreateCondBr(
+        LB.CreateICmpULT(iter, ConstantInt::get(i32, kWatchdogMaxIterations)),
+        bodyBB, retBB);
 
     IRBuilder<> BB(bodyBB);
     FunctionCallee sleepFn =
@@ -2144,7 +2210,9 @@ Function *heartbeatWatchThread(Module &M, GlobalVariable *State,
     iter->addIncoming(ConstantInt::get(i32, 0), entry);
     last->addIncoming(ConstantInt::get(i64, 0), entry);
     staleCount->addIncoming(ConstantInt::get(i32, 0), entry);
-    LB.CreateBr(bodyBB);
+    LB.CreateCondBr(
+        LB.CreateICmpULT(iter, ConstantInt::get(i32, kWatchdogMaxIterations)),
+        bodyBB, retBB);
 
     IRBuilder<> BB(bodyBB);
     FunctionCallee sleepFn =
@@ -2215,15 +2283,20 @@ void emitAntiDebugWatchdogStart(Module &M, Function *Probe, GlobalVariable *Stat
 
 void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
                         ir::IRRandom &rng, const Triple &TT,
-                        bool AllowSelfTrace) {
+                        bool AllowSelfTrace, bool StartLiveWatchers) {
     LLVMContext &ctx = M.getContext();
     auto *i32 = Type::getInt32Ty(ctx);
     IRBuilder<> B(&Ctor->getEntryBlock());
 
-    GlobalVariable *buddyPid = antiDebugBuddyPid(M);
-    bool drSentinel = emitLinuxDrSentinelStart(B, M, State, buddyPid, rng, TT);
-    if (!drSentinel)
-        buddyPid = nullptr;
+    GlobalVariable *buddyPid = nullptr;
+    bool drSentinel = false;
+    if (StartLiveWatchers) {
+        buddyPid = antiDebugBuddyPid(M);
+        drSentinel =
+            emitLinuxDrSentinelStart(B, M, State, buddyPid, rng, TT);
+        if (!drSentinel)
+            buddyPid = nullptr;
+    }
     emitLinuxHardening(B, M, TT, drSentinel);
     if (AllowSelfTrace && !drSentinel) {
         Value *traceRc = emitLinuxPtrace(B, M, TT, 0);
@@ -2242,9 +2315,11 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
     emitLinuxLandlockSandbox(B, M, State, TT);
     emitLinuxSeccompFilter(B, M, TT, AllowSelfTrace && !drSentinel);
 
-    Function *watch = linuxWatchThread(M, statusFn, statFn, State, buddyPid, TT,
-                                       AllowSelfTrace && !drSentinel);
-    emitLinuxWatcherStart(B, M, watch);
+    if (StartLiveWatchers) {
+        Function *watch = linuxWatchThread(M, statusFn, statFn, State, buddyPid,
+                                           TT, AllowSelfTrace && !drSentinel);
+        emitLinuxWatcherStart(B, M, watch);
+    }
     B.CreateRetVoid();
 }
 
@@ -2533,14 +2608,17 @@ Function *darwinDrWatchThread(Module &M, const Triple &TT) {
 }
 
 void emitDarwinAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
-                         ir::IRRandom &rng, const Triple &TT) {
+                         ir::IRRandom &rng, const Triple &TT,
+                         bool StartLiveWatchers) {
     IRBuilder<> B(&Ctor->getEntryBlock());
     emitDarwinPtrace(B, M, TT, 31); // PT_DENY_ATTACH
     emitDarwinSysctlCheck(B, M, State, TT);
     emitDarwinCsopsCheck(B, M, State, TT);
     emitDarwinDyldCensus(B, M, State, rng);
-    if (Function *drWatch = darwinDrWatchThread(M, TT))
-        emitLinuxWatcherStart(B, M, drWatch);
+    if (StartLiveWatchers) {
+        if (Function *drWatch = darwinDrWatchThread(M, TT))
+            emitLinuxWatcherStart(B, M, drWatch);
+    }
     B.CreateRetVoid();
 }
 
@@ -6025,13 +6103,18 @@ bool insertAntiDebugCallsiteProbes(Module &M, Function *Probe,
         if (F.isDeclaration() || F.hasAvailableExternallyLinkage() ||
             F.getName().starts_with("morok."))
             continue;
+        if (directlyRecursive(F))
+            continue;
         if (!rng.chance(kFunctionChance))
             continue;
 
+        SmallPtrSet<BasicBlock *, 32> LoopBlocks = naturalLoopBlocks(F);
         std::vector<Instruction *> candidates;
         candidates.reserve(8);
         for (BasicBlock &BB : F) {
             if (BB.isEHPad() || BB.isLandingPad())
+                continue;
+            if (LoopBlocks.contains(&BB))
                 continue;
             for (Instruction &I : BB)
                 if (isProbeInsertionPoint(I))
@@ -11426,6 +11509,7 @@ Function *windowsProcessMitigationsProbe(Module &M, GlobalVariable *State,
 
 bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
     const Triple tt(M.getTargetTriple());
+    const bool startLiveWatchers = !moduleUsesForkOrSignalApis(M);
 
     if (tt.isOSLinux())
         emitLinuxMemfdReexecCtor(M, rng, tt);
@@ -11433,15 +11517,17 @@ bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
     Function *ctor = makeCtorShell(M, "morok.antidbg");
     GlobalVariable *state = antiDebugState(M, rng);
     if (tt.isOSLinux())
-        emitLinuxAntiDebug(M, ctor, state, rng, tt, AllowSelfTrace);
+        emitLinuxAntiDebug(M, ctor, state, rng, tt, AllowSelfTrace,
+                           startLiveWatchers);
     else if (tt.isOSDarwin())
-        emitDarwinAntiDebug(M, ctor, state, rng, tt);
+        emitDarwinAntiDebug(M, ctor, state, rng, tt, startLiveWatchers);
     else
         IRBuilder<>(&ctor->getEntryBlock()).CreateRetVoid();
     Function *probe = antiDebugProbe(M, state, rng, tt);
     insertAntiDebugCallsiteProbes(M, probe, rng);
     appendToGlobalCtors(M, ctor, 0);
-    emitAntiDebugWatchdogStart(M, probe, state, rng, tt);
+    if (startLiveWatchers)
+        emitAntiDebugWatchdogStart(M, probe, state, rng, tt);
     return true;
 }
 
