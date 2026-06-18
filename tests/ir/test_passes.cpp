@@ -59,6 +59,8 @@
 #include "morok/passes/Virtualization.hpp"
 #include "morok/pipeline/Scheduler.hpp"
 
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/Constants.h"
@@ -82,6 +84,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace llvm;
@@ -272,6 +275,82 @@ std::size_t countInlineAsmCalls(Function &F) {
             if (CB->isInlineAsm())
                 ++n;
     return n;
+}
+
+bool valueDependsOnOpaqueBarrier(Value *V) {
+    SmallVector<Value *, 32> Work;
+    SmallPtrSet<Value *, 32> Seen;
+    Work.push_back(V);
+    while (!Work.empty()) {
+        Value *Cur = Work.pop_back_val();
+        if (!Seen.insert(Cur).second)
+            continue;
+        if (auto *CB = dyn_cast<CallBase>(Cur))
+            if (CB->isInlineAsm() ||
+                (CB->getCalledFunction() &&
+                 CB->getCalledFunction()->getName().starts_with(
+                     "morok.opaque.zero")))
+                return true;
+        if (auto *I = dyn_cast<Instruction>(Cur)) {
+            for (Use &U : I->operands())
+                Work.push_back(U.get());
+            continue;
+        }
+        if (auto *CE = dyn_cast<ConstantExpr>(Cur))
+            for (Use &U : CE->operands())
+                Work.push_back(U.get());
+    }
+    return false;
+}
+
+Value *pointerBase(Value *V) {
+    for (;;) {
+        V = V->stripPointerCasts();
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
+            V = GEP->getPointerOperand();
+            continue;
+        }
+        if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+            if (CE->getOpcode() == Instruction::GetElementPtr) {
+                V = CE->getOperand(0);
+                continue;
+            }
+        }
+        return V;
+    }
+}
+
+std::pair<std::size_t, std::size_t>
+countStoresToBaseWithOpaqueSource(Function &F, StringRef basePrefix) {
+    std::size_t total = 0;
+    std::size_t opaque = 0;
+    for (Instruction &I : instructions(F)) {
+        auto *SI = dyn_cast<StoreInst>(&I);
+        if (!SI)
+            continue;
+        Value *Base = pointerBase(SI->getPointerOperand());
+        if (!Base->hasName() || !Base->getName().starts_with(basePrefix))
+            continue;
+        ++total;
+        if (valueDependsOnOpaqueBarrier(SI->getValueOperand()))
+            ++opaque;
+    }
+    return {total, opaque};
+}
+
+std::pair<std::size_t, std::size_t>
+countStoresToBaseWithOpaqueSource(Module &M, StringRef basePrefix) {
+    std::size_t total = 0;
+    std::size_t opaque = 0;
+    for (Function &F : M) {
+        if (F.isDeclaration())
+            continue;
+        auto [ftotal, fopaque] =
+            countStoresToBaseWithOpaqueSource(F, basePrefix);
+        total += ftotal;
+        opaque += fopaque;
+    }
+    return {total, opaque};
 }
 
 bool hasReadableByteString(Module &M, StringRef needle) {
@@ -9726,6 +9805,10 @@ lpad:
     CHECK(IndirectInvoke->getUnwindDest() == LPad);
     CHECK(countCallsTo(*F, "may_throw") == 0u);
     CHECK(countCallsTo(*F, "dlsym") == 1u);
+    auto [cloakStores, opaqueCloakStores] =
+        countStoresToBaseWithOpaqueSource(*M, "morok.cloak.buf");
+    CHECK(cloakStores >= 1u);
+    CHECK(opaqueCloakStores == cloakStores);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -10497,6 +10580,10 @@ entry:
     CHECK(M->getFunction("pthread_detach") != nullptr);
     CHECK(M->getFunction("sleep") != nullptr);
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_INSERT_LIBRARIES"));
+    auto [cloakStores, opaqueCloakStores] =
+        countStoresToBaseWithOpaqueSource(*M, "morok.cloak.buf");
+    CHECK(cloakStores >= 8u);
+    CHECK(opaqueCloakStores == cloakStores);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -10554,6 +10641,10 @@ entry:
     CHECK(countGlobals(*M, "morok.cloak.c") >= 8u);
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_INSERT_LIBRARIES"));
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_PRINT"));
+    auto [cloakStores, opaqueCloakStores] =
+        countStoresToBaseWithOpaqueSource(*M, "morok.cloak.buf");
+    CHECK(cloakStores >= 8u);
+    CHECK(opaqueCloakStores == cloakStores);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

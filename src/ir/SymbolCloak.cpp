@@ -8,7 +8,9 @@
 
 #include "morok/ir/IRRandom.hpp"
 
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
@@ -60,19 +62,6 @@ void emitStaticAnalysisBarrier(IRBuilderBase &B, const Module &M) {
     B.CreateCall(AsmTy, IA);
 }
 
-Value *emitVolatileStableZero(IRBuilderBase &B, std::uint64_t Salt,
-                              StringRef Prefix) {
-    auto *I64 = B.getInt64Ty();
-    AllocaInst *Slot =
-        B.CreateAlloca(I64, nullptr, Twine(Prefix) + ".slot");
-    B.CreateStore(ConstantInt::get(I64, Salt), Slot, /*isVolatile=*/true);
-    LoadInst *A =
-        B.CreateLoad(I64, Slot, /*isVolatile=*/true, Twine(Prefix) + ".a");
-    LoadInst *Bv =
-        B.CreateLoad(I64, Slot, /*isVolatile=*/true, Twine(Prefix) + ".b");
-    return B.CreateSub(A, Bv, Twine(Prefix) + ".zero");
-}
-
 // Shared finalizer: T already holds `K0 + (j+1)*mul`; spread it per variant.
 Value *emitFinalizer(IRBuilderBase &B, unsigned variant, Value *T) {
     auto *I64 = B.getInt64Ty();
@@ -84,8 +73,10 @@ Value *emitFinalizer(IRBuilderBase &B, unsigned variant, Value *T) {
     };
     switch (variant) {
     case 1:
-        T = B.CreateMul(B.CreateXor(T, R(T, 30)), ConstantInt::get(I64, kSplit1));
-        T = B.CreateMul(B.CreateXor(T, R(T, 27)), ConstantInt::get(I64, kSplit2));
+        T = B.CreateMul(B.CreateXor(T, R(T, 30)),
+                        ConstantInt::get(I64, kSplit1));
+        T = B.CreateMul(B.CreateXor(T, R(T, 27)),
+                        ConstantInt::get(I64, kSplit2));
         return B.CreateXor(T, R(T, 31));
     case 2:
         T = B.CreateXor(T, L(T, 13));
@@ -99,6 +90,51 @@ Value *emitFinalizer(IRBuilderBase &B, unsigned variant, Value *T) {
         T = B.CreateMul(T, ConstantInt::get(I64, kMurmur2));
         return B.CreateXor(T, R(T, 33));
     }
+}
+
+Value *emitOpaqueMix(IRBuilderBase &B, Value *V, Value *Salt,
+                     const Twine &name) {
+    auto *I64 = B.getInt64Ty();
+    Value *X = B.CreateXor(V, Salt, name + ".x");
+    Value *Odd = B.CreateOr(Salt, ConstantInt::get(I64, 1), name + ".odd");
+    X = B.CreateMul(X, Odd, name + ".m");
+    Value *R = B.CreateOr(
+        B.CreateShl(X, ConstantInt::get(I64, 13), name + ".l"),
+        B.CreateLShr(X, ConstantInt::get(I64, 51), name + ".r"), name + ".rot");
+    Value *SaltMix =
+        B.CreateMul(Salt, ConstantInt::get(I64, kXorMul), name + ".sm");
+    return B.CreateXor(R, SaltMix, name + ".y");
+}
+
+Function *opaqueZeroHelper(Module &M) {
+    if (Function *Existing = M.getFunction("morok.opaque.zero"))
+        return Existing;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *FTy = FunctionType::get(I64, {I64, I64}, false);
+    auto *Fn = Function::Create(FTy, GlobalValue::PrivateLinkage,
+                                "morok.opaque.zero", &M);
+    Fn->setDSOLocal(true);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->addFnAttr(Attribute::OptimizeNone);
+    Argument *Arg = Fn->getArg(0);
+    Arg->setName("x");
+    Argument *Salt = Fn->getArg(1);
+    Salt->setName("salt");
+
+    IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Fn));
+    AllocaInst *Slot = B.CreateAlloca(I64, nullptr, "morok.opaque.slot");
+    B.CreateStore(Arg, Slot, /*isVolatile=*/true);
+    LoadInst *A =
+        B.CreateLoad(I64, Slot, /*isVolatile=*/true, "morok.opaque.a");
+    emitStaticAnalysisBarrier(B, M);
+    LoadInst *Bv =
+        B.CreateLoad(I64, Slot, /*isVolatile=*/true, "morok.opaque.b");
+    Value *MA = emitOpaqueMix(B, A, Salt, "morok.opaque.ma");
+    Value *MB = emitOpaqueMix(B, Bv, Salt, "morok.opaque.mb");
+    B.CreateRet(B.CreateXor(MA, MB, "morok.opaque.zero"));
+    return Fn;
 }
 
 } // namespace
@@ -144,6 +180,19 @@ Value *emitKeystreamDynamic(IRBuilderBase &B, unsigned variant, Value *K0,
     return emitFinalizer(B, variant, T);
 }
 
+Value *emitRuntimeOpaqueZero(IRBuilderBase &B, Module &M, std::uint64_t salt,
+                             StringRef prefix) {
+    auto *I8 = Type::getInt8Ty(M.getContext());
+    auto *I64 = Type::getInt64Ty(M.getContext());
+
+    AllocaInst *Anchor = B.CreateAlloca(I8, nullptr, Twine(prefix) + ".anchor");
+    Value *Addr = B.CreatePtrToInt(Anchor, I64, Twine(prefix) + ".addr");
+    Function *Helper = opaqueZeroHelper(M);
+    return B.CreateCall(Helper->getFunctionType(), Helper,
+                        {Addr, ConstantInt::get(I64, salt)},
+                        Twine(prefix) + ".zero");
+}
+
 // The per-module runtime key: a private *mutable* global holding a random
 // value, always read with a volatile load.  Mutable + volatile is the
 // established anti-fold pattern — the optimizer must treat the loaded value as
@@ -153,10 +202,9 @@ GlobalVariable *cloakSeed(Module &M, IRRandom &rng) {
             M.getGlobalVariable("morok.cloak.seed", /*AllowInternal=*/true))
         return Existing;
     auto *I64 = Type::getInt64Ty(M.getContext());
-    auto *GV = new GlobalVariable(M, I64, /*isConstant=*/false,
-                                  GlobalValue::PrivateLinkage,
-                                  ConstantInt::get(I64, rng.next()),
-                                  "morok.cloak.seed");
+    auto *GV = new GlobalVariable(
+        M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I64, rng.next()), "morok.cloak.seed");
     GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
     return GV;
 }
@@ -185,8 +233,8 @@ Value *emitCloakedSymbol(IRBuilderBase &B, Module &M, StringRef symbol,
     SmallVector<Constant *, 32> CipherBytes;
     CipherBytes.reserve(Len);
     for (std::uint32_t j = 0; j < Len; ++j) {
-        const auto Ks =
-            static_cast<std::uint8_t>(keystreamValue(Variant, K0, j, Mul) & 0xFFu);
+        const auto Ks = static_cast<std::uint8_t>(
+            keystreamValue(Variant, K0, j, Mul) & 0xFFu);
         const auto Plain = static_cast<std::uint8_t>(Bytes[j]);
         const auto C = AddCombine ? static_cast<std::uint8_t>(Plain + Ks)
                                   : static_cast<std::uint8_t>(Plain ^ Ks);
@@ -202,12 +250,14 @@ Value *emitCloakedSymbol(IRBuilderBase &B, Module &M, StringRef symbol,
     LoadInst *SeedLoad =
         B.CreateLoad(I64, Seed, /*isVolatile=*/true, "morok.cloak.k");
     emitStaticAnalysisBarrier(B, M);
-    Value *SeedMix =
-        B.CreateAdd(SeedLoad,
-                    emitVolatileStableZero(B, rng.next(), "morok.cloak.mix"),
-                    "morok.cloak.k.mix");
-    Value *RtKey = B.CreateXor(SeedMix, ConstantInt::get(I64, SiteKey),
-                               "morok.cloak.k0");
+    Value *SeedMix = B.CreateAdd(
+        SeedLoad, emitRuntimeOpaqueZero(B, M, rng.next(), "morok.cloak.mix"),
+        "morok.cloak.k.mix");
+    Value *RtKey =
+        B.CreateXor(SeedMix, ConstantInt::get(I64, SiteKey), "morok.cloak.k0");
+    Value *StoreMask = B.CreateTrunc(
+        emitRuntimeOpaqueZero(B, M, rng.next(), "morok.cloak.store"), I8,
+        "morok.cloak.store.byte");
 
     for (std::uint32_t j = 0; j < Len; ++j) {
         Value *Ks = emitKeystream(B, Variant, RtKey, j, Mul);
@@ -218,9 +268,11 @@ Value *emitCloakedSymbol(IRBuilderBase &B, Module &M, StringRef symbol,
         Value *CipherByte = B.CreateLoad(I8, CipherPtr);
         Value *Plain = AddCombine ? B.CreateSub(CipherByte, KsByte)
                                   : B.CreateXor(CipherByte, KsByte);
+        Value *MaskedPlain =
+            B.CreateXor(Plain, StoreMask, "morok.cloak.masked");
         Value *BufPtr = B.CreateInBoundsGEP(
             ArrTy, Buf, {ConstantInt::get(I64, 0), ConstantInt::get(I64, j)});
-        B.CreateStore(Plain, BufPtr);
+        B.CreateStore(MaskedPlain, BufPtr);
     }
     emitStaticAnalysisBarrier(B, M);
     return B.CreateInBoundsGEP(

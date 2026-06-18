@@ -52,6 +52,14 @@ llvm::Value *emitKeystreamDynamic(llvm::IRBuilderBase &B, unsigned variant,
                                   llvm::Value *K0, llvm::Value *JVal,
                                   std::uint64_t mul);
 
+/// Emit an i64 that is zero at runtime but opaque to ordinary microcode
+/// constant folding.  The value is tied to a stack address through a private
+/// noinline helper call, so intraprocedural decompiler passes cannot reduce
+/// dependent byte stores to constants just by reading globals and replaying
+/// arithmetic.
+llvm::Value *emitRuntimeOpaqueZero(llvm::IRBuilderBase &B, llvm::Module &M,
+                                   std::uint64_t salt, llvm::StringRef prefix);
+
 /// The shared per-module runtime key: a private *mutable* i64 global holding a
 /// random value, meant to be read with a volatile load (so the optimizer cannot
 /// fold keystream-derived values back to plaintext).  Created on first use.
@@ -60,11 +68,12 @@ llvm::GlobalVariable *cloakSeed(llvm::Module &M, IRRandom &rng);
 /// Emit, at `B`'s current insertion point, an inline per-site decryption of the
 /// C symbol name `symbol` into a fresh stack buffer, and return an `i8*` to the
 /// recovered NUL-terminated string.  No readable copy of `symbol` exists in the
-/// artifact: each call site carries its own ciphertext (a private `morok.cloak.c`
-/// byte global) and its own unrolled keystream — one of several generators,
-/// XOR- or ADD-combined, chosen per site — keyed on `k0 = (volatile load of the
-/// mutable module seed `morok.cloak.seed`) ^ siteKey`.  The volatile load is
-/// opaque to the optimizer, so the cipher never folds back to text.
+/// artifact: each call site carries its own ciphertext (a private
+/// `morok.cloak.c` byte global) and its own unrolled keystream — one of several
+/// generators, XOR- or ADD-combined, chosen per site — keyed on `k0 = (volatile
+/// load of the mutable module seed `morok.cloak.seed`) ^ siteKey`.  The
+/// volatile load is opaque to the optimizer, so the cipher never folds back to
+/// text.
 llvm::Value *emitCloakedSymbol(llvm::IRBuilderBase &B, llvm::Module &M,
                                llvm::StringRef symbol, IRRandom &rng);
 
