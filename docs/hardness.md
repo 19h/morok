@@ -7,12 +7,12 @@ to instruction volume:
 1. **T-function single-cycle state generator** (`core/TFunction.hpp`) — a
    provably full-period nonlinear dispatcher-state generator that replaces the
    logistic map in control-flow flattening.
-2. **Multivariate-quadratic (MQ) input gate** (`core/MqGf2.hpp`) — a degree-2
-   GF(2) gate that is cheap forward and MQ-hard to invert, hardening genuinely
-   input-derived branches against symbolic input-finding.
-3. **Shamir (k,n) threshold sharing bound to control flow**
-   (`core/ShamirGf256.hpp`) — threshold reconstruction of a high-value value
-   that is information-theoretically unrecoverable from sub-quorum coverage.
+2. **Multivariate-quadratic (MQ) opaque gate** (`core/MqGf2.hpp`) — planted
+   GF(2) quadratic systems emitted as opaque branch guards; a future validation
+   mode can bind the same core to application-owned accepting inputs.
+3. **Shamir (k,n) threshold sharing for selected constants**
+   (`core/ShamirGf256.hpp`) — threshold reconstruction of high-value literals;
+   future path-distributed placement can add sub-quorum coverage guarantees.
 
 The three pure cores are already implemented and exhaustively/property-testable
 with zero LLVM dependency, per the project's "prove the math in `core`, emit the
@@ -124,7 +124,7 @@ namespace morok::core::tfunc {
 function:
 
 ```cpp
-enum class StateGenerator { Logistic, TFunction };
+enum class CsmGenerator { Logistic, TFunction };
 
 struct CsmParams {                 // populated by the scheduler from CsmConfig
   StateGenerator generator = StateGenerator::Logistic;
@@ -180,13 +180,13 @@ scheduler loop. A standalone `-passes=morok-tfa` wrapper may expose
 |---|---|---|---|
 | `enabled` | `Opt<bool>` | off | gate (`csm` attr) |
 | `generator` | `Opt<enum>` | `logistic` | `logistic` \| `tfunction` |
-| `tf_const` | `Opt<u64>` | `5` | rejected at resolve time unless `isSingleCycleConstant`; `0`/unset ⇒ per-build random valid C |
+| `tf_const` | `Opt<u64>` | `5` | `0`/unset/invalid ⇒ per-build random valid C |
 | `nested_dispatch` | `Opt<bool>` | off | existing |
 | `warmup` | `Opt<u32>` | `64` | unused for `tfunction` (period ≫ blocks) |
 
-TOML: `[passes.csm] generator = "tfunction"`. Validation lives in the resolver
-(reject out-of-class constants with a diagnostic, like the existing
-`share_count`/`width` clamps).
+TOML: `[passes.chaos_state_machine] generator = "tfunction"`. Invalid
+`tf_const` values fall back to a per-build valid constant, preserving the
+single-cycle guarantee.
 
 ### 1.6 Scheduler placement
 
@@ -223,24 +223,23 @@ nonlinear state that strengthens the existing entanglement. Keep the state at
 
 ---
 
-## 2. Multivariate-quadratic (MQ) input gate
+## 2. Multivariate-quadratic (MQ) opaque gate
 
 ### 2.1 Motivation
 
 `PathExplosion` and `TraceKeying` raise the *cost* of symbolic exploration; they
-are not backed by a hardness assumption. The MQ gate adds one that is: deciding
-whether a system of multivariate quadratic equations over GF(2) has a common
-root is NP-complete, and *random dense* systems are precisely the regime where
-generic SAT and Gröbner-basis methods stall — the hardness underpinning
-UOV/Rainbow signatures.
+are not backed by a compact algebraic primitive. The MQ gate adds one:
+evaluating a multivariate quadratic system over GF(2) is cheap, while solving a
+random dense system for a root is the hard problem behind classic MQ
+cryptosystems.
 
-The asymmetry is the point. A planted quadratic system is trivial to
-**evaluate** (a few AND/XOR per equation) but, at adequate width, intractable to
-**invert** (find the satisfying assignment). Against a coverage-driven symbolic
-engine asking "what input reaches this block?", the path constraint *is* an MQ
-system. Against a keygen-style attacker forging an accepting input, forgery *is*
-MQ. And unlike a cryptographic-hash gate — which is also SMT-hard but bloats both
-the binary and the emitted SMT formula — a degree-2 system keeps both small.
+The implemented form is deliberately correctness-first: it plants a root and
+emits an opaque guard that is true at runtime, so arbitrary programs keep their
+semantics. This does not claim that ordinary program input has become an
+MQ-hard keygen problem. It gives the binary a dense quadratic predicate that a
+static simplifier must either preserve or prove through volatile cancellation.
+The stronger "forge an accepting input" claim is reserved for a future mode
+where the application supplies or models a legitimate accepting assignment.
 
 ### 2.2 Architecture
 
@@ -248,39 +247,39 @@ the binary and the emitted SMT formula — a degree-2 system keeps both small.
 `Gate{opens}`, `makePlantedGate`. `makePlantedForm` re-bases each form's constant
 so a chosen assignment `s` is a root, i.e. the gate **opens exactly at `s`**.
 
-The pass is a new per-function member of the anti-DSE family. It harvests the
-gate-input bits from genuinely input-derived values (the same harvesting
-`DataEntangledFlattening`/`PathExplosion` already do over arguments and live
-integers), emits the system as a private constant, evaluates `opens()` inline,
-branches on it, and — crucially — folds the gate-failed signal into downstream
-data exactly as `TraceKeying` folds its accumulator diff, so there is no
-separable success/fail edge to patch.
+The pass is a per-function anti-DSE transform. It selects conditional branches
+whose condition is transitively argument/load-derived, emits a private
+`morok.mq.sys.*` audit global, evaluates the planted system inline, and guards
+the original branch through a continuation block. The gate bits are built from
+argument-derived bit extractions, but each bit is written to volatile scratch and
+loaded twice; the xor of the two loads is zero at runtime, and the planted bit is
+xored in. The result is a true planted assignment with volatile input-derived IR
+structure.
 
-Two honest operating modes, both relying on MQ-hardness against *symbolic*
-adversaries (neither claims resistance to a single concrete trace):
+Two modes are now distinguished:
 
-- **Mode A — input validation.** The `m` bits are attacker-controlled input
-  (serial, key, feature token). The gate opens iff input satisfies the system;
-  a legitimate user supplies a valid input (a root exists — the planted `s` is
-  one). Morok does not fabricate the input; it only emits the check. Forging an
-  accepting input is MQ.
-- **Mode B — anti-coverage on a derived predicate.** The `m` bits are derived
-  from input by a known map `g`. Reaching the gated block under symbolic
-  exploration requires solving `system ∘ g`; concrete runs that already drive
-  `g(input)` to a root pass normally.
+- **Implemented — planted opaque gate.** Always semantics-preserving for
+  arbitrary programs. The fail edge writes volatile decoy state and rejoins the
+  original branch continuation. Static and symbolic tooling must carry a dense
+  degree-2 predicate plus volatile memory reasoning to prove the guard.
+- **Future — input validation / anti-coverage gate.** The `m` bits are genuinely
+  application-controlled input or a known derived predicate `g(input)`, and the
+  application owns a valid root. Reaching the protected edge or forging a valid
+  input then reduces to solving the emitted MQ system. This mode needs
+  application-level validity knowledge and is not enabled by the current pass.
 
 ### 2.3 Pass specification
 
 ```cpp
-struct MqParams {
+struct MqGateParams {
   uint32_t probability = 20;   // per-eligible-branch coin
-  uint32_t vars        = 64;   // m  (gate-input bit count)
-  uint32_t eqs         = 64;   // keep ≈ vars; avoid over-defined systems
+  uint32_t vars        = 24;   // m  (raise to 64+ for heavy experiments)
+  uint32_t eqs         = 24;   // keep ≈ vars; avoid over-defined systems
   uint32_t density     = 50;   // per-coefficient 1-probability, %
-  uint32_t max_gates   = 4;    // per-function cap
-  bool     fold_diff   = true; // TraceKeying-style poisoning of the bypass
+  uint32_t max_gates   = 2;    // per-function cap
+  bool     fold_diff   = true; // emit volatile fail-side decoy
 };
-bool mqGateFunction(Function&, const MqParams&, ir::IRRandom&);
+bool mqGateFunction(Function&, const MqGateParams&, ir::IRRandom&);
 ```
 
 **Selection.** Eligible sites are conditional branches whose condition is
@@ -289,12 +288,12 @@ arguments / loaded inputs, reusing the liveness harvest already used by the
 entanglement passes. Cap by `max_gates` after a per-build shuffle; skip EH pads,
 entry setup, and `morok.*` blocks.
 
-**Bit harvesting.** Build the `m`-bit gate input from harvested `iN` values:
-for each contributing value `v`, `bit_k = trunc i1 (lshr v, p_k)`; pack into the
-`Gate`'s assignment order. Where fewer than `m` independent input bits are
-available, top up from additional live values; the planted `s` is fixed to match
-whatever the legitimate path produces (Mode A: a valid input's bits; Mode B:
-`g(input)` on the intended branch).
+**Bit harvesting.** Build the `m` visible source bits from function arguments:
+`bit_k = trunc i1 (lshr v, p_k)`. Store each bit to a per-function
+`morok.mq.scratch` alloca byte, load that byte twice volatilely, xor the loads
+to a runtime zero, and xor in the planted bit. The MQ system therefore receives
+the planted assignment exactly, while the IR still exposes argument-derived
+volatile bit flow.
 
 **System emission.** At build time the coefficients are known, so emit **only
 the nonzero terms** (the dense `QuadForm` is generated then pruned to its set
@@ -302,27 +301,27 @@ bits): each form is `XOR` of the selected `AND`-pairs `(b_i & b_j)` and linear
 `b_i`, plus the constant; the gate is the `AND` of `form == 0` over all `eqs`.
 Store the packed coefficient matrix as a private constant `morok.mq.sys.*`
 (documentation/forensics only; the live check is the unrolled term tree). The
-gate i1 replaces the original condition; the planted assignment guarantees the
-intended edge at runtime.
+MQ guard branches to a continuation containing the original conditional branch;
+the fail block performs a volatile scratch write and rejoins the same
+continuation.
 
-**Bypass poisoning (`fold_diff`).** Compute `fail = zext(gate_failed)` and fold
-a width-matched `fail * K` into the block's outgoing data/return exactly as
-`TraceKeying` does (XOR into branch/switch conditions, XOR into integer
-returns). On the valid path `fail == 0`; an attacker who forces the branch past
-the gate still corrupts routing/output — so the gate cannot be NOP'd, only
-solved.
+**Fail side (`fold_diff`).** Current `fold_diff=true` keeps a side-effecting
+decoy fail block, not semantic poisoning. Because the current gate is an opaque
+true guard, the fail edge is not expected during normal execution; if it is
+forced, it still rejoins the original continuation to preserve semantics. True
+data poisoning belongs to the future validation mode.
 
 ### 2.4 Config schema
 
-| Field (`MqConfig`) | Default | Notes |
+| Field (`MqGateConfig`) | Default | Notes |
 |---|---|---|
 | `enabled` | off | gate (`mq` attr) |
 | `probability` | 20 | per input-derived branch |
-| `vars` | 64 | `< ~32` is solvable instantly; specify ≥ 64 for margin |
-| `eqs` | 64 | keep ≈ `vars`; over-defined systems can be easier |
+| `vars` | 24 | bounded default; specify ≥64 only when code size is acceptable |
+| `eqs` | 24 | keep ≈ `vars`; over-defined systems can be easier |
 | `density` | 50 | coefficient fill % |
 | `max_gates` | 4 | per-function |
-| `fold_diff` | true | bypass poisoning |
+| `fold_diff` | true | emit volatile fail-side decoy |
 
 ### 2.5 Scheduler placement
 
@@ -344,26 +343,25 @@ passes that run earlier.
   open (statistical — false-open probability `≈ 2^{-eqs}`). `triIndex` is a
   bijection onto `[0, m(m+1)/2)`; `evalForm` matches a brute-force reference on
   small `m`.
-- **passes.** The pass verifies and fires; the emitted gate tree contains only
-  `and`/`xor`/`icmp eq`/`select`, no division/loads of the system in the hot
-  path; `max_gates` respected.
-- **e2e.** Differential build where the fixtures supply the planted/valid input
-  ⇒ byte-identical output. A **separate, non-differential** targeted test feeds
-  a non-satisfying input and asserts the `fold_diff` corruption path diverges
-  (this test is excluded from the byte-identical suite by construction).
+- **passes.** The pass verifies and fires; the emitted gate tree contains
+  `and`/`xor`/`icmp eq`, no division or coefficient loads in the hot path;
+  `max_gates` respected; fail-side volatile scratch writes exist.
+- **e2e.** Differential build compiles and runs byte-identically because the
+  current gate is planted opaque-true and the fail path rejoins the original
+  continuation.
 
 ### 2.7 Weaknesses / guardrails
 
 Hardness needs adequate width: `m ≳ 64` and `eqs ≈ m` (small or heavily
 over-defined systems solve quickly). Code size grows ~`m²` in pruned terms; cap
-`max_gates`. MQ resists *symbolic input-finding*, **not** concrete execution — a
-single observed valid run reveals the accepting input. Therefore restrict the
-pass to genuinely input-derived conditions (a constant-derived condition gains
-nothing) and lean on `fold_diff` for tamper-resistance of the bypass.
+`max_gates`. The current planted opaque gate raises simplification cost but does
+not make arbitrary input-finding MQ-hard. That stronger claim requires the
+future validation mode, a real application-owned accepting assignment, and
+non-neutral fail semantics.
 
 ---
 
-## 3. Shamir (k,n) threshold sharing bound to control flow
+## 3. Shamir (k,n) threshold sharing for selected constants
 
 ### 3.1 Motivation
 
@@ -374,34 +372,36 @@ of a random degree-`(k-1)` polynomial; any `k` of `n` evaluation shares
 reconstruct it by Lagrange interpolation, and **any `k-1` shares are
 information-theoretically independent of it**.
 
-The obfuscation move is to bind the shares to control flow: deposit the `n`
-shares at `n` distinct program points and reconstruct only after a quorum of `k`
-has executed. A high-value value (a constant, a jump-table index, a key) then
-materializes only along paths reaching quorum, and any partial backward slice or
-sub-quorum path yields **provably zero information** — a strictly stronger claim
-than the cost-based passes.
+The implemented obfuscation move is dominator-deposited fixed-quorum
+reconstruction: selected integer constants are split bytewise, `k` shares are
+published through volatile cells from a dominating deposit point, and the value
+is rebuilt by Lagrange interpolation at the use site. A future path-distributed
+mode can bind shares to distinct control-flow deposits and reconstruct only
+after a quorum has executed; that stronger mode would make partial path slices
+yield **provably zero information**.
 
 ### 3.2 Architecture
 
 `core::shamir` is shipped: `split(secret,k,n)`, `reconstruct(shares)` (Lagrange
 at 0, with characteristic-2 simplification: `-x ≡ x`, `a-b ≡ a^b`), `evalPoly`.
-The pass is a new per-function transform placed just before `ConstantEncryption`
-(so the emitted share globals are themselves constant-encrypted) and after
-`SelfChecksumConstants`. It reuses the `getOrCreateGf8Mul` → `morok.gf8mul`
-idiom from `StringEncryption`.
+The pass is a per-function transform placed after the late integrity passes and
+before `ConstantEncryption`, so it claims selected remaining constants before
+generic XOR sharing. It reuses the `getOrCreateGf8Mul` → `morok.gf8mul` idiom
+from `StringEncryption`.
 
 Two placement strategies, differing in their correctness obligation:
 
-- **`dominator` (default, provably correct).** Choose `k` deposit blocks that
-  **all dominate** the use site, so every path reaching the use has populated
-  all `k` shares; the abscissa set is therefore fixed and known at build time.
-  Then the Lagrange basis coefficients `L_j(0) = ∏_{m≠j} x_m·inv(x_j ⊕ x_m)` are
-  **compile-time constants in GF(2⁸)**, and reconstruction collapses to
-  `secret = XOR_j gf8mul(share_j, L_j)` — `k` loads, `k` constant-multiplies,
-  and a XOR-fold. No field inverse is emitted in IR; only `morok.gf8mul` is
-  needed. This is a build-time specialization of `shamir::reconstruct` for the
-  fixed abscissae.
-- **`distributed` (advanced).** Shares deposited across genuinely distinct paths
+- **`dominator` (implemented, provably correct).** Emit private mutable share
+  globals, load the first `k` shares in a block that dominates the use, store
+  them volatilely into private `morok.shamir.cell.*` globals, and reconstruct at
+  the use site from those cells.  The abscissa set is fixed and known at build
+  time, so the Lagrange basis coefficients
+  `L_j(0) = ∏_{m≠j} x_m·inv(x_j ⊕ x_m)` are compile-time constants in GF(2⁸),
+  and reconstruction collapses to
+  `secret = XOR_j gf8mul(cell_j, L_j)` — `k` volatile cell loads, `k`
+  constant-multiplies, and a XOR-fold. No field inverse is emitted in IR; only
+  `morok.gf8mul` is needed.
+- **`distributed` (future, advanced).** Shares deposited across genuinely distinct paths
   (any `k` of `n`). Requires a runtime populated-share selection and Lagrange
   over the *actual* abscissae, hence a baked public inverse table
   `morok.shamir.ginv` (256 bytes, filled at build with `core::gf8::inv`; field
@@ -412,14 +412,11 @@ Two placement strategies, differing in their correctness obligation:
 ### 3.3 Pass specification
 
 ```cpp
-enum class SharePlacement { Dominator, Distributed };
-
 struct ShamirParams {
   uint32_t       probability = 30;     // per eligible value
   uint32_t       threshold   = 3;      // k  (≥2)
   uint32_t       shares      = 5;      // n  (≥k, ≤255)
   uint32_t       max_secrets = 8;      // per-function cap
-  SharePlacement placement   = SharePlacement::Dominator;
 };
 bool shamirShareFunction(Function&, const ShamirParams&, ir::IRRandom&);
 ```
@@ -435,17 +432,17 @@ private mutable global `morok.shamir.share.*` (so a later pass / the loader can
 relocate them; they are not the secret). Abscissae are `1..n`.
 
 **Deposit + quorum.**
-- *Dominator:* select `k` blocks dominating the use; in each, a (volatile) store
-  publishes its share into a per-secret cell `morok.shamir.cell.*` (or simply
-  reference the share global directly, since domination guarantees liveness).
-  Reconstruct at the use site with the constant-folded form above.
+- *Dominator:* publish the selected quorum into `morok.shamir.cell.*` with
+  volatile stores from a dominating point. The current implementation uses the
+  entry block as the conservative deposit point, which dominates every use.
+  Reconstruct at the use site with the constant-folded Lagrange form above.
 - *Distributed:* in each of the `n` deposit blocks, store `(abscissa_i,
   share_i)` into `morok.shamir.cell.*` and set a populated-bit; at the use site,
   gather the first `k` populated entries and run the `morok.gf8mul` +
   `morok.shamir.ginv` Lagrange loop. The pass emits a build-time assertion that
   the chosen deposit blocks guarantee ≥`k` on all paths to the use.
 
-**Reconstruction IR (dominator).** With abscissae `{1,2,3}` for `k=3`, the basis
+**Reconstruction IR (fixed quorum).** With abscissae `{1,2,3}` for `k=3`, the basis
 `L_j(0)` are three `GF(2⁸)` constants computed at build time; emit
 `r = gf8mul(s1,L1) ^ gf8mul(s2,L2) ^ gf8mul(s3,L3)` where `s_*` are the loaded
 share bytes. By Lagrange this equals the secret exactly, proven by the same
@@ -460,17 +457,19 @@ field round-trip the core test exercises.
 | `threshold` (`k`) | 3 | clamp ≥2 |
 | `shares` (`n`) | 5 | clamp `[k,255]` |
 | `max_secrets` | 8 | per-function |
-| `placement` | `dominator` | `dominator` \| `distributed` |
+
+There is no public placement knob yet; the implemented pass uses conservative
+entry-block dominator deposits. Path-distributed deposits remain future work.
 
 ### 3.5 Scheduler placement
 
 ```text
-… → SelfChecksum → ShamirShare → ConstEnc → IndirectBranch → …
+… → SelfChecksum → MutualGuardGraph → ShamirShare → ConstEnc → IndirectBranch → …
 ```
 
-Before `ConstEnc` so the share globals get XOR-share-encrypted (defense in depth,
-mirroring the `SelfChecksum`→`ConstEnc` ordering rationale); after `SelfChecksum`
-so integrity fusion targets the original constants, not share reconstructions.
+Before `ConstEnc` so Shamir claims selected constants before generic XOR sharing;
+after `SelfChecksum` and `MutualGuardGraph` so integrity fusion targets the
+original constants, not share reconstructions.
 
 ### 3.6 Test plan
 
@@ -478,11 +477,12 @@ so integrity fusion targets the original constants, not share reconstructions.
   every 3-subset reconstructs the secret. Property: random `(k,n,secret,subset)`
   round-trips. Regression: the `secret=0x42,k=3,n=5,coeffs={0x42,0x1D,0x8C}`
   share vector and its reconstruction in the header.
-- **passes.** The pass verifies and fires; dominator mode emits exactly `k`
-  loads + `k` `gf8mul` + XOR (no inverse, no loop); `max_secrets` respected;
-  share globals are private and `morok.shamir.*`.
-- **e2e.** This is the correctness proof: with shares deposited and reconstructed
-  on the real path, output is byte-identical across `low`/`mid`/`high` × seeds.
+- **passes.** The pass verifies and fires; dominator mode emits `k` share loads,
+  `k` cell stores, `k` cell loads, `k` `gf8mul`, and XOR reconstruction (no
+  inverse, no loop); `max_secrets` respected; share/cell globals are private and
+  `morok.shamir.*`.
+- **e2e.** This is the correctness proof: with shares reconstructed on the real
+  path, output is byte-identical across `low`/`mid`/`high` × seeds.
   The differential harness is exactly the right gate — a reconstruction bug
   surfaces immediately as divergent output.
 
@@ -490,13 +490,10 @@ so integrity fusion targets the original constants, not share reconstructions.
 
 The value is reconstructed in a register **at runtime**, so a dynamic attacker
 at the reconstruction point sees plaintext — Shamir hides the value from *static*
-and *sub-quorum* analysis, not from a breakpoint at the use site. The
-`distributed` mode's information-theoretic story only holds if the `n` deposits
-lie on genuinely distinct control paths; the `dominator` default trades that for
-provable correctness (statically it reads as "value computed from `k` constants",
-but each share is independently encrypted by `ConstEnc` and no single share
-reveals anything). Prefer `dominator` unless a specific path structure justifies
-`distributed`.
+and *sub-quorum* analysis, not from a breakpoint at the use site. The current
+dominator mode is a correctness-first literal reconstruction pass; the
+`distributed` mode's information-theoretic control-flow story only holds if the
+`n` deposits lie on genuinely distinct control paths.
 
 ---
 
@@ -511,14 +508,15 @@ existing convention (off in `low`, modest in `mid`, full in `high`):
 |---|---|---|---|
 | `csm.generator` | — | `tfunction` | `tfunction` |
 | `csm.tf_const` | — | random valid | random valid |
-| `mq.enabled` / `probability` | off | off | on / 15 |
-| `mq.vars` / `eqs` | — | — | 64 / 64 |
+| `mq.enabled` / `probability` | off | off | off / 0 |
+| `mq.vars` / `eqs` | — | — | — |
 | `shamir.enabled` / `probability` | off | on / 15 | on / 30 |
 | `shamir.threshold` / `shares` | — | 3 / 5 | 3 / 5 |
 
-MQ is `high`-only by default: it is the heaviest (code size, and it only helps on
-input-derived branches). The T-function is free relative to the logistic map and
-strictly better, so `mid`+ default to it.
+MQ is opt-in by default because dense quadratic trees scale roughly with
+`vars² * eqs`; explicit configurations can enable a bounded 24x24 system, and
+standalone MQ refuses oversized functions. The T-function is free relative to
+the logistic map and strictly better, so `mid`+ default to it.
 
 ### 4.2 Annotations
 
@@ -533,12 +531,12 @@ T-function flattening), `mq`, `shamir`, with their `no*` opposites. The existing
 - `passes/`: add `MqGate.cpp`, `ShamirShare.cpp` (and headers) to
   `src/passes/CMakeLists.txt`; the T-function modifies `ChaosStateMachine.cpp`
   (add `emitStepTF`, `CsmParams`) and may add a thin `morok-tfa` wrapper.
-- `config/`: add `MqConfig`, `ShamirShareConfig`, and `CsmConfig.generator`/
+- `config/`: add `MqGateConfig`, `ShamirShareConfig`, and `CsmConfig.generator`/
   `.tf_const` to `PassConfig.hpp`; extend the TOML loader, resolver validation
-  (reject non-single-cycle `tf_const`, clamp `k`/`n`/`vars`), and preset tables.
+  for later MQ/Shamir clamps (`k`/`n`/`vars`), and preset tables.
 - `pipeline/`: add the two scheduler blocks at the placements in §2.5/§3.5,
-  reading `eff.mq.*` / `eff.shamir.*` via `value_or`; pass `CsmParams.generator`
-  into the existing CSM call.
+  reading `eff.mq_gate.*` / `eff.shamir_share.*` via `value_or`; pass
+  `CsmParams.generator` into the existing CSM call.
 - `Plugin.cpp`: register `-passes=morok-mq`, `-passes=morok-shamir`,
   `-passes=morok-tfa`.
 - `docs/algorithms.md`: add one entry per primitive in the existing format.
@@ -546,23 +544,24 @@ T-function flattening), `mq`, `shamir`, with their `no*` opposites. The existing
 ### 4.4 Polymorphism & determinism
 
 All three draw exclusively from the shared `IRRandom` engine: the system
-coefficients, the planted/abscissa choices, the deposit-block selection, and the
-per-build `C` are all seeded, so `-morok-seed` reproduces the build and distinct
-seeds produce structurally distinct binaries (different MQ systems, different
-share polynomials, different `C`), defeating cross-binary diffing for free.
+coefficients, the planted/abscissa choices, the Shamir share polynomials, and
+the per-build `C` are all seeded, so `-morok-seed` reproduces the build and
+distinct seeds produce structurally distinct binaries (different MQ systems,
+different share polynomials, different `C`), defeating cross-binary diffing for
+free.
 
 ---
 
 ## 5. Honest ceiling
 
-Stated plainly so each piece is aimed correctly. The T-function, Shamir, and MQ
-are, respectively, a **correctness upgrade** (full-period nonlinear state with no
-impure hack), an **information-theoretic** guarantee against *sub-quorum / static
-partial* analysis, and a **named-hardness** guarantee against *symbolic
-input-finding*. None of them resists a full concrete trace sitting at the
-generator step, the reconstruction point, or the gate evaluation — a dynamic
-attacker there observes concrete state. The durable, hard-to-argue-away wins are
-exactly those three framed claims; layering them with the existing entanglement,
-trace-keying, and constant-encryption passes is what raises the cost of getting
-to those observation points. Do not document any of these as "undeobfuscatable";
-document them as what they are.
+Stated plainly so each piece is aimed correctly. The T-function and Shamir are,
+respectively, a **correctness upgrade** (full-period nonlinear state with no
+impure hack) and an **information-theoretic** guarantee against
+*sub-quorum / static partial* analysis. The current MQ pass is a
+semantics-preserving planted opaque predicate that adds dense quadratic
+simplification pressure; only a future application-bound validation mode should
+be documented as a **named-hardness** guarantee against input forgery or
+symbolic input-finding. None of these resists a full concrete trace sitting at
+the generator step, the reconstruction point, or the gate evaluation — a dynamic
+attacker there observes concrete state. Do not document any of these as
+"undeobfuscatable"; document them as what they are.

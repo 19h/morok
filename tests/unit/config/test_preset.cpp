@@ -406,8 +406,8 @@ TEST_CASE("max preset enables every pass at full intensity") {
     CHECK(c.mba.probability == 100u);
     CHECK(c.virtualization.probability == 100u);
     CHECK(c.virtualization.max_functions == 16u);
-    CHECK(c.virtualization.max_instructions == 256u);
-    CHECK(c.virtualization.max_registers == 128u);
+    CHECK(c.virtualization.max_instructions == 1024u);
+    CHECK(c.virtualization.max_registers == 255u);
     CHECK(c.vec.width == 512u);
     CHECK(c.const_enc.share_count == 8u);
     CHECK(c.func_wrap.times == 2u);

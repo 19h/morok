@@ -824,8 +824,12 @@ PassConfig makeMax() {
     c.virtualization.enabled = true;
     c.virtualization.probability = 100;
     c.virtualization.max_functions = 16;
-    c.virtualization.max_instructions = 256;
-    c.virtualization.max_registers = 128;
+    // Headroom for whole multi-block loop kernels: after CFG/memory/call/
+    // intrinsic lifting a real round function is several hundred VM ops with a
+    // large cross-block live set, so push the register file to the 1-byte
+    // operand-index ceiling (255 selectable registers).
+    c.virtualization.max_instructions = 1024;
+    c.virtualization.max_registers = 255;
 
     c.hash_self_decrypt.enabled = true;
     c.hash_self_decrypt.probability = 100;

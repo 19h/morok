@@ -162,7 +162,14 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
     Module &M = *F.getParent();
     const unsigned shareCount = std::clamp<unsigned>(
         params.share_count, core::kMinShares, core::kMaxShares);
-    const std::uint32_t iterations = params.iterations ? params.iterations : 1;
+    // Each iteration re-encrypts constants (including those introduced by the
+    // previous round's key material), so IR size grows with the iteration
+    // count.  The "max" preset asks for 3; clamp to a generous ceiling so a
+    // malformed config — or a stale/partial build handing this pass an
+    // uninitialized ConstEncParams — cannot detonate compile time.
+    constexpr std::uint32_t kMaxConstEncIterations = 8;
+    const std::uint32_t iterations = std::clamp<std::uint32_t>(
+        params.iterations ? params.iterations : 1, 1, kMaxConstEncIterations);
     bool changed = false;
 
     for (std::uint32_t it = 0; it < iterations; ++it) {

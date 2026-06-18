@@ -233,6 +233,317 @@ Value *loadAt(IRBuilder<> &B, Module &M, Type *Ty, Value *Base,
                   Name);
 }
 
+Value *emitWindowsGsRead(IRBuilder<> &B, Module &M, std::uint32_t Offset,
+                         const Twine &Name) {
+    auto *IP = M.getDataLayout().getIntPtrType(M.getContext());
+    auto *AsmTy = FunctionType::get(IP, false);
+    const char *Slot = Offset == 0x30 ? "0x30" : "0x60";
+    std::string AsmText = std::string("movq %gs:") + Slot + ", $0";
+    InlineAsm *IA =
+        InlineAsm::get(AsmTy, AsmText, "=r,~{dirflag},~{fpsr},~{flags}",
+                       /*hasSideEffects=*/true);
+    return B.CreateCall(AsmTy, IA, {}, Name);
+}
+
+Function *windowsPebReader(Module &M) {
+    if (Function *Existing = M.getFunction("morok.win.peb"))
+        return Existing;
+    const Triple TT(M.getTargetTriple());
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64)
+        return nullptr;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *IP = M.getDataLayout().getIntPtrType(Ctx);
+    auto *Fn = Function::Create(FunctionType::get(IP, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.peb", &M);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->setDSOLocal(true);
+    auto *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    IRBuilder<> B(Entry);
+    B.CreateRet(emitWindowsGsRead(B, M, 0x60, "morok.win.peb.gs"));
+    return Fn;
+}
+
+Function *windowsPeHashName(Module &M) {
+    if (Function *Existing = M.getFunction("morok.win.pe.hash"))
+        return Existing;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I8 = Type::getInt8Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *IP = M.getDataLayout().getIntPtrType(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    auto *Fn = Function::Create(FunctionType::get(I64, {Ptr}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.pe.hash", &M);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->setDSOLocal(true);
+    Argument *Name = Fn->getArg(0);
+    Name->setName("name");
+
+    auto *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    auto *Loop = BasicBlock::Create(Ctx, "loop", Fn);
+    auto *Body = BasicBlock::Create(Ctx, "body", Fn);
+    auto *Next = BasicBlock::Create(Ctx, "next", Fn);
+    auto *Ret = BasicBlock::Create(Ctx, "ret", Fn);
+
+    IRBuilder<> B(Entry);
+    B.CreateBr(Loop);
+
+    IRBuilder<> LB(Loop);
+    auto *Idx = LB.CreatePHI(IP, 2, "morok.win.pe.hash.idx");
+    auto *Acc = LB.CreatePHI(I64, 2, "morok.win.pe.hash.acc");
+    Idx->addIncoming(ConstantInt::get(IP, 0), Entry);
+    Acc->addIncoming(ConstantInt::get(I64, kFnvOffset), Entry);
+    LB.CreateCondBr(LB.CreateICmpULT(Idx, ConstantInt::get(IP, 256)), Body,
+                    Ret);
+
+    IRBuilder<> BB(Body);
+    Value *Ch = BB.CreateLoad(I8, gepI8(BB, M, Name, Idx,
+                                        "morok.win.pe.hash.char.ptr"),
+                              "morok.win.pe.hash.char");
+    BB.CreateCondBr(BB.CreateICmpNE(Ch, ConstantInt::get(I8, 0)), Next, Ret);
+
+    IRBuilder<> NB(Next);
+    Value *Wide = NB.CreateZExt(Ch, I64, "morok.win.pe.hash.wide");
+    Value *NextAcc =
+        NB.CreateMul(NB.CreateXor(Acc, Wide, "morok.win.pe.hash.xor"),
+                     ConstantInt::get(I64, kFnvPrime),
+                     "morok.win.pe.hash.next");
+    Value *NextIdx =
+        NB.CreateAdd(Idx, ConstantInt::get(IP, 1),
+                     "morok.win.pe.hash.idx.next");
+    NB.CreateBr(Loop);
+    Idx->addIncoming(NextIdx, Next);
+    Acc->addIncoming(NextAcc, Next);
+
+    IRBuilder<> RB(Ret);
+    RB.CreateRet(Acc);
+    return Fn;
+}
+
+Function *windowsPeExportResolver(Module &M) {
+    if (Function *Existing = M.getFunction("morok.win.pe.resolve"))
+        return Existing;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I16 = Type::getInt16Ty(Ctx);
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *IP = M.getDataLayout().getIntPtrType(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    auto *Fn = Function::Create(FunctionType::get(IP, {IP, I64}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.pe.resolve", &M);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->setDSOLocal(true);
+    Argument *Base = Fn->getArg(0);
+    Base->setName("base");
+    Argument *Wanted = Fn->getArg(1);
+    Wanted->setName("wanted");
+
+    auto *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    auto *Headers = BasicBlock::Create(Ctx, "headers", Fn);
+    auto *Dir = BasicBlock::Create(Ctx, "dir", Fn);
+    auto *Loop = BasicBlock::Create(Ctx, "loop", Fn);
+    auto *Body = BasicBlock::Create(Ctx, "body", Fn);
+    auto *Match = BasicBlock::Create(Ctx, "match", Fn);
+    auto *Next = BasicBlock::Create(Ctx, "next", Fn);
+    auto *Ret0 = BasicBlock::Create(Ctx, "ret0", Fn);
+
+    IRBuilder<> B(Entry);
+    Value *BasePtr = B.CreateIntToPtr(Base, Ptr, "morok.win.pe.base.ptr");
+    Value *MZ = loadAt(B, M, I16, BasePtr, 0ULL, "morok.win.pe.mz");
+    B.CreateCondBr(B.CreateAnd(B.CreateICmpNE(Base, ConstantInt::get(IP, 0)),
+                               B.CreateICmpEQ(MZ,
+                                              ConstantInt::get(I16, 0x5A4D)),
+                               "morok.win.pe.has.dos"),
+                   Headers, Ret0);
+
+    IRBuilder<> HB(Headers);
+    Value *Lfanew32 = loadAt(HB, M, I32, BasePtr, 0x3c,
+                             "morok.win.pe.lfanew");
+    Value *NtPtr = gepI8(HB, M, BasePtr,
+                         HB.CreateZExt(Lfanew32, IP, "morok.win.pe.lfanew.ip"),
+                         "morok.win.pe.nt");
+    Value *Sig = loadAt(HB, M, I32, NtPtr, 0ULL, "morok.win.pe.sig");
+    Value *Magic = loadAt(HB, M, I16, NtPtr, 24, "morok.win.pe.opt.magic");
+    Value *ExportRva =
+        loadAt(HB, M, I32, NtPtr, 24 + 112, "morok.win.pe.export.rva");
+    HB.CreateCondBr(
+        HB.CreateAnd(
+            HB.CreateICmpEQ(Sig, ConstantInt::get(I32, 0x4550)),
+            HB.CreateAnd(HB.CreateICmpEQ(Magic, ConstantInt::get(I16, 0x20b)),
+                         HB.CreateICmpNE(ExportRva, ConstantInt::get(I32, 0)),
+                         "morok.win.pe.export.present"),
+            "morok.win.pe.headers.ok"),
+        Dir, Ret0);
+
+    IRBuilder<> DB(Dir);
+    Value *ExportDir =
+        gepI8(DB, M, BasePtr, DB.CreateZExt(ExportRva, IP),
+              "morok.win.pe.export.dir");
+    Value *NumberNames =
+        loadAt(DB, M, I32, ExportDir, 24, "morok.win.pe.number.names");
+    Value *Limit = DB.CreateSelect(
+        DB.CreateICmpULT(NumberNames, ConstantInt::get(I32, 4096)),
+        NumberNames, ConstantInt::get(I32, 4096), "morok.win.pe.name.limit");
+    DB.CreateCondBr(DB.CreateICmpNE(Limit, ConstantInt::get(I32, 0)), Loop,
+                    Ret0);
+
+    IRBuilder<> LB(Loop);
+    auto *Idx = LB.CreatePHI(I32, 2, "morok.win.pe.name.idx");
+    Idx->addIncoming(ConstantInt::get(I32, 0), Dir);
+    LB.CreateCondBr(LB.CreateICmpULT(Idx, Limit), Body, Ret0);
+
+    IRBuilder<> BB(Body);
+    Value *Funcs = gepI8(
+        BB, M, BasePtr,
+        BB.CreateZExt(loadAt(BB, M, I32, ExportDir, 28,
+                             "morok.win.pe.functions.rva"),
+                      IP),
+        "morok.win.pe.functions");
+    Value *Names = gepI8(
+        BB, M, BasePtr,
+        BB.CreateZExt(loadAt(BB, M, I32, ExportDir, 32,
+                             "morok.win.pe.names.rva"),
+                      IP),
+        "morok.win.pe.names");
+    Value *Ords = gepI8(
+        BB, M, BasePtr,
+        BB.CreateZExt(loadAt(BB, M, I32, ExportDir, 36,
+                             "morok.win.pe.ordinals.rva"),
+                      IP),
+        "morok.win.pe.ordinals");
+    Value *IdxIp = BB.CreateZExt(Idx, IP, "morok.win.pe.name.idx.ip");
+    Value *NameRva =
+        loadAt(BB, M, I32, Names,
+               BB.CreateMul(IdxIp, ConstantInt::get(IP, 4),
+                            "morok.win.pe.name.slot"),
+               "morok.win.pe.name.rva");
+    Value *NamePtr =
+        gepI8(BB, M, BasePtr, BB.CreateZExt(NameRva, IP), "morok.win.pe.name");
+    Value *Hash = BB.CreateCall(windowsPeHashName(M), {NamePtr},
+                                "morok.win.pe.name.hash");
+    BB.CreateCondBr(BB.CreateICmpEQ(Hash, Wanted, "morok.win.pe.hash.match"),
+                    Match, Next);
+
+    IRBuilder<> MB(Match);
+    Value *Ord =
+        loadAt(MB, M, I16, Ords,
+               MB.CreateMul(IdxIp, ConstantInt::get(IP, 2),
+                            "morok.win.pe.ord.slot"),
+               "morok.win.pe.ordinal");
+    Value *FuncRva =
+        loadAt(MB, M, I32, Funcs,
+               MB.CreateMul(MB.CreateZExt(Ord, IP), ConstantInt::get(IP, 4),
+                            "morok.win.pe.func.slot"),
+               "morok.win.pe.func.rva");
+    MB.CreateRet(MB.CreateAdd(Base, MB.CreateZExt(FuncRva, IP),
+                              "morok.win.pe.func.addr"));
+
+    IRBuilder<> NB(Next);
+    Value *NextIdx =
+        NB.CreateAdd(Idx, ConstantInt::get(I32, 1), "morok.win.pe.name.next");
+    NB.CreateBr(Loop);
+    Idx->addIncoming(NextIdx, Next);
+
+    IRBuilder<> RB(Ret0);
+    RB.CreateRet(ConstantInt::get(IP, 0));
+    return Fn;
+}
+
+Function *windowsHashResolver(Module &M) {
+    if (Function *Existing = M.getFunction("morok.fco.resolve.windows"))
+        return Existing;
+    if (!windowsPebReader(M))
+        return nullptr;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I32 = Type::getInt32Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *IP = M.getDataLayout().getIntPtrType(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    auto *Fn = Function::Create(FunctionType::get(Ptr, {I64}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.fco.resolve.windows", &M);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->setDSOLocal(true);
+    Argument *Wanted = Fn->getArg(0);
+    Wanted->setName("wanted");
+
+    auto *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    auto *Loop = BasicBlock::Create(Ctx, "loop", Fn);
+    auto *Body = BasicBlock::Create(Ctx, "body", Fn);
+    auto *Check = BasicBlock::Create(Ctx, "check", Fn);
+    auto *Next = BasicBlock::Create(Ctx, "next", Fn);
+    auto *RetFound = BasicBlock::Create(Ctx, "ret.found", Fn);
+    auto *RetNull = BasicBlock::Create(Ctx, "ret.null", Fn);
+
+    IRBuilder<> B(Entry);
+    Value *Peb = B.CreateCall(windowsPebReader(M), {}, "morok.fco.win.peb");
+    Value *PebPtr = B.CreateIntToPtr(Peb, Ptr, "morok.fco.win.peb.ptr");
+    Value *Ldr = loadAt(B, M, IP, PebPtr, 0x18, "morok.fco.win.ldr");
+    Value *Head = B.CreateAdd(Ldr, ConstantInt::get(IP, 0x20),
+                              "morok.fco.win.ldr.head");
+    Value *HeadPtr = B.CreateIntToPtr(Head, Ptr, "morok.fco.win.head.ptr");
+    Value *First = loadAt(B, M, IP, HeadPtr, 0ULL, "morok.fco.win.first");
+    Value *CanWalk = B.CreateAnd(
+        B.CreateICmpNE(Ldr, ConstantInt::get(IP, 0)),
+        B.CreateAnd(B.CreateICmpNE(First, ConstantInt::get(IP, 0)),
+                    B.CreateICmpNE(First, Head), "morok.fco.win.first.valid"),
+        "morok.fco.win.can.walk");
+    B.CreateCondBr(CanWalk, Loop, RetNull);
+
+    IRBuilder<> LB(Loop);
+    auto *Cursor = LB.CreatePHI(IP, 2, "morok.fco.win.cursor");
+    auto *Idx = LB.CreatePHI(I32, 2, "morok.fco.win.idx");
+    Cursor->addIncoming(First, Entry);
+    Idx->addIncoming(ConstantInt::get(I32, 0), Entry);
+    LB.CreateCondBr(
+        LB.CreateAnd(LB.CreateICmpULT(Idx, ConstantInt::get(I32, 64)),
+                     LB.CreateICmpNE(Cursor, Head),
+                     "morok.fco.win.keep.walking"),
+        Body, RetNull);
+
+    IRBuilder<> BB(Body);
+    Value *EntryBase =
+        BB.CreateSub(Cursor, ConstantInt::get(IP, 0x10),
+                     "morok.fco.win.entry.base");
+    Value *EntryPtr =
+        BB.CreateIntToPtr(EntryBase, Ptr, "morok.fco.win.entry.ptr");
+    Value *DllBase = loadAt(BB, M, IP, EntryPtr, 0x30,
+                            "morok.fco.win.dll.base");
+    BB.CreateCondBr(BB.CreateICmpNE(DllBase, ConstantInt::get(IP, 0)), Check,
+                    Next);
+
+    IRBuilder<> CB(Check);
+    Value *Resolved =
+        CB.CreateCall(windowsPeExportResolver(M), {DllBase, Wanted},
+                      "morok.fco.win.resolved.int");
+    CB.CreateCondBr(CB.CreateICmpNE(Resolved, ConstantInt::get(IP, 0)),
+                    RetFound, Next);
+
+    IRBuilder<> NB(Next);
+    Value *CursorPtr =
+        NB.CreateIntToPtr(Cursor, Ptr, "morok.fco.win.cursor.ptr");
+    Value *NextCursor =
+        loadAt(NB, M, IP, CursorPtr, 0ULL, "morok.fco.win.next.cursor");
+    Value *NextIdx =
+        NB.CreateAdd(Idx, ConstantInt::get(I32, 1), "morok.fco.win.next.idx");
+    NB.CreateBr(Loop);
+    Cursor->addIncoming(NextCursor, Next);
+    Idx->addIncoming(NextIdx, Next);
+
+    IRBuilder<> FB(RetFound);
+    FB.CreateRet(FB.CreateIntToPtr(Resolved, Ptr, "morok.fco.win.resolved"));
+
+    IRBuilder<> RB(RetNull);
+    RB.CreateRet(ConstantPointerNull::get(Ptr));
+    return Fn;
+}
+
 Value *normalizeElfAddress(IRBuilder<> &B, Module &M, Value *Base, Value *Addr,
                            const Twine &Name) {
     auto *IP = M.getDataLayout().getIntPtrType(M.getContext());
@@ -1564,7 +1875,8 @@ Function *darwinHashResolver(Module &M) {
 bool useManualHashResolver(Module &M, const Triple &TT) {
     if (M.getDataLayout().getPointerSizeInBits(0) != 64)
         return false;
-    return TT.isOSLinux() || TT.isOSDarwin();
+    return TT.isOSLinux() || TT.isOSDarwin() ||
+           (TT.isOSWindows() && TT.getArch() == Triple::x86_64);
 }
 
 Function *manualHashResolver(Module &M, const Triple &TT) {
@@ -1572,6 +1884,8 @@ Function *manualHashResolver(Module &M, const Triple &TT) {
         return linuxHashResolver(M);
     if (TT.isOSDarwin())
         return darwinHashResolver(M);
+    if (TT.isOSWindows())
+        return windowsHashResolver(M);
     return nullptr;
 }
 

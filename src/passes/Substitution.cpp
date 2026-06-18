@@ -17,6 +17,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/NoFolder.h"
 
+#include <algorithm>
 #include <vector>
 
 using namespace llvm;
@@ -26,6 +27,14 @@ namespace morok::passes {
 namespace {
 
 constexpr std::size_t kMaxSubstitutionTargetsPerIteration = 256;
+
+// Each iteration re-collects and re-substitutes the function's binary
+// operators (including those produced by prior iterations), so IR size grows
+// with the iteration count.  The "max" preset asks for 3; clamp to a generous
+// ceiling so a malformed config — or a stale/partial build that hands this
+// pass an uninitialized SubstitutionParams — can never turn a sub-second
+// compile into a multi-minute MachineCombiner reassociation blowup.
+constexpr std::uint32_t kMaxSubstitutionIterations = 8;
 
 using Builder = IRBuilder<NoFolder>;
 
@@ -129,7 +138,8 @@ Value *emitSubstitution(BinaryOperator *bo, ir::IRRandom &rng) {
 
 bool substituteFunction(Function &F, const SubstitutionParams &params,
                         ir::IRRandom &rng) {
-    const std::uint32_t iterations = params.iterations ? params.iterations : 1;
+    const std::uint32_t iterations = std::clamp<std::uint32_t>(
+        params.iterations ? params.iterations : 1, 1, kMaxSubstitutionIterations);
     bool changed = false;
 
     for (std::uint32_t it = 0; it < iterations; ++it) {

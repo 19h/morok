@@ -67,10 +67,19 @@
 #include "morok/ir/Annotations.hpp"
 
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/CommandLine.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -173,6 +182,22 @@ public:
         const morok::config::PassConfig eff =
             morok::config::resolve(config_, M->getSourceFileName(),
                                    F.getName(), demangle);
+
+        // Yield VM-bound functions to the virtualizer untouched: amplification
+        // would bloat them past the lifter's instruction budget (it runs later,
+        // at OptimizerLast).  Virtualization is the stronger transform, so it
+        // takes priority on any function it can lift.
+        if (eff.virtualization.enabled.value_or(false)) {
+            morok::passes::VirtualizationParams vp;
+            vp.probability = eff.virtualization.probability.value_or(20);
+            vp.max_functions = eff.virtualization.max_functions.value_or(1);
+            vp.max_instructions =
+                eff.virtualization.max_instructions.value_or(64);
+            vp.max_registers = eff.virtualization.max_registers.value_or(96);
+            if (morok::passes::virtualizationWillLift(F, vp))
+                return PreservedAnalyses::all();
+        }
+
         if (!morok::ir::shouldObfuscate(
                 F, "optamp", eff.opt_amplify.enabled.value_or(false)))
             return PreservedAnalyses::all();
@@ -192,6 +217,139 @@ public:
 private:
     morok::config::Config config_;
     morok::core::Xoshiro256pp engine_;
+};
+
+// Pre-inline candidate preservation for the bytecode VM.
+//
+// The full Morok pass (and therefore the virtualizer) runs at OptimizerLast,
+// i.e. *after* the inliner.  By then a program's small leaf helpers — exactly
+// the integer/pointer computation kernels the VM can lift (key mixers, hashes,
+// round functions) — have been inlined into their callers and no longer exist
+// as standalone, VM-eligible functions.  The net effect on real -O2/-O3 input
+// is that the VM lifts nothing.
+//
+// This pass runs at PipelineEarlySimplification, *before* the inliner, and pins
+// the plausible VM candidates with `noinline` so they survive intact to
+// OptimizerLast where the virtualizer can lift them.  Adding `noinline` is
+// always semantics-preserving (it only constrains code layout, never results),
+// and it is gated on virtualization being enabled, so non-VM builds (and the
+// VM-disabled x86/portable configurations) are completely unaffected.
+class VmCandidatePreserverPass
+    : public PassInfoMixin<VmCandidatePreserverPass> {
+public:
+    explicit VmCandidatePreserverPass(morok::config::Config config)
+        : config_(std::move(config)) {}
+
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+        if (!config_.passes.virtualization.enabled.value_or(false))
+            return PreservedAnalyses::all();
+
+        bool changed = false;
+        for (Function &F : M)
+            if (isCandidate(F)) {
+                F.addFnAttr(Attribute::NoInline);
+                changed = true;
+            }
+        return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    }
+
+    static bool isRequired() { return true; }
+
+private:
+    static bool vmScalarType(Type *T) {
+        if (auto *I = dyn_cast<IntegerType>(T))
+            return I->getBitWidth() >= 1 && I->getBitWidth() <= 64;
+        if (auto *P = dyn_cast<PointerType>(T))
+            return P->getAddressSpace() == 0;
+        return false;
+    }
+
+    static bool reachesBlock(const BasicBlock *From, const BasicBlock *Target,
+                             SmallPtrSetImpl<const BasicBlock *> &Seen) {
+        if (!Seen.insert(From).second)
+            return false;
+        if (Seen.size() > 512)
+            return false;
+        for (const BasicBlock *Succ : successors(From)) {
+            if (Succ == Target)
+                return true;
+            if (reachesBlock(Succ, Target, Seen))
+                return true;
+        }
+        return false;
+    }
+
+    static bool blockIsCyclic(const BasicBlock &BB) {
+        for (const BasicBlock *Succ : successors(&BB)) {
+            if (Succ == &BB)
+                return true;
+            SmallPtrSet<const BasicBlock *, 32> Seen;
+            if (reachesBlock(Succ, &BB, Seen))
+                return true;
+        }
+        return false;
+    }
+
+    static bool hasLoopCallsite(const Function &F) {
+        for (const User *U : F.users()) {
+            const auto *CB = dyn_cast<CallBase>(U);
+            if (!CB || CB->getCalledFunction() != &F)
+                continue;
+            if (const BasicBlock *BB = CB->getParent())
+                if (blockIsCyclic(*BB))
+                    return true;
+        }
+        return false;
+    }
+
+    // A plausible VM lift target: a small, leaf, local-linkage function whose
+    // signature is scalar (integer/pointer/void).  The virtualizer applies the
+    // precise eligibility check later; this only has to avoid pinning functions
+    // that obviously can never lift (so the inliner stays free to flatten them).
+    static bool isCandidate(const Function &F) {
+        if (F.isDeclaration() || F.isVarArg() || !F.hasLocalLinkage())
+            return false;
+        if (F.getName() == "main" || F.getName().starts_with("morok."))
+            return false;
+        if (F.hasFnAttribute(Attribute::NoInline) ||
+            F.hasFnAttribute(Attribute::AlwaysInline) ||
+            F.hasFnAttribute(Attribute::InlineHint) ||
+            F.hasFnAttribute(Attribute::Naked) ||
+            F.hasFnAttribute(Attribute::OptimizeNone) ||
+            F.hasPersonalityFn())
+            return false;
+
+        Type *Ret = F.getReturnType();
+        if (!Ret->isVoidTy() && !vmScalarType(Ret))
+            return false;
+        for (const Argument &A : F.args())
+            if (!vmScalarType(A.getType()))
+                return false;
+
+        // Do not pin tiny helpers called from loops.  Those are exactly the
+        // round/multiply/hash primitives the inliner must flatten; virtualizing
+        // them turns a single ALU expression in a hot loop into an interpreter
+        // dispatch for every dynamic call.
+        if (hasLoopCallsite(F))
+            return false;
+
+        // Leaf check + size bound (pre-optimization instruction count).  A call
+        // to any user (or indirect) function makes the body un-liftable today,
+        // so such functions are left for the inliner.
+        std::uint64_t insts = 0;
+        for (const BasicBlock &BB : F)
+            for (const Instruction &I : BB) {
+                ++insts;
+                if (const auto *CB = dyn_cast<CallBase>(&I)) {
+                    const Function *Callee = CB->getCalledFunction();
+                    if (!Callee || !Callee->isIntrinsic())
+                        return false;
+                }
+            }
+        return insts >= 4 && insts <= 256;
+    }
+
+    morok::config::Config config_;
 };
 
 } // namespace
@@ -501,6 +659,17 @@ PassPluginLibraryInfo getPluginInfo() {
                             FPM.addPass(
                                 EarlyOptimizerAmplificationPass(loadConfig()));
                 });
+
+                // Pre-inline: pin VM-liftable leaf helpers with noinline so they
+                // survive the inliner and are still standalone functions when the
+                // virtualizer runs at OptimizerLast.  Gated on -morok + an
+                // enabled virtualization config, so it is a no-op otherwise.
+                PB.registerPipelineEarlySimplificationEPCallback(
+                    [](ModulePassManager &MPM, OptimizationLevel,
+                       ThinOrFullLTOPhase) {
+                        if (EnableMorok)
+                            MPM.addPass(VmCandidatePreserverPass(loadConfig()));
+                    });
             }};
 }
 

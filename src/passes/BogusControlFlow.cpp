@@ -23,6 +23,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
+#include <algorithm>
 #include <vector>
 
 using namespace llvm;
@@ -32,6 +33,13 @@ namespace morok::passes {
 namespace {
 
 constexpr char kOpaqueGlobal[] = "morok.bcf.opaque";
+
+// Each iteration clones/branches more of the function's blocks, so the CFG
+// grows with the iteration count.  The "max" preset asks for 3; clamp to a
+// generous ceiling so a malformed config — or a stale/partial build that hands
+// this pass an uninitialized BogusControlFlowParams — can never explode compile
+// time on the amplified function.
+constexpr std::uint32_t kMaxBcfIterations = 8;
 
 // A never-written private i32 global used to source opaque predicates.
 GlobalVariable *opaqueGlobal(Module &M, ir::IRRandom &rng) {
@@ -47,7 +55,8 @@ GlobalVariable *opaqueGlobal(Module &M, ir::IRRandom &rng) {
 
 bool bogusControlFlowFunction(Function &F, const BcfParams &params,
                               ir::IRRandom &rng) {
-    const std::uint32_t iterations = params.iterations ? params.iterations : 1;
+    const std::uint32_t iterations = std::clamp<std::uint32_t>(
+        params.iterations ? params.iterations : 1, 1, kMaxBcfIterations);
     Module &M = *F.getParent();
     auto *i32 = Type::getInt32Ty(F.getContext());
     bool changed = false;

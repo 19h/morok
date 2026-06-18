@@ -159,8 +159,14 @@ bool aliasOpaquePredicatesFunction(Function &F, const AliasOpParams &params,
     if (F.isDeclaration() || params.probability == 0 || params.max_blocks == 0)
         return false;
 
-    const std::uint32_t iterations =
-        std::max<std::uint32_t>(params.iterations, 1);
+    // max_blocks already caps how many blocks are transformed across all
+    // iterations, but the outer loop still spins once per iteration; clamp to a
+    // generous ceiling so a malformed config — or a stale/partial build handing
+    // this pass an uninitialized AliasOpParams — cannot spin it billions of
+    // times.  The "max" preset asks for 2.
+    constexpr std::uint32_t kMaxAliasOpIterations = 8;
+    const std::uint32_t iterations = std::clamp<std::uint32_t>(
+        std::max<std::uint32_t>(params.iterations, 1), 1, kMaxAliasOpIterations);
     AllocaInst *Cell = nullptr;
     bool changed = false;
     std::uint32_t transformed = 0;

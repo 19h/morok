@@ -18,6 +18,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/TargetParser/Triple.h"
@@ -5268,8 +5269,18 @@ bool insertStackOriginChecks(Module &M, Function *Check, GlobalVariable *State,
     auto *i32 = Type::getInt32Ty(M.getContext());
     auto *ip = intPtrTy(M);
     auto *ptr = PointerType::getUnqual(M.getContext());
-    FunctionCallee returnAddress = M.getOrInsertFunction(
-        "llvm.returnaddress.p0", FunctionType::get(ptr, {i32}, false));
+    const Triple TT(M.getTargetTriple());
+    FunctionCallee returnAddress;
+    if (TT.isOSWindows()) {
+        Function *Intrinsic =
+            Intrinsic::getOrInsertDeclaration(&M, Intrinsic::returnaddress,
+                                              {ptr});
+        returnAddress =
+            FunctionCallee(Intrinsic->getFunctionType(), Intrinsic);
+    } else {
+        returnAddress = M.getOrInsertFunction(
+            "llvm.returnaddress.p0", FunctionType::get(ptr, {i32}, false));
+    }
     bool changed = false;
     std::uint32_t site = 1;
     for (Function *target : Targets) {
@@ -5949,7 +5960,7 @@ Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
     } else if (TT.isOSDarwin()) {
         emitDarwinSysctlCheck(B, M, State, TT);
         emitDarwinCsopsCheck(B, M, State, TT);
-    } else {
+    } else if (!TT.isOSWindows()) {
         auto *i32 = Type::getInt32Ty(ctx);
         Value *rc = emitPtrace(B, M, 0);
         foldFlag(B, State, B.CreateICmpSLT(rc, ConstantInt::getSigned(i32, 0)),
@@ -8143,6 +8154,7 @@ Function *windowsPeExportResolver(Module &M) {
     wanted->setName("wanted");
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *mzBB = BasicBlock::Create(ctx, "mz", fn);
     auto *headersBB = BasicBlock::Create(ctx, "headers", fn);
     auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
     auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
@@ -8150,11 +8162,21 @@ Function *windowsPeExportResolver(Module &M) {
     auto *nextBB = BasicBlock::Create(ctx, "next", fn);
     auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
 
+    // Guard the module base before dereferencing it. windowsLdrModuleByHash
+    // returns 0 when the requested module is not in the loader list (e.g.
+    // kernelbase.dll on NT 6.0 / Windows Vista, or user32.dll in a process that
+    // never loaded it). Reading the MZ signature from a null base would fault in
+    // a startup constructor, so reject base == 0 up front.
     IRBuilder<> B(entry);
-    Value *basePtr = B.CreateIntToPtr(base, ptr, "morok.win.pe.base.ptr");
-    Value *mz = loadAt(B, M, i16, basePtr, 0ULL, "morok.win.pe.mz");
-    B.CreateCondBr(B.CreateICmpEQ(mz, ConstantInt::get(i16, 0x5A4D)),
-                   headersBB, ret0BB);
+    B.CreateCondBr(B.CreateICmpNE(base, ConstantInt::get(ip, 0),
+                                  "morok.win.pe.base.present"),
+                   mzBB, ret0BB);
+
+    IRBuilder<> MZB(mzBB);
+    Value *basePtr = MZB.CreateIntToPtr(base, ptr, "morok.win.pe.base.ptr");
+    Value *mz = loadAt(MZB, M, i16, basePtr, 0ULL, "morok.win.pe.mz");
+    MZB.CreateCondBr(MZB.CreateICmpEQ(mz, ConstantInt::get(i16, 0x5A4D)),
+                     headersBB, ret0BB);
 
     IRBuilder<> HB(headersBB);
     Value *lfanew32 = loadAt(HB, M, i32, basePtr, 0x3c,
@@ -11414,11 +11436,8 @@ bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
         emitLinuxAntiDebug(M, ctor, state, rng, tt, AllowSelfTrace);
     else if (tt.isOSDarwin())
         emitDarwinAntiDebug(M, ctor, state, rng, tt);
-    else {
-        IRBuilder<> B(&ctor->getEntryBlock());
-        emitPtrace(B, M, 0);
-        B.CreateRetVoid();
-    }
+    else
+        IRBuilder<>(&ctor->getEntryBlock()).CreateRetVoid();
     Function *probe = antiDebugProbe(M, state, rng, tt);
     insertAntiDebugCallsiteProbes(M, probe, rng);
     appendToGlobalCtors(M, ctor, 0);

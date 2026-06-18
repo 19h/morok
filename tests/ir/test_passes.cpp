@@ -343,6 +343,7 @@ countStoresToBaseWithOpaqueSource(Function &F, StringRef basePrefix) {
             continue;
         ++total;
         if (valueDependsOnOpaqueBarrier(SI->getValueOperand()))
+        if (valueDependsOnOpaqueBarrier(SI->getValueOperand()))
             ++opaque;
     }
     return {total, opaque};
