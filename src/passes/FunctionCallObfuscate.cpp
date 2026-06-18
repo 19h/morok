@@ -629,6 +629,8 @@ Function *elfModuleHashResolver(Module &M) {
     auto *SymCheck = BasicBlock::Create(Ctx, "sym.check", Fn);
     auto *SymNext = BasicBlock::Create(Ctx, "sym.next", Fn);
     auto *RetFound = BasicBlock::Create(Ctx, "ret.found", Fn);
+    auto *RetIfunc = BasicBlock::Create(Ctx, "ret.ifunc", Fn);
+    auto *RetDirect = BasicBlock::Create(Ctx, "ret.direct", Fn);
     auto *RetNull = BasicBlock::Create(Ctx, "ret.null", Fn);
 
     IRBuilder<> B(Entry);
@@ -782,7 +784,19 @@ Function *elfModuleHashResolver(Module &M) {
     SymIdx->addIncoming(SymNextIdx, SymNext);
 
     IRBuilder<> RFB(RetFound);
-    RFB.CreateRet(RFB.CreateIntToPtr(TargetAddr, Ptr, "morok.fco.elf.target"));
+    RFB.CreateCondBr(RFB.CreateICmpEQ(Type, ConstantInt::get(I8, 10),
+                                      "morok.fco.elf.ifunc"),
+                     RetIfunc, RetDirect);
+
+    IRBuilder<> RIB(RetIfunc);
+    auto *IfuncTy = FunctionType::get(Ptr, false);
+    Value *IfuncResolver =
+        RIB.CreateIntToPtr(TargetAddr, Ptr, "morok.fco.elf.ifunc.resolver");
+    RIB.CreateRet(RIB.CreateCall(IfuncTy, IfuncResolver, {},
+                                 "morok.fco.elf.ifunc.target"));
+
+    IRBuilder<> RDB(RetDirect);
+    RDB.CreateRet(RDB.CreateIntToPtr(TargetAddr, Ptr, "morok.fco.elf.target"));
 
     IRBuilder<> RNB(RetNull);
     RNB.CreateRet(ConstantPointerNull::get(Ptr));
@@ -2085,6 +2099,79 @@ Value *emitResolvedViaException(CallInst *CI, Module &M, ExceptionRuntime &Rt,
     return encodeResolvedPointer(CB, M, Resolved, rng);
 }
 
+Value *emitCachedResolvedViaException(CallInst *CI, Module &M,
+                                      ExceptionRuntime &Rt,
+                                      FunctionCallee Resolver,
+                                      const std::vector<std::uint64_t> &Hashes,
+                                      ir::IRRandom &rng) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I64 = Type::getInt64Ty(Ctx);
+    auto *Ptr = PointerType::getUnqual(Ctx);
+    const unsigned Variant = rng.range(ir::kKeystreamVariants);
+    const std::uint64_t SiteKey = rng.next();
+    const std::uint64_t Mul = rng.next() | 1ull;
+    const std::uint64_t Mask = rng.next();
+
+    auto *Cache = new GlobalVariable(
+        M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I64, 0), "morok.fco.cache");
+    Cache->setAlignment(Align(8));
+
+    Function *F = CI->getFunction();
+    BasicBlock *HitBB = CI->getParent();
+    BasicBlock *ContBB = HitBB->splitBasicBlock(CI, "morok.fco.ex.cache.cont");
+    HitBB->getTerminator()->eraseFromParent();
+    BasicBlock *MissBB =
+        BasicBlock::Create(Ctx, "morok.fco.ex.cache.miss", F, ContBB);
+    BasicBlock *ResolveBB =
+        BasicBlock::Create(Ctx, "morok.fco.ex.cache.resolve", F, ContBB);
+
+    IRBuilder<> HB(HitBB);
+    LoadInst *Cached =
+        HB.CreateLoad(I64, Cache, "morok.fco.cache.encoded.load");
+    Cached->setVolatile(true);
+    HB.CreateCondBr(HB.CreateICmpNE(Cached, ConstantInt::get(I64, 0),
+                                    "morok.fco.cache.ready"),
+                    ContBB, MissBB);
+
+    IRBuilder<> MB(MissBB);
+    AllocaInst *Slot = entryAlloca(*F, Ptr, "morok.fco.ex.slot");
+    MB.CreateStore(ConstantPointerNull::get(Ptr), Slot);
+    MB.CreateStore(ConstantInt::get(I64, Hashes.front()), Rt.hash);
+    MB.CreateStore(ConstantPointerNull::get(Ptr), Rt.name);
+    MB.CreateStore(Slot, Rt.out);
+    MB.CreateStore(BlockAddress::get(F, ResolveBB), Rt.cont);
+    emitFault(MB);
+    MB.CreateUnreachable();
+
+    IRBuilder<> RB(ResolveBB);
+    Value *Resolved =
+        RB.CreateCall(Resolver, {ConstantInt::get(I64, Hashes.front())},
+                      "morok.fco.hash.resolved");
+    for (std::uint64_t AliasHash : ArrayRef(Hashes).drop_front()) {
+        Value *AliasResolved =
+            RB.CreateCall(Resolver, {ConstantInt::get(I64, AliasHash)},
+                          "morok.fco.hash.alias.resolved");
+        Resolved = RB.CreateSelect(
+            RB.CreateICmpEQ(Resolved, ConstantPointerNull::get(Ptr)),
+            AliasResolved, Resolved, "morok.fco.hash.resolved.alias.sel");
+    }
+    Value *MissKey = pointerKey(RB, M, rng, SiteKey, Variant, Mul, Mask);
+    Value *NewEncoded = RB.CreateXor(RB.CreatePtrToInt(Resolved, I64),
+                                     MissKey, "morok.fco.cache.encoded");
+    StoreInst *CacheStore = RB.CreateStore(NewEncoded, Cache);
+    CacheStore->setVolatile(true);
+    RB.CreateBr(ContBB);
+
+    IRBuilder<> CB(CI);
+    PHINode *Encoded = CB.CreatePHI(I64, 2, "morok.fco.cache.encoded.phi");
+    Encoded->addIncoming(Cached, HitBB);
+    Encoded->addIncoming(NewEncoded, ResolveBB);
+    Value *HitKey = pointerKey(CB, M, rng, SiteKey, Variant, Mul, Mask);
+    Value *Raw = CB.CreateXor(Encoded, HitKey, "morok.fco.cache.raw");
+    return CB.CreateIntToPtr(Raw, Ptr, "morok.fco.cache.ptr");
+}
+
 AllocaInst *entryAlloca(Function &F, Type *Ty, StringRef Name) {
     IRBuilder<> EntryB(&*F.getEntryBlock().getFirstInsertionPt());
     return EntryB.CreateAlloca(Ty, nullptr, Name);
@@ -2281,7 +2368,11 @@ bool functionCallObfuscateModule(Module &M, const FcoParams &params,
         Value *name = manualResolver ? nullptr
                                      : ir::emitCloakedSymbol(B, M, dlName, rng);
         Value *decoded = nullptr;
-        if (exceptionCalls && isa<CallInst>(cb)) {
+        if (exceptionCalls && manualResolver && isa<CallInst>(cb)) {
+            decoded = emitCachedResolvedViaException(cast<CallInst>(cb), M,
+                                                     exceptionRt, resolver,
+                                                     resolverHashes, rng);
+        } else if (exceptionCalls && isa<CallInst>(cb)) {
             decoded = emitResolvedViaException(cast<CallInst>(cb), M,
                                                exceptionRt, resolver,
                                                manualResolver, name,

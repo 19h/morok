@@ -10108,7 +10108,21 @@ define i32 @caller() {
     CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
     CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(M->getFunction("morok.fco.resolve.elf") != nullptr);
-    CHECK(M->getFunction("morok.fco.resolve.elf.module") != nullptr);
+    Function *Scan = M->getFunction("morok.fco.resolve.elf.module");
+    REQUIRE(Scan);
+    bool hasIfuncReturn = false;
+    bool hasIfuncCall = false;
+    for (BasicBlock &BB : *Scan) {
+        hasIfuncReturn |= BB.getName() == "ret.ifunc";
+        for (Instruction &I : BB) {
+            auto *CI = dyn_cast<CallInst>(&I);
+            hasIfuncCall |= CI && CI->getCalledFunction() == nullptr &&
+                            CI->getName().starts_with(
+                                "morok.fco.elf.ifunc.target");
+        }
+    }
+    CHECK(hasIfuncReturn);
+    CHECK(hasIfuncCall);
     Function *Caller = M->getFunction("caller");
     REQUIRE(Caller);
     CHECK(hasInlineAsmCall(*Caller));
@@ -10210,17 +10224,20 @@ define i32 @caller() {
     // or shared dlsym string path is needed for the target symbol.
     CHECK(countGlobals(*M, "morok.cloak.c") == 0u);
 
-    // The caller publishes only a pending hash/out/continuation request before
-    // faulting; the handler only resumes the continuation, then the callsite
-    // resolves by hash outside the signal context. dlsym never appears.
+    // The first miss publishes only a pending hash/out/continuation request
+    // before faulting; the handler resumes a hidden block that resolves by hash
+    // and stores an encoded per-site cache. Later hits avoid the signal path.
     Function *Caller = M->getFunction("caller");
     REQUIRE(Caller);
     bool storesPendingHash = false;
     bool hasFaultAsm = false;
-    bool indirectUsesDecodedPointer = false;
+    bool hasResolveBlock = false;
+    bool indirectUsesCachedPointer = false;
     GlobalVariable *PendingHash =
         M->getGlobalVariable("morok.fco.ex.pending.hash", true);
     REQUIRE(PendingHash);
+    for (BasicBlock &BB : *Caller)
+        hasResolveBlock |= BB.getName() == "morok.fco.ex.cache.resolve";
     for (Instruction &I : instructions(*Caller)) {
         if (auto *SI = dyn_cast<StoreInst>(&I))
             storesPendingHash |=
@@ -10233,8 +10250,8 @@ define i32 @caller() {
                     "movq %rax, (%rax)");
             } else if (auto *I2P =
                            dyn_cast<IntToPtrInst>(CI->getCalledOperand())) {
-                indirectUsesDecodedPointer =
-                    I2P->getName().starts_with("morok.fco.ptr.dec");
+                indirectUsesCachedPointer =
+                    I2P->getName().starts_with("morok.fco.cache.ptr");
             }
         }
     }
@@ -10250,14 +10267,16 @@ define i32 @caller() {
     CHECK(M->getGlobalVariable("morok.fco.ex.pending.name", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.fco.ex.pending.out", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.fco.ex.pending.cont", true) != nullptr);
+    CHECK(countGlobals(*M, "morok.fco.cache") == 1u);
     CHECK(storesPendingHash);
     CHECK(hasFaultAsm);
-    CHECK(indirectUsesDecodedPointer);
+    CHECK(hasResolveBlock);
+    CHECK(indirectUsesCachedPointer);
     CHECK(countInlineAsmCalls(*Caller) >= 1u);
     CHECK(countNamedAllocas(*Caller, "morok.cloak.mix") == 0u);
-    CHECK(countNamedAllocas(*Caller, "morok.fco.ptr.slot") == 1u);
     CHECK(countNamedAllocas(*Caller, "morok.fco.ex.slot") == 1u);
-    CHECK(countNamedInstructions(*Caller, "morok.fco.ptr.enc") >= 1u);
+    CHECK(countNamedInstructions(*Caller, "morok.fco.cache.encoded") >= 1u);
+    CHECK(countNamedInstructions(*Caller, "morok.fco.cache.raw") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
