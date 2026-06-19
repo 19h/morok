@@ -3219,6 +3219,102 @@ Function *linuxGotTargetInRx(Module &M) {
     return fn;
 }
 
+Function *linuxGotTargetInNeeded(Module &M) {
+    if (Function *existing = M.getFunction("morok.antihook.got.needed"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+
+    auto *fn = Function::Create(
+        FunctionType::get(i32, {ptr, ptr, ip, ip}, false),
+        GlobalValue::PrivateLinkage, "morok.antihook.got.needed", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    auto *name = fn->getArg(0);
+    name->setName("name");
+    auto *target = fn->getArg(1);
+    target->setName("target");
+    auto *dynamic = fn->getArg(2);
+    dynamic->setName("dynamic");
+    auto *strTab = fn->getArg(3);
+    strTab->setName("strtab");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "needed.loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "needed.body", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "needed.resolve", fn);
+    auto *symBB = BasicBlock::Create(ctx, "needed.sym", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "needed.next", fn);
+    auto *ret1BB = BasicBlock::Create(ctx, "ret1", fn);
+    auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
+
+    FunctionCallee dlopen = M.getOrInsertFunction(
+        "dlopen", FunctionType::get(ptr, {ptr, i32}, false));
+    FunctionCallee dlsym =
+        M.getOrInsertFunction("dlsym", FunctionType::get(ptr, {ptr, ptr}, false));
+
+    IRBuilder<> EB(entry);
+    Value *valid = EB.CreateAnd(
+        EB.CreateICmpNE(name, ConstantPointerNull::get(ptr)),
+        EB.CreateAnd(
+            EB.CreateICmpNE(target, ConstantPointerNull::get(ptr)),
+            EB.CreateAnd(EB.CreateICmpNE(dynamic, ConstantInt::get(ip, 0)),
+                         EB.CreateICmpNE(strTab, ConstantInt::get(ip, 0)))),
+        "morok.antihook.got.needed.valid");
+    EB.CreateCondBr(valid, loopBB, ret0BB);
+
+    IRBuilder<> LB(loopBB);
+    auto *idx = LB.CreatePHI(ip, 2, "morok.antihook.got.needed.idx");
+    idx->addIncoming(ConstantInt::get(ip, 0), entry);
+    LB.CreateCondBr(LB.CreateICmpULT(idx, ConstantInt::get(ip, 256)), bodyBB,
+                    ret0BB);
+
+    IRBuilder<> BB(bodyBB);
+    Value *dynPtr = BB.CreateIntToPtr(
+        BB.CreateAdd(dynamic, BB.CreateMul(idx, ConstantInt::get(ip, 16))),
+        ptr, "morok.antihook.got.needed.dynamic");
+    Value *tag = loadAt(BB, M, i64, dynPtr, 0ULL,
+                        "morok.antihook.got.needed.tag");
+    Value *val = loadAt(BB, M, i64, dynPtr, 8,
+                        "morok.antihook.got.needed.val");
+    BB.CreateCondBr(BB.CreateICmpEQ(tag, ConstantInt::get(i64, 1)), resolveBB,
+                    nextBB);
+
+    IRBuilder<> RB(resolveBB);
+    Value *neededName = RB.CreateIntToPtr(
+        RB.CreateAdd(strTab, val), ptr, "morok.antihook.got.needed.name");
+    Value *handle = RB.CreateCall(
+        dlopen, {neededName, ConstantInt::get(i32, 0x5)},
+        "morok.antihook.got.needed.handle");
+    RB.CreateCondBr(RB.CreateICmpNE(handle, ConstantPointerNull::get(ptr)),
+                    symBB, nextBB);
+
+    IRBuilder<> SB(symBB);
+    Value *expected =
+        SB.CreateCall(dlsym, {handle, name}, "morok.antihook.got.needed.sym");
+    Value *matches = SB.CreateAnd(
+        SB.CreateICmpNE(expected, ConstantPointerNull::get(ptr)),
+        SB.CreateICmpEQ(expected, target), "morok.antihook.got.needed.match");
+    SB.CreateCondBr(matches, ret1BB, nextBB);
+
+    IRBuilder<> NB(nextBB);
+    Value *next = NB.CreateAdd(idx, ConstantInt::get(ip, 1),
+                               "morok.antihook.got.needed.next");
+    NB.CreateBr(loopBB);
+    idx->addIncoming(next, nextBB);
+
+    IRBuilder<> R1(ret1BB);
+    R1.CreateRet(ConstantInt::get(i32, 1));
+
+    IRBuilder<> R0(ret0BB);
+    R0.CreateRet(ConstantInt::get(i32, 0));
+    return fn;
+}
+
 Function *linuxGotPltProbe(Module &M, const Triple &TT) {
     if (!TT.isOSLinux())
         return nullptr;
@@ -3232,6 +3328,7 @@ Function *linuxGotPltProbe(Module &M, const Triple &TT) {
     auto *ip = intPtrTy(M);
     auto *ptr = PointerType::getUnqual(ctx);
     auto *rxCheck = linuxGotTargetInRx(M);
+    auto *neededCheck = linuxGotTargetInNeeded(M);
 
     auto *fn = Function::Create(FunctionType::get(i64, false),
                                 GlobalValue::PrivateLinkage,
@@ -3292,8 +3389,6 @@ Function *linuxGotPltProbe(Module &M, const Triple &TT) {
 
     FunctionCallee getauxval =
         M.getOrInsertFunction("getauxval", FunctionType::get(ip, {ip}, false));
-    FunctionCallee dlsym =
-        M.getOrInsertFunction("dlsym", FunctionType::get(ptr, {ptr, ptr}, false));
     Value *atPhdr =
         B.CreateCall(getauxval, {ConstantInt::get(ip, 3)}, "morok.got.atphdr");
     Value *phEnt =
@@ -3497,6 +3592,9 @@ Function *linuxGotPltProbe(Module &M, const Triple &TT) {
     Value *nameOff32 =
         loadAt(RBB, M, Type::getInt32Ty(ctx), symPtr, 0ULL,
                "morok.antihook.got.sym.name");
+    Value *symShndx =
+        loadAt(RBB, M, Type::getInt16Ty(ctx), symPtr, 6,
+               "morok.antihook.got.sym.shndx");
     Value *nameOff =
         RBB.CreateZExt(nameOff32, ip, "morok.antihook.got.sym.name.w");
     Value *namePtr = RBB.CreateIntToPtr(
@@ -3512,19 +3610,21 @@ Function *linuxGotPltProbe(Module &M, const Triple &TT) {
     Value *rxOk = RBB.CreateCall(
         rxCheck, {targetAddr, atPhdr, phNum, phEnt, base, debugPtr},
         "morok.antihook.got.rx");
-    Value *expectedPtr = RBB.CreateCall(
-        dlsym, {ConstantPointerNull::get(ptr), namePtr},
+    Value *expected = RBB.CreateCall(
+        neededCheck, {namePtr, targetPtr, dynAddr, strTab},
         "morok.antihook.got.expected");
-    Value *hasExpected = RBB.CreateAnd(
-        RBB.CreateICmpNE(expectedPtr, ConstantPointerNull::get(ptr)),
-        RBB.CreateICmpNE(targetPtr, ConstantPointerNull::get(ptr)),
-        "morok.antihook.got.expected.present");
     Value *expectedOk =
-        RBB.CreateAnd(hasExpected, RBB.CreateICmpEQ(targetPtr, expectedPtr),
-                      "morok.antihook.got.expected.ok");
-    Value *targetOk = RBB.CreateOr(
+        RBB.CreateICmpNE(expected, ConstantInt::get(Type::getInt32Ty(ctx), 0),
+                         "morok.antihook.got.expected.ok");
+    Value *externalSym =
+        RBB.CreateICmpEQ(symShndx, ConstantInt::get(Type::getInt16Ty(ctx), 0),
+                         "morok.antihook.got.sym.external");
+    Value *localRxOk = RBB.CreateAnd(
+        RBB.CreateNot(externalSym, "morok.antihook.got.sym.local"),
         RBB.CreateICmpNE(rxOk, ConstantInt::get(Type::getInt32Ty(ctx), 0)),
-        expectedOk, "morok.antihook.got.target.ok");
+        "morok.antihook.got.local.rx");
+    Value *targetOk =
+        RBB.CreateOr(expectedOk, localRxOk, "morok.antihook.got.target.ok");
     incrementDiff(
         RBB, diff,
         RBB.CreateNot(targetOk, "morok.antihook.got.violation.pred"),

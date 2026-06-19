@@ -13835,6 +13835,8 @@ entry:
     REQUIRE(Got != nullptr);
     Function *Rx = M->getFunction("morok.antihook.elf.rx");
     REQUIRE(Rx != nullptr);
+    Function *Needed = M->getFunction("morok.antihook.got.needed");
+    REQUIRE(Needed != nullptr);
     Function *Maps = M->getFunction("morok.antihook.maps.linux");
     REQUIRE(Maps != nullptr);
     Function *Wx = M->getFunction("morok.antihook.wxorx.linux");
@@ -13866,6 +13868,7 @@ entry:
     bool hasGuardedDlsymBlock = false;
     std::size_t dlsymCalls = 0;
     bool dlsymUsesLinuxRtldDefault = false;
+    bool gotNeededUsesLinuxRtldDefault = false;
     for (BasicBlock &BB : *Ctor)
         hasGuardedDlsymBlock |= BB.getName() == "morok.antihook.dlsym";
     for (Instruction &I : instructions(*Ctor)) {
@@ -13874,6 +13877,13 @@ entry:
             continue;
         ++dlsymCalls;
         dlsymUsesLinuxRtldDefault =
+            isa<ConstantPointerNull>(CB->getArgOperand(0));
+    }
+    for (Instruction &I : instructions(*Needed)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || CB->getCalledFunction() != M->getFunction("dlsym"))
+            continue;
+        gotNeededUsesLinuxRtldDefault |=
             isa<ConstantPointerNull>(CB->getArgOperand(0));
     }
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
@@ -13892,12 +13902,14 @@ entry:
                          "morok.antihook.wxorx.linux"));
     CHECK(dlsymCalls == 1u);
     CHECK(dlsymUsesLinuxRtldDefault);
+    CHECK_FALSE(gotNeededUsesLinuxRtldDefault);
     CHECK(hasInlineAsmCall(*Clean));
     CHECK(hasInlineAsmCall(*Got));
     CHECK(hasInlineAsmCall(*Maps));
     CHECK(hasInlineAsmCall(*Wx));
     CHECK(hasInlineAsmCall(*AntiDump));
     CHECK(M->getFunction("dlsym") != nullptr);
+    CHECK(M->getFunction("dlopen") != nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
     CHECK(M->getFunction("readlink") == nullptr);
     CHECK(M->getFunction("open") == nullptr);
@@ -13919,13 +13931,21 @@ entry:
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.rel.offset") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.rel.info") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.sym.name") >= 1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.sym.shndx") >= 1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.sym.external") >=
+          1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.expected") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.target.ok") >= 1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.local.rx") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.protect.ok") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.rx") >= 1u);
     CHECK(countNamedInstructions(*Rx, "morok.antihook.got.self.seg.hit") >= 1u);
     CHECK(countNamedInstructions(*Rx, "morok.antihook.got.map.seg.hit") == 0u);
+    CHECK(countNamedInstructions(*Needed, "morok.antihook.got.needed.name") >=
+          1u);
+    CHECK(countNamedInstructions(*Needed, "morok.antihook.got.needed.match") >=
+          1u);
     CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.rx") >= 1u);
     CHECK(hasInlineAsmCall(*Diverge));

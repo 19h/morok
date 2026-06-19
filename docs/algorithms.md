@@ -1356,12 +1356,14 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   full byte scan reports segment drift.
   On Linux, AntiHooking also walks the main ELF dynamic table's `DT_JMPREL`
   PLT relocations at runtime, volatile-loads each GOT/PLT slot, and verifies the
-  resolved target lands inside an executable `PT_LOAD` segment from the main
-  image or a loader `link_map` module discovered through `DT_DEBUG`.  When the
-  binary advertises `BIND_NOW` and the slot lies in `PT_GNU_RELRO`, the checker
-  re-applies read-only protection to the slot page with an inline x86_64
-  `mprotect` syscall path; bad targets or failed reprotection are folded into
-  delayed anti-hook state.
+  resolved target matches the relocation symbol as resolved from one of the
+  main executable's direct `DT_NEEDED` libraries.  Locally-defined PLT entries
+  may additionally resolve inside the main executable's executable `PT_LOAD`
+  segments, but undefined external imports do not accept arbitrary in-image
+  stubs or `LD_PRELOAD` interposers.  When the binary advertises `BIND_NOW` and
+  the slot lies in `PT_GNU_RELRO`, the checker re-applies read-only protection
+  to the slot page with an inline x86_64 `mprotect` syscall path; bad targets or
+  failed reprotection are folded into delayed anti-hook state.
   On macOS, AntiHooking walks the main Mach-O load commands, scans
   `S_NON_LAZY_SYMBOL_POINTERS` and `S_LAZY_SYMBOL_POINTERS` sections such as
   `__got` and `__la_symbol_ptr`, volatile-loads each non-null pointer, and
