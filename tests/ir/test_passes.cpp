@@ -12782,10 +12782,10 @@ entry:
 }
 
 // Regression for #48's storage-reuse angle: once a slot has been armed by a
-// real vtable store, a later non-vtable pointer store to that same storage must
-// disarm it.  Otherwise placement-new, arena, heap, or stack reuse can make a
-// legitimate ops-table dispatch trip the unknown-vptr path solely because the
-// raw slot address was remembered from a previous object lifetime.
+// real vtable store, a later statically proven non-vtable pointer store to that
+// same storage may disarm it.  Dynamic pointer stores are not proof of safe
+// reuse: they are also how fake vptr swaps appear, so they must leave the slot
+// armed and let the unknown-vptr verifier path trap.
 TEST_CASE("vtableIntegrityModule disarms reused vptr storage") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -12828,6 +12828,13 @@ entry:
   ret void
 }
 
+define void @tamper_dynamic(ptr %slot, ptr %fake_vptr) {
+entry:
+  store ptr getelementptr inbounds ({ [4 x ptr] }, ptr @_ZTV4Base, i64 0, i32 0, i64 2), ptr %slot
+  store ptr %fake_vptr, ptr %slot
+  ret void
+}
+
 define i32 @dispatch_reused(ptr %slot) {
 entry:
   %vptr = load ptr, ptr %slot
@@ -12858,7 +12865,7 @@ entry:
             ++disarmCalls;
     }
 
-    CHECK(armCalls == 2u);
+    CHECK(armCalls == 3u);
     CHECK(disarmCalls == 1u);
     CHECK(countNamedInstructions(*Remember, "morok.vti.track.clear.same") >=
           1u);

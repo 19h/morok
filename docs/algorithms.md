@@ -92,12 +92,15 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   byte-offset GEPs.  Arbitrary indirect calls without a loaded object vptr are
   ignored.
 - Runtime stores of harvested `_ZTV*` address points arm the exact vptr storage
-  slot in a small hashed side table.  Later non-vtable pointer stores to the
-  same storage disarm the matching tracked slot, so placement-new, arena, heap,
-  or stack reuse can hand that address to callback/ops tables without inheriting
-  stale vptr state.  Structurally similar callback/ops-table dispatches whose
-  table pointer storage is unarmed remain non-fatal on a no-match verifier path,
-  avoiding DoS on legitimate function-pointer tables.
+  slot in a small hashed side table.  Later statically proven non-vtable
+  constant pointer stores to the same storage disarm the matching tracked slot,
+  so placement-new, arena, heap, or stack reuse can hand that address to
+  callback/ops tables without inheriting stale vptr state.  Dynamic pointer
+  stores are not disarms: if an armed object slot receives an unverifiable
+  runtime pointer, an unknown-vptr dispatch still traps.  Structurally similar
+  callback/ops-table dispatches whose table pointer storage is unarmed remain
+  non-fatal on a no-match verifier path, avoiding DoS on legitimate
+  function-pointer tables.
 - The emitted private tables store expected vptr address points, slot offsets,
   expected targets, and deterministic per-entry cookies.  Each guarded call
   invokes `morok.vti.verify(vptr, slot, target)` immediately before dispatch.

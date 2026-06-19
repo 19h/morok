@@ -225,9 +225,8 @@ void collectStoredAddressPoints(
                     AddressPoints[GV].insert(Offset);
                     if (VPtrStores)
                         VPtrStores->arm.push_back(SI);
-                } else if (VPtrStores) {
-                    if (StoredConst &&
-                        isVTableLikeAddressPoint(StoredConst, DL))
+                } else if (VPtrStores && StoredConst) {
+                    if (isVTableLikeAddressPoint(StoredConst, DL))
                         continue;
                     VPtrStores->disarm.push_back(SI);
                 }
