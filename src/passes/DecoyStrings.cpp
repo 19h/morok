@@ -14,6 +14,7 @@
 #include "morok/passes/DecoyStrings.hpp"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -234,6 +235,22 @@ bool decoyStringsModule(Module &M, ir::IRRandom &rng) {
         if (F.getName().starts_with("morok."))
             continue;
         if (F.getEntryBlock().empty())
+            continue;
+        // Inserting a normal (memory-effecting) call into the entry block is
+        // unsafe for several special function kinds, matching the guards every
+        // other instrumenting pass applies (Nanomites, AntiAnalysis,
+        // AdversarialFunctionMerging, StackDeltaGames):
+        //  - Naked: has no prologue; a spliced call corrupts the stack frame.
+        //  - available_externally: the body must stay ODR-identical to the
+        //    external definition, so it must not be mutated.
+        //  - intrinsic: not a real definition to instrument.
+        //  - OptimizeNone: left untouched by convention.
+        //  - memory(none)/memory(read): a call that writes memory contradicts
+        //    the declared effects and miscompiles.
+        if (F.hasFnAttribute(Attribute::Naked) ||
+            F.hasAvailableExternallyLinkage() || F.isIntrinsic() ||
+            F.hasFnAttribute(Attribute::OptimizeNone) ||
+            F.doesNotAccessMemory() || F.onlyReadsMemory())
             continue;
         targets.push_back(&F);
     }

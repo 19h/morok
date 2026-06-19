@@ -1084,6 +1084,70 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #47: the decoy pass spliced a memory-effecting log call into
+// every user function's entry block, but did not skip special function kinds
+// the way every sibling instrumenting pass does.  A call in a naked function
+// corrupts the prologue, an available_externally body must stay ODR-identical,
+// and a call that writes memory contradicts a memory(none)/memory(read)
+// attribute.  Those functions must be left untouched; ordinary ones instrument.
+TEST_CASE("decoyStringsModule skips naked/available-externally/readonly funcs") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+
+define void @normal() {
+entry:
+  ret void
+}
+
+define void @naked_fn() #0 {
+entry:
+  ret void
+}
+
+define available_externally void @avail_ext() {
+entry:
+  ret void
+}
+
+define void @readnone_fn() #1 {
+entry:
+  ret void
+}
+
+define void @readonly_fn() #2 {
+entry:
+  ret void
+}
+
+attributes #0 = { naked }
+attributes #1 = { memory(none) }
+attributes #2 = { memory(read) }
+)ir");
+    REQUIRE(M);
+    REQUIRE_FALSE(verifyModule(*M, &errs()));
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x4700);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::decoyStringsModule(*M, rng));
+
+    auto callsDbglog = [](Function &F) {
+        for (Instruction &I : instructions(F))
+            if (auto *CI = dyn_cast<CallInst>(&I))
+                if (Function *C = CI->getCalledFunction())
+                    if (C->getName().starts_with("morok.dbglog."))
+                        return true;
+        return false;
+    };
+
+    CHECK(callsDbglog(*M->getFunction("normal")));            // ordinary -> yes
+    CHECK_FALSE(callsDbglog(*M->getFunction("naked_fn")));    // naked
+    CHECK_FALSE(callsDbglog(*M->getFunction("avail_ext")));   // ODR-fixed body
+    CHECK_FALSE(callsDbglog(*M->getFunction("readnone_fn"))); // memory(none)
+    CHECK_FALSE(callsDbglog(*M->getFunction("readonly_fn"))); // memory(read)
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("decoyStringsModule skips modules without user bodies") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
