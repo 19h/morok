@@ -1712,6 +1712,44 @@ entry:
     CHECK(shares >= 4);
 }
 
+TEST_CASE("constantEncryptFunction feistel + substitute_xor layers are wired") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @withconst(i32 %a) {
+entry:
+  %0 = add i32 %a, 305419896
+  ret i32 %0
+}
+)ir");
+    Function *F = M->getFunction("withconst");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(9);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::ConstEncParams p;
+    p.probability = 100;
+    p.share_count = 2;
+    p.iterations = 1;
+    p.feistel = true;
+    p.substitute_xor = true;
+    p.substitute_xor_prob = 100;
+    CHECK(morok::passes::constantEncryptFunction(*F, p, rng));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+    // Feistel emits a non-linear round multiply (vs the pure XOR/add fold the
+    // plain XOR-share layer would leave) — the dead-knob regression would not.
+    bool hasMul = false;
+    for (BasicBlock &BB : *F)
+        for (Instruction &I : BB)
+            if (I.getOpcode() == Instruction::Mul)
+                hasMul = true;
+    CHECK(hasMul);
+    // substitute_xor materialises a runtime-loaded key global.
+    std::size_t subkeys = 0;
+    for (GlobalVariable &gv : M->globals())
+        if (gv.getName().starts_with("morok.subkey"))
+            ++subkeys;
+    CHECK(subkeys >= 1);
+}
+
 TEST_CASE("constantEncryptFunction supports sub-byte and odd-width literals") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

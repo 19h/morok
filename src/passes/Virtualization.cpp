@@ -1570,12 +1570,50 @@ void invalidateCallerEffects(Function &F) {
     }
 }
 
+// L1: the bytecode keystream is otherwise a pure function of compile-time
+// constants (statically decodable).  Get-or-create the verdict seal so the VM
+// decode can fold in a 0-on-clean runtime delta; S0 is read back from the
+// initializer wherever the seal is consumed, so all passes that share it agree.
+GlobalVariable *getOrCreateAntidbgSeal(Module &M, ir::IRRandom &Rng) {
+    if (auto *g =
+            M.getGlobalVariable("morok.antidbg.seal", /*AllowInternal=*/true))
+        return g;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i64, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i64, Rng.next()),
+                                  "morok.antidbg.seal");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(8));
+    return gv;
+}
+
 Value *emitStreamKey(Builder &B, Value *Offset, const Encoding &Enc) {
     auto *I32 = B.getInt32Ty();
     auto *I8 = B.getInt8Ty();
     Value *X =
         B.CreateMul(Offset, ConstantInt::get(I32, Enc.mul), "morok.vm.key.mul");
     X = B.CreateAdd(X, ConstantInt::get(I32, Enc.add), "morok.vm.key.add");
+    // L1: fold a 0-on-clean delta from the verdict seal into the keystream.  On a
+    // clean run seal==S0 so X is unchanged and the decode matches the compile-time
+    // encode; under a tripped detector (injection/tamper) every decoded byte —
+    // opcode, operand, and immediate (all route through emitDecodeByte) — is wrong
+    // and vm.exec yields garbage.  Closes the vm.exec gap left open by M4.
+    if (GlobalVariable *Seal = B.GetInsertBlock()->getModule()->getGlobalVariable(
+            "morok.antidbg.seal", /*AllowInternal=*/true)) {
+        std::uint64_t S0 = 0;
+        if (Seal->hasInitializer())
+            if (auto *CI = dyn_cast<ConstantInt>(Seal->getInitializer()))
+                S0 = CI->getZExtValue();
+        auto *I64 = B.getInt64Ty();
+        Value *D = B.CreateXor(B.CreateLoad(I64, Seal, "morok.vm.seal"),
+                               ConstantInt::get(I64, S0), "morok.vm.seal.delta");
+        Value *D32 = B.CreateXor(
+            B.CreateTrunc(D, I32),
+            B.CreateTrunc(B.CreateLShr(D, ConstantInt::get(I64, 32)), I32),
+            "morok.vm.seal.fold");
+        X = B.CreateAdd(X, D32, "morok.vm.key.seal");
+    }
     X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 7)),
                     "morok.vm.key.fold7");
     X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 15)),
@@ -2254,6 +2292,10 @@ bool virtualizeModule(Module &M, const VirtualizationParams &Params,
     if (Params.probability == 0 || Params.max_functions == 0 ||
         Params.max_instructions == 0 || Params.max_registers == 0)
         return false;
+
+    // L1: ensure the verdict seal exists before any exec is emitted so the
+    // keystream decode can fold it in (see emitStreamKey).
+    getOrCreateAntidbgSeal(M, Rng);
 
     // Snapshot candidate functions before any mutation: materializing a helper
     // inserts new functions into `M`, which would invalidate a live range-for

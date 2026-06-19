@@ -32,6 +32,9 @@ struct ConstEncParams {
     std::uint32_t probability = 100; ///< per-constant chance, 0..100
     std::uint32_t share_count = 2;   ///< XOR shares, clamped to [2,8]
     std::uint32_t iterations = 1;    ///< sweeps over the function (>=1)
+    bool feistel = false;            ///< 4-round Feistel layer before XOR shares
+    bool substitute_xor = false;     ///< extra runtime-keyed XOR substitution layer
+    std::uint32_t substitute_xor_prob = 100; ///< per-constant chance, sub layer
     /// Restrict to decision-gate constants only: the operands of comparisons and
     /// of constant branch/switch conditions.  Used for an early sweep that hides
     /// a license gate's `cmp reg, #imm` BEFORE the structural passes inflate the

@@ -911,6 +911,10 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
                     100; // encrypt every eligible literal when enabled
                 p.share_count = eff.const_enc.share_count.value_or(2);
                 p.iterations = eff.const_enc.iterations.value_or(1);
+                p.feistel = eff.const_enc.feistel.value_or(false);
+                p.substitute_xor = eff.const_enc.substitute_xor.value_or(false);
+                p.substitute_xor_prob =
+                    eff.const_enc.substitute_xor_prob.value_or(100);
                 changed |= passes::constantEncryptFunction(F, p, rng);
             }
 
@@ -931,6 +935,10 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
                 p.share_count = eff.const_enc.share_count.value_or(2);
                 p.iterations = 1;
                 p.conditions_only = true;
+                p.feistel = eff.const_enc.feistel.value_or(false);
+                p.substitute_xor = eff.const_enc.substitute_xor.value_or(false);
+                p.substitute_xor_prob =
+                    eff.const_enc.substitute_xor_prob.value_or(100);
                 changed |= passes::constantEncryptFunction(F, p, rng);
             }
 

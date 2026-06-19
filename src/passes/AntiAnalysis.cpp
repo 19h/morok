@@ -4071,9 +4071,25 @@ Function *darwinTextTargetInDyldImages(Module &M) {
     Value *slide = IBB.CreateCall(imageSlide, {imageIdx}, "morok.macho.slide");
     Value *magic = loadAt(IBB, M, i32, hdr, 0ULL, "morok.antihook.macho.magic");
     Value *ncmds = loadAt(IBB, M, i32, hdr, 16, "morok.antihook.macho.ncmds");
+    // L2: only the main executable (image 0) or a system dylib (/usr/lib//System/)
+    // counts as legit text.  Without this, an injected dylib (DYLD_INSERT) is a
+    // loaded image too, so its text range satisfies the check and whitelists the
+    // attacker's own code.  Path prefix compared as the first 8 bytes.
+    FunctionCallee imageName = M.getOrInsertFunction(
+        "_dyld_get_image_name", FunctionType::get(ptr, {i32}, false));
+    Value *name = IBB.CreateCall(imageName, {imageIdx}, "morok.macho.name");
+    Value *name8 = IBB.CreateAlignedLoad(i64, name, Align(1), "morok.macho.name8");
+    Value *isMain = IBB.CreateICmpEQ(imageIdx, ConstantInt::get(i32, 0));
+    Value *isUsrLib = // "/usr/lib"
+        IBB.CreateICmpEQ(name8, ConstantInt::get(i64, 0x62696c2f7273752fULL));
+    Value *isSystem = // "/System/"
+        IBB.CreateICmpEQ(name8, ConstantInt::get(i64, 0x2f6d65747379532fULL));
+    Value *legitPath =
+        IBB.CreateOr(isMain, IBB.CreateOr(isUsrLib, isSystem), "morok.macho.legit");
     Value *validImage = IBB.CreateAnd(
-        IBB.CreateICmpNE(hdr, ConstantPointerNull::get(ptr)),
-        IBB.CreateICmpEQ(magic, ConstantInt::get(i32, 0xFEEDFACF)));
+        IBB.CreateAnd(IBB.CreateICmpNE(hdr, ConstantPointerNull::get(ptr)),
+                      IBB.CreateICmpEQ(magic, ConstantInt::get(i32, 0xFEEDFACF))),
+        legitPath);
     IBB.CreateCondBr(validImage, cmdLoopBB, imageNextBB);
 
     IRBuilder<> CLB(cmdLoopBB);

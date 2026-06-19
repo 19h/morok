@@ -825,6 +825,13 @@ bool bindLeafHelpersToSeal(Module &M, ir::IRRandom &Rng) {
             if (!RI || !RI->getReturnValue() ||
                 !RI->getReturnValue()->getType()->isIntegerTy())
                 continue;
+            // A musttail return must be `ret <call-result>` with nothing between
+            // the call and the ret; folding the seal into its operand would insert
+            // ops there and break the backend's tail-call lowering.  Leave such
+            // returns alone (other returns in the function are still bound).
+            if (auto *CI = dyn_cast<CallInst>(RI->getReturnValue()))
+                if (CI->isMustTailCall())
+                    continue;
             IRBuilder<> B(RI);
             Value *RV = RI->getReturnValue();
             auto *Cur = B.CreateLoad(I64, Seal, "morok.helper.seal");

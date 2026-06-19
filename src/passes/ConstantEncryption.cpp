@@ -15,6 +15,7 @@
 
 #include "morok/passes/ConstantEncryption.hpp"
 
+#include "morok/core/Feistel.hpp"
 #include "morok/core/XorShare.hpp"
 
 #include "llvm/ADT/DenseMap.h"
@@ -146,16 +147,64 @@ std::optional<EncodedConstant> encodeConstant(Constant *C) {
     return EncodedConstant{CarrierTy, C->getType(), Bits.getZExtValue()};
 }
 
+// Emit the inverse of core::feistelEncrypt as IR (4 reverse rounds), recovering
+// the plaintext from the reconstructed ciphertext.  The round multiply is the
+// non-linear component that defeats purely affine/XOR-fold static recovery of
+// the XOR-share layer.
+Value *emitFeistelDecrypt(IRBuilder<NoFolder> &B, Value *V, unsigned bits,
+                          const core::FeistelKeys &keys) {
+    auto *ty = cast<IntegerType>(V->getType());
+    const unsigned half = bits / 2;
+    const std::uint64_t mask =
+        half >= 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << half) - 1u);
+    Value *maskV = ConstantInt::get(ty, mask);
+    Value *halfV = ConstantInt::get(ty, half);
+    Value *l = B.CreateAnd(B.CreateLShr(V, halfV), maskV);
+    Value *r = B.CreateAnd(V, maskV);
+    for (int i = core::FeistelKeys::kRounds - 1; i >= 0; --i) {
+        const auto &rk = keys.rounds[static_cast<std::size_t>(i)];
+        Value *f = B.CreateAnd(
+            B.CreateXor(B.CreateMul(l, ConstantInt::get(ty, rk.mult)),
+                        ConstantInt::get(ty, rk.xork)),
+            maskV);
+        Value *newL = B.CreateAnd(B.CreateXor(r, f), maskV);
+        r = l;
+        l = newL;
+    }
+    return B.CreateOr(B.CreateShl(l, halfV), r);
+}
+
 Value *reconstruct(Module &M, Instruction &user, Constant *c,
-                   unsigned shareCount, ir::IRRandom &rng) {
+                   unsigned shareCount, ir::IRRandom &rng, bool feistel = false,
+                   bool subXor = false, std::uint32_t subProb = 100) {
     std::optional<EncodedConstant> Enc = encodeConstant(c);
     if (!Enc)
         return c;
     auto *ty = Enc->carrier_ty;
     const unsigned bits = ty->getBitWidth();
-    const auto shares =
-        core::splitXorShares(Enc->raw, shareCount, bits, rng.engine());
+    std::uint64_t value = Enc->raw;
 
+    // Feistel layer (balanced network needs an even width >= 16).  Encrypt at
+    // compile time, emit the inverse at runtime.
+    const bool useFeistel = feistel && bits >= 16 && (bits % 2 == 0);
+    core::FeistelKeys fkeys;
+    if (useFeistel) {
+        fkeys = core::makeFeistelKeys(rng.engine(), bits);
+        value = core::feistelEncrypt(value, bits, fkeys);
+    }
+    // Substitute-XOR layer: blind the shared value with a runtime-loaded key so
+    // the shares no longer XOR-fold to the (post-Feistel) value statically.
+    const std::uint64_t widthMask =
+        bits >= 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << bits) - 1u);
+    const bool useSub = subXor && rng.chance(subProb);
+    std::uint64_t subKey = 0;
+    if (useSub) {
+        subKey = rng.next() & widthMask;
+        value ^= subKey;
+    }
+
+    const auto shares =
+        core::splitXorShares(value, shareCount, bits, rng.engine());
     IRBuilder<NoFolder> B(&user);
     Value *acc = nullptr;
     for (std::uint64_t share : shares) {
@@ -165,6 +214,16 @@ Value *reconstruct(Module &M, Instruction &user, Constant *c,
         Value *loaded = B.CreateLoad(ty, gv, /*isVolatile=*/true);
         acc = acc ? B.CreateXor(acc, loaded) : loaded;
     }
+    // Undo the layers in reverse: substitute-XOR (runtime key), then Feistel.
+    if (useSub) {
+        auto *kv = new GlobalVariable(
+            M, ty, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+            ConstantInt::get(ty, subKey), "morok.subkey");
+        acc = B.CreateXor(acc, B.CreateLoad(ty, kv, /*isVolatile=*/true),
+                          "morok.sub.undo");
+    }
+    if (useFeistel)
+        acc = emitFeistelDecrypt(B, acc, bits, fkeys);
     if (Enc->result_ty != Enc->carrier_ty)
         return B.CreateBitCast(acc, Enc->result_ty, "morok.share.fp");
     return acc;
@@ -296,6 +355,23 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
     constexpr std::uint32_t kMaxConstEncIterations = 8;
     const std::uint32_t iterations = std::clamp<std::uint32_t>(
         params.iterations ? params.iterations : 1, 1, kMaxConstEncIterations);
+    // A musttail call must be the last instruction before its `ret`.  The plain
+    // XOR-share reconstruction is musttail-safe, but the Feistel/substitute
+    // layers add a multi-instruction non-linear sequence; skip those layers for
+    // such functions defensively (the program cf_musttail exercises this).
+    bool hasMusttail = false;
+    for (BasicBlock &bb : F) {
+        for (Instruction &inst : bb)
+            if (auto *CI = dyn_cast<CallInst>(&inst))
+                if (CI->isMustTailCall()) {
+                    hasMusttail = true;
+                    break;
+                }
+        if (hasMusttail)
+            break;
+    }
+    const bool useFeistel = params.feistel && !hasMusttail;
+    const bool useSubstitute = params.substitute_xor && !hasMusttail;
     bool changed = false;
     const std::size_t maxTargets = kMaxConstEncTargetsPerIteration;
 
@@ -398,7 +474,9 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
             if (!InsertBefore)
                 continue;
             Value *repl =
-                reconstruct(M, *InsertBefore, t.value, shareCount, rng);
+                reconstruct(M, *InsertBefore, t.value, shareCount, rng,
+                            useFeistel, useSubstitute,
+                            params.substitute_xor_prob);
             if (t.phi_incoming) {
                 auto *PN = cast<PHINode>(t.user);
                 BasicBlock *Incoming = t.incoming_block;
