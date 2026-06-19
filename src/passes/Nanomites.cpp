@@ -174,46 +174,35 @@ bool nanomiteLayout(const Triple &TT, NanomiteLayout &L) {
     return false;
 }
 
-GlobalVariable *decisionGlobal(Module &M) {
-    if (auto *existing =
-            M.getGlobalVariable("morok.nanomite.decision",
-                                /*AllowInternal=*/true))
+void configureStateGlobal(GlobalVariable &GV) {
+    GV.setThreadLocalMode(GlobalValue::InitialExecTLSModel);
+    GV.setUnnamedAddr(GlobalValue::UnnamedAddr::None);
+    GV.setAlignment(Align(8));
+}
+
+GlobalVariable *stateGlobal(Module &M, const char *Name) {
+    if (auto *existing = M.getGlobalVariable(Name, /*AllowInternal=*/true)) {
+        configureStateGlobal(*existing);
         return existing;
+    }
     auto *ip = intPtrTy(M);
-    auto *gv = new GlobalVariable(
-        M, ip, /*isConstant=*/false, GlobalValue::PrivateLinkage,
-        ConstantInt::get(ip, 0), "morok.nanomite.decision");
-    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-    gv->setAlignment(Align(8));
+    auto *gv = new GlobalVariable(M, ip, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(ip, 0), Name);
+    configureStateGlobal(*gv);
     return gv;
+}
+
+GlobalVariable *decisionGlobal(Module &M) {
+    return stateGlobal(M, "morok.nanomite.decision");
 }
 
 GlobalVariable *tokenGlobal(Module &M) {
-    if (auto *existing =
-            M.getGlobalVariable("morok.nanomite.token",
-                                /*AllowInternal=*/true))
-        return existing;
-    auto *ip = intPtrTy(M);
-    auto *gv = new GlobalVariable(
-        M, ip, /*isConstant=*/false, GlobalValue::PrivateLinkage,
-        ConstantInt::get(ip, 0), "morok.nanomite.token");
-    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-    gv->setAlignment(Align(8));
-    return gv;
+    return stateGlobal(M, "morok.nanomite.token");
 }
 
 GlobalVariable *targetGlobal(Module &M) {
-    if (auto *existing =
-            M.getGlobalVariable("morok.nanomite.target",
-                                /*AllowInternal=*/true))
-        return existing;
-    auto *ip = intPtrTy(M);
-    auto *gv = new GlobalVariable(
-        M, ip, /*isConstant=*/false, GlobalValue::PrivateLinkage,
-        ConstantInt::get(ip, 0), "morok.nanomite.target");
-    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-    gv->setAlignment(Align(8));
-    return gv;
+    return stateGlobal(M, "morok.nanomite.target");
 }
 
 std::uint64_t ptrWidthMask(Module &M, std::uint64_t V) {

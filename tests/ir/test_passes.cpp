@@ -13389,9 +13389,16 @@ else:
     CHECK(indirectBranches == 1u);
     CHECK(hasInlineAsmCall(*Pick));
     CHECK(M->getGlobalVariable("morok.nanomite.table", true) != nullptr);
-    CHECK(M->getGlobalVariable("morok.nanomite.decision", true) != nullptr);
-    CHECK(M->getGlobalVariable("morok.nanomite.token", true) != nullptr);
-    CHECK(M->getGlobalVariable("morok.nanomite.target", true) != nullptr);
+    auto requireThreadLocalState = [&](const char *name) {
+        GlobalVariable *GV = M->getGlobalVariable(name, true);
+        REQUIRE(GV != nullptr);
+        CHECK(GV->isThreadLocal());
+        CHECK(GV->getThreadLocalMode() == GlobalValue::InitialExecTLSModel);
+        CHECK(GV->getUnnamedAddr() == GlobalValue::UnnamedAddr::None);
+    };
+    requireThreadLocalState("morok.nanomite.decision");
+    requireThreadLocalState("morok.nanomite.token");
+    requireThreadLocalState("morok.nanomite.target");
     CHECK(M->getFunction("morok.nanomite.handler") != nullptr);
     CHECK(M->getFunction("morok.nanomite.install") != nullptr);
     CHECK(M->getFunction("sigaction") != nullptr);
