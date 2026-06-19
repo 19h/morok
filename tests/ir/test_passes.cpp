@@ -7804,7 +7804,10 @@ entry:
     CHECK(keyUsesEnv);
     CHECK(hasCycleProbe);
     CHECK(hasCpuidProbe);
-    CHECK(hasRdtscpProbe);
+    // No RDTSCP: it #UDs on x86 CPUs/VMs that lack the feature and its result was
+    // folded to a guaranteed 0, so it was removed (#64); CPUID + readcyclecounter
+    // still provide the environment/timestamp mix.
+    CHECK_FALSE(hasRdtscpProbe);
     CHECK(hasVolumeProbe);
     CHECK(hasVolatileBoundLoad);
     CHECK(hasVolatileBoundHashLoad);

@@ -426,25 +426,6 @@ Value *emitCpuidProbe(Builder &B, Module &M, Value *Leaf, Value *Subleaf) {
     return B.CreateCall(AsmTy, Cpuid, {Leaf, Subleaf}, "morok.sdb.env.cpuid");
 }
 
-Value *emitRdtscpProbe(Builder &B, Module &M) {
-    LLVMContext &Ctx = M.getContext();
-    auto *I32 = Type::getInt32Ty(Ctx);
-    auto *I64 = Type::getInt64Ty(Ctx);
-    auto *PairTy = StructType::get(Ctx, {I32, I32});
-    auto *AsmTy = FunctionType::get(PairTy, false);
-    InlineAsm *Rdtscp =
-        InlineAsm::get(AsmTy, "lfence\nrdtscp\nlfence",
-                       "={eax},={edx},~{ecx},~{dirflag},~{fpsr},~{flags}",
-                       /*hasSideEffects=*/true);
-    Value *Pair = B.CreateCall(AsmTy, Rdtscp, {}, "morok.sdb.env.rdtscp");
-    Value *Lo = B.CreateExtractValue(Pair, {0}, "morok.sdb.env.tsc.lo");
-    Value *Hi = B.CreateExtractValue(Pair, {1}, "morok.sdb.env.tsc.hi");
-    return B.CreateOr(
-        B.CreateZExt(Lo, I64),
-        B.CreateShl(B.CreateZExt(Hi, I64), ConstantInt::get(I64, 32)),
-        "morok.sdb.env.tsc");
-}
-
 Value *emitCycleProbe(Builder &B, Module &M) {
     Function *ReadCycle =
         Intrinsic::getOrInsertDeclaration(&M, Intrinsic::readcyclecounter);
@@ -591,10 +572,11 @@ Value *emitEnvironmentZero(Builder &B, Module &M, Function *Fn,
                 B, packRegs64(B, Ecx0, Edx0, "morok.sdb.env.cpuid.hi"),
                 "morok.sdb.env.cpuid.hi"),
             "morok.sdb.env.acc");
-        Acc = B.CreateXor(Acc,
-                          volatileStableZero(B, emitRdtscpProbe(B, M),
-                                             "morok.sdb.env.rdtscp"),
-                          "morok.sdb.env.acc");
+        // No RDTSCP environment term: it raises #UD on x86 CPUs/VMs that lack
+        // the feature, and its result is folded through volatileStableZero (it
+        // contributes a guaranteed 0 to the key), so it was pure crash-liability
+        // for zero key entropy.  The CPUID(leaf 0) and readcyclecounter terms
+        // already supply the portable environment/timestamp mix (#64).
     }
 
     if (TT.isOSLinux() && TT.getArch() == Triple::x86_64)
