@@ -6,9 +6,9 @@
 //
 // Direct internal calls are rewritten to call a shared native dispatcher.  The
 // original callee address is carried in a callee-saved register and is decoded
-// from a per-site encoded dispatcher-relative delta.  The first hit at each
-// site computes the volatile caller-byte hash and then caches the recovered
-// target locally so hot loops do not replay the hash on every iteration.
+// from a per-site encoded dispatcher-relative delta.  A per-site cache may keep
+// the sealed encoded value locally, but the volatile caller-byte hash is still
+// recomputed on every call so warmed sites remain sensitive to live patches.
 //
 // Each routed site also emits a post-link manifest.  The sealer patches the
 // encoded target against final native bytes and marks the site sealed; sealed
@@ -380,6 +380,8 @@ void rewriteSite(Module &M, Function *Dispatcher, const Site &S,
         BasicBlock::Create(Ctx, "morok.ckd.cache.miss", S.caller, JoinBB);
 
     Builder EntryB(EntryBB);
+    Value *H = emitSiteHash(EntryB, M, Dispatcher, S.caller, S.block, S,
+                            RegionBytes);
     LoadInst *Cached = EntryB.CreateLoad(I64, S.cache, /*isVolatile=*/true,
                                          "morok.ckd.cache");
     Value *CachedReady =
@@ -391,21 +393,20 @@ void rewriteSite(Module &M, Function *Dispatcher, const Site &S,
     HitB.CreateBr(JoinBB);
 
     Builder MissB(MissBB);
-    Value *H = emitSiteHash(MissB, M, Dispatcher, S.caller, S.block, S,
-                            RegionBytes);
     LoadInst *Encoded = MissB.CreateLoad(I64, S.encoded,
                                          /*isVolatile=*/true, "morok.ckd.enc");
-    Value *Delta = MissB.CreateSub(Encoded, H, "morok.ckd.target.delta");
-    Value *Base = ptrToI64(MissB, Dispatcher);
-    Value *DecodedTarget =
-        MissB.CreateAdd(Base, Delta, "morok.ckd.target.decoded");
-    MissB.CreateStore(DecodedTarget, S.cache, /*isVolatile=*/true);
+    MissB.CreateStore(Encoded, S.cache, /*isVolatile=*/true);
     MissB.CreateBr(JoinBB);
 
     Builder CallB(Old);
-    PHINode *TargetInt = CallB.CreatePHI(I64, 2, "morok.ckd.target.int");
-    TargetInt->addIncoming(Cached, HitBB);
-    TargetInt->addIncoming(DecodedTarget, MissBB);
+    PHINode *EncodedForCall =
+        CallB.CreatePHI(I64, 2, "morok.ckd.target.enc.cached");
+    EncodedForCall->addIncoming(Cached, HitBB);
+    EncodedForCall->addIncoming(Encoded, MissBB);
+    Value *Delta =
+        CallB.CreateSub(EncodedForCall, H, "morok.ckd.target.delta");
+    Value *Base = ptrToI64(CallB, Dispatcher);
+    Value *TargetInt = CallB.CreateAdd(Base, Delta, "morok.ckd.target.decoded");
     Value *Target = CallB.CreateIntToPtr(
         TargetInt, PointerType::getUnqual(M.getContext()), "morok.ckd.target");
 

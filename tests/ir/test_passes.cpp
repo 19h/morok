@@ -224,6 +224,22 @@ std::size_t countVolatileAccesses(Function &F) {
     return n;
 }
 
+bool storesNamedValueToGlobalPrefix(Function &F, StringRef globalPrefix,
+                                    StringRef valuePrefix) {
+    for (Instruction &I : instructions(F)) {
+        auto *SI = dyn_cast<StoreInst>(&I);
+        if (!SI)
+            continue;
+        Value *Ptr = SI->getPointerOperand()->stripPointerCasts();
+        if (!Ptr->hasName() || !Ptr->getName().starts_with(globalPrefix))
+            continue;
+        Value *Stored = SI->getValueOperand();
+        if (Stored->hasName() && Stored->getName().starts_with(valuePrefix))
+            return true;
+    }
+    return false;
+}
+
 bool isMonotonicAtomicLoadFrom(const LoadInst *LI, StringRef globalPrefix) {
     return LI->isVolatile() && LI->isAtomic() &&
            LI->getOrdering() == AtomicOrdering::Monotonic &&
@@ -11492,6 +11508,11 @@ entry:
     CHECK(countGlobals(*M, "morok.ckd.cache") == 2u);
     CHECK(countGlobals(*M, "morok.ckd.code.size") == 2u);
     CHECK(countGlobals(*M, "morok.postlink.ckd") == 1u);
+    CHECK(countNamedInstructions(*Caller, "morok.ckd.target.enc.cached") == 2u);
+    CHECK(storesNamedValueToGlobalPrefix(*Caller, "morok.ckd.cache",
+                                         "morok.ckd.enc"));
+    CHECK_FALSE(storesNamedValueToGlobalPrefix(
+        *Caller, "morok.ckd.cache", "morok.ckd.target.decoded"));
     CHECK(M->getGlobalVariable("llvm.global_ctors") != nullptr);
     CHECK(countCallsTo(*Init, "morok.ckd.dispatch") == 0u);
 
