@@ -254,8 +254,12 @@ passes::BcfParams bcfParams(const config::BcfConfig &C, bool Sensitive) {
     P.complexity = C.complexity.value_or(1);
     P.entropy_chain = C.entropy_chain.value_or(false);
     P.junk_asm = C.junk_asm.value_or(false);
-    P.junk_asm_min = C.junk_asm_min.value_or(0);
-    P.junk_asm_max = C.junk_asm_max.value_or(0);
+    P.junk_asm_min =
+        std::min(C.junk_asm_min.value_or(0), passes::kBcfMaxJunkAsm);
+    P.junk_asm_max =
+        std::min(C.junk_asm_max.value_or(0), passes::kBcfMaxJunkAsm);
+    if (P.junk_asm_max < P.junk_asm_min)
+        P.junk_asm_max = P.junk_asm_min;
     return P;
 }
 

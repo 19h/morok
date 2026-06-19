@@ -25,6 +25,8 @@ class Function;
 
 namespace morok::passes {
 
+inline constexpr std::uint32_t kBcfMaxJunkAsm = 16;
+
 struct BcfParams {
     std::uint32_t probability = 60; ///< per-block chance, 0..100
     std::uint32_t iterations = 1;   ///< sweeps over the function (>=1)

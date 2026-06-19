@@ -39,6 +39,9 @@ TEST_CASE("unsigned TOML integers reject negative and overflowing values") {
     seed = -1
     [passes.split_blocks]
     splits = -3
+    [passes.bcf]
+    junk_asm_min = -4
+    junk_asm_max = 4294967296
     [passes.external_opaque_predicates]
     enabled = true
     probability = -25
@@ -48,6 +51,8 @@ TEST_CASE("unsigned TOML integers reject negative and overflowing values") {
     REQUIRE(r.ok);
     CHECK(r.config.seed == 0u);
     CHECK_FALSE(r.config.passes.split.splits.has_value());
+    CHECK_FALSE(r.config.passes.bcf.junk_asm_min.has_value());
+    CHECK_FALSE(r.config.passes.bcf.junk_asm_max.has_value());
     CHECK(r.config.passes.external_op.enabled == true);
     CHECK_FALSE(r.config.passes.external_op.probability.has_value());
     CHECK_FALSE(r.config.passes.external_op.max_blocks.has_value());

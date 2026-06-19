@@ -4417,6 +4417,7 @@ TEST_CASE("bogusControlFlowFunction honors complexity/entropy/junk knobs") {
         unsigned andI1 = 0;    // predicate-conjunction depth (complexity)
         bool entropy = false;  // entropy_chain global + store
         unsigned asmCalls = 0; // junk_asm barriers
+        unsigned junkBlocks = 0;
     };
     auto run = [](const morok::passes::BcfParams &p) {
         LLVMContext ctx;
@@ -4427,6 +4428,9 @@ TEST_CASE("bogusControlFlowFunction honors complexity/entropy/junk knobs") {
         morok::ir::IRRandom rng(engine);
         CHECK(morok::passes::bogusControlFlowFunction(*F, p, rng));
         Counts c;
+        for (BasicBlock &BB : *F)
+            if (BB.getName().starts_with("morok.bcf.junk"))
+                ++c.junkBlocks;
         for (Instruction &I : instructions(*F)) {
             if (auto *BO = dyn_cast<BinaryOperator>(&I))
                 c.andI1 += BO->getOpcode() == Instruction::And &&
@@ -4453,6 +4457,49 @@ TEST_CASE("bogusControlFlowFunction honors complexity/entropy/junk knobs") {
     CHECK(hi.andI1 >= 1u); // complexity>1 emits i1 AND conjunctions
     CHECK(hi.entropy);
     CHECK(hi.asmCalls >= 1u);
+
+    // Hostile direct params are capped per junk block, not used as an
+    // unbounded IR-emission loop count.
+    const Counts bounded =
+        run({/*prob=*/100, /*iterations=*/1, /*complexity=*/1,
+             /*entropy_chain=*/false, /*junk_asm=*/true,
+             /*junk_asm_min=*/1000, /*junk_asm_max=*/2000});
+    REQUIRE(bounded.junkBlocks >= 1u);
+    CHECK(bounded.asmCalls ==
+          bounded.junkBlocks * morok::passes::kBcfMaxJunkAsm);
+}
+
+TEST_CASE("MorokPass clamps BCF junk asm config") {
+    LLVMContext ctx;
+    auto M = parse(ctx, kArith);
+    Function *F = M->getFunction("arith");
+    REQUIRE(F);
+
+    morok::config::Config cfg;
+    cfg.seed = 8101;
+    cfg.passes.bcf.enabled = true;
+    cfg.passes.bcf.probability = 100;
+    cfg.passes.bcf.iterations = 1;
+    cfg.passes.bcf.complexity = 1;
+    cfg.passes.bcf.junk_asm = true;
+    cfg.passes.bcf.junk_asm_min = 1000;
+    cfg.passes.bcf.junk_asm_max = 2000;
+
+    ModuleAnalysisManager AM;
+    morok::pipeline::MorokPass(std::move(cfg)).run(*M, AM);
+
+    unsigned junkBlocks = 0;
+    unsigned asmCalls = 0;
+    for (BasicBlock &BB : *F)
+        if (BB.getName().starts_with("morok.bcf.junk"))
+            ++junkBlocks;
+    for (Instruction &I : instructions(*F))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            asmCalls += CI->isInlineAsm();
+
+    REQUIRE(junkBlocks >= 1u);
+    CHECK(asmCalls == junkBlocks * morok::passes::kBcfMaxJunkAsm);
+    CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
 TEST_CASE("aliasOpaquePredicatesFunction builds alias-invariant guards") {

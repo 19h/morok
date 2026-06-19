@@ -140,8 +140,11 @@ bool bogusControlFlowFunction(Function &F, const BcfParams &params,
             }
             // junk_asm: emit dead inline-asm barriers in the junk arm.
             if (params.junk_asm) {
-                const std::uint32_t lo = params.junk_asm_min;
-                const std::uint32_t hi = std::max(lo, params.junk_asm_max);
+                const std::uint32_t lo =
+                    std::min(params.junk_asm_min, kBcfMaxJunkAsm);
+                const std::uint32_t hi =
+                    std::min(std::max(lo, params.junk_asm_max),
+                             kBcfMaxJunkAsm);
                 const std::uint32_t n =
                     lo + (hi > lo ? rng.range(hi - lo + 1) : 0);
                 auto *asmTy =
