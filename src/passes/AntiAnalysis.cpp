@@ -224,6 +224,44 @@ void foldFlag(IRBuilderBase &B, GlobalVariable *State, Value *Flag,
     foldState(B, State, B.CreateZExtOrTrunc(Flag, B.getInt64Ty()), Salt, Name);
 }
 
+// The verdict-bound anti-debug seal.  Unlike morok.antidbg.state (a one-way
+// accumulator nothing reads), this global is consumed by the self-checksum diff
+// (SelfChecksumConstants createDiffFunction): a clean run leaves it at its
+// build-time S0 so it contributes 0, while any tripped detector flips it and
+// silently corrupts every self-checksummed constant.  No branch/abort to skip.
+GlobalVariable *antiDebugSeal(Module &M, ir::IRRandom &rng) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.antidbg.seal", /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, rng.next()), "morok.antidbg.seal");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(8));
+    return gv;
+}
+
+// Fold a ZERO-ON-CLEAN detector flag into the seal: `seal ^= flag ? salt : 0`.
+// Must only be called with flags that are false on a legitimate run (e.g. traced
+// / DYLD-inserted / debugger-parent) — otherwise it would corrupt clean runs.
+void sealFold(IRBuilderBase &B, Value *Flag, std::uint64_t Salt) {
+    Module *M = B.GetInsertBlock()->getModule();
+    GlobalVariable *Seal =
+        M->getGlobalVariable("morok.antidbg.seal", /*AllowInternal=*/true);
+    if (!Seal)
+        return;
+    auto *i64 = B.getInt64Ty();
+    Value *contrib = B.CreateMul(B.CreateZExtOrTrunc(Flag, i64),
+                                 ConstantInt::get(i64, Salt | 1ull));
+    auto *cur = B.CreateLoad(i64, Seal, "morok.antidbg.seal.cur");
+    cur->setVolatile(true);
+    cur->setAlignment(Align(8));
+    auto *st = B.CreateStore(B.CreateXor(cur, contrib), Seal);
+    st->setVolatile(true);
+    st->setAlignment(Align(8));
+}
+
 Value *constIp(Module &M, std::uint64_t V) {
     return ConstantInt::get(intPtrTy(M), V);
 }
@@ -467,6 +505,33 @@ bool useDirectDarwinSyscalls(const Triple &TT) {
     return TT.isOSDarwin() && TT.getArch() == Triple::x86_64;
 }
 
+// Direct Darwin arm64 BSD syscall via svc — used ONLY for the interposable
+// anti-debug checks (ptrace/sysctl/csops/getpid) so they cannot be DYLD-rebound,
+// while leaving infra syscalls (mmap/mprotect/...) on their existing path.
+// ABI: x16 = BSD number (no 0x2000000 class bit), args x0-x5, svc #0x80, result
+// x0; arg0 is tied to the x0 output via the matching "0" constraint.
+Value *emitDarwinArm64Svc(IRBuilder<> &B, Module &M, std::uint32_t Number,
+                          std::initializer_list<Value *> Args) {
+    auto *ip = intPtrTy(M);
+    std::array<Value *, 6> a = {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0),
+                                ConstantInt::get(ip, 0), ConstantInt::get(ip, 0),
+                                ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)};
+    std::size_t i = 0;
+    for (Value *arg : Args)
+        if (i < a.size())
+            a[i++] = toSyscallArg(B, arg);
+    std::vector<Type *> params(7, ip);
+    auto *asmTy = FunctionType::get(ip, params, false);
+    InlineAsm *svc = InlineAsm::get(
+        asmTy, "svc #0x80",
+        "={x0},{x16},0,{x1},{x2},{x3},{x4},{x5},~{memory},~{cc}",
+        /*hasSideEffects=*/true);
+    return B.CreateCall(asmTy, svc,
+                        {ConstantInt::get(ip, Number), a[0], a[1], a[2], a[3],
+                         a[4], a[5]},
+                        "morok.darwin.svc");
+}
+
 Value *emitDarwinSyscall(IRBuilder<> &B, Module &M, const Triple &TT,
                          std::uint32_t Number,
                          std::initializer_list<Value *> Args) {
@@ -507,6 +572,8 @@ Value *emitDarwinGetpid(IRBuilder<> &B, Module &M, const Triple &TT) {
     auto *i32 = Type::getInt32Ty(M.getContext());
     if (useDirectDarwinSyscalls(TT))
         return B.CreateTruncOrBitCast(emitDarwinSyscall(B, M, TT, 20, {}), i32);
+    if (TT.getArch() == Triple::aarch64)
+        return B.CreateTruncOrBitCast(emitDarwinArm64Svc(B, M, 20, {}), i32);
     return B.CreateCall(getpidDecl(M));
 }
 
@@ -518,6 +585,13 @@ Value *emitDarwinPtrace(IRBuilder<> &B, Module &M, const Triple &TT,
         return B.CreateTruncOrBitCast(
             emitDarwinSyscall(
                 B, M, TT, 26,
+                {ConstantInt::getSigned(i32, Request), ConstantInt::get(i32, 0),
+                 ConstantPointerNull::get(ptr), ConstantInt::get(i32, 0)}),
+            i32);
+    if (TT.getArch() == Triple::aarch64)
+        return B.CreateTruncOrBitCast(
+            emitDarwinArm64Svc(
+                B, M, 26,
                 {ConstantInt::getSigned(i32, Request), ConstantInt::get(i32, 0),
                  ConstantPointerNull::get(ptr), ConstantInt::get(i32, 0)}),
             i32);
@@ -534,6 +608,11 @@ Value *emitDarwinSysctl(IRBuilder<> &B, Module &M, const Triple &TT, Value *Mib,
         return B.CreateTruncOrBitCast(
             emitDarwinSyscall(B, M, TT, 202,
                               {Mib, MibLen, OldP, OldLenP, NewP, NewLen}),
+            i32);
+    if (TT.getArch() == Triple::aarch64)
+        return B.CreateTruncOrBitCast(
+            emitDarwinArm64Svc(B, M, 202,
+                               {Mib, MibLen, OldP, OldLenP, NewP, NewLen}),
             i32);
     FunctionCallee sysctl = M.getOrInsertFunction(
         "sysctl", FunctionType::get(i32, {ptr, i32, ptr, ptr, ptr, ip}, false));
@@ -554,6 +633,9 @@ Value *emitDarwinCsops(IRBuilder<> &B, Module &M, const Triple &TT, Value *Pid,
         return B.CreateTruncOrBitCast(
             emitDarwinSyscall(B, M, TT, 169, {Pid, Ops, UserAddr, UserSize}),
             i32);
+    if (TT.getArch() == Triple::aarch64)
+        return B.CreateTruncOrBitCast(
+            emitDarwinArm64Svc(B, M, 169, {Pid, Ops, UserAddr, UserSize}), i32);
     FunctionCallee csops = M.getOrInsertFunction(
         "csops", FunctionType::get(i32, {i32, i32, ptr, ip}, false));
     return B.CreateCall(csops, {B.CreateTruncOrBitCast(Pid, i32),
@@ -2366,8 +2448,37 @@ void emitDarwinSysctlCheck(IRBuilder<> &B, Module &M, GlobalVariable *State,
         B.CreateICmpNE(B.CreateAnd(pflag, ConstantInt::get(i32, 0x800)),
                        ConstantInt::get(i32, 0));
     Value *ok = B.CreateICmpEQ(rc, ConstantInt::get(i32, 0));
-    foldFlag(B, State, B.CreateAnd(ok, traced), 0xBD6A33A5F07A4E31ULL,
-             "morok.antidbg.sysctl");
+    Value *tracedFlag = B.CreateAnd(ok, traced);
+    foldFlag(B, State, tracedFlag, 0xBD6A33A5F07A4E31ULL, "morok.antidbg.sysctl");
+    sealFold(B, tracedFlag, 0xBD6A33A5F07A4E31ULL);
+
+    // M5: parent-identity check.  e_ppid sits at offset 560 of the kinfo just
+    // read; re-query the PARENT's kinfo and compare its p_comm (offset 243) to
+    // debugger launchers.  We key on the parent NAME, not ppid==1 — a normal
+    // shell/CLI launch has a shell parent (ppid != 1), so a launchd check would
+    // false-positive; "debugserver"/"lldb" are absent on a clean run.
+    constexpr std::uint64_t kEppidOffset = 560;
+    constexpr std::uint64_t kPCommOffset = 243;
+    Value *eppidPtr = B.CreateInBoundsGEP(
+        bufTy, buf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, kEppidOffset)});
+    Value *eppid = B.CreateLoad(i32, eppidPtr);
+    storeMib(3, eppid);
+    B.CreateStore(ConstantInt::get(ip, kKinfoProcBytes), len);
+    Value *rc2 = emitDarwinSysctl(B, M, TT, mibPtr, ConstantInt::get(i32, 4),
+                                  bufPtr, len, ConstantPointerNull::get(ptr),
+                                  ConstantInt::get(ip, 0));
+    Value *pcommPtr = B.CreateInBoundsGEP(
+        bufTy, buf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, kPCommOffset)});
+    Value *pcomm8 = B.CreateAlignedLoad(B.getInt64Ty(), pcommPtr, Align(1));
+    // "debugser" (prefix of debugserver) and "lldb\0\0\0\0", little-endian.
+    Value *isDbgsrv =
+        B.CreateICmpEQ(pcomm8, ConstantInt::get(B.getInt64Ty(), 0x7265736775626564ULL));
+    Value *isLldb =
+        B.CreateICmpEQ(pcomm8, ConstantInt::get(B.getInt64Ty(), 0x0000000062646c6cULL));
+    Value *ok2 = B.CreateICmpEQ(rc2, ConstantInt::get(i32, 0));
+    Value *dbgParent = B.CreateAnd(ok2, B.CreateOr(isDbgsrv, isLldb));
+    foldFlag(B, State, dbgParent, 0x53A1D7F0C46B82E9ULL, "morok.antidbg.ppid");
+    sealFold(B, dbgParent, 0x53A1D7F0C46B82E9ULL);
 }
 
 void emitDarwinCsopsCheck(IRBuilder<> &B, Module &M, GlobalVariable *State,
@@ -2386,8 +2497,9 @@ void emitDarwinCsopsCheck(IRBuilder<> &B, Module &M, GlobalVariable *State,
         B.CreateICmpNE(B.CreateAnd(flags, ConstantInt::get(i32, 0x10000000)),
                        ConstantInt::get(i32, 0));
     Value *ok = B.CreateICmpEQ(rc, ConstantInt::get(i32, 0));
-    foldFlag(B, State, B.CreateAnd(ok, debugged), 0xF1D88C6C72195307ULL,
-             "morok.antidbg.csops");
+    Value *dbgFlag = B.CreateAnd(ok, debugged);
+    foldFlag(B, State, dbgFlag, 0xF1D88C6C72195307ULL, "morok.antidbg.csops");
+    sealFold(B, dbgFlag, 0xF1D88C6C72195307ULL);
 }
 
 void emitDarwinDyldCensus(IRBuilder<> &B, Module &M, GlobalVariable *State,
@@ -2418,7 +2530,54 @@ void emitDarwinDyldCensus(IRBuilder<> &B, Module &M, GlobalVariable *State,
         Value *found = B.CreateICmpNE(B.CreateCall(getenv, {name}),
                                       ConstantPointerNull::get(ptr));
         foldFlag(B, State, found, salts[i], "morok.antidbg.dyld");
+        // Any DYLD_* instrumentation var is absent on a clean run, so binding it
+        // into the verdict seal is safe and corrupts an injected/keygen run.
+        sealFold(B, found, salts[i]);
     }
+}
+
+// M3: enumerate loaded images and flag any that is NOT the main executable
+// (index 0) and whose path is not under /usr/lib/ or /System/Library/.  An
+// injected dylib (the keygen ships one via DYLD_INSERT_LIBRARIES) loads from an
+// arbitrary path and is caught even if the attacker scrubs the DYLD_* env var.
+// Folded into the seal so the foreign image silently poisons the verdict.
+void emitDarwinImageCensus(IRBuilder<> &B, Module &M, GlobalVariable *State) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+    FunctionCallee imgCount =
+        M.getOrInsertFunction("_dyld_image_count", FunctionType::get(i32, false));
+    FunctionCallee imgName = M.getOrInsertFunction(
+        "_dyld_get_image_name", FunctionType::get(ptr, {i32}, false));
+
+    Function *F = B.GetInsertBlock()->getParent();
+    Value *count = B.CreateCall(imgCount, {}, "morok.imgcensus.count");
+    BasicBlock *pre = B.GetInsertBlock();
+    BasicBlock *loop = BasicBlock::Create(ctx, "morok.imgcensus.loop", F);
+    BasicBlock *done = BasicBlock::Create(ctx, "morok.imgcensus.done", F);
+    // Skip index 0 (the main executable, whose path is arbitrary).
+    B.CreateCondBr(B.CreateICmpUGT(count, ConstantInt::get(i32, 1)), loop, done);
+
+    IRBuilder<> LB(loop);
+    PHINode *i = LB.CreatePHI(i32, 2, "morok.imgcensus.i");
+    i->addIncoming(ConstantInt::get(i32, 1), pre);
+    Value *name = LB.CreateCall(imgName, {i}, "morok.imgcensus.name");
+    // First 8 bytes of the path; dyld paths are long, so an 8-byte read is in
+    // bounds within the contiguous load-command string table.
+    Value *first8 = LB.CreateAlignedLoad(i64, name, Align(1));
+    Value *isUsrLib = // "/usr/lib"
+        LB.CreateICmpEQ(first8, ConstantInt::get(i64, 0x62696c2f7273752fULL));
+    Value *isSystem = // "/System/"
+        LB.CreateICmpEQ(first8, ConstantInt::get(i64, 0x2f6d65747379532fULL));
+    Value *foreign = LB.CreateNot(LB.CreateOr(isUsrLib, isSystem));
+    foldFlag(LB, State, foreign, 0x2D9E64B0A7135CC1ULL, "morok.antidbg.image");
+    sealFold(LB, foreign, 0x2D9E64B0A7135CC1ULL);
+    Value *next = LB.CreateAdd(i, ConstantInt::get(i32, 1), "morok.imgcensus.next");
+    i->addIncoming(next, loop);
+    LB.CreateCondBr(LB.CreateICmpULT(next, count), loop, done);
+
+    B.SetInsertPoint(done);
 }
 
 bool darwinDebugStateShape(const Triple &TT, std::uint32_t &Flavor,
@@ -2611,10 +2770,18 @@ void emitDarwinAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
                          ir::IRRandom &rng, const Triple &TT,
                          bool StartLiveWatchers) {
     IRBuilder<> B(&Ctor->getEntryBlock());
-    emitDarwinPtrace(B, M, TT, 31); // PT_DENY_ATTACH
+    // PT_DENY_ATTACH via direct svc (no imported ptrace to interpose).  Bind its
+    // result to the verdict: it returns 0 on an untraced process, so a nonzero
+    // return (already traced, or a forced result) folds into the seal and poisons
+    // the verdict rather than being discarded.
+    Value *ptraceRc = emitDarwinPtrace(B, M, TT, 31);
+    sealFold(B,
+             B.CreateICmpNE(ptraceRc, ConstantInt::get(ptraceRc->getType(), 0)),
+             0x9C2F71A6E5B30D4FULL);
     emitDarwinSysctlCheck(B, M, State, TT);
     emitDarwinCsopsCheck(B, M, State, TT);
     emitDarwinDyldCensus(B, M, State, rng);
+    emitDarwinImageCensus(B, M, State);
     if (StartLiveWatchers) {
         if (Function *drWatch = darwinDrWatchThread(M, TT))
             emitLinuxWatcherStart(B, M, drWatch);
@@ -11516,6 +11683,9 @@ bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
 
     Function *ctor = makeCtorShell(M, "morok.antidbg");
     GlobalVariable *state = antiDebugState(M, rng);
+    // Create the verdict-bound seal up front so it exists before the per-function
+    // self-checksum pass references it; detectors fold into it via sealFold.
+    antiDebugSeal(M, rng);
     if (tt.isOSLinux())
         emitLinuxAntiDebug(M, ctor, state, rng, tt, AllowSelfTrace,
                            startLiveWatchers);

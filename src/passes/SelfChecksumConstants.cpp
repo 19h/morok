@@ -81,6 +81,8 @@ struct Runtime {
     GlobalVariable *expected = nullptr;
     GlobalVariable *code_size = nullptr;
     GlobalVariable *heartbeat_crypto = nullptr;
+    GlobalVariable *antidbg_seal = nullptr;
+    std::uint64_t antidbg_seal_s0 = 0;
     std::uint64_t expected_hash = 0;
     std::uint64_t seed = 0;
 };
@@ -429,7 +431,8 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
                              GlobalVariable *Region, GlobalVariable *Expected,
                              GlobalVariable *CodeSize, Function *Target,
                              GlobalVariable *HeartbeatCrypto,
-                             std::uint64_t Seed) {
+                             GlobalVariable *AntidbgSeal,
+                             std::uint64_t AntidbgSealS0, std::uint64_t Seed) {
     LLVMContext &Ctx = M.getContext();
     auto *I8 = Type::getInt8Ty(Ctx);
     auto *I32 = Type::getInt32Ty(Ctx);
@@ -520,6 +523,17 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
         Crypto->setAlignment(Align(8));
         Diff = XB.CreateXor(Diff, Crypto, "morok.sc.crypto.diff");
     }
+    if (AntidbgSeal) {
+        // seal == S0 on a clean run -> (seal ^ S0) == 0 contribution; any tripped
+        // anti-debug detector (or one an attacker forced) makes it nonzero, which
+        // poisons this function's fused constants.  Binds anti-debug to the verdict.
+        auto *Seal = XB.CreateLoad(I64, AntidbgSeal, "morok.sc.antidbg.seal");
+        Seal->setVolatile(true);
+        Seal->setAlignment(Align(8));
+        Value *SealDelta = XB.CreateXor(
+            Seal, ConstantInt::get(I64, AntidbgSealS0), "morok.sc.antidbg.delta");
+        Diff = XB.CreateXor(Diff, SealDelta, "morok.sc.antidbg.diff");
+    }
     XB.CreateRet(Diff);
     return Fn;
 }
@@ -541,10 +555,29 @@ Runtime createRuntime(Function &F, const SelfChecksumParams &Params,
     R.code_size = createCodeSize(M, Suffix);
     R.heartbeat_crypto =
         M.getGlobalVariable("morok.watchdog.crypto", /*AllowInternal=*/true);
+    // The anti-debug seal holds S0 on a clean run; the diff cancels it to 0
+    // unless a detector tripped at runtime.  This pass may run BEFORE the
+    // anti-debug pass that folds into the seal, so create it here if absent
+    // (getOrInsert) — the anti-debug pass then shares the same global.  S0 is
+    // read back from the initializer so the cancellation constant always matches.
+    R.antidbg_seal =
+        M.getGlobalVariable("morok.antidbg.seal", /*AllowInternal=*/true);
+    if (!R.antidbg_seal) {
+        auto *I64Ty = Type::getInt64Ty(M.getContext());
+        R.antidbg_seal = new GlobalVariable(
+            M, I64Ty, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+            ConstantInt::get(I64Ty, Rng.next()), "morok.antidbg.seal");
+        R.antidbg_seal->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+        R.antidbg_seal->setAlignment(Align(8));
+    }
+    if (R.antidbg_seal->hasInitializer())
+        if (auto *CI = dyn_cast<ConstantInt>(R.antidbg_seal->getInitializer()))
+            R.antidbg_seal_s0 = CI->getZExtValue();
     createPostlinkManifest(M, F, Suffix, R.region, R.expected, R.code_size,
                            RegionSize, R.seed, R.expected_hash);
     R.diff = createDiffFunction(M, Suffix, R.region, R.expected, R.code_size,
-                                &F, R.heartbeat_crypto, Seed);
+                                &F, R.heartbeat_crypto, R.antidbg_seal,
+                                R.antidbg_seal_s0, Seed);
     return R;
 }
 

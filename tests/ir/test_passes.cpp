@@ -11050,9 +11050,14 @@ entry:
 
     CHECK(M->getGlobalVariable("morok.antidbg.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.watchdog.heartbeat", true) != nullptr);
-    CHECK(M->getFunction("ptrace") != nullptr);
-    CHECK(M->getFunction("sysctl") != nullptr);
-    CHECK(M->getFunction("csops") != nullptr);
+    // The verdict-bound anti-debug seal (M1): detectors fold into it and the
+    // self-checksum diff consumes it, so detection actually corrupts the verdict.
+    CHECK(M->getGlobalVariable("morok.antidbg.seal", true) != nullptr);
+    // On arm64 the trace checks are emitted as direct `svc` (no imported stub to
+    // DYLD-interpose), so ptrace/sysctl/csops must NOT appear as imports (M2).
+    CHECK(M->getFunction("ptrace") == nullptr);
+    CHECK(M->getFunction("sysctl") == nullptr);
+    CHECK(M->getFunction("csops") == nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
     CHECK(M->getFunction("morok.antidbg.probe") != nullptr);
     CHECK(M->getFunction("morok.antidbg.probe.watch") != nullptr);
