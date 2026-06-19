@@ -278,6 +278,7 @@ PassConfig makeLow() {
     c.anti_dbg.enabled = false;
     c.anti_class_dump.enabled = false;
     c.timing_oracles.enabled = false;
+    c.scheduler_step_oracles.enabled = false;
     c.trap_oracles.enabled = false;
     c.decoy_strings.enabled = true;
     return c;
@@ -523,6 +524,7 @@ PassConfig makeMid() {
     c.anti_dbg.enabled = false;
     c.anti_class_dump.enabled = false;
     c.timing_oracles.enabled = false;
+    c.scheduler_step_oracles.enabled = false;
     c.trap_oracles.enabled = false;
     c.decoy_strings.enabled = true;
     return c;
@@ -782,6 +784,7 @@ PassConfig makeHigh() {
     c.anti_dbg.enabled = false;
     c.anti_class_dump.enabled = false;
     c.timing_oracles.enabled = false;
+    c.scheduler_step_oracles.enabled = false;
     c.trap_oracles.enabled = false;
     c.decoy_strings.enabled = true;
     return c;
@@ -1058,6 +1061,7 @@ PassConfig makeMax() {
     c.windows_veh_audit.enabled = true;
     c.windows_process_mitigations.enabled = true;
     c.timing_oracles.enabled = true;
+    c.scheduler_step_oracles.enabled = true;
     c.trap_oracles.enabled = true;
     c.page_fault_oracles.enabled = true;
     c.cache_timing_oracles.enabled = true;

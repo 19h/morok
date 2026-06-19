@@ -137,6 +137,12 @@ bool windowsProcessMitigationsModule(llvm::Module &M,
 /// anomalies into hidden state.  Returns true if code was added.
 bool timingOracleModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
+/// Inject a scheduler/context-switch oracle.  The emitted helper samples Linux
+/// context-switch counters or platform thread-time skew over short spans and
+/// folds high-confidence anomalies into hidden state.  Returns true if code was
+/// added for the target.
+bool schedulerStepOracleModule(llvm::Module &M, morok::ir::IRRandom &rng);
+
 /// Inject a trap-delivery oracle.  The emitted constructor temporarily installs
 /// a SIGTRAP handler, triggers a few architecture-appropriate traps, and folds
 /// missing delivery into hidden state.  Returns true if code was added.
@@ -322,6 +328,19 @@ private:
 class TimingOraclePass : public llvm::PassInfoMixin<TimingOraclePass> {
 public:
     explicit TimingOraclePass(std::uint64_t seed = 0x710C10C5u)
+        : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
+
+    llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
+    static bool isRequired() { return true; }
+
+private:
+    core::Xoshiro256pp engine_;
+};
+
+class SchedulerStepOraclePass
+    : public llvm::PassInfoMixin<SchedulerStepOraclePass> {
+public:
+    explicit SchedulerStepOraclePass(std::uint64_t seed = 0x57E0A11Cu)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);

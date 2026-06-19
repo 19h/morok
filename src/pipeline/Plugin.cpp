@@ -490,6 +490,10 @@ PassPluginLibraryInfo getPluginInfo() {
                         MPM.addPass(passes::TimingOraclePass());
                         return true;
                     }
+                    if (name == "morok-step") {
+                        MPM.addPass(passes::SchedulerStepOraclePass());
+                        return true;
+                    }
                     if (name == "morok-trap") {
                         MPM.addPass(passes::TrapOraclePass());
                         return true;

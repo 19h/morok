@@ -104,6 +104,7 @@ TEST_CASE("low preset matches the documented table") {
     CHECK(c.csm.enabled == false);
     CHECK(c.flatten.enabled == false);
     CHECK(c.timing_oracles.enabled == false);
+    CHECK(c.scheduler_step_oracles.enabled == false);
     CHECK(c.trap_oracles.enabled == false);
 }
 
@@ -461,6 +462,7 @@ TEST_CASE("max preset enables every pass at full intensity") {
     CHECK(c.windows_veh_audit.enabled == true);
     CHECK(c.windows_process_mitigations.enabled == true);
     CHECK(c.timing_oracles.enabled == true);
+    CHECK(c.scheduler_step_oracles.enabled == true);
     CHECK(c.trap_oracles.enabled == true);
     CHECK(c.page_fault_oracles.enabled == true);
     CHECK(c.cache_timing_oracles.enabled == true);

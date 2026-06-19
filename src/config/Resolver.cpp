@@ -380,6 +380,8 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.windows_process_mitigations.enabled,
              src.windows_process_mitigations.enabled);
     mergeOpt(dst.timing_oracles.enabled, src.timing_oracles.enabled);
+    mergeOpt(dst.scheduler_step_oracles.enabled,
+             src.scheduler_step_oracles.enabled);
     mergeOpt(dst.trap_oracles.enabled, src.trap_oracles.enabled);
     mergeOpt(dst.page_fault_oracles.enabled, src.page_fault_oracles.enabled);
     mergeOpt(dst.cache_timing_oracles.enabled,

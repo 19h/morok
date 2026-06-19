@@ -384,6 +384,8 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     enabled = true
     [passes.timing_oracles]
     enabled = true
+    [passes.scheduler_step_oracles]
+    enabled = true
     [passes.trap_oracles]
     enabled = true
     [passes.page_fault_oracles]
@@ -582,6 +584,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.windows_veh_audit.enabled == true);
     CHECK(r.config.passes.windows_process_mitigations.enabled == true);
     CHECK(r.config.passes.timing_oracles.enabled == true);
+    CHECK(r.config.passes.scheduler_step_oracles.enabled == true);
     CHECK(r.config.passes.trap_oracles.enabled == true);
     CHECK(r.config.passes.page_fault_oracles.enabled == true);
     CHECK(r.config.passes.cache_timing_oracles.enabled == true);

@@ -6530,6 +6530,18 @@ GlobalVariable *timingOracleState(Module &M, ir::IRRandom &rng) {
     return gv;
 }
 
+GlobalVariable *schedulerStepOracleState(Module &M, ir::IRRandom &rng) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.step.state", /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, rng.next()), "morok.step.state");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
 bool isX86Target(const Triple &TT) {
     return TT.getArch() == Triple::x86 || TT.getArch() == Triple::x86_64;
 }
@@ -6778,6 +6790,502 @@ Function *timingOracleProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
                      "morok.timing.bad.distribution");
     foldEnforcedFlag(B, State, divergentDistribution, 0x5E74B29D13C8A60BULL,
                      "morok.timing.divergent.distribution");
+    B.CreateRetVoid();
+    return fn;
+}
+
+struct SchedulerCounterSample {
+    Value *value;
+    Value *ready;
+};
+
+bool linuxSchedulerStepSyscalls(const Triple &TT, std::uint32_t &PerfOpen,
+                                std::uint32_t &Read, std::uint32_t &Close) {
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        PerfOpen = 298;
+        Read = 0;
+        Close = 3;
+        return true;
+    case Triple::aarch64:
+        PerfOpen = 241;
+        Read = 63;
+        Close = 57;
+        return true;
+    default:
+        return false;
+    }
+}
+
+Value *gepI8Offset(IRBuilder<> &B, Module &M, Value *Base,
+                   std::uint64_t Offset, const Twine &Name) {
+    return B.CreateGEP(Type::getInt8Ty(M.getContext()), Base,
+                       ConstantInt::get(intPtrTy(M), Offset), Name);
+}
+
+StoreInst *storeI32AtOffset(IRBuilder<> &B, Module &M, Value *Base,
+                            std::uint64_t Offset, std::uint32_t V,
+                            const Twine &Name) {
+    auto *st = B.CreateStore(
+        ConstantInt::get(Type::getInt32Ty(M.getContext()), V),
+        gepI8Offset(B, M, Base, Offset, Name + ".ptr"));
+    st->setAlignment(Align(4));
+    return st;
+}
+
+StoreInst *storeI64AtOffset(IRBuilder<> &B, Module &M, Value *Base,
+                            std::uint64_t Offset, std::uint64_t V,
+                            const Twine &Name) {
+    auto *st = B.CreateStore(
+        ConstantInt::get(Type::getInt64Ty(M.getContext()), V),
+        gepI8Offset(B, M, Base, Offset, Name + ".ptr"));
+    st->setAlignment(Align(8));
+    return st;
+}
+
+LoadInst *loadI64AtOffset(IRBuilder<> &B, Module &M, Value *Base,
+                          std::uint64_t Offset, const Twine &Name) {
+    auto *li = B.CreateLoad(Type::getInt64Ty(M.getContext()),
+                            gepI8Offset(B, M, Base, Offset, Name + ".ptr"),
+                            Name);
+    li->setVolatile(true);
+    li->setAlignment(Align(8));
+    return li;
+}
+
+Value *emitLinuxPerfContextSwitchOpen(IRBuilder<> &B, Module &M,
+                                      const Triple &TT, Value *&Ready) {
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *attrTy = ArrayType::get(i8, 128);
+    auto *attr = B.CreateAlloca(attrTy, nullptr, "morok.step.perf.attr");
+    B.CreateMemSet(attr, ConstantInt::get(i8, 0), ConstantInt::get(ip, 128),
+                   MaybeAlign(1));
+    // struct perf_event_attr: type, size, config.
+    storeI32AtOffset(B, M, attr, 0, 1, "morok.step.perf.type");
+    storeI32AtOffset(B, M, attr, 4, 128, "morok.step.perf.size");
+    storeI64AtOffset(B, M, attr, 8, 3, "morok.step.perf.config.ctxsw");
+
+    std::uint32_t perfNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    if (!linuxSchedulerStepSyscalls(TT, perfNr, readNr, closeNr)) {
+        Ready = ConstantInt::getFalse(ctx);
+        return ConstantInt::getSigned(ip, -1);
+    }
+
+    // pid=0,cpu=-1 scopes the software event to the current thread on any CPU.
+    Value *fd = emitLinuxSyscall(
+        B, M, TT, perfNr,
+        {attr, ConstantInt::getSigned(ip, 0), ConstantInt::getSigned(ip, -1),
+         ConstantInt::getSigned(ip, -1), ConstantInt::get(ip, 0)});
+    Ready = B.CreateICmpSGE(fd, ConstantInt::getSigned(ip, 0),
+                            "morok.step.perf.open.ready");
+    return fd;
+}
+
+SchedulerCounterSample emitLinuxPerfRead(IRBuilder<> &B, Module &M,
+                                         const Triple &TT, Value *Fd,
+                                         const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    std::uint32_t perfNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    if (!linuxSchedulerStepSyscalls(TT, perfNr, readNr, closeNr))
+        return {ConstantInt::get(i64, 0), ConstantInt::getFalse(ctx)};
+
+    auto *slot = B.CreateAlloca(i64, nullptr, Name + ".slot");
+    B.CreateStore(ConstantInt::get(i64, 0), slot)->setVolatile(true);
+    Value *rc = emitLinuxSyscall(B, M, TT, readNr,
+                                 {Fd, slot, ConstantInt::get(ip, 8)});
+    auto *value = B.CreateLoad(i64, slot, Name + ".value");
+    value->setVolatile(true);
+    value->setAlignment(Align(8));
+    Value *ready =
+        B.CreateICmpEQ(rc, ConstantInt::get(ip, 8), Name + ".ready");
+    return {value, ready};
+}
+
+void emitLinuxPerfClose(IRBuilder<> &B, Module &M, const Triple &TT,
+                        Value *Fd) {
+    std::uint32_t perfNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    if (!linuxSchedulerStepSyscalls(TT, perfNr, readNr, closeNr))
+        return;
+    emitLinuxSyscall(B, M, TT, closeNr, {Fd});
+}
+
+SchedulerCounterSample emitLinuxRusageSwitches(IRBuilder<> &B, Module &M,
+                                               const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *bufTy = ArrayType::get(i8, 144);
+    auto *buf = B.CreateAlloca(bufTy, nullptr, Name + ".rusage");
+    B.CreateMemSet(buf, ConstantInt::get(i8, 0), ConstantInt::get(ip, 144),
+                   MaybeAlign(1));
+    FunctionCallee getrusage = M.getOrInsertFunction(
+        "getrusage", FunctionType::get(i32, {i32, PointerType::getUnqual(ctx)},
+                                        false));
+    Value *rc = B.CreateCall(getrusage, {ConstantInt::get(i32, 1), buf},
+                             Name + ".rc");
+    Value *nv = loadI64AtOffset(B, M, buf, 128, Name + ".nvcsw");
+    Value *ni = loadI64AtOffset(B, M, buf, 136, Name + ".nivcsw");
+    Value *total = B.CreateAdd(nv, ni, Name + ".total.raw");
+    Value *ready =
+        B.CreateICmpEQ(rc, ConstantInt::get(i32, 0), Name + ".ready");
+    return {B.CreateSelect(ready, total, ConstantInt::get(i64, 0),
+                           Name + ".total"),
+            ready};
+}
+
+SchedulerCounterSample emitDarwinThreadCpuNanos(IRBuilder<> &B, Module &M,
+                                                const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *infoTy = ArrayType::get(i32, 10);
+    auto *info = B.CreateAlloca(infoTy, nullptr, Name + ".basic");
+    auto *count = B.CreateAlloca(i32, nullptr, Name + ".count");
+    B.CreateMemSet(info, ConstantInt::get(Type::getInt8Ty(ctx), 0),
+                   ConstantInt::get(ip, 40), MaybeAlign(4));
+    B.CreateStore(ConstantInt::get(i32, 10), count);
+    FunctionCallee self = M.getOrInsertFunction(
+        "mach_thread_self", FunctionType::get(i32, false));
+    FunctionCallee threadInfo = M.getOrInsertFunction(
+        "thread_info",
+        FunctionType::get(i32, {i32, i32, PointerType::getUnqual(ctx),
+                                PointerType::getUnqual(ctx)},
+                          false));
+    Value *thread = B.CreateCall(self, {}, Name + ".thread");
+    Value *rc = B.CreateCall(threadInfo,
+                             {thread, ConstantInt::get(i32, 3), info, count},
+                             Name + ".rc");
+    auto loadWord = [&](unsigned idx, const Twine &WordName) -> Value * {
+        auto *ptr = B.CreateGEP(i32, info, ConstantInt::get(ip, idx),
+                                WordName + ".ptr");
+        auto *li = B.CreateLoad(i32, ptr, WordName);
+        li->setVolatile(true);
+        li->setAlignment(Align(4));
+        return B.CreateSExt(li, i64, WordName + ".i64");
+    };
+    Value *userSec = loadWord(0, Name + ".user.sec");
+    Value *userUsec = loadWord(1, Name + ".user.usec");
+    Value *sysSec = loadWord(2, Name + ".sys.sec");
+    Value *sysUsec = loadWord(3, Name + ".sys.usec");
+    Value *secs = B.CreateAdd(userSec, sysSec, Name + ".secs");
+    Value *usecs = B.CreateAdd(userUsec, sysUsec, Name + ".usecs");
+    Value *nanos = B.CreateAdd(
+        B.CreateMul(secs, ConstantInt::get(i64, 1000000000ULL)),
+        B.CreateMul(usecs, ConstantInt::get(i64, 1000ULL)), Name + ".nanos");
+    Value *ready =
+        B.CreateICmpEQ(rc, ConstantInt::get(i32, 0), Name + ".ready");
+    return {B.CreateSelect(ready, nanos, ConstantInt::get(i64, 0),
+                           Name + ".nanos.safe"),
+            ready};
+}
+
+SchedulerCounterSample emitWindowsThreadTime100ns(IRBuilder<> &B, Module &M,
+                                                  const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+    FunctionCallee getCurrentThread =
+        M.getOrInsertFunction("GetCurrentThread", FunctionType::get(ptr, false));
+    FunctionCallee getThreadTimes = M.getOrInsertFunction(
+        "GetThreadTimes", FunctionType::get(i32, {ptr, ptr, ptr, ptr, ptr},
+                                             false));
+    Value *thread = B.CreateCall(getCurrentThread, {}, Name + ".thread");
+    auto *creation = B.CreateAlloca(i64, nullptr, Name + ".creation");
+    auto *exit = B.CreateAlloca(i64, nullptr, Name + ".exit");
+    auto *kernel = B.CreateAlloca(i64, nullptr, Name + ".kernel");
+    auto *user = B.CreateAlloca(i64, nullptr, Name + ".user");
+    B.CreateStore(ConstantInt::get(i64, 0), creation)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), exit)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), kernel)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), user)->setVolatile(true);
+    Value *rc = B.CreateCall(getThreadTimes,
+                             {thread, creation, exit, kernel, user},
+                             Name + ".rc");
+    auto *k = B.CreateLoad(i64, kernel, Name + ".kernel.100ns");
+    auto *u = B.CreateLoad(i64, user, Name + ".user.100ns");
+    k->setVolatile(true);
+    u->setVolatile(true);
+    k->setAlignment(Align(4));
+    u->setAlignment(Align(4));
+    Value *total = B.CreateAdd(k, u, Name + ".total.100ns");
+    Value *ready =
+        B.CreateICmpNE(rc, ConstantInt::get(i32, 0), Name + ".ready");
+    return {B.CreateSelect(ready, total, ConstantInt::get(i64, 0),
+                           Name + ".total.safe"),
+            ready};
+}
+
+SchedulerCounterSample emitWindowsThreadCycles(IRBuilder<> &B, Module &M,
+                                               const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+    FunctionCallee getCurrentThread =
+        M.getOrInsertFunction("GetCurrentThread", FunctionType::get(ptr, false));
+    FunctionCallee queryCycles = M.getOrInsertFunction(
+        "QueryThreadCycleTime", FunctionType::get(i32, {ptr, ptr}, false));
+    auto *slot = B.CreateAlloca(i64, nullptr, Name + ".slot");
+    B.CreateStore(ConstantInt::get(i64, 0), slot)->setVolatile(true);
+    Value *thread = B.CreateCall(getCurrentThread, {}, Name + ".thread");
+    Value *rc = B.CreateCall(queryCycles, {thread, slot}, Name + ".rc");
+    auto *cycles = B.CreateLoad(i64, slot, Name + ".cycles");
+    cycles->setVolatile(true);
+    cycles->setAlignment(Align(8));
+    Value *ready =
+        B.CreateICmpNE(rc, ConstantInt::get(i32, 0), Name + ".ready");
+    return {B.CreateSelect(ready, cycles, ConstantInt::get(i64, 0),
+                           Name + ".cycles.safe"),
+            ready};
+}
+
+Value *emitWindowsQpcFrequency(IRBuilder<> &B, Module &M, const Twine &Name) {
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *slot = B.CreateAlloca(i64, nullptr, Name + ".slot");
+    B.CreateStore(ConstantInt::get(i64, 0), slot);
+    FunctionCallee qpf = M.getOrInsertFunction(
+        "QueryPerformanceFrequency",
+        FunctionType::get(i32, {PointerType::getUnqual(M.getContext())},
+                          false));
+    Value *rc = B.CreateCall(qpf, {slot}, Name + ".rc");
+    Value *freq = B.CreateLoad(i64, slot, Name + ".freq");
+    return B.CreateSelect(B.CreateICmpNE(rc, ConstantInt::get(i32, 0)), freq,
+                          ConstantInt::get(i64, 0), Name + ".ok");
+}
+
+void emitSchedulerStepSpan(IRBuilder<> &B, AllocaInst *Acc,
+                           ir::IRRandom &rng) {
+    for (unsigned part = 0; part < 8; ++part)
+        emitShortTimingSpan(B, Acc,
+                            rng.next() ^ (0xD1B54A32D192ED03ULL * (part + 1)));
+}
+
+Function *schedulerStepOracleProbe(Module &M, GlobalVariable *State,
+                                   ir::IRRandom &rng, const Triple &TT) {
+    if (intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (!TT.isOSLinux() && !TT.isOSDarwin() && !TT.isOSWindows())
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.step.oracle"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.step.oracle", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    auto *acc = B.CreateAlloca(i64, nullptr, "morok.step.span.acc");
+    B.CreateStore(ConstantInt::get(i64, rng.next()), acc)->setVolatile(true);
+
+    Value *anomalousSamples = ConstantInt::get(i32, 0);
+    Value *availableSamples = ConstantInt::get(i32, 0);
+    Value *mix = ConstantInt::get(i64, rng.next());
+
+    if (TT.isOSLinux()) {
+        Value *perfReady = nullptr;
+        Value *perfFd = emitLinuxPerfContextSwitchOpen(B, M, TT, perfReady);
+        for (unsigned sample = 0; sample < 3; ++sample) {
+            SchedulerCounterSample perfBefore =
+                emitLinuxPerfRead(B, M, TT, perfFd,
+                                  "morok.step.perf.before");
+            SchedulerCounterSample usageBefore =
+                emitLinuxRusageSwitches(B, M, "morok.step.getrusage.before");
+            emitSchedulerStepSpan(B, acc, rng);
+            SchedulerCounterSample perfAfter =
+                emitLinuxPerfRead(B, M, TT, perfFd, "morok.step.perf.after");
+            SchedulerCounterSample usageAfter =
+                emitLinuxRusageSwitches(B, M, "morok.step.getrusage.after");
+
+            Value *perfSampleReady = B.CreateAnd(
+                perfReady, B.CreateAnd(perfBefore.ready, perfAfter.ready),
+                "morok.step.perf.sample.ready");
+            Value *usageSampleReady =
+                B.CreateAnd(usageBefore.ready, usageAfter.ready,
+                            "morok.step.getrusage.sample.ready");
+            Value *perfDelta = B.CreateSub(perfAfter.value, perfBefore.value,
+                                           "morok.step.perf.delta");
+            Value *usageDelta =
+                B.CreateSub(usageAfter.value, usageBefore.value,
+                            "morok.step.getrusage.delta");
+            Value *counterReady =
+                B.CreateOr(perfSampleReady, usageSampleReady,
+                           "morok.step.counter.ready");
+            Value *counterDelta =
+                B.CreateSelect(perfSampleReady, perfDelta, usageDelta,
+                               "morok.step.counter.delta.raw");
+            counterDelta = B.CreateSelect(counterReady, counterDelta,
+                                          ConstantInt::get(i64, 0),
+                                          "morok.step.counter.delta");
+            Value *sampleBad = B.CreateAnd(
+                counterReady,
+                B.CreateICmpUGE(counterDelta, ConstantInt::get(i64, 16),
+                                "morok.step.switch.anomaly"),
+                "morok.step.switch.anomaly.ready");
+            anomalousSamples =
+                B.CreateAdd(anomalousSamples, B.CreateZExt(sampleBad, i32),
+                            "morok.step.anomalous.n");
+            availableSamples =
+                B.CreateAdd(availableSamples, B.CreateZExt(counterReady, i32),
+                            "morok.step.available.n");
+            mix = B.CreateXor(
+                B.CreateAdd(mix,
+                            B.CreateMul(counterDelta,
+                                        ConstantInt::get(i64, rng.next() | 1ULL))),
+                B.CreateZExt(counterReady, i64), "morok.step.counter.mix");
+        }
+        emitLinuxPerfClose(B, M, TT, perfFd);
+    } else if (TT.isOSDarwin()) {
+        for (unsigned sample = 0; sample < 3; ++sample) {
+            SchedulerCounterSample cpuBefore =
+                emitDarwinThreadCpuNanos(B, M, "morok.step.thread.before");
+            Value *wallBefore =
+                emitClockGettimeNanos(B, M, 4, "morok.step.wall.before");
+            emitSchedulerStepSpan(B, acc, rng);
+            SchedulerCounterSample cpuAfter =
+                emitDarwinThreadCpuNanos(B, M, "morok.step.thread.after");
+            Value *wallAfter =
+                emitClockGettimeNanos(B, M, 4, "morok.step.wall.after");
+
+            Value *wallOrdered =
+                B.CreateICmpUGE(wallAfter, wallBefore,
+                                "morok.step.wall.ordered");
+            Value *wallDelta = B.CreateSelect(
+                wallOrdered, B.CreateSub(wallAfter, wallBefore),
+                ConstantInt::get(i64, 0), "morok.step.wall.delta");
+            Value *cpuDelta = B.CreateSub(cpuAfter.value, cpuBefore.value,
+                                          "morok.step.cpu.delta");
+            Value *cpuReady =
+                B.CreateAnd(cpuBefore.ready, cpuAfter.ready,
+                            "morok.step.cpu.ready");
+            Value *sampleReady = B.CreateAnd(
+                cpuReady,
+                B.CreateAnd(wallOrdered,
+                            B.CreateICmpNE(cpuDelta, ConstantInt::get(i64, 0),
+                                           "morok.step.cpu.nonzero")),
+                "morok.step.sample.ready");
+            Value *limit = B.CreateAdd(
+                B.CreateMul(cpuDelta, ConstantInt::get(i64, 256),
+                            "morok.step.cpu.scaled"),
+                ConstantInt::get(i64, 50000000ULL), "morok.step.wall.limit");
+            Value *sampleBad =
+                B.CreateAnd(sampleReady,
+                            B.CreateICmpUGT(wallDelta, limit,
+                                            "morok.step.thread.skew"),
+                            "morok.step.thread.skew.ready");
+            anomalousSamples =
+                B.CreateAdd(anomalousSamples, B.CreateZExt(sampleBad, i32),
+                            "morok.step.anomalous.n");
+            availableSamples =
+                B.CreateAdd(availableSamples, B.CreateZExt(sampleReady, i32),
+                            "morok.step.available.n");
+            mix = B.CreateXor(
+                B.CreateAdd(mix,
+                            B.CreateMul(wallDelta,
+                                        ConstantInt::get(i64, rng.next() | 1ULL))),
+                B.CreateMul(cpuDelta, ConstantInt::get(i64, rng.next() | 1ULL)),
+                "morok.step.thread.mix");
+        }
+    } else {
+        Value *qpcFreq = emitWindowsQpcFrequency(B, M, "morok.step.qpc.freq");
+        for (unsigned sample = 0; sample < 3; ++sample) {
+            SchedulerCounterSample cpuBefore =
+                emitWindowsThreadTime100ns(B, M, "morok.step.thread.before");
+            SchedulerCounterSample cyclesBefore =
+                emitWindowsThreadCycles(B, M, "morok.step.cycles.before");
+            Value *wallBefore = emitWindowsQpc(B, M, "morok.step.qpc.before");
+            emitSchedulerStepSpan(B, acc, rng);
+            SchedulerCounterSample cpuAfter =
+                emitWindowsThreadTime100ns(B, M, "morok.step.thread.after");
+            SchedulerCounterSample cyclesAfter =
+                emitWindowsThreadCycles(B, M, "morok.step.cycles.after");
+            Value *wallAfter = emitWindowsQpc(B, M, "morok.step.qpc.after");
+
+            Value *wallOrdered =
+                B.CreateICmpUGE(wallAfter, wallBefore,
+                                "morok.step.qpc.ordered");
+            Value *wallDelta = B.CreateSelect(
+                wallOrdered, B.CreateSub(wallAfter, wallBefore),
+                ConstantInt::get(i64, 0), "morok.step.qpc.delta");
+            Value *cpuDelta = B.CreateSub(cpuAfter.value, cpuBefore.value,
+                                          "morok.step.cpu.delta.100ns");
+            Value *cpuReady =
+                B.CreateAnd(cpuBefore.ready, cpuAfter.ready,
+                            "morok.step.cpu.ready");
+            Value *sampleReady = B.CreateAnd(
+                B.CreateAnd(cpuReady, wallOrdered),
+                B.CreateAnd(B.CreateICmpNE(cpuDelta, ConstantInt::get(i64, 0),
+                                           "morok.step.cpu.nonzero"),
+                            B.CreateICmpNE(qpcFreq, ConstantInt::get(i64, 0),
+                                           "morok.step.qpc.freq.nonzero")),
+                "morok.step.sample.ready");
+            Value *cpuTicks = B.CreateUDiv(
+                B.CreateMul(cpuDelta, qpcFreq, "morok.step.cpu.qpc.product"),
+                ConstantInt::get(i64, 10000000ULL), "morok.step.cpu.qpc");
+            Value *limit = B.CreateAdd(
+                B.CreateMul(cpuTicks, ConstantInt::get(i64, 256),
+                            "morok.step.cpu.qpc.scaled"),
+                B.CreateUDiv(qpcFreq, ConstantInt::get(i64, 20),
+                             "morok.step.qpc.floor"),
+                "morok.step.qpc.limit");
+            Value *sampleBad =
+                B.CreateAnd(sampleReady,
+                            B.CreateICmpUGT(wallDelta, limit,
+                                            "morok.step.thread.skew"),
+                            "morok.step.thread.skew.ready");
+            Value *cyclesReady =
+                B.CreateAnd(cyclesBefore.ready, cyclesAfter.ready,
+                            "morok.step.cycles.ready");
+            Value *cyclesDelta = B.CreateSelect(
+                cyclesReady, B.CreateSub(cyclesAfter.value, cyclesBefore.value),
+                ConstantInt::get(i64, 0), "morok.step.cycles.delta");
+            anomalousSamples =
+                B.CreateAdd(anomalousSamples, B.CreateZExt(sampleBad, i32),
+                            "morok.step.anomalous.n");
+            availableSamples =
+                B.CreateAdd(availableSamples, B.CreateZExt(sampleReady, i32),
+                            "morok.step.available.n");
+            mix = B.CreateXor(
+                B.CreateAdd(mix,
+                            B.CreateMul(wallDelta,
+                                        ConstantInt::get(i64, rng.next() | 1ULL))),
+                B.CreateXor(
+                    B.CreateMul(cpuDelta, ConstantInt::get(i64, rng.next() | 1ULL)),
+                    B.CreateMul(cyclesDelta,
+                                ConstantInt::get(i64, rng.next() | 1ULL))),
+                "morok.step.thread.mix");
+        }
+    }
+
+    foldState(B, State, mix, 0x9C07D36E4A12B5F1ULL, "morok.step.mix");
+    foldState(B, State, availableSamples, 0x71AF63C49E20D8B5ULL,
+              "morok.step.available.samples");
+    foldState(B, State, anomalousSamples, 0xC2E4B8A1975D306FULL,
+              "morok.step.anomalous.samples");
+    Value *anomaly = B.CreateICmpUGE(anomalousSamples, ConstantInt::get(i32, 2),
+                                     "morok.step.anomaly.distribution");
+    foldEnforcedFlag(B, State, anomaly, 0xF18D47A6C2B9035EULL,
+                     "morok.step.anomaly.distribution");
     B.CreateRetVoid();
     return fn;
 }
@@ -12163,6 +12671,25 @@ bool timingOracleModule(Module &M, ir::IRRandom &rng) {
     return true;
 }
 
+bool schedulerStepOracleModule(Module &M, ir::IRRandom &rng) {
+    const Triple tt(M.getTargetTriple());
+    if (intPtrTy(M)->getBitWidth() != 64 ||
+        (!tt.isOSLinux() && !tt.isOSDarwin() && !tt.isOSWindows()))
+        return false;
+    antiDebugSeal(M, rng);
+    GlobalVariable *state = schedulerStepOracleState(M, rng);
+    Function *oracle = schedulerStepOracleProbe(M, state, rng, tt);
+    if (!oracle)
+        return false;
+
+    Function *ctor = makeCtorShell(M, "morok.step");
+    IRBuilder<> B(&ctor->getEntryBlock());
+    B.CreateCall(oracle);
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, ctor, 0);
+    return true;
+}
+
 bool trapOracleModule(Module &M, ir::IRRandom &rng) {
     const Triple tt(M.getTargetTriple());
     TrapSigactionLayout layout;
@@ -12802,6 +13329,13 @@ PreservedAnalyses TimingOraclePass::run(Module &M, ModuleAnalysisManager &) {
     ir::IRRandom rng(engine_);
     return timingOracleModule(M, rng) ? PreservedAnalyses::none()
                                       : PreservedAnalyses::all();
+}
+
+PreservedAnalyses SchedulerStepOraclePass::run(Module &M,
+                                               ModuleAnalysisManager &) {
+    ir::IRRandom rng(engine_);
+    return schedulerStepOracleModule(M, rng) ? PreservedAnalyses::none()
+                                             : PreservedAnalyses::all();
 }
 
 PreservedAnalyses TrapOraclePass::run(Module &M, ModuleAnalysisManager &) {

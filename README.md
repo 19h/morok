@@ -464,7 +464,7 @@ VM(user code)
 -> fault-paged VM payload delivery
 -> hash-gated VM self-decrypt for remaining eager payloads
 -> anti-hook / anti-class-dump / Windows substrate and Windows probes
--> anti-debug / timing / trap / page-fault / cache / microarchitectural probes
+-> anti-debug / timing / scheduler-step / trap / page-fault / cache / microarchitectural probes
 -> decoy strings
 -> string encryption
 -> function-call obfuscation
@@ -632,6 +632,7 @@ logic is not left as a simple native plaintext island.
 | Anti-hooking | `morok-antihook` | `anti_hooking` | Clean-copy executable byte diff, prologue hook scan, function-window MACs, GOT/PLT or Mach-O fixup validation, W^X enforcement, address-space census, guarded pages, anti-dump, call-stack origin checks, method divergence, anti-VM/DBI heuristics, negative-space verification, and corroboration scoring. |
 | Anti-class-dump | `morok-antiacd` | `anti_class_dump` | Scrambles Objective-C metadata when present. |
 | Timing oracle | `morok-timing` | `timing_oracles` | Samples short spans with independent clocks and folds slow/divergent distributions into private state. |
+| Scheduler-step oracle | `morok-step` | `scheduler_step_oracles` | Samples context-switch counters or thread-time/wall-clock skew over short spans and folds high-confidence anomalies into the anti-debug seal. |
 | Trap oracle | `morok-trap` | `trap_oracles` | Installs temporary trap handlers and checks trap delivery. |
 | Page-fault/TLB oracle | `morok-pftlb` | `page_fault_oracles` | Maps protected code islands, validates fault provenance, and folds missing/extra/slow faults into state. |
 | Cache-timing oracle | `morok-cachetime` | `cache_timing_oracles` | Pseudo-random pointer chase over code bytes with clock distribution checks. |
@@ -764,6 +765,7 @@ windows_unhook
 windows_veh_audit
 windows_process_mitigations
 timing_oracles
+scheduler_step_oracles
 trap_oracles
 page_fault_oracles
 cache_timing_oracles

@@ -438,6 +438,7 @@ struct PassConfig {
     ToggleConfig windows_veh_audit;
     ToggleConfig windows_process_mitigations;
     ToggleConfig timing_oracles;
+    ToggleConfig scheduler_step_oracles;
     ToggleConfig trap_oracles;
     ToggleConfig page_fault_oracles;
     ToggleConfig cache_timing_oracles;

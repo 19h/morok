@@ -14897,6 +14897,104 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("schedulerStepOracleModule emits Linux context-switch sampling") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8841);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::schedulerStepOracleModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.step");
+    Function *Oracle = M->getFunction("morok.step.oracle");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Oracle != nullptr);
+    CHECK(M->getGlobalVariable("morok.step.state", true) != nullptr);
+    checkSealEnforcement(*M, *Oracle);
+    CHECK(M->getFunction("getrusage") != nullptr);
+    CHECK(M->getFunction("syscall") == nullptr);
+    CHECK(hasInlineAsmCall(*Oracle));
+    CHECK(functionHasConstantInt(*Oracle, 298u)); // perf_event_open syscall
+    CHECK(functionHasConstantInt(*Oracle, 3u));   // PERF_COUNT_SW_CONTEXT_SWITCHES
+    CHECK(countNamedInstructions(*Oracle, "morok.step.perf.open.ready") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.step.getrusage.before.total") >=
+          1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.step.getrusage.after.total") >=
+          1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.step.switch.anomaly") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.step.anomaly.distribution") >=
+          1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("schedulerStepOracleModule emits Darwin thread-time skew sampling") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "arm64-apple-macosx13.0.0"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8842);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::schedulerStepOracleModule(*M, rng));
+
+    Function *Oracle = M->getFunction("morok.step.oracle");
+    REQUIRE(Oracle != nullptr);
+    CHECK(M->getFunction("mach_thread_self") != nullptr);
+    CHECK(M->getFunction("thread_info") != nullptr);
+    CHECK(M->getFunction("clock_gettime") != nullptr);
+    checkSealEnforcement(*M, *Oracle);
+    CHECK_FALSE(hasInlineAsmCall(*Oracle));
+    CHECK(countNamedInstructions(*Oracle, "morok.step.cpu.delta") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.step.thread.skew") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("schedulerStepOracleModule emits Windows thread-time and cycle sampling") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-pc-windows-msvc"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8843);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::schedulerStepOracleModule(*M, rng));
+
+    Function *Oracle = M->getFunction("morok.step.oracle");
+    REQUIRE(Oracle != nullptr);
+    CHECK(M->getFunction("GetThreadTimes") != nullptr);
+    CHECK(M->getFunction("QueryThreadCycleTime") != nullptr);
+    CHECK(M->getFunction("QueryPerformanceCounter") != nullptr);
+    CHECK(M->getFunction("QueryPerformanceFrequency") != nullptr);
+    checkSealEnforcement(*M, *Oracle);
+    CHECK(countNamedInstructions(*Oracle, "morok.step.cpu.delta") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.step.cycles.delta") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.step.thread.skew") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("schedulerStepOracleModule skips unsupported pointer widths") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target datalayout = "e-m:e-p:32:32-i64:64-f80:128-n8:16:32-S128"
+target triple = "i386-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8844);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::schedulerStepOracleModule(*M, rng));
+    CHECK(M->getFunction("morok.step") == nullptr);
+    CHECK(M->getFunction("morok.step.oracle") == nullptr);
+    CHECK(M->getGlobalVariable("morok.step.state", true) == nullptr);
+    CHECK(M->getFunction("getrusage") == nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("trapOracleModule emits x86 trap stimuli and SIGTRAP handler") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

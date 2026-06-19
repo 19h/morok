@@ -242,6 +242,7 @@ TEST_CASE("merge handles every pass family") {
     src.windows_veh_audit.enabled = true;
     src.windows_process_mitigations.enabled = true;
     src.timing_oracles.enabled = true;
+    src.scheduler_step_oracles.enabled = true;
     src.trap_oracles.enabled = true;
     src.page_fault_oracles.enabled = true;
     src.cache_timing_oracles.enabled = true;
@@ -426,6 +427,7 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.windows_veh_audit.enabled == true);
     CHECK(dst.windows_process_mitigations.enabled == true);
     CHECK(dst.timing_oracles.enabled == true);
+    CHECK(dst.scheduler_step_oracles.enabled == true);
     CHECK(dst.trap_oracles.enabled == true);
     CHECK(dst.page_fault_oracles.enabled == true);
     CHECK(dst.cache_timing_oracles.enabled == true);

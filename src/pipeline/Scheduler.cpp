@@ -532,6 +532,8 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
     }
     if (config_.passes.timing_oracles.enabled.value_or(false))
         changed |= passes::timingOracleModule(M, rng);
+    if (config_.passes.scheduler_step_oracles.enabled.value_or(false))
+        changed |= passes::schedulerStepOracleModule(M, rng);
     if (config_.passes.trap_oracles.enabled.value_or(false))
         changed |= passes::trapOracleModule(M, rng);
     if (config_.passes.page_fault_oracles.enabled.value_or(false))
