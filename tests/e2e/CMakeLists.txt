@@ -51,6 +51,8 @@ set(_dr_sentinel_fallback_config
     "${CMAKE_CURRENT_SOURCE_DIR}/dr_sentinel_fallback.toml")
 set(_dr_sentinel_fallback_workload
     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/dr_sentinel_fallback.c")
+set(_release_audit_driver
+    "${CMAKE_CURRENT_SOURCE_DIR}/release_audit_test.py")
 set(_vtable_integrity_driver
     "${CMAKE_CURRENT_SOURCE_DIR}/vtable_integrity_dispatch.sh")
 set(_vtable_integrity_config
@@ -105,6 +107,19 @@ add_test(NAME "e2e/workflows_pinned"
   COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/workflows_pinned.sh"
           "${CMAKE_SOURCE_DIR}/.github")
 set_tests_properties("e2e/workflows_pinned" PROPERTIES LABELS "e2e")
+
+if(Python3_EXECUTABLE)
+  add_test(NAME "e2e/release_audit"
+    COMMAND "${Python3_EXECUTABLE}" "${_release_audit_driver}"
+            "${CMAKE_SOURCE_DIR}")
+  set_tests_properties("e2e/release_audit" PROPERTIES
+    LABELS "e2e;security"
+    REQUIRED_FILES
+      "${CMAKE_SOURCE_DIR}/tools/morok-audit.py;${_release_audit_driver}"
+    TIMEOUT 30)
+else()
+  message(STATUS "release audit e2e skipped (Python3 not found).")
+endif()
 
 foreach(preset low mid high)
   add_test(NAME "e2e/differential_${preset}"

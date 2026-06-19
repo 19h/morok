@@ -35,6 +35,10 @@ OPT_LEVEL="${OPT_LEVEL:--O3}"
 SEAL_BINARIES="${SEAL_BINARIES:-1}"
 SEAL_WINDOW="${SEAL_WINDOW:-262144}"
 SEAL_TOOL="${SEAL_TOOL:-$ROOT/tests/e2e/adversarial_binary.py}"
+AUDIT_BINARIES="${AUDIT_BINARIES:-$SEAL_BINARIES}"
+AUDIT_TOOL="${AUDIT_TOOL:-$ROOT/tools/morok-audit.py}"
+AUDIT_PROVENANCE="${AUDIT_PROVENANCE:-}"
+AUDIT_ALLOWLIST="${AUDIT_ALLOWLIST:-}"
 PYTHON="${PYTHON:-python3}"
 
 BUILD_LINUX=1
@@ -73,11 +77,14 @@ Options:
   --no-linux             Skip Linux
   --no-macos             Skip macOS
   --no-strip             Do not strip produced binaries
+  --no-audit             Skip the final morok-audit release gate
   -h, --help             Show this help
 
 Environment overrides mirror the option names in uppercase, for example:
   SRC=programs/01_hello_world.c MACOS_ARCHES="arm64 x86_64" ./cross_build.sh
   LINUX_TARGET=i686-linux-musl LINUX_CC=i686-linux-musl-gcc ./cross_build.sh
+  AUDIT_TOOL=tools/morok-audit.py AUDIT_PROVENANCE=build/cross/audit.json ./cross_build.sh
+  AUDIT_ALLOWLIST=release-audit-allow.json ./cross_build.sh
 USAGE
 }
 
@@ -142,6 +149,7 @@ while [ "$#" -gt 0 ]; do
     --no-linux) BUILD_LINUX=0; shift ;;
     --no-macos) BUILD_MACOS=0; shift ;;
     --no-strip) STRIP_BINARIES=0; shift ;;
+    --no-audit) AUDIT_BINARIES=0; shift ;;
     -h|--help) usage; exit 0 ;;
     # Test hook: emit the derived static config and exit (see
     # tests/e2e/static_config_layering.sh).  Args: <src|""> <preset> <out>.
@@ -255,6 +263,24 @@ seal_binary() {
   fi
 }
 
+audit_bundle() {
+  [ "$AUDIT_BINARIES" -eq 1 ] || return 0
+  [ -f "$AUDIT_TOOL" ] || die "audit tool not found: $AUDIT_TOOL"
+  need_tool "$PYTHON"
+  local provenance="$OUT_DIR/morok-audit.json"
+  if [ -n "$AUDIT_PROVENANCE" ]; then
+    provenance="$AUDIT_PROVENANCE"
+  fi
+  local allowlist=()
+  if [ -n "$AUDIT_ALLOWLIST" ]; then
+    allowlist=(--allowlist "$AUDIT_ALLOWLIST")
+  fi
+  echo ">> auditing release bundle $OUT_DIR"
+  "$PYTHON" "$AUDIT_TOOL" "$OUT_DIR" --release --require-sealed-manifest \
+    --provenance "$provenance" "${allowlist[@]}" ||
+    die "release audit failed for $OUT_DIR"
+}
+
 build_linux() {
   local cc="${LINUX_CC:-${LINUX_TARGET}-gcc}"
   need_tool "$cc"
@@ -359,6 +385,8 @@ fi
 if [ "$BUILD_MACOS" -eq 1 ]; then
   build_macos
 fi
+
+audit_bundle
 
 echo ">> built"
 printf '   %s\n' "${OUTPUTS[@]}"

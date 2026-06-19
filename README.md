@@ -319,7 +319,10 @@ Post-link sealing is mandatory for shippable binaries that rely on
 `self_checksum_constants` or `mutual_guard_graph` native-code windows. The IR
 passes reserve retained manifests, but final code byte ranges are only known
 after linking and stripping. `cross_build.sh` seals automatically after strip
-and fails closed if no manifests are present. Manual sealing is:
+and fails closed if no manifests are present. It then runs `tools/morok-audit.py`
+over the final output directory to reject unsealed manifests, placeholder
+manifest state, private-key sidecars, embedded development paths, and plaintext
+high-value release markers before anything is shipped. Manual sealing is:
 
 ```sh
 python3 tests/e2e/adversarial_binary.py seal path/to/binary --window 262144
@@ -327,6 +330,27 @@ python3 tests/e2e/adversarial_binary.py seal path/to/binary --window 262144
 
 On macOS, an in-place seal invalidates the ad hoc signature, so the helper
 re-signs the binary after patching.
+
+Manual release audit is:
+
+```sh
+python3 tools/morok-audit.py build/cross --release --require-sealed-manifest \
+  --provenance build/cross/morok-audit.json
+```
+
+The audit writes a provenance manifest with file hashes, detected binary
+formats, sealed-manifest counts, and any findings. Release findings are hard
+failures. Test fixtures must be allowlisted explicitly with a versioned JSON
+file:
+
+```json
+{
+  "version": 1,
+  "allow": [
+    {"path": "fixtures/*.pem", "checks": ["private-key-sidecar"]}
+  ]
+}
+```
 
 ## Configuration Model
 
@@ -802,7 +826,7 @@ python3 tests/e2e/adversarial_binary.py seal path/to/binary --window 262144
 | Plugin load reports API/version mismatch | `clang`/`opt` and Morok were built against different LLVM plugin ABIs | Rebuild Morok with the same LLVM used by the host driver. |
 | `-mllvm -morok` is unknown on Windows | Windows plugin cl::opts are not parsed by host clang the same way | Use `MOROK_ENABLE=1` plus `MOROK_CONFIG`, `MOROK_PRESET`, and `MOROK_SEED`. |
 | Static Linux binary crashes around import indirection | FCO was left enabled in a static link | Use `cross_build.sh` or force `[passes.function_call_obfuscate].enabled = false`. |
-| Self-checksum does not detect a native patch | Post-link manifests were not sealed | Seal after final link/strip and fail closed if manifest count is zero. |
+| Self-checksum does not detect a native patch | Post-link manifests were not sealed | Seal after final link/strip and run `tools/morok-audit.py --release --require-sealed-manifest`. |
 | E2E max fails off Apple | Some max-level runtime/backend paths are still Apple-first | Use `tests/e2e/portable.toml` and consult the comments in that file. |
 | A huge input stops getting later transforms | Scheduler growth budgets are firing | Narrow with policy/annotations or increase the specific pass budget after adding tests. |
 
