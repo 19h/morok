@@ -135,6 +135,13 @@ def write_synthetic_ckd_elf(path: Path, *, sealed: bool) -> None:
     path.write_bytes(data)
 
 
+def write_fat_macho_stub(path: Path) -> None:
+    data = bytearray(0x100)
+    struct.pack_into(">II", data, 0, 0xCAFEBABE, 1)
+    struct.pack_into(">IIIII", data, 8, 0x01000007, 3, 0x80, 0x80, 2)
+    path.write_bytes(data)
+
+
 def run(tool: Path, bundle: Path, *extra: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(tool), str(bundle), "--release", *extra],
@@ -215,6 +222,15 @@ def main(argv: list[str]) -> int:
         require_fail(
             run(tool, missing, "--require-sealed-manifest"),
             "missing-sealed-manifest",
+        )
+
+        fat_macho = tmp / "fat-macho"
+        fat_macho.mkdir()
+        write_synthetic_elf(fat_macho / "app", sealed=True)
+        write_fat_macho_stub(fat_macho / "universal")
+        require_fail(
+            run(tool, fat_macho, "--require-sealed-manifest"),
+            "unsupported-fat-macho-audit",
         )
 
         sidecar = tmp / "sidecar"

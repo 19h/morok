@@ -71,6 +71,12 @@ PLAINTEXT_SENTINEL_MARKERS = (
     b"placeholder_magic",
     b"PLACEHOLDER_MAGIC",
 )
+FAT_MACHO_MAGICS = {
+    b"\xca\xfe\xba\xbe",  # FAT_MAGIC
+    b"\xbe\xba\xfe\xca",  # FAT_CIGAM
+    b"\xca\xfe\xba\xbf",  # FAT_MAGIC_64
+    b"\xbf\xba\xfe\xca",  # FAT_CIGAM_64
+}
 
 
 @dataclass
@@ -425,12 +431,19 @@ class Auditor:
         try:
             binary = adv.Binary(path)
         except SystemExit:
-            if data.startswith(b"MZ") and self.require_sealed_manifest:
-                self.emit_finding(
-                    "unsupported-pe-audit",
-                    path,
-                    "PE release audit is not implemented yet for sealed-manifest verification",
-                )
+            if self.require_sealed_manifest:
+                if data.startswith(b"MZ"):
+                    self.emit_finding(
+                        "unsupported-pe-audit",
+                        path,
+                        "PE release audit is not implemented yet for sealed-manifest verification",
+                    )
+                elif data[:4] in FAT_MACHO_MAGICS:
+                    self.emit_finding(
+                        "unsupported-fat-macho-audit",
+                        path,
+                        "fat Mach-O release audit must verify every architecture slice",
+                    )
             return
         except Exception as exc:
             self.emit_finding("binary-parse-error", path, str(exc))
