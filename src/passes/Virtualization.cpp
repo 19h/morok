@@ -282,10 +282,16 @@ bool isVmIntTy(Type *T) {
 bool isScalarVmTy(Type *T) { return isVmIntTy(T) || isPtrAS0(T); }
 
 // Byte size of a load/store access; only the {1,2,4,8}-byte accesses have a
-// fixed handler, so other widths make the function ineligible.
-std::optional<unsigned> accessBytes(Type *T) {
+// fixed handler, so other widths make the function ineligible.  A pointer
+// load/store must access exactly the target's pointer width; the VM memory ops
+// are emitted at the canonical register width, so a pointer is only lift-able
+// when the target's address-space-0 pointer is genuinely 8 bytes.  On 32-bit
+// (or other non-64-bit-pointer) targets an 8-byte access would read/write past
+// the pointer object, so refuse to lift it (the op stays as normal IR).
+std::optional<unsigned> accessBytes(Type *T, const DataLayout &DL) {
     if (isPtrAS0(T))
-        return 8u;
+        return DL.getPointerSize(0) == 8u ? std::optional<unsigned>(8u)
+                                          : std::nullopt;
     if (auto *IT = dyn_cast<IntegerType>(T)) {
         switch (IT->getBitWidth()) {
         case 1:
@@ -594,10 +600,10 @@ bool liftableInstruction(const Instruction &I, const BasicBlock &Entry,
                isScalarVmTy(S->getType());
     if (const auto *L = dyn_cast<LoadInst>(&I))
         return !L->isAtomic() && isPtrAS0(L->getPointerOperandType()) &&
-               accessBytes(L->getType()).has_value();
+               accessBytes(L->getType(), DL).has_value();
     if (const auto *St = dyn_cast<StoreInst>(&I))
         return !St->isAtomic() && isPtrAS0(St->getPointerOperandType()) &&
-               accessBytes(St->getValueOperand()->getType()).has_value();
+               accessBytes(St->getValueOperand()->getType(), DL).has_value();
     if (const auto *G = dyn_cast<GetElementPtrInst>(&I)) {
         if (!isPtrAS0(G->getType()) ||
             !isPtrAS0(G->getPointerOperandType()))
@@ -975,7 +981,7 @@ bool Lifter::liftLoad(LoadInst &L) {
     auto Addr = materialize(L.getPointerOperand());
     if (!Addr)
         return false;
-    auto Bytes = accessBytes(L.getType());
+    auto Bytes = accessBytes(L.getType(), DL_);
     if (!Bytes)
         return false;
     auto D = newLocalReg();
@@ -992,7 +998,7 @@ bool Lifter::liftStore(StoreInst &St) {
     auto Val = materialize(St.getValueOperand());
     if (!Addr || !Val)
         return false;
-    auto Bytes = accessBytes(St.getValueOperand()->getType());
+    auto Bytes = accessBytes(St.getValueOperand()->getType(), DL_);
     if (!Bytes)
         return false;
     return emit({storeOpForBytes(*Bytes), 0, *Addr, *Val, 0});

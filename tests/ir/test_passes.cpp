@@ -6258,6 +6258,58 @@ TEST_CASE("uniformPrimitiveLowerFunction caps branch lowering") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #58: the VM emits pointer load/store at a fixed 8-byte width,
+// so on a non-64-bit-pointer target a virtualized `load ptr` would read/write
+// past the (e.g. 4-byte) pointer object — leaking or corrupting adjacent memory.
+// Pointer memory ops must only be lifted when the target's AS0 pointer is
+// genuinely 8 bytes; otherwise the op stays as normal typed IR.
+TEST_CASE("virtualizeModule skips pointer memory ops on 32-bit targets") {
+    auto fixture = [](const char *dl) {
+        return std::string("target datalayout = \"") + dl + "\"\n" + R"ir(
+define i64 @ptr_mem(ptr %p, ptr %q) {
+entry:
+  %v = load ptr, ptr %p
+  store ptr %v, ptr %q
+  %i = ptrtoint ptr %v to i64
+  %r = add i64 %i, 1
+  ret i64 %r
+}
+)ir";
+    };
+    const morok::passes::VirtualizationParams params{
+        /*probability=*/100, /*max_functions=*/1,
+        /*max_instructions=*/32, /*max_registers=*/64};
+
+    // 64-bit pointers: a fixed 8-byte access is correct, so the function lifts.
+    {
+        LLVMContext ctx;
+        auto M = parse(ctx, fixture("e-p:64:64").c_str());
+        auto engine = morok::core::Xoshiro256pp::fromSeed(5801);
+        morok::ir::IRRandom rng(engine);
+        CHECK(morok::passes::virtualizeModule(*M, params, rng));
+        CHECK(M->getFunction("morok.vm.ptr_mem.exec") != nullptr);
+        CHECK_FALSE(verifyModule(*M, &errs()));
+    }
+    // 32-bit pointers: pointer memory ops are not lift-able, so the function is
+    // left untouched and its typed `load ptr` survives.
+    {
+        LLVMContext ctx;
+        auto M = parse(ctx, fixture("e-p:32:32").c_str());
+        auto engine = morok::core::Xoshiro256pp::fromSeed(5801);
+        morok::ir::IRRandom rng(engine);
+        CHECK_FALSE(morok::passes::virtualizeModule(*M, params, rng));
+        CHECK(M->getFunction("morok.vm.ptr_mem.exec") == nullptr);
+        Function *F = M->getFunction("ptr_mem");
+        REQUIRE(F);
+        bool hasPtrLoad = false;
+        for (Instruction &I : instructions(*F))
+            if (auto *L = dyn_cast<LoadInst>(&I))
+                hasPtrLoad |= L->getType()->isPointerTy();
+        CHECK(hasPtrLoad);
+        CHECK_FALSE(verifyModule(*M, &errs()));
+    }
+}
+
 TEST_CASE("virtualizeModule lifts simple arithmetic to encrypted threaded VM") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
