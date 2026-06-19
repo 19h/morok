@@ -11160,6 +11160,92 @@ TEST_CASE("stringEncryptModule materializes used strings on the stack") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #43: per-use stack materialization replaced every operand with
+// its own buffer, so check(secret, secret) became check(buf1, buf2) — breaking a
+// callee that compares argument pointer identity.  All operands of one call that
+// reference the same global must now share a single buffer.
+TEST_CASE("stringEncryptModule preserves pointer identity within a call") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+declare void @check(ptr nocapture, ptr nocapture)
+@secret = private constant [7 x i8] c"secret\00"
+
+define void @use_twice() {
+entry:
+  call void @check(ptr @secret, ptr @secret)
+  ret void
+}
+)ir");
+    REQUIRE(M);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(4301);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(
+        *M, morok::passes::StrEncParams{}, rng));
+
+    Function *F = M->getFunction("use_twice");
+    REQUIRE(F);
+    // Exactly one stack buffer, and both call arguments point to it.
+    CHECK(countNamedAllocas(*F, "morok.str.stack.buf") == 1u);
+    CallInst *Call = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            if (CI->getCalledFunction() &&
+                CI->getCalledFunction()->getName() == "check")
+                Call = CI;
+    REQUIRE(Call);
+    CHECK(Call->getArgOperand(0) == Call->getArgOperand(1));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+// Regression for #43: the stack buffer alloca was inserted before the use site,
+// so a use in a loop allocated a fresh buffer every iteration (never freed until
+// return) — attacker-controlled loop counts exhaust the stack.  The alloca is
+// now hoisted to the entry block (allocated once per call activation).
+TEST_CASE("stringEncryptModule hoists stack string buffers out of loops") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+declare void @log(ptr nocapture)
+@msg = private constant [4 x i8] c"msg\00"
+
+define void @loop(i32 %n) {
+entry:
+  br label %body
+body:
+  %i = phi i32 [ 0, %entry ], [ %next, %body ]
+  call void @log(ptr @msg)
+  %next = add i32 %i, 1
+  %c = icmp slt i32 %next, %n
+  br i1 %c, label %body, label %exit
+exit:
+  ret void
+}
+)ir");
+    REQUIRE(M);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(4302);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(
+        *M, morok::passes::StrEncParams{}, rng));
+
+    Function *F = M->getFunction("loop");
+    REQUIRE(F);
+    // The stack buffer must live in the entry block, not the loop body.
+    BasicBlock &Entry = F->getEntryBlock();
+    unsigned entryBufs = 0;
+    unsigned totalBufs = 0;
+    for (BasicBlock &BB : *F)
+        for (Instruction &I : BB)
+            if (auto *AI = dyn_cast<AllocaInst>(&I))
+                if (AI->getName().starts_with("morok.str.stack.buf")) {
+                    ++totalBufs;
+                    entryBufs += (&BB == &Entry);
+                }
+    REQUIRE(totalBufs >= 1u);
+    CHECK(entryBufs == totalBufs); // every stack buffer is in the entry block
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("stringEncryptModule honors force_content when probability is zero") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("force-strings", ctx);

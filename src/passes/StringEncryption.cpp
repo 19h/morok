@@ -49,6 +49,11 @@ constexpr std::uint64_t kMaxEncryptedStrings = 8192;
 constexpr std::uint64_t kMaxEncryptedStringBytes = 1u << 20; // 1 MiB / string
 constexpr std::uint64_t kMaxEncryptedTotalBytes = 8u << 20;  // 8 MiB / module
 constexpr std::uint64_t kUnrollThreshold = 64; // ≤ this ⇒ unrolled, else loop
+// Per-use stack materialization places a buffer of the whole string on the
+// frame; keep it well below the 1 MiB global cap so a large constant string
+// never inflates the stack frame.  Larger strings fall back to the in-place
+// global decryptor instead of the stack path.
+constexpr std::uint64_t kMaxStackStringBytes = 4096;
 
 bool eligible(const GlobalVariable &gv) {
     if (!gv.hasInitializer() || !gv.hasLocalLinkage())
@@ -327,12 +332,19 @@ Function *createStackDecryptHelper(Module &M, const Cipher &C,
 Value *emitStackString(Instruction *InsertBefore, const Cipher &C,
                        GlobalVariable *Seed, GlobalVariable *CipherText,
                        ArrayType *ArrTy, std::uint64_t Len) {
-    Module &M = *InsertBefore->getFunction()->getParent();
+    Function *F = InsertBefore->getFunction();
+    Module &M = *F->getParent();
     Function *Helper =
         createStackDecryptHelper(M, C, Seed, CipherText, ArrTy, Len);
+    auto *I64 = Type::getInt64Ty(M.getContext());
+    // Hoist the buffer to the entry block (a static alloca) so it is allocated
+    // once per call activation, not once per loop iteration: a per-use alloca in
+    // a loop body is never released until the function returns, so an
+    // attacker-controlled loop count would exhaust the stack.  The decrypt call
+    // and pointer materialization stay at the use site, refilling the buffer.
+    IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
+    AllocaInst *Buf = EB.CreateAlloca(ArrTy, nullptr, "morok.str.stack.buf");
     IRBuilder<> B(InsertBefore);
-    auto *I64 = Type::getInt64Ty(B.getContext());
-    AllocaInst *Buf = B.CreateAlloca(ArrTy, nullptr, "morok.str.stack.buf");
     B.CreateCall(Helper->getFunctionType(), Helper, {Buf});
     emitStaticAnalysisBarrier(B, M);
     return B.CreateInBoundsGEP(
@@ -373,13 +385,25 @@ GlobalVariable *createGuard(Module &M) {
 bool materializeStackUses(GlobalVariable *GV, const Cipher &C,
                           GlobalVariable *Seed, ArrayType *ArrTy,
                           std::uint64_t Len) {
+    // Large strings would put a large buffer on the frame at each use; leave
+    // those to the in-place global decryptor.
+    if (Len > kMaxStackStringBytes)
+        return false;
+
     SmallVector<UseSite, 8> Sites;
     SmallPtrSet<Value *, 8> Seen;
     if (!collectStackUseSites(GV, GV, Sites, Seen) || Sites.empty())
         return false;
 
+    // Materialize one buffer per USE INSTRUCTION, not per operand: a call that
+    // passes the same global in two arguments (e.g. check(secret, secret)) must
+    // still receive the same pointer in both, or a callee comparing argument
+    // identity would behave differently than with the original global.
+    DenseMap<Instruction *, Value *> PerInst;
     for (UseSite Site : Sites) {
-        Value *Stack = emitStackString(Site.inst, C, Seed, GV, ArrTy, Len);
+        Value *&Stack = PerInst[Site.inst];
+        if (!Stack)
+            Stack = emitStackString(Site.inst, C, Seed, GV, ArrTy, Len);
         Site.inst->setOperand(Site.operand, Stack);
     }
     return true;
