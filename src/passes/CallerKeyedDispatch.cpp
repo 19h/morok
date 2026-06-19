@@ -21,6 +21,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -102,6 +103,16 @@ bool eligible(CallInst &CI) {
     if (Callee->isVarArg())
         return false;
     if (Callee->getName().starts_with("morok."))
+        return false;
+    // The carrier register (r14 / x19) is only a safe, callee-saved hidden slot
+    // under the standard C calling convention.  Non-C conventions
+    // (e.g. x86_regcallcc, vectorcall) may pass integer arguments in that very
+    // register, so the call's argument setup would overwrite the loaded jump
+    // target after the carrier asm — and the naked `jmp *%r14` would then jump
+    // to an argument value, turning attacker-influenced input into the
+    // instruction pointer.  Only rewrite plain C-convention calls.
+    if (CI.getCallingConv() != CallingConv::C ||
+        Callee->getCallingConv() != CallingConv::C)
         return false;
     Function *Caller = CI.getFunction();
     if (!Caller || Caller->isDeclaration() || Caller->hasPersonalityFn())

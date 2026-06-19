@@ -10062,6 +10062,55 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #76: the carrier register (r14 on x86_64) is only callee-saved
+// under the C calling convention.  x86_regcallcc passes later integer arguments
+// in r14, so rewriting such a call would let argument setup overwrite the loaded
+// jump target after the carrier asm — `jmp *%r14` would then jump to an argument
+// value (attacker-influenced input becomes the instruction pointer).  Only plain
+// C-convention calls may be rewritten.
+TEST_CASE("callerKeyedDispatchModule skips non-C calling conventions") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-musl"
+define internal i32 @plain(i32 %x) {
+entry:
+  %r = add i32 %x, 1
+  ret i32 %r
+}
+
+define internal x86_regcallcc i32 @reg(i32 %x) {
+entry:
+  %r = xor i32 %x, 9
+  ret i32 %r
+}
+
+define i32 @caller(i32 %x) {
+entry:
+  %a = call i32 @plain(i32 %x)
+  %b = call x86_regcallcc i32 @reg(i32 %a)
+  ret i32 %b
+}
+)ir");
+    Function *Caller = M->getFunction("caller");
+    REQUIRE(Caller);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(7601);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::CallerKeyedDispatchParams params;
+    params.probability = 100;
+    params.max_calls = 16;
+    params.region_bytes = 8;
+
+    CHECK(morok::passes::callerKeyedDispatchModule(*M, params, rng));
+
+    // The plain C-convention call is routed through the dispatcher; the
+    // x86_regcallcc call (which may use r14 for an argument) is left as a direct
+    // call, so its argument can never become the jump target.
+    CHECK(countCallsTo(*Caller, "plain") == 0u);
+    CHECK(countCallsTo(*Caller, "reg") == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("callerKeyedDispatchModule leaves variadic call ABI untouched") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
