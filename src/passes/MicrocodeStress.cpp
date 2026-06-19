@@ -271,11 +271,16 @@ std::optional<std::pair<StringRef, StringRef>>
 antiDisasmHopAsm(const Triple &TT) {
     switch (TT.getArch()) {
     case Triple::x86_64:
+        // Recover the target address RIP-relatively rather than with the
+        // classic callq/popq PC trick: on SysV x86_64 the callq writes a return
+        // address to -8(%rsp), inside the 128-byte red zone the compiler may be
+        // using for leaf-function allocas/spills.  The inline asm is opaque, so
+        // LLVM cannot see that stack write, and it silently corrupts live
+        // red-zone slots.  `leaq 1f(%rip), %rax` computes the same address with
+        // no stack access; the indirect jmp + junk bytes still break linear
+        // disassembly (#59).
         return std::pair<StringRef, StringRef>{
-            "callq 0f\n"
-            "0:\n\t"
-            "popq %rax\n\t"
-            "leaq 1f-0b(%rax), %rax\n\t"
+            "leaq 1f(%rip), %rax\n\t"
             "jmpq *%rax\n\t"
             ".byte 0xe9,0x13,0x37,0x00,0x00\n\t"
             ".byte 0x0f,0x85\n"

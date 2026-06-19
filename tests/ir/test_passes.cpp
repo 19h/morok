@@ -9655,9 +9655,11 @@ join:
             if (auto *CB = dyn_cast<CallBase>(&I))
                 if (auto *Asm = dyn_cast<InlineAsm>(CB->getCalledOperand())) {
                     StringRef S = Asm->getAsmString();
-                    hasAntiDisasmHop |= S.contains("callq 0f") &&
-                                        S.contains("popq %rax") &&
-                                        S.contains("jmpq *%rax");
+                    // The x86_64 hop recovers the target RIP-relatively (no
+                    // stack-writing callq/popq that would clobber the red zone).
+                    hasAntiDisasmHop |= S.contains("leaq 1f(%rip), %rax") &&
+                                        S.contains("jmpq *%rax") &&
+                                        !S.contains("callq");
                     hasMidInstructionHop |=
                         S.contains(".byte 0x0f,0x85") &&
                         S.contains(".byte 0x90,0x90,0xeb,0x04") &&
