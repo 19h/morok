@@ -2252,13 +2252,29 @@ bool liftOne(Function &F, const VirtualizationParams &Params,
     return materializeProgram(*F.getParent(), *P, Rng);
 }
 
+bool hasUnresolvedIndirectCall(Module &M) {
+    for (Function &F : M) {
+        if (F.isDeclaration())
+            continue;
+        for (BasicBlock &BB : F)
+            for (Instruction &I : BB)
+                if (auto *CB = dyn_cast<CallBase>(&I))
+                    if (!CB->isInlineAsm() && !CB->getCalledFunction())
+                        return true;
+    }
+    return false;
+}
+
 // Functions that participate in a call-graph cycle (direct self-recursion or a
 // mutual-recursion SCC).  Virtualizing these under allow_internal_user_calls is
 // unsafe: each recursion level would re-enter the bytecode interpreter, and the
 // heavy per-frame VM state amplifies stack use until it traps (observed as
-// call_nested / call_tail_recursive / 04_bst exiting 133).  Leaf functions can
-// never be in a cycle, so this only ever excludes the call-bearing functions the
-// user-call path newly made eligible.
+// call_nested / call_tail_recursive / 04_bst exiting 133).
+//
+// LLVM's CallGraph cannot resolve ordinary function-pointer callbacks.  If any
+// unresolved indirect call exists in the module, every address-taken function is
+// a possible callback target and must stay native too; otherwise A -> B ->
+// (*fp=A) can re-enter A's VM wrapper even though no SCC cycle is visible.
 SmallPtrSet<const Function *, 16> recursiveFunctions(Module &M) {
     SmallPtrSet<const Function *, 16> Rec;
     CallGraph CG(M);
@@ -2269,6 +2285,10 @@ SmallPtrSet<const Function *, 16> recursiveFunctions(Module &M) {
             if (Function *F = Node->getFunction())
                 Rec.insert(F);
     }
+    if (hasUnresolvedIndirectCall(M))
+        for (Function &F : M)
+            if (!F.isDeclaration() && F.hasAddressTaken())
+                Rec.insert(&F);
     return Rec;
 }
 

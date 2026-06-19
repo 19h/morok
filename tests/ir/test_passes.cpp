@@ -6882,6 +6882,61 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("virtualizeModule skips address-taken callbacks when indirect calls exist") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+@cb = internal global ptr @callback_entry, align 8
+
+define internal i32 @callback_entry(i32 %n) {
+entry:
+  %keep_going = icmp sgt i32 %n, 0
+  br i1 %keep_going, label %call, label %done
+call:
+  %next = add i32 %n, -1
+  %r = call i32 @dispatch_back(i32 %next)
+  %out = add i32 %r, 1
+  ret i32 %out
+done:
+  ret i32 0
+}
+
+define internal i32 @dispatch_back(i32 %n) {
+entry:
+  %fp = load ptr, ptr @cb, align 8
+  %r = call i32 %fp(i32 %n)
+  ret i32 %r
+}
+
+define internal i32 @leaf(i32 %x) {
+entry:
+  %a = xor i32 %x, 85
+  %b = add i32 %a, 7
+  ret i32 %b
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(333);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::VirtualizationParams P{/*probability=*/100,
+                                           /*max_functions=*/4,
+                                           /*max_instructions=*/96,
+                                           /*max_registers=*/96};
+    P.allow_internal_user_calls = true;
+
+    CHECK(morok::passes::virtualizeModule(*M, P, rng));
+
+    Function *Callback = M->getFunction("callback_entry");
+    REQUIRE(Callback);
+    CHECK(M->getFunction("morok.vm.callback_entry.exec") == nullptr);
+    CHECK(countGlobals(*M, "morok.vm.bytecode.callback_entry") == 0u);
+    CHECK(countCallsTo(*Callback, "dispatch_back") == 1u);
+
+    CHECK(M->getFunction("morok.vm.dispatch_back.exec") == nullptr);
+    CHECK(countGlobals(*M, "morok.vm.bytecode.dispatch_back") == 0u);
+    CHECK(M->getFunction("morok.vm.leaf.exec") != nullptr);
+    CHECK(countGlobals(*M, "morok.vm.bytecode.leaf") == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("virtualizeModule lifts funnel-shift and min/max intrinsics") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
