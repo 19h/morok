@@ -383,10 +383,19 @@ Function *createEnsureFunction(Module &M, GlobalVariable *Table,
         EB.CreateICmpEQ(ReadyLoad, ReadyValue, "morok.tablearith.ready.done"),
         Exit, Claim);
 
+    // The failure ordering must be Acquire, not Monotonic: when the claim CAS
+    // fails it returns the Observed state, and the ClaimObserved block below
+    // branches straight to Exit (skipping the Wait acquire load) whenever the
+    // failed CAS already saw ReadyValue.  That fast path is the consumer's only
+    // synchronization with the decoder's Release store of the decoded cells, so
+    // a Monotonic failure ordering would let a losing thread observe Ready==2
+    // yet read stale, still-encoded table entries on weak-memory targets
+    // (AArch64/ARM).  Acquire failure ordering makes the failed CAS
+    // synchronize-with the decoder's release, just like the Entry/Wait loads.
     IRBuilder<> CB(Claim);
     auto *StateClaim = CB.CreateAtomicCmpXchg(
         Ready, Encoded, Decoding, MaybeAlign(4),
-        AtomicOrdering::AcquireRelease, AtomicOrdering::Monotonic);
+        AtomicOrdering::AcquireRelease, AtomicOrdering::Acquire);
     Value *Claimed =
         CB.CreateExtractValue(StateClaim, 1, "morok.tablearith.claimed");
     Value *Observed =

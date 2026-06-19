@@ -6149,6 +6149,16 @@ TEST_CASE("tableArithmeticFunction caps selected table count") {
 // the same cells (volatile is not synchronization), corrupting wide i9..i16
 // authorization/bounds/integrity decisions.  A constructor also used priority
 // 65535, so earlier user ctors could start threads before the table ctor ran.
+//
+// The fix replaced the volatile flag with an Encoded/Decoding/Ready atomic
+// state machine, but the claim CAS initially used a Monotonic failure ordering.
+// The claim.observed fast path branches straight to Exit when the *failed* CAS
+// already saw Ready, skipping the Wait acquire load -- so the failed CAS is a
+// losing thread's only handshake with the decoder's Release store.  Monotonic
+// failure ordering does not synchronize-with that release, so on weak-memory
+// targets (AArch64/ARM) a thread could observe Ready yet read stale, still
+// encoded table cells.  The claim CAS must therefore use an Acquire failure
+// ordering, matching the Entry/Wait acquire loads.
 TEST_CASE("tableArithmeticFunction decodes tables with early atomic guard") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("table-ctor", ctx);
@@ -6203,12 +6213,14 @@ TEST_CASE("tableArithmeticFunction decodes tables with early atomic guard") {
         } else if (auto *CAS = dyn_cast<AtomicCmpXchgInst>(&I)) {
             if (isReadyGlobal(CAS->getPointerOperand()) &&
                 CAS->getSuccessOrdering() == AtomicOrdering::AcquireRelease &&
-                CAS->getFailureOrdering() == AtomicOrdering::Monotonic)
+                CAS->getFailureOrdering() == AtomicOrdering::Acquire)
                 ++claimCAS;
         }
     }
     CHECK(acquireLoads >= 2u);
     CHECK(releaseStores == 1u);
+    // Exactly one claim CAS, and its failure ordering must be Acquire so the
+    // claim.observed -> Exit fast path synchronizes with the decoder's release.
     CHECK(claimCAS == 1u);
     CHECK_FALSE(volatileReadyAccess);
     CHECK_FALSE(verifyModule(*M, &errs()));
