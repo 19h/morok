@@ -175,6 +175,18 @@ Value *mix64(IRBuilder<NoFolder> &B, Value *State, Value *Tag,
                        Name);
 }
 
+// A swifterror pointer (a swifterror alloca or a swifterror argument) may only
+// be loaded/stored or passed directly as a swifterror argument; freeze and
+// ptrtoint on it are invalid IR the verifier rejects.  Mirrors the guards in
+// PointerLaundering / PathExplosion / StackCoalescing.  False on non-Swift IR.
+bool isSwiftErrorValue(const Value *V) {
+    if (const auto *Arg = dyn_cast<Argument>(V))
+        return Arg->hasSwiftErrorAttr();
+    if (const auto *AI = dyn_cast<AllocaInst>(V))
+        return AI->isSwiftError();
+    return false;
+}
+
 Value *traceValueBits(IRBuilder<NoFolder> &B, Value *V) {
     auto *I64 = B.getInt64Ty();
     Type *Ty = V->getType();
@@ -188,6 +200,8 @@ Value *traceValueBits(IRBuilder<NoFolder> &B, Value *V) {
         return B.CreateZExtOrTrunc(Frozen, I64, "morok.trace.value.bits");
     }
     if (Ty->isPointerTy()) {
+        if (isSwiftErrorValue(V))
+            return nullptr;
         Value *Frozen = B.CreateFreeze(V, "morok.trace.value.freeze");
         return B.CreatePtrToInt(Frozen, I64, "morok.trace.value.bits");
     }

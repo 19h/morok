@@ -8693,6 +8693,59 @@ right:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #51: valueTraceTag() scans instructions preceding an
+// instrumented branch and hashes their values.  A swifterror alloca is
+// pointer-typed but may only be loaded/stored or passed as a swifterror
+// argument; emitting freeze/ptrtoint on it (as traceValueBits did for any
+// pointer) produces IR the verifier rejects.  The swifterror value must be
+// skipped.
+TEST_CASE("traceKeyFunction skips swifterror pointers in value tracing") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+declare void @swifterror_sink(ptr swifterror)
+
+define i32 @trace_swifterror(i1 %c) {
+entry:
+  %err = alloca swifterror ptr, align 8
+  store ptr null, ptr %err
+  call void @swifterror_sink(ptr swifterror %err)
+  br i1 %c, label %yes, label %no
+yes:
+  br label %join
+no:
+  br label %join
+join:
+  ret i32 0
+}
+)ir");
+    Function *F = M->getFunction("trace_swifterror");
+    REQUIRE(F);
+    REQUIRE_FALSE(verifyModule(*M, &errs())); // fixture starts valid
+    auto *I64 = Type::getInt64Ty(ctx);
+    auto *Crypto = new GlobalVariable(
+        *M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I64, 0), "morok.watchdog.crypto");
+    Crypto->setAlignment(Align(8));
+    auto engine = morok::core::Xoshiro256pp::fromSeed(5101);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::traceKeyFunction(
+        *F, {/*probability=*/100, /*max_blocks=*/8}, rng));
+
+    // The swifterror alloca must never be frozen or ptrtoint'd.
+    AllocaInst *Err = nullptr;
+    for (Instruction &I : instructions(*F))
+        if (auto *AI = dyn_cast<AllocaInst>(&I))
+            if (AI->isSwiftError())
+                Err = AI;
+    REQUIRE(Err);
+    for (const User *U : Err->users()) {
+        const bool frozenOrCast = isa<FreezeInst>(U) || isa<PtrToIntInst>(U);
+        CHECK_FALSE(frozenOrCast);
+    }
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("dispatcherlessRoutingFunction replaces branch/switch dispatch") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
