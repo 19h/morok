@@ -1,0 +1,327 @@
+[global]
+preset = "max"
+
+[passes.bcf]
+enabled = true
+probability = 100
+iterations = 3
+complexity = 8
+entropy_chain = true
+junk_asm = true
+junk_asm_min = 3
+junk_asm_max = 6
+
+[passes.sub]
+enabled = true
+probability = 100
+iterations = 3
+
+[passes.mba]
+enabled = true
+probability = 100
+layers = 3
+heuristic = true
+
+[passes.str_enc]
+enabled = true
+probability = 100
+
+[passes.const_enc]
+enabled = true
+iterations = 3
+share_count = 8
+feistel = true
+substitute_xor = true
+substitute_xor_prob = 100
+globalize = true
+globalize_prob = 100
+
+[passes.split]
+enabled = true
+splits = 8
+stack_confusion = true
+
+[passes.stack_coalesce]
+enabled = true
+probability = 100
+opaque_offsets = true
+
+[passes.stack_delta]
+enabled = true
+probability = 100
+max_blocks = 10
+min_bytes = 17
+max_extra_bytes = 96
+touches = 4
+
+[passes.pointer_launder]
+enabled = true
+pointer_probability = 100
+integer_probability = 100
+
+[passes.type_pun]
+enabled = true
+probability = 100
+include_floating = true
+max_targets = 64
+
+[passes.phi_tangle]
+enabled = true
+probability = 100
+layers = 3
+max_phis = 48
+
+[passes.alias_op]
+enabled = true
+probability = 100
+iterations = 3
+max_blocks = 16
+
+[passes.external_op]
+enabled = true
+probability = 100
+max_blocks = 16
+decoy_stores = 3
+
+[passes.coherent_decoy]
+enabled = true
+probability = 100
+max_blocks = 12
+depth = 6
+
+[passes.data_entangled_flatten]
+enabled = true
+max_terms = 24
+
+[passes.non_invertible_state]
+enabled = true
+max_terms = 8
+rounds = 5
+
+[passes.state_opaque]
+enabled = true
+probability = 100
+max_blocks = 48
+max_terms = 8
+
+[passes.interprocedural_fsm]
+enabled = true
+probability = 100
+max_sites = 96
+max_terms = 8
+
+[passes.opt_amplify]
+enabled = true
+probability = 100
+max_forms = 4
+
+[passes.table_arith]
+enabled = true
+probability = 100
+max_tables = 12
+
+[passes.sub_threshold]
+enabled = true
+probability = 100
+max_terms = 4
+
+[passes.uniform_lower]
+enabled = true
+op_probability = 100
+branch_probability = 100
+max_tables = 8
+max_branches = 12
+
+[passes.virtualization]
+enabled = true
+probability = 100
+max_functions = 64
+max_instructions = 4096
+max_registers = 255
+
+[passes.hash_self_decrypt]
+enabled = true
+probability = 100
+max_payloads = 64
+context_keying = true
+
+[passes.self_checksum]
+enabled = true
+probability = 100
+max_constants = 12
+region_bytes = 48
+
+[passes.data_flow_integrity]
+enabled = true
+probability = 100
+max_tables = 4
+region_bytes = 48
+
+[passes.mutual_guard]
+enabled = true
+probability = 100
+nodes = 24
+region_bytes = 128
+max_returns = 12
+
+[passes.shamir_share]
+enabled = true
+probability = 100
+threshold = 5
+shares = 10
+max_secrets = 128
+
+[passes.mq_gate]
+enabled = true
+probability = 100
+vars = 64
+eqs = 64
+density = 50
+max_gates = 10
+fold_diff = true
+
+[passes.adversarial_merge]
+enabled = true
+probability = 100
+max_groups = 12
+max_functions = 5
+outline_probability = 100
+max_outlines = 10
+
+[passes.adversarial_tuning]
+enabled = true
+max_candidates = 2
+max_candidate_passes = 2
+score_floor = 0
+emit_marker = true
+
+[passes.per_build_polymorphism]
+enabled = true
+function_order = true
+block_order = true
+anchor_probability = 100
+max_anchors = 48
+
+[passes.path_explosion]
+enabled = true
+probability = 100
+max_blocks = 4
+max_iterations = 16
+
+[passes.trace_keying]
+enabled = true
+probability = 100
+max_blocks = 8
+
+[passes.dispatcherless]
+enabled = true
+probability = 100
+max_routes = 96
+max_terms = 32
+
+[passes.microcode_stress]
+enabled = true
+probability = 100
+max_sites = 15
+table_entries = 64
+decoy_blocks = 32
+alias_stores = 5
+
+[passes.caller_keyed_dispatch]
+enabled = true
+probability = 100
+max_calls = 16368
+region_bytes = 128
+
+[passes.vec]
+enabled = true
+probability = 100
+width = 512
+shuffle = true
+lift_comparisons = true
+
+[passes.csm]
+enabled = true
+generator = "TFunction"
+tf_const = 0
+nested_dispatch = true
+warmup = 256
+
+[passes.flatten]
+enabled = true
+
+[passes.indir_branch]
+enabled = true
+
+[passes.func_wrap]
+enabled = true
+probability = 100
+times = 2
+
+[passes.function_call_obfuscate]
+enabled = true
+
+[passes.vtable_integrity]
+enabled = true
+
+[passes.anti_hook]
+enabled = true
+
+[passes.anti_dbg]
+enabled = true
+
+[passes.anti_class_dump]
+enabled = true
+
+[passes.windows_pe_foundation]
+enabled = true
+
+[passes.windows_peb_heap_debug]
+enabled = true
+
+[passes.windows_debug_object]
+enabled = true
+
+[passes.windows_thread_hide]
+enabled = true
+
+[passes.windows_anti_attach]
+enabled = true
+
+[passes.windows_kernel_debugger]
+enabled = true
+
+[passes.windows_syscalls]
+enabled = true
+
+[passes.windows_unhook]
+enabled = true
+
+[passes.windows_veh_audit]
+enabled = true
+
+[passes.windows_process_mitigations]
+enabled = true
+
+[passes.timing_oracles]
+enabled = true
+
+[passes.trap_oracles]
+enabled = true
+
+[passes.page_fault_oracles]
+enabled = true
+
+[passes.cache_timing_oracles]
+enabled = true
+
+[passes.microarchitectural_canaries]
+enabled = true
+
+[passes.nanomites]
+enabled = true
+probability = 100
+max_sites = 1024
+
+[passes.decoy_strings]
+enabled = true

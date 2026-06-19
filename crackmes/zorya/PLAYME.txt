@@ -1,0 +1,9 @@
+ZORYA — play
+
+  ./zorya "Agent Dva" "$(cat license.txt)"
+
+or run with no arguments and answer the two prompts (name, license).
+
+An honest run prints the flag. Reach for a debugger, single-step, a breakpoint
+in the key math, or patch a byte, and the seal holds — you get nothing usable.
+The name for THIS build is "Agent Dva" (it is also encoded in the license).

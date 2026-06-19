@@ -1,0 +1,9 @@
+# Morok config for the static x86_64-linux build of ZORYA.
+# Mirrors the proven siloterminal linux-static recipe: full `max` preset, but
+# function_call_obfuscate disabled — it relies on indirection that breaks in a
+# fully static (no PLT/dynamic-symbol) ELF.
+[global]
+preset = "max"
+
+[passes.function_call_obfuscate]
+enabled = false
