@@ -5999,10 +5999,9 @@ TEST_CASE("tableArithmeticFunction caps selected table count") {
 // decode on a volatile (non-atomic) flag, so two threads entering a freshly
 // transformed function could both observe ready=false and concurrently decode
 // the same cells (volatile is not synchronization), corrupting wide i9..i16
-// authorization/bounds/integrity decisions.  The ensure helper now runs as a
-// global constructor: static init is single-threaded and completes before any
-// user thread exists, so the decode is race-free and runtime calls short-circuit.
-TEST_CASE("tableArithmeticFunction decodes tables in a global constructor") {
+// authorization/bounds/integrity decisions.  A constructor also used priority
+// 65535, so earlier user ctors could start threads before the table ctor ran.
+TEST_CASE("tableArithmeticFunction decodes tables with early atomic guard") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("table-ctor", ctx);
     Function *F = makeI8OpChain(*M, 16, "bytes");
@@ -6018,12 +6017,52 @@ TEST_CASE("tableArithmeticFunction decodes tables in a global constructor") {
             Ensure = &G;
     REQUIRE(Ensure);
 
-    // The decode helper must be registered as a global constructor (so it runs
-    // single-threaded at static init), not left to a racy lazy runtime path.
+    // The decode helper must run before ordinary user ctors and must retain a
+    // thread-safe fallback for same-priority or unusual pre-main entry paths.
     GlobalVariable *Ctors = M->getGlobalVariable("llvm.global_ctors");
     REQUIRE(Ctors);
     REQUIRE(Ctors->hasInitializer());
     CHECK(constantReferencesGlobal(Ctors->getInitializer(), Ensure));
+    std::vector<unsigned> priorities =
+        ctorPrioritiesFor(*M, "morok.tablearith.ensure");
+    REQUIRE_FALSE(priorities.empty());
+    CHECK(std::all_of(priorities.begin(), priorities.end(),
+                      [](unsigned P) { return P == 0; }));
+
+    auto isReadyGlobal = [](Value *V) {
+        if (auto *GV = dyn_cast<GlobalVariable>(V->stripPointerCasts()))
+            return GV->getName().starts_with("morok.tablearith.ready");
+        return false;
+    };
+
+    std::size_t acquireLoads = 0;
+    std::size_t releaseStores = 0;
+    std::size_t claimCAS = 0;
+    bool volatileReadyAccess = false;
+    for (Instruction &I : instructions(Ensure)) {
+        if (auto *LI = dyn_cast<LoadInst>(&I)) {
+            if (!isReadyGlobal(LI->getPointerOperand()))
+                continue;
+            volatileReadyAccess |= LI->isVolatile();
+            if (LI->isAtomic() && LI->getOrdering() == AtomicOrdering::Acquire)
+                ++acquireLoads;
+        } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+            if (!isReadyGlobal(SI->getPointerOperand()))
+                continue;
+            volatileReadyAccess |= SI->isVolatile();
+            if (SI->isAtomic() && SI->getOrdering() == AtomicOrdering::Release)
+                ++releaseStores;
+        } else if (auto *CAS = dyn_cast<AtomicCmpXchgInst>(&I)) {
+            if (isReadyGlobal(CAS->getPointerOperand()) &&
+                CAS->getSuccessOrdering() == AtomicOrdering::AcquireRelease &&
+                CAS->getFailureOrdering() == AtomicOrdering::Monotonic)
+                ++claimCAS;
+        }
+    }
+    CHECK(acquireLoads >= 2u);
+    CHECK(releaseStores == 1u);
+    CHECK(claimCAS == 1u);
+    CHECK_FALSE(volatileReadyAccess);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

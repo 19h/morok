@@ -23,6 +23,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
+#include "llvm/Support/AtomicOrdering.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <algorithm>
@@ -353,10 +354,12 @@ Function *createEnsureFunction(Module &M, GlobalVariable *Table,
                                GlobalVariable *Ready, const KeySchedule &key) {
     LLVMContext &Ctx = M.getContext();
     auto *VoidTy = Type::getVoidTy(Ctx);
-    auto *I1 = Type::getInt1Ty(Ctx);
     auto *I32 = Type::getInt32Ty(Ctx);
     auto *TableTy = cast<ArrayType>(Table->getValueType());
     auto *ElementTy = cast<IntegerType>(TableTy->getElementType());
+    Constant *Encoded = ConstantInt::get(I32, 0);
+    Constant *Decoding = ConstantInt::get(I32, 1);
+    Constant *ReadyValue = ConstantInt::get(I32, 2);
 
     auto *Fn = Function::Create(FunctionType::get(VoidTy, false),
                                 GlobalValue::InternalLinkage,
@@ -364,18 +367,40 @@ Function *createEnsureFunction(Module &M, GlobalVariable *Table,
     Fn->addFnAttr(Attribute::NoInline);
 
     BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    BasicBlock *Claim = BasicBlock::Create(Ctx, "claim", Fn);
+    BasicBlock *ClaimObserved = BasicBlock::Create(Ctx, "claim.observed", Fn);
     BasicBlock *Loop = BasicBlock::Create(Ctx, "loop", Fn);
     BasicBlock *Done = BasicBlock::Create(Ctx, "done", Fn);
+    BasicBlock *Wait = BasicBlock::Create(Ctx, "wait", Fn);
+    BasicBlock *MaybeClaim = BasicBlock::Create(Ctx, "maybe.claim", Fn);
     BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
 
     IRBuilder<> EB(Entry);
-    auto *ReadyLoad = EB.CreateLoad(I1, Ready, "morok.tablearith.ready");
-    ReadyLoad->setVolatile(true);
-    EB.CreateCondBr(ReadyLoad, Exit, Loop);
+    auto *ReadyLoad = EB.CreateLoad(I32, Ready, "morok.tablearith.ready");
+    ReadyLoad->setAtomic(AtomicOrdering::Acquire);
+    ReadyLoad->setAlignment(Align(4));
+    EB.CreateCondBr(
+        EB.CreateICmpEQ(ReadyLoad, ReadyValue, "morok.tablearith.ready.done"),
+        Exit, Claim);
+
+    IRBuilder<> CB(Claim);
+    auto *StateClaim = CB.CreateAtomicCmpXchg(
+        Ready, Encoded, Decoding, MaybeAlign(4),
+        AtomicOrdering::AcquireRelease, AtomicOrdering::Monotonic);
+    Value *Claimed =
+        CB.CreateExtractValue(StateClaim, 1, "morok.tablearith.claimed");
+    Value *Observed =
+        CB.CreateExtractValue(StateClaim, 0, "morok.tablearith.observed");
+    CB.CreateCondBr(Claimed, Loop, ClaimObserved);
+
+    IRBuilder<> OB(ClaimObserved);
+    OB.CreateCondBr(
+        OB.CreateICmpEQ(Observed, ReadyValue, "morok.tablearith.claim.ready"),
+        Exit, Wait);
 
     IRBuilder<> LB(Loop);
     PHINode *Idx = LB.CreatePHI(I32, 2, "morok.tablearith.idx");
-    Idx->addIncoming(ConstantInt::get(I32, 0), Entry);
+    Idx->addIncoming(ConstantInt::get(I32, 0), Claim);
     Value *Ptr =
         LB.CreateInBoundsGEP(TableTy, Table, {ConstantInt::get(I32, 0), Idx},
                              "morok.tablearith.cell");
@@ -392,23 +417,30 @@ Function *createEnsureFunction(Module &M, GlobalVariable *Table,
     LB.CreateCondBr(AtEnd, Done, Loop);
 
     IRBuilder<> DB(Done);
-    auto *ReadyStore = DB.CreateStore(ConstantInt::get(I1, true), Ready);
-    ReadyStore->setVolatile(true);
+    auto *ReadyStore = DB.CreateStore(ReadyValue, Ready);
+    ReadyStore->setAtomic(AtomicOrdering::Release);
+    ReadyStore->setAlignment(Align(4));
     DB.CreateBr(Exit);
+
+    IRBuilder<> WB(Wait);
+    auto *WaitLoad = WB.CreateLoad(I32, Ready, "morok.tablearith.wait");
+    WaitLoad->setAtomic(AtomicOrdering::Acquire);
+    WaitLoad->setAlignment(Align(4));
+    WB.CreateCondBr(
+        WB.CreateICmpEQ(WaitLoad, ReadyValue, "morok.tablearith.wait.ready"),
+        Exit, MaybeClaim);
+
+    IRBuilder<> MB(MaybeClaim);
+    MB.CreateCondBr(
+        MB.CreateICmpEQ(WaitLoad, Encoded, "morok.tablearith.wait.encoded"),
+        Claim, Wait);
 
     IRBuilder<> XB(Exit);
     XB.CreateRetVoid();
 
-    // Decode the table once, at static-init time, by running this helper as a
-    // global constructor.  Constructors run single-threaded before main (and
-    // before any user thread can exist), so the in-place XOR decode completes
-    // race-free; by the time multiple threads can call the function-body ensure
-    // hooks, Ready is already set and they all short-circuit.  Without this, two
-    // threads reaching a freshly-transformed function could both observe
-    // Ready=false and concurrently XOR the same cells (volatile is not
-    // synchronization), leaving the table double-/partially-decoded and
-    // corrupting wide i9..i16 authorization/bounds/integrity decisions.
-    appendToGlobalCtors(M, Fn, /*Priority=*/65535);
+    // Decode early during static init, and keep the function-body fallback
+    // single-decoder for same-priority or unusual pre-main entry paths.
+    appendToGlobalCtors(M, Fn, /*Priority=*/0);
     return Fn;
 }
 
@@ -417,7 +449,7 @@ TableMaterial createTable(Module &M, const TableOpSpec &op,
     LLVMContext &Ctx = M.getContext();
     const unsigned ElementBits = tableElementBits(op);
     auto *ElementTy = IntegerType::get(Ctx, ElementBits);
-    auto *I1 = Type::getInt1Ty(Ctx);
+    auto *I32 = Type::getInt32Ty(Ctx);
     auto *TableTy = ArrayType::get(ElementTy, kTableSize);
     const KeySchedule key{static_cast<std::uint32_t>(rng.next()) | 1u,
                           static_cast<std::uint32_t>(rng.next()),
@@ -444,8 +476,8 @@ TableMaterial createTable(Module &M, const TableOpSpec &op,
                                      "morok.tablearith.table");
     Table->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
     auto *Ready = new GlobalVariable(
-        M, I1, /*isConstant=*/false, GlobalValue::PrivateLinkage,
-        ConstantInt::get(I1, false), "morok.tablearith.ready");
+        M, I32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I32, 0), "morok.tablearith.ready");
     Function *Ensure = createEnsureFunction(M, Table, Ready, key);
     return {Table, Ensure};
 }
