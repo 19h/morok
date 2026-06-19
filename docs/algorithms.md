@@ -91,11 +91,16 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   -> load target -> indirect call`, covering both pointer-index GEPs and
   byte-offset GEPs.  Arbitrary indirect calls without a loaded object vptr are
   ignored.
+- Runtime stores of harvested `_ZTV*` address points arm the exact vptr storage
+  slot in a small hashed side table.  Structurally similar callback/ops-table
+  dispatches whose table pointer storage was never armed remain non-fatal on a
+  no-match verifier path, avoiding DoS on legitimate function-pointer tables.
 - The emitted private tables store expected vptr address points, slot offsets,
   expected targets, and deterministic per-entry cookies.  Each guarded call
   invokes `morok.vti.verify(vptr, slot, target)` immediately before dispatch.
   The verifier matches vptr+slot, recomputes a mixed pointer/slot/cookie hash
-  for the live and expected target, and traps on mismatch or unknown vptr.
+  for the live and expected target, and traps on target mismatch or on an
+  unknown vptr loaded from an armed vptr slot.
 - Direct caps bound harvesting to 256 address points and 1024 guard entries, so
   pathological C++ modules cannot explode memory or IR size.  Generated
   `morok.vti.*` helpers are eligible for the scheduler's sensitive-helper

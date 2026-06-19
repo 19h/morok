@@ -51,6 +51,12 @@ set(_dr_sentinel_fallback_config
     "${CMAKE_CURRENT_SOURCE_DIR}/dr_sentinel_fallback.toml")
 set(_dr_sentinel_fallback_workload
     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/dr_sentinel_fallback.c")
+set(_vtable_integrity_driver
+    "${CMAKE_CURRENT_SOURCE_DIR}/vtable_integrity_dispatch.sh")
+set(_vtable_integrity_config
+    "${CMAKE_CURRENT_SOURCE_DIR}/vtable_integrity_dispatch.toml")
+set(_vtable_integrity_workload
+    "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/vtable_integrity_dispatch.cpp")
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
@@ -272,6 +278,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
 else()
   message(STATUS "Linux x86_64 security e2e tests skipped on this host.")
 endif()
+
+add_test(NAME "e2e/vtable_integrity_dispatch"
+  COMMAND bash "${_vtable_integrity_driver}"
+          "${CMAKE_CXX_COMPILER}"
+          "$<TARGET_FILE:morok_plugin>"
+          "${_sysroot}"
+          "${_vtable_integrity_workload}"
+          "${_vtable_integrity_config}"
+          4801)
+set_tests_properties("e2e/vtable_integrity_dispatch" PROPERTIES
+  LABELS "e2e;security"
+  REQUIRED_FILES
+    "$<TARGET_FILE:morok_plugin>;${_vtable_integrity_driver};${_vtable_integrity_config};${_vtable_integrity_workload}"
+  TIMEOUT 120)
 
 # The full sample-program compile sweep runs only when the corpus is present.
 # `programs/` lives outside version control (it carries arch/OS-specific

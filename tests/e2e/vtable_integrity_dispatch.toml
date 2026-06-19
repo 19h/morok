@@ -1,0 +1,5 @@
+[global]
+preset = "none"
+
+[passes.vtable_integrity]
+enabled = true

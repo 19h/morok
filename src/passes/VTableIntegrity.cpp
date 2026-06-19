@@ -7,8 +7,9 @@
 // Itanium C++ ABI vptr/vtable-slot guard.  The pass harvests vtable address
 // points stored into objects, records the expected virtual function pointer for
 // each dispatched slot, and inserts a small verifier before recognized virtual
-// calls.  A vptr swap to an unknown table or a patched table slot trips the
-// verifier before the indirect call executes.
+// calls.  A vptr swap to an unknown table trips only after the object's vptr
+// storage has been observed receiving a harvested vtable address point; a
+// patched known table slot always trips before the indirect call executes.
 
 #include "morok/passes/VTableIntegrity.hpp"
 
@@ -26,6 +27,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/Support/AtomicOrdering.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -42,6 +44,7 @@ namespace {
 
 constexpr std::uint64_t kMaxAddressPoints = 256;
 constexpr std::uint64_t kMaxGuardEntries = 1024;
+constexpr std::uint64_t kTrackedVPtrSlots = 1024;
 constexpr std::uint64_t kHashMul1 = 0xFF51AFD7ED558CCDULL;
 constexpr std::uint64_t kHashMul2 = 0xC4CEB9FE1A85EC53ULL;
 constexpr std::uint64_t kSlotMix = 0x9E3779B97F4A7C15ULL;
@@ -56,6 +59,7 @@ struct VTableInfo {
 struct DispatchSite {
     CallBase *call = nullptr;
     LoadInst *target_load = nullptr;
+    Value *vptr_slot = nullptr;
     Value *vptr = nullptr;
     std::uint64_t slot_offset = 0;
 };
@@ -147,9 +151,10 @@ bool getVTableAddressPoint(Constant *C, const DataLayout &DL,
 
 void collectStoredAddressPoints(
     Module &M, const DataLayout &DL,
-    std::map<GlobalVariable *, std::set<std::uint64_t>> &AddressPoints) {
+    std::map<GlobalVariable *, std::set<std::uint64_t>> &AddressPoints,
+    std::vector<StoreInst *> *VPtrStores = nullptr) {
     for (Function &F : M) {
-        if (F.isDeclaration())
+        if (F.isDeclaration() || F.getName().starts_with("morok."))
             continue;
         for (BasicBlock &BB : F)
             for (Instruction &I : BB) {
@@ -161,8 +166,11 @@ void collectStoredAddressPoints(
                     continue;
                 GlobalVariable *GV = nullptr;
                 std::uint64_t Offset = 0;
-                if (getVTableAddressPoint(C, DL, GV, Offset))
+                if (getVTableAddressPoint(C, DL, GV, Offset)) {
                     AddressPoints[GV].insert(Offset);
+                    if (VPtrStores)
+                        VPtrStores->push_back(SI);
+                }
             }
     }
 }
@@ -187,9 +195,10 @@ void collectConventionalAddressPoints(
 }
 
 std::vector<VTableInfo> collectVTables(Module &M, const DataLayout &DL,
-                                       std::uint64_t PtrSize) {
+                                       std::uint64_t PtrSize,
+                                       std::vector<StoreInst *> *VPtrStores) {
     std::map<GlobalVariable *, std::set<std::uint64_t>> AddressPoints;
-    collectStoredAddressPoints(M, DL, AddressPoints);
+    collectStoredAddressPoints(M, DL, AddressPoints, VPtrStores);
 
     std::vector<VTableInfo> Out;
     for (GlobalVariable &GV : M.globals()) {
@@ -270,8 +279,12 @@ bool extractDispatchSite(CallBase &CB, const DataLayout &DL,
         return false;
     if (!isLoadedVptr(Base))
         return false;
+    auto *VPtrLoad = dyn_cast<LoadInst>(Base->stripPointerCasts());
+    if (!VPtrLoad)
+        return false;
 
-    Out = {&CB, TargetLoad, Base->stripPointerCasts(), SlotOffset};
+    Out = {&CB, TargetLoad, VPtrLoad->getPointerOperand(),
+           Base->stripPointerCasts(), SlotOffset};
     return true;
 }
 
@@ -341,7 +354,88 @@ GlobalVariable *constantArray(Module &M, ArrayType *Ty,
     return GV;
 }
 
-Function *createVerifier(Module &M, ArrayRef<GuardEntry> Entries) {
+Align pointerAlign(Module &M) {
+    const std::uint64_t PtrSize = M.getDataLayout().getPointerSize(0);
+    return Align(PtrSize == 0 ? 8 : PtrSize);
+}
+
+GlobalVariable *trackedSlotTable(Module &M) {
+    if (auto *Existing =
+            M.getGlobalVariable("morok.vti.tracked.slots",
+                                /*AllowInternal=*/true))
+        return Existing;
+    auto *PtrTy = PointerType::getUnqual(M.getContext());
+    auto *TableTy = ArrayType::get(PtrTy, kTrackedVPtrSlots);
+    auto *GV = new GlobalVariable(M, TableTy, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantAggregateZero::get(TableTy),
+                                  "morok.vti.tracked.slots");
+    GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    GV->setAlignment(pointerAlign(M));
+    return GV;
+}
+
+Value *trackedSlotIndex(IRBuilder<> &B, Value *SlotPtr, StringRef Prefix) {
+    auto *I64 = B.getInt64Ty();
+    Value *X = B.CreatePtrToInt(SlotPtr, I64, Prefix + ".ptr");
+    X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I64, 33)),
+                    Prefix + ".h0");
+    X = B.CreateMul(X, ConstantInt::get(I64, kHashMul1), Prefix + ".h1");
+    X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I64, 29)),
+                    Prefix + ".h2");
+    X = B.CreateMul(X, ConstantInt::get(I64, kHashMul2), Prefix + ".h3");
+    X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I64, 32)),
+                    Prefix + ".h4");
+    return B.CreateAnd(X, ConstantInt::get(I64, kTrackedVPtrSlots - 1),
+                       Prefix + ".idx");
+}
+
+Function *createSlotRemember(Module &M, GlobalVariable *SlotTable) {
+    if (Function *Existing = M.getFunction("morok.vti.remember"))
+        return Existing;
+
+    LLVMContext &Ctx = M.getContext();
+    auto *VoidTy = Type::getVoidTy(Ctx);
+    auto *PtrTy = PointerType::getUnqual(Ctx);
+    auto *FnTy = FunctionType::get(VoidTy, {PtrTy}, false);
+    auto *Fn = Function::Create(FnTy, GlobalValue::InternalLinkage,
+                                "morok.vti.remember", M);
+    Fn->setDSOLocal(true);
+    Fn->addFnAttr(Attribute::NoInline);
+    Fn->addFnAttr(Attribute::NoUnwind);
+
+    Value *SlotPtr = &*Fn->arg_begin();
+    SlotPtr->setName("slot.addr");
+
+    BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", Fn);
+    IRBuilder<> B(EntryBB);
+    auto *TableTy = cast<ArrayType>(SlotTable->getValueType());
+    Value *Index = trackedSlotIndex(B, SlotPtr, "morok.vti.track");
+    Value *Slot = B.CreateInBoundsGEP(
+        TableTy, SlotTable, {ConstantInt::get(B.getInt64Ty(), 0), Index},
+        "morok.vti.track.slot");
+    auto *Store = B.CreateStore(SlotPtr, Slot);
+    Store->setAtomic(AtomicOrdering::Release);
+    Store->setAlignment(pointerAlign(M));
+    B.CreateRetVoid();
+    return Fn;
+}
+
+bool instrumentVPtrStores(ArrayRef<StoreInst *> Stores, Function *Remember) {
+    bool Changed = false;
+    for (StoreInst *SI : Stores) {
+        if (!SI || !SI->getParent())
+            continue;
+        IRBuilder<> B(SI->getNextNode());
+        B.CreateCall(Remember->getFunctionType(), Remember,
+                     {SI->getPointerOperand()});
+        Changed = true;
+    }
+    return Changed;
+}
+
+Function *createVerifier(Module &M, ArrayRef<GuardEntry> Entries,
+                         GlobalVariable *TrackedSlots) {
     LLVMContext &Ctx = M.getContext();
     auto *VoidTy = Type::getVoidTy(Ctx);
     auto *PtrTy = PointerType::getUnqual(Ctx);
@@ -375,7 +469,7 @@ Function *createVerifier(Module &M, ArrayRef<GuardEntry> Entries) {
     GlobalVariable *CookieTable =
         constantArray(M, I64ArrTy, Cookies, "morok.vti.cookies");
 
-    auto *FnTy = FunctionType::get(VoidTy, {PtrTy, I64, PtrTy}, false);
+    auto *FnTy = FunctionType::get(VoidTy, {PtrTy, PtrTy, I64, PtrTy}, false);
     auto *Fn = Function::Create(FnTy, GlobalValue::InternalLinkage,
                                 "morok.vti.verify", M);
     Fn->setDSOLocal(true);
@@ -383,6 +477,8 @@ Function *createVerifier(Module &M, ArrayRef<GuardEntry> Entries) {
     Fn->addFnAttr(Attribute::NoUnwind);
 
     auto ArgIt = Fn->arg_begin();
+    Value *LiveVPtrSlot = &*ArgIt++;
+    LiveVPtrSlot->setName("vptr.slot");
     Value *LiveVPtr = &*ArgIt++;
     LiveVPtr->setName("vptr");
     Value *LiveSlot = &*ArgIt++;
@@ -394,6 +490,7 @@ Function *createVerifier(Module &M, ArrayRef<GuardEntry> Entries) {
     BasicBlock *LoopBB = BasicBlock::Create(Ctx, "loop", Fn);
     BasicBlock *CheckBB = BasicBlock::Create(Ctx, "check", Fn);
     BasicBlock *NextBB = BasicBlock::Create(Ctx, "next", Fn);
+    BasicBlock *UnknownBB = BasicBlock::Create(Ctx, "unknown", Fn);
     BasicBlock *PassBB = BasicBlock::Create(Ctx, "pass", Fn);
     BasicBlock *FailBB = BasicBlock::Create(Ctx, "fail", Fn);
 
@@ -437,14 +534,26 @@ Function *createVerifier(Module &M, ArrayRef<GuardEntry> Entries) {
     Value *Next =
         B.CreateAdd(Index, ConstantInt::get(IdxTy, 1), "morok.vti.next");
     Index->addIncoming(Next, NextBB);
-    // Loop exhausted with no harvested vtable matching the live (vptr, slot):
-    // the dispatch recognizer is heuristic and also matches ordinary
-    // callback/ops tables, whose pointer is not a known _ZTV address point and
-    // is statically indistinguishable from a vptr swap.  Allow the call through
-    // instead of trapping — trapping here is a reliable DoS on legitimate
-    // function-pointer-table code.  A recognized vtable whose target was
-    // tampered in place is still caught by the hash check (FailBB) below.
-    B.CreateCondBr(B.CreateICmpULT(Next, EntryCount), LoopBB, PassBB);
+    B.CreateCondBr(B.CreateICmpULT(Next, EntryCount), LoopBB, UnknownBB);
+
+    B.SetInsertPoint(UnknownBB);
+    auto *TrackedTy = cast<ArrayType>(TrackedSlots->getValueType());
+    Value *TrackedIndex =
+        trackedSlotIndex(B, LiveVPtrSlot, "morok.vti.unknown");
+    Value *TrackedSlotPtr = B.CreateInBoundsGEP(
+        TrackedTy, TrackedSlots,
+        {ConstantInt::get(IdxTy, 0), TrackedIndex},
+        "morok.vti.unknown.slot");
+    auto *TrackedSlot =
+        B.CreateLoad(PtrTy, TrackedSlotPtr, "morok.vti.unknown.tracked");
+    TrackedSlot->setAtomic(AtomicOrdering::Acquire);
+    TrackedSlot->setAlignment(pointerAlign(M));
+    // Loop exhaustion is only fatal for storage locations that were actually
+    // armed by a runtime store of a harvested _ZTV address point.  Unarmed
+    // callback/ops tables still fall through, preserving the #48 DoS fix.
+    Value *KnownVPtrSlot =
+        B.CreateICmpEQ(TrackedSlot, LiveVPtrSlot, "morok.vti.unknown.armed");
+    B.CreateCondBr(KnownVPtrSlot, FailBB, PassBB);
 
     B.SetInsertPoint(PassBB);
     B.CreateRetVoid();
@@ -508,7 +617,9 @@ bool vtableIntegrityModule(Module &M) {
     if (PtrSize == 0)
         return false;
 
-    std::vector<VTableInfo> VTables = collectVTables(M, DL, PtrSize);
+    std::vector<StoreInst *> VPtrStores;
+    std::vector<VTableInfo> VTables =
+        collectVTables(M, DL, PtrSize, &VPtrStores);
     if (VTables.empty())
         return false;
 
@@ -555,15 +666,21 @@ bool vtableIntegrityModule(Module &M) {
     if (Entries.empty() || Instrumented.empty())
         return false;
 
-    Function *Verifier = createVerifier(M, Entries);
+    GlobalVariable *TrackedSlots = trackedSlotTable(M);
+    Function *Verifier = createVerifier(M, Entries, TrackedSlots);
     auto *I64 = Type::getInt64Ty(M.getContext());
     bool Changed = false;
+    if (!VPtrStores.empty()) {
+        Function *Remember = createSlotRemember(M, TrackedSlots);
+        Changed = instrumentVPtrStores(VPtrStores, Remember);
+    }
     for (const DispatchSite &Site : Sites) {
         if (!Instrumented.contains(Site.call))
             continue;
         IRBuilder<> B(Site.call);
         B.CreateCall(Verifier->getFunctionType(), Verifier,
-                     {Site.vptr, ConstantInt::get(I64, Site.slot_offset),
+                     {Site.vptr_slot, Site.vptr,
+                      ConstantInt::get(I64, Site.slot_offset),
                       Site.target_load});
         Changed = true;
     }

@@ -11646,20 +11646,23 @@ entry:
 )ir");
 
     CHECK(morok::passes::vtableIntegrityModule(*M));
-    CHECK(M->getFunction("morok.vti.verify") != nullptr);
+    Function *Verify = M->getFunction("morok.vti.verify");
+    REQUIRE(Verify != nullptr);
+    CHECK(M->getFunction("morok.vti.remember") != nullptr);
     CHECK(countUserCallsTo(*M, "morok.vti.verify") == 2u);
-    CHECK(countGlobals(*M, "morok.vti.") == 4u);
+    CHECK(countUserCallsTo(*M, "morok.vti.remember") == 1u);
+    CHECK(countGlobals(*M, "morok.vti.") == 5u);
+    CHECK(countNamedInstructions(*Verify, "morok.vti.unknown.armed") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
 // Regression for #48: the dispatch recognizer is heuristic and also matches
 // ordinary callback/ops tables, whose pointer is not a known _ZTV address point.
-// The verifier's loop-exhaustion path (no harvested vtable matched the live
-// vptr) used to llvm.trap(), turning a legitimate function-pointer-table call
-// into a reliable abort (DoS).  That path now returns instead; only a recognized
-// vtable with an in-place tampered target still traps — so the trap block has a
-// single incoming edge (the hash mismatch), not two.
-TEST_CASE("vtableIntegrityModule allows unrecognized dispatch tables through") {
+// Unknown vptrs are fatal only when the vptr storage was armed by a runtime
+// store of a harvested _ZTV address point.  A callback table with no such store
+// may still match the structural load/gep/load/call shape, but it remains
+// unarmed, so verifier loop exhaustion falls through instead of trapping.
+TEST_CASE("vtableIntegrityModule leaves unarmed dispatch tables non-fatal") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 target datalayout = "e-p:64:64"
@@ -11688,6 +11691,9 @@ entry:
     CHECK(morok::passes::vtableIntegrityModule(*M));
     Function *Verify = M->getFunction("morok.vti.verify");
     REQUIRE(Verify);
+    CHECK(M->getFunction("morok.vti.remember") == nullptr);
+    CHECK(countUserCallsTo(*M, "morok.vti.remember") == 0u);
+    CHECK(countNamedInstructions(*Verify, "morok.vti.unknown.armed") >= 1u);
 
     // Find the abort block (llvm.trap).
     BasicBlock *TrapBB = nullptr;
@@ -11699,8 +11705,10 @@ entry:
                         TrapBB = &BB;
     REQUIRE(TrapBB);
 
-    // Exactly one edge reaches the trap (the tamper/hash-mismatch path); the
-    // no-match exhaustion edge now falls through to the return.
+    // Two static edges can reach the trap: recognized in-place table tamper,
+    // plus unknown vptrs for slots that were armed by a real _ZTV store.  This
+    // fixture has no such store, so the unknown edge is dynamically unreachable
+    // for its callback-table-shaped dispatch.
     unsigned trapEdges = 0;
     for (BasicBlock &BB : *Verify) {
         Instruction *T = BB.getTerminator();
@@ -11708,7 +11716,7 @@ entry:
             if (T->getSuccessor(s) == TrapBB)
                 ++trapEdges;
     }
-    CHECK(trapEdges == 1u);
+    CHECK(trapEdges == 2u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
