@@ -30,6 +30,7 @@
 #include "morok/passes/DecoyStrings.hpp"
 #include "morok/passes/DispatcherlessRouting.hpp"
 #include "morok/passes/ExternalOpaquePredicates.hpp"
+#include "morok/passes/ExternalSecretBinding.hpp"
 #include "morok/passes/Flattening.hpp"
 #include "morok/passes/FunctionCallObfuscate.hpp"
 #include "morok/passes/FunctionWrapper.hpp"
@@ -412,6 +413,10 @@ PassPluginLibraryInfo getPluginInfo() {
                         }
                         if (name == "morok-selfdecrypt") {
                             MPM.addPass(passes::HashGatedSelfDecryptPass());
+                            return true;
+                        }
+                        if (name == "morok-proofbind") {
+                            MPM.addPass(passes::ExternalSecretBindingPass());
                             return true;
                         }
                         if (name == "morok-antidbg") {

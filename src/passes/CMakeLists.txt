@@ -20,6 +20,7 @@ add_library(morok_passes STATIC
   PhiTangling.cpp
   AliasOpaquePredicates.cpp
   ExternalOpaquePredicates.cpp
+  ExternalSecretBinding.cpp
   CoherentDecoys.cpp
   DataFlowIntegrity.cpp
   BogusControlFlow.cpp

@@ -207,6 +207,8 @@ bool generatedProtectionFunction(const Function &F) {
         Name.starts_with("morok.antihook.schro") ||
         Name.starts_with("morok.antihook.antidump"))
         return false;
+    if (Name.starts_with("morok.proof."))
+        return !F.hasFnAttribute("morok.proof.no_vm");
     // Generated protection helpers are already hardened natively by the
     // scheduler.  Lifting startup checkers into the threaded VM makes normal
     // launches pay interpreter cost before user code runs, and can perturb

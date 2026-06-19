@@ -52,6 +52,12 @@ Opt<bool> readBool(const Node &v) {
     return std::nullopt;
 }
 
+Opt<std::string> readString(const Node &v) {
+    if (auto s = v.value<std::string>())
+        return *s;
+    return std::nullopt;
+}
+
 void readStrArr(const Node &v, std::vector<std::string> &out) {
     if (const auto *arr = v.as_array())
         for (const auto &el : *arr)
@@ -213,6 +219,16 @@ void parseHashSelfDecrypt(const toml::table &t, HashSelfDecryptConfig &c) {
     c.max_payloads = readU32(t["max_payloads"]);
     c.max_payload_bytes = readU32(t["max_payload_bytes"]);
     c.context_keying = readBool(t["context_keying"]);
+}
+
+void parseExternalSecretBinding(const toml::table &t,
+                                ExternalSecretBindingConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.mode = readString(t["mode"]);
+    c.public_key = readString(t["public_key"]);
+    c.identity_policy = readString(t["identity_policy"]);
+    c.bind_to_runtime_seal = readBool(t["bind_to_runtime_seal"]);
+    c.virtualize_helpers = readBool(t["virtualize_helpers"]);
 }
 
 void parseSelfChecksum(const toml::table &t, SelfChecksumConfig &c) {
@@ -420,6 +436,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseVirtualization(*t, pc.virtualization);
     if (auto *t = p["hash_gated_self_decrypt"].as_table())
         parseHashSelfDecrypt(*t, pc.hash_self_decrypt);
+    if (auto *t = p["external_secret_binding"].as_table())
+        parseExternalSecretBinding(*t, pc.external_secret_binding);
     if (auto *t = p["self_checksum_constants"].as_table())
         parseSelfChecksum(*t, pc.self_checksum);
     if (auto *t = p["data_flow_integrity"].as_table())

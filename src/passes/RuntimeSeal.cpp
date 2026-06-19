@@ -147,4 +147,28 @@ void foldFlag(IRBuilderBase &B, StringRef Channel, Value *Flag,
     Store->setAlignment(Align(8));
 }
 
+void foldWord(IRBuilderBase &B, StringRef Channel, Value *Word,
+              std::uint64_t Salt, const Twine &Name) {
+    Module *M = B.GetInsertBlock() ? B.GetInsertBlock()->getModule() : nullptr;
+    if (!M)
+        return;
+    GlobalVariable *Seal = findChannel(*M, Channel);
+    if (!Seal)
+        return;
+
+    auto *I64 = B.getInt64Ty();
+    Value *Word64 = toI64(B, Word);
+    Value *Active = B.CreateICmpNE(Word64, ConstantInt::get(I64, 0),
+                                   Name + ".active");
+    auto *Cur = B.CreateLoad(I64, Seal, Name + ".cur");
+    Cur->setVolatile(true);
+    Cur->setAlignment(Align(8));
+    Value *Input = B.CreateXor(Cur, Word64, Name + ".word");
+    Value *Mixed = mix64(B, Input, Salt ^ 0xA0761D6478BD642FULL, Name);
+    Value *Next = B.CreateSelect(Active, Mixed, Cur, Name + ".next");
+    auto *Store = B.CreateStore(Next, Seal);
+    Store->setVolatile(true);
+    Store->setAlignment(Align(8));
+}
+
 } // namespace morok::passes::runtime_seal

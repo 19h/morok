@@ -166,6 +166,18 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.hash_self_decrypt.max_payload_bytes);
     mergeOpt(dst.hash_self_decrypt.context_keying,
              src.hash_self_decrypt.context_keying);
+    // External proof/license binding
+    mergeOpt(dst.external_secret_binding.enabled,
+             src.external_secret_binding.enabled);
+    mergeOpt(dst.external_secret_binding.mode, src.external_secret_binding.mode);
+    mergeOpt(dst.external_secret_binding.public_key,
+             src.external_secret_binding.public_key);
+    mergeOpt(dst.external_secret_binding.identity_policy,
+             src.external_secret_binding.identity_policy);
+    mergeOpt(dst.external_secret_binding.bind_to_runtime_seal,
+             src.external_secret_binding.bind_to_runtime_seal);
+    mergeOpt(dst.external_secret_binding.virtualize_helpers,
+             src.external_secret_binding.virtualize_helpers);
     // Self-checksum-fused constants
     mergeOpt(dst.self_checksum.enabled, src.self_checksum.enabled);
     mergeOpt(dst.self_checksum.probability, src.self_checksum.probability);

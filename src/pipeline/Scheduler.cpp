@@ -25,6 +25,7 @@
 #include "morok/passes/DecoyStrings.hpp"
 #include "morok/passes/DispatcherlessRouting.hpp"
 #include "morok/passes/ExternalOpaquePredicates.hpp"
+#include "morok/passes/ExternalSecretBinding.hpp"
 #include "morok/passes/Flattening.hpp"
 #include "morok/passes/FunctionCallObfuscate.hpp"
 #include "morok/passes/FunctionWrapper.hpp"
@@ -382,6 +383,22 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
     const ModuleSize InitialSize = measureModule(M);
     const bool InitialModuleGrowthOk = moduleGrowthOk(InitialSize);
     bool changed = false;
+
+    if (InitialModuleGrowthOk &&
+        config_.passes.external_secret_binding.enabled.value_or(false)) {
+        passes::ExternalSecretBindingParams p;
+        p.mode = config_.passes.external_secret_binding.mode.value_or("feed_api");
+        p.identity_policy =
+            config_.passes.external_secret_binding.identity_policy.value_or(
+                "ascii_lower_strip_ws");
+        p.bind_to_runtime_seal =
+            config_.passes.external_secret_binding.bind_to_runtime_seal.value_or(
+                true);
+        p.virtualize_helpers =
+            config_.passes.external_secret_binding.virtualize_helpers.value_or(
+                true);
+        changed |= passes::externalSecretBindingModule(M, p, rng);
+    }
 
     // VM lifting runs FIRST, before any other obfuscation touches user code.
     // The virtualizer only lifts pristine integer/pointer computation kernels;

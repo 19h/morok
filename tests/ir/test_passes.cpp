@@ -26,6 +26,7 @@
 #include "morok/passes/DecoyStrings.hpp"
 #include "morok/passes/DispatcherlessRouting.hpp"
 #include "morok/passes/ExternalOpaquePredicates.hpp"
+#include "morok/passes/ExternalSecretBinding.hpp"
 #include "morok/passes/Flattening.hpp"
 #include "morok/passes/FunctionCallObfuscate.hpp"
 #include "morok/passes/FunctionWrapper.hpp"
@@ -7021,6 +7022,37 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("virtualizeModule lifts proof helpers in protection-helper mode") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+
+define private i64 @morok.proof.mix(i64 %x) {
+entry:
+  %a = xor i64 %x, 1229782938247303441
+  %b = mul i64 %a, 11400714819323198485
+  %c = xor i64 %b, 6148914691236517205
+  ret i64 %c
+}
+)ir");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(95104);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::VirtualizationParams P{/*probability=*/100,
+                                           /*max_functions=*/4,
+                                           /*max_instructions=*/64,
+                                           /*max_registers=*/64};
+    P.include_protection_helpers = true;
+    P.protection_helpers_only = true;
+    CHECK(morok::passes::virtualizeModule(*M, P, rng));
+
+    Function *Proof = M->getFunction("morok.proof.mix");
+    REQUIRE(Proof != nullptr);
+    CHECK(M->getFunction("morok.vm.morok.proof.mix.exec") != nullptr);
+    CHECK(countCallsTo(*Proof, "morok.vm.morok.proof.mix.exec") == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("virtualizeModule keeps heavy anti-hook scanners native") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -8372,6 +8404,52 @@ entry:
         *M, {/*probability=*/0, /*max_payloads=*/4}, rng));
     CHECK(countGlobals(*M, "morok.sdb.ready") == 0u);
     CHECK(M->getFunction("morok.sdb.ensure.vm_zero") == nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("externalSecretBindingModule emits proof feed API and seal binding") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() {
+entry:
+  ret i32 0
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(95105);
+    morok::ir::IRRandom rng(engine);
+
+    morok::passes::ExternalSecretBindingParams params;
+    CHECK(morok::passes::externalSecretBindingModule(*M, params, rng));
+
+    GlobalVariable *Seal = M->getGlobalVariable(
+        "morok.seal.root.external_proof", /*AllowInternal=*/true);
+    REQUIRE(Seal != nullptr);
+    CHECK(M->getGlobalVariable("morok.proof.accum", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.proof.seen", true) != nullptr);
+
+    Function *Feed = M->getFunction("morok.proof.feed");
+    Function *Finish = M->getFunction("morok.proof.finish");
+    REQUIRE(Feed != nullptr);
+    REQUIRE(Finish != nullptr);
+    CHECK(Feed->hasFnAttribute(Attribute::NoInline));
+    CHECK(Finish->hasFnAttribute(Attribute::NoInline));
+    bool feedLoadsProofByte = false;
+    for (Instruction &I : instructions(*Feed))
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+            feedLoadsProofByte |= LI->isVolatile() &&
+                                  LI->getName() == "morok.proof.feed.byte";
+    CHECK(feedLoadsProofByte);
+    CHECK(countNamedInstructions(*Finish, "morok.proof.finish.contribution") ==
+          1u);
+    CHECK(countNamedInstructions(*Finish, "morok.proof.finish.seal.next") ==
+          1u);
+
+    bool finishStoresSeal = false;
+    for (Instruction &I : instructions(*Finish))
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+            finishStoresSeal |= SI->getPointerOperand() == Seal;
+    CHECK(finishStoresSeal);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

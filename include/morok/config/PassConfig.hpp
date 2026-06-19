@@ -176,6 +176,15 @@ struct HashSelfDecryptConfig {
     Opt<bool> context_keying;
 };
 
+struct ExternalSecretBindingConfig {
+    Opt<bool> enabled;
+    Opt<std::string> mode;
+    Opt<std::string> public_key;
+    Opt<std::string> identity_policy;
+    Opt<bool> bind_to_runtime_seal;
+    Opt<bool> virtualize_helpers;
+};
+
 struct SelfChecksumConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
@@ -356,6 +365,7 @@ struct PassConfig {
     UniformLowerConfig uniform_lower;
     VirtualizationConfig virtualization;
     HashSelfDecryptConfig hash_self_decrypt;
+    ExternalSecretBindingConfig external_secret_binding;
     SelfChecksumConfig self_checksum;
     DataFlowIntegrityConfig data_flow_integrity;
     MutualGuardConfig mutual_guard;

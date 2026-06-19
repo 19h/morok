@@ -17,6 +17,7 @@
 namespace morok::passes::runtime_seal {
 
 inline constexpr llvm::StringLiteral kAntiDebugChannel = "anti_debug";
+inline constexpr llvm::StringLiteral kExternalProofChannel = "external_proof";
 
 llvm::GlobalVariable *getChannel(llvm::Module &M, llvm::StringRef Channel,
                                  ir::IRRandom &Rng);
@@ -32,6 +33,9 @@ llvm::Value *emitKdf64(llvm::IRBuilderBase &B, llvm::Value *Delta,
 
 void foldFlag(llvm::IRBuilderBase &B, llvm::StringRef Channel,
               llvm::Value *Flag, std::uint64_t Salt,
+              const llvm::Twine &Name);
+void foldWord(llvm::IRBuilderBase &B, llvm::StringRef Channel,
+              llvm::Value *Word, std::uint64_t Salt,
               const llvm::Twine &Name);
 
 } // namespace morok::passes::runtime_seal
