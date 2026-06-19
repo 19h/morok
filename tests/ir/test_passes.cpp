@@ -12389,9 +12389,16 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Clean, "morok.negative.text.int3") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.rel.offset") >= 1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.rel.info") >= 1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.sym.name") >= 1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.expected") >= 1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.target.ok") >= 1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.protect.ok") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.rx") >= 1u);
-    CHECK(countNamedInstructions(*Rx, "morok.antihook.got.map.seg.hit") >= 1u);
+    CHECK(countNamedInstructions(*Rx, "morok.antihook.got.self.seg.hit") >=
+          1u);
+    CHECK(countNamedInstructions(*Rx, "morok.antihook.got.map.seg.hit") == 0u);
     CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.rx") >= 1u);
     CHECK(hasInlineAsmCall(*Diverge));
