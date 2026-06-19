@@ -167,7 +167,7 @@ Use the top-level script unless you are intentionally narrowing the loop:
 ./run_tests.sh            # incremental configure/build + entire ctest suite
 ./run_tests.sh --clean    # remove build/ and configure from scratch
 ./run_tests.sh -R passes  # ctest name regex
-./run_tests.sh -L ir      # ctest label: core/config/ir/e2e/programs/max/unit/aggregate
+./run_tests.sh -L ir      # labels include core/config/ir/e2e/security/adversarial/programs/max/unit/aggregate
 ```
 
 The full gate covers:
@@ -178,14 +178,15 @@ The full gate covers:
 | `config` | doctest suites | presets, merge precedence, policy resolution, TOML parsing, and error paths |
 | `ir` / `passes` | LLVM-linked IR tests | every pass emits verifier-clean IR and fires on representative shapes |
 | whole pipeline | clean-vs-obfuscated differentials | compiled binaries preserve output across presets/configs/seeds |
+| build/release hygiene | shell/Python e2e gates | static config layering, entropy-seeded cross-build default, pinned privileged GitHub Actions, release audit policy, and fail-closed unsealed behavior stay enforced |
 | `programs/` corpus | compile and runtime sweeps, when present | real C/C++ programs compile at high/max intensity; curated deterministic programs also run byte-for-byte equal |
 
 Platform behavior in the e2e suite:
 
 | Host | E2E behavior |
 |---|---|
-| Apple | Exercises built-in `high`/`max`, `tests/e2e/max.toml`, VM-specific differential tests, and adversarial post-link patch tests when Python is available. |
-| Non-Apple | Uses `tests/e2e/portable.toml` for high-intensity e2e paths where virtualization, trap-oracle recovery, and some anti-analysis runtime probes are not yet fully ported. |
+| Apple | Exercises built-in `high`/`max`, `tests/e2e/max.toml`, VM-specific differential tests, release audit, and adversarial post-link patch/fail-closed tests when Python is available. |
+| Non-Apple | Uses `tests/e2e/portable.toml` for high-intensity e2e paths where virtualization and some anti-analysis/mutual-guard runtime paths are not yet fully ported. |
 | Windows | Skips behavioral plugin-dlopen e2e tests; coverage comes from core/config/IR tests and targeted object-level checks. |
 
 ## Quick Use
@@ -286,13 +287,15 @@ Common options:
 | `--linux-only`, `--macos-only` | Build only one platform family. |
 | `--no-linux`, `--no-macos` | Skip one platform family. |
 | `--no-strip` | Leave produced binaries unstripped. |
+| `--no-audit` | Skip the final `morok-audit` release gate. |
 | `-h`, `--help` | Show the script help. |
 
 Recognized environment overrides include `BUILD_DIR`, `OUT_DIR`, `CLANG`,
 `CLANGXX`, `PLUGIN`, `PRESET`, `SEED`, `OPT_LEVEL`, `LINUX_TARGET`,
 `LINUX_CC`, `LINUX_STATIC`, `LINUX_SYSROOT`, `LINUX_STRIP`, `MACOS_ARCHES`,
-`MACOS_MIN`, `MACOS_SDK`, `SEAL_BINARIES`, `SEAL_WINDOW`, `SEAL_TOOL`, and
-`PYTHON`.
+`MACOS_MIN`, `MACOS_SDK`, `SEAL_BINARIES`, `SEAL_WINDOW`, `SEAL_TOOL`,
+`AUDIT_BINARIES`, `AUDIT_TOOL`, `AUDIT_PROVENANCE`, `AUDIT_ALLOWLIST`,
+and `PYTHON`.
 
 Important defaults:
 
@@ -300,7 +303,7 @@ Important defaults:
 source:       programs/cf_license_crackme.c
 out dir:      build/cross
 preset:       max, unless --config is provided
-seed:         832040
+seed:         0, which means per-build entropy
 optimization: -O3
 clang:        clang-23
 plugin:       build/src/pipeline/libMorok.dylib
@@ -674,7 +677,12 @@ policy, or pass default. Percentages use `0..100` unless noted.
 | Scope | Keys |
 |---|---|
 | `[global]` | `preset`, `seed`, `verbose`, `trace`, `demangle_names` |
+| `[passes]` | `fail_closed_on_unsealed` plus nested pass sections |
 | `[[policy]]` | `module`, `function`, `preset`, nested `passes.<section>.<key>` overrides |
+
+`fail_closed_on_unsealed` is a cross-pass release switch. When enabled, runtime
+paths that depend on post-link manifests fail closed if a binary still contains
+unsealed manifest sentinels instead of sealed code-window metadata.
 
 ### Structural and Control-Flow Sections
 
@@ -732,7 +740,7 @@ shares where needed.
 |---|---|
 | `string_encryption` | `enabled`, `probability`, `skip_content`, `force_content` |
 | `function_call_obfuscate` | `enabled` |
-| `caller_keyed_dispatch` | `enabled`, `probability`, `max_calls`, `region_bytes` |
+| `caller_keyed_dispatch` | `enabled`, `probability`, `max_calls`, `region_bytes`, `seal_required` |
 | `function_wrapper` | `enabled`, `probability`, `times` |
 | `vtable_integrity` | `enabled` |
 | `decoy_strings` | `enabled` |
