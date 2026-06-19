@@ -250,6 +250,11 @@ passes::BcfParams bcfParams(const config::BcfConfig &C, bool Sensitive) {
     passes::BcfParams P;
     P.probability = raised(C.probability.value_or(60), 100, Sensitive);
     P.iterations = C.iterations.value_or(1);
+    P.complexity = C.complexity.value_or(1);
+    P.entropy_chain = C.entropy_chain.value_or(false);
+    P.junk_asm = C.junk_asm.value_or(false);
+    P.junk_asm_min = C.junk_asm_min.value_or(0);
+    P.junk_asm_max = C.junk_asm_max.value_or(0);
     return P;
 }
 

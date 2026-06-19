@@ -3990,6 +3990,52 @@ TEST_CASE("bogusControlFlowFunction adds guarded edges and stays valid") {
     CHECK(M->getGlobalVariable("morok.bcf.opaque", true) != nullptr);
 }
 
+// Regression for #25: BCF's complexity / entropy_chain / junk_asm knobs were
+// declared and preset but never reached the pass, so high/max BCF was no
+// stronger than the density bump.  They must now measurably change the IR.
+TEST_CASE("bogusControlFlowFunction honors complexity/entropy/junk knobs") {
+    struct Counts {
+        unsigned andI1 = 0;    // predicate-conjunction depth (complexity)
+        bool entropy = false;  // entropy_chain global + store
+        unsigned asmCalls = 0; // junk_asm barriers
+    };
+    auto run = [](const morok::passes::BcfParams &p) {
+        LLVMContext ctx;
+        auto M = parse(ctx, kArith);
+        Function *F = M->getFunction("arith");
+        REQUIRE(F);
+        auto engine = morok::core::Xoshiro256pp::fromSeed(2501);
+        morok::ir::IRRandom rng(engine);
+        CHECK(morok::passes::bogusControlFlowFunction(*F, p, rng));
+        Counts c;
+        for (Instruction &I : instructions(*F)) {
+            if (auto *BO = dyn_cast<BinaryOperator>(&I))
+                c.andI1 += BO->getOpcode() == Instruction::And &&
+                           BO->getType()->isIntegerTy(1);
+            if (auto *CI = dyn_cast<CallInst>(&I))
+                c.asmCalls += CI->isInlineAsm();
+        }
+        c.entropy = M->getGlobalVariable("morok.bcf.entropy", true) != nullptr;
+        CHECK_FALSE(verifyModule(*M, &errs()));
+        return c;
+    };
+
+    // Minimal: single-compare predicate, no entropy chain, no junk asm.
+    const Counts lo = run({/*prob=*/100, /*iterations=*/1, /*complexity=*/1,
+                           /*entropy_chain=*/false, /*junk_asm=*/false});
+    CHECK(lo.andI1 == 0u);
+    CHECK_FALSE(lo.entropy);
+    CHECK(lo.asmCalls == 0u);
+
+    // Rich: deeper predicate conjunction, entropy chain, junk asm barriers.
+    const Counts hi = run({/*prob=*/100, /*iterations=*/1, /*complexity=*/4,
+                           /*entropy_chain=*/true, /*junk_asm=*/true,
+                           /*junk_asm_min=*/2, /*junk_asm_max=*/4});
+    CHECK(hi.andI1 >= 1u); // complexity>1 emits i1 AND conjunctions
+    CHECK(hi.entropy);
+    CHECK(hi.asmCalls >= 1u);
+}
+
 TEST_CASE("aliasOpaquePredicatesFunction builds alias-invariant guards") {
     LLVMContext ctx;
     auto M = parse(ctx, kArith);

@@ -28,6 +28,16 @@ namespace morok::passes {
 struct BcfParams {
     std::uint32_t probability = 60; ///< per-block chance, 0..100
     std::uint32_t iterations = 1;   ///< sweeps over the function (>=1)
+    /// Opaque-predicate depth: the guard is a conjunction of this many
+    /// independent always-true volatile-load comparisons (clamped >=1).
+    std::uint32_t complexity = 1;
+    /// Chain a shared entropy global through every (dead) junk arm, linking the
+    /// junk computations so they cannot be pruned independently.
+    bool entropy_chain = false;
+    /// Emit junk inline-asm barriers in the (dead) junk arm.
+    bool junk_asm = false;
+    std::uint32_t junk_asm_min = 0; ///< min junk-asm barriers per junk block
+    std::uint32_t junk_asm_max = 0; ///< max junk-asm barriers per junk block
 };
 
 /// Apply bogus control flow to `F`.  Returns true if anything changed.

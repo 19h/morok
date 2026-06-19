@@ -16,9 +16,11 @@
 
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -33,6 +35,11 @@ namespace morok::passes {
 namespace {
 
 constexpr char kOpaqueGlobal[] = "morok.bcf.opaque";
+constexpr char kEntropyGlobal[] = "morok.bcf.entropy";
+
+// Upper bound on opaque-predicate depth so a malformed/huge `complexity` cannot
+// explode the guard size.
+constexpr std::uint32_t kMaxComplexity = 16;
 
 // Each iteration clones/branches more of the function's blocks, so the CFG
 // grows with the iteration count.  The "max" preset asks for 3; clamp to a
@@ -51,6 +58,16 @@ GlobalVariable *opaqueGlobal(Module &M, ir::IRRandom &rng) {
         ConstantInt::get(i32, rng.next() & 0xFFFFFFFFu), kOpaqueGlobal);
 }
 
+// A shared private i32 the entropy_chain knob threads through every junk arm.
+GlobalVariable *entropyGlobal(Module &M, ir::IRRandom &rng) {
+    if (auto *gv = M.getGlobalVariable(kEntropyGlobal, /*AllowInternal=*/true))
+        return gv;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    return new GlobalVariable(
+        M, i32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i32, rng.next() & 0xFFFFFFFFu), kEntropyGlobal);
+}
+
 } // namespace
 
 bool bogusControlFlowFunction(Function &F, const BcfParams &params,
@@ -64,6 +81,7 @@ bool bogusControlFlowFunction(Function &F, const BcfParams &params,
     // (consuming one rng draw, exactly as before), and later guarded blocks
     // reuse the pointer instead of re-running a module-wide symbol lookup.
     GlobalVariable *gv = nullptr;
+    GlobalVariable *entropyGv = nullptr;
 
     for (std::uint32_t it = 0; it < iterations; ++it) {
         std::vector<BasicBlock *> blocks;
@@ -86,12 +104,21 @@ bool bogusControlFlowFunction(Function &F, const BcfParams &params,
                 gv = opaqueGlobal(M, rng);
 
             // Build the opaque-true predicate at the end of head, replacing the
-            // unconditional branch SplitBlock inserted.
+            // unconditional branch SplitBlock inserted.  `complexity` chains a
+            // conjunction of independent always-true comparisons; each `a == b`
+            // over two volatile loads is true at run time but unfoldable, so the
+            // whole AND is always true and the body is always taken.
             Instruction *headTerm = head->getTerminator();
             IRBuilder<> B(headTerm);
-            Value *a = B.CreateLoad(i32, gv, /*isVolatile=*/true);
-            Value *b = B.CreateLoad(i32, gv, /*isVolatile=*/true);
-            Value *pred = B.CreateICmpEQ(a, b); // always true at run time
+            const std::uint32_t depth = std::clamp<std::uint32_t>(
+                params.complexity ? params.complexity : 1, 1, kMaxComplexity);
+            Value *pred = nullptr;
+            for (std::uint32_t d = 0; d < depth; ++d) {
+                Value *a = B.CreateLoad(i32, gv, /*isVolatile=*/true);
+                Value *b = B.CreateLoad(i32, gv, /*isVolatile=*/true);
+                Value *eq = B.CreateICmpEQ(a, b);
+                pred = pred ? B.CreateAnd(pred, eq) : eq;
+            }
 
             // Junk block: a dead computation that re-joins the body.
             BasicBlock *junk =
@@ -100,6 +127,30 @@ bool bogusControlFlowFunction(Function &F, const BcfParams &params,
             Value *j = JB.CreateLoad(i32, gv, /*isVolatile=*/true);
             j = JB.CreateAdd(j, ConstantInt::get(i32, rng.next() & 0xFFFF));
             j = JB.CreateXor(j, ConstantInt::get(i32, rng.next() & 0xFFFF));
+            // entropy_chain: thread a shared global through every junk arm so the
+            // dead computations form a chain.  This arm never executes (the
+            // predicate is always true), so it is semantics-preserving.
+            if (params.entropy_chain) {
+                if (!entropyGv)
+                    entropyGv = entropyGlobal(M, rng);
+                Value *e = JB.CreateLoad(i32, entropyGv, /*isVolatile=*/true);
+                e = JB.CreateXor(JB.CreateAdd(e, j),
+                                 ConstantInt::get(i32, rng.next() & 0xFFFF));
+                JB.CreateStore(e, entropyGv)->setVolatile(true);
+            }
+            // junk_asm: emit dead inline-asm barriers in the junk arm.
+            if (params.junk_asm) {
+                const std::uint32_t lo = params.junk_asm_min;
+                const std::uint32_t hi = std::max(lo, params.junk_asm_max);
+                const std::uint32_t n =
+                    lo + (hi > lo ? rng.range(hi - lo + 1) : 0);
+                auto *asmTy =
+                    FunctionType::get(Type::getVoidTy(F.getContext()), false);
+                InlineAsm *ia =
+                    InlineAsm::get(asmTy, "", "", /*hasSideEffects=*/true);
+                for (std::uint32_t k = 0; k < n; ++k)
+                    JB.CreateCall(ia);
+            }
             (void)j;
             JB.CreateBr(body);
 
