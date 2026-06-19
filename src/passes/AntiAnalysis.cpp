@@ -10250,6 +10250,10 @@ Function *windowsDebugObjectProbe(Module &M, GlobalVariable *State,
     auto *i64 = Type::getInt64Ty(ctx);
     auto *ip = intPtrTy(M);
     auto *ptr = PointerType::getUnqual(ctx);
+    constexpr std::uint64_t kObjectTypesBufferBytes = 16384;
+    constexpr std::uint64_t kObjectTypesHeaderBytes = 8;
+    constexpr std::uint64_t kObjectTypeInfoFixedBytes = 0x68;
+    constexpr std::uint32_t kObjectTypeWalkLimit = 64;
     auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
                                 GlobalValue::PrivateLinkage,
                                 "morok.win.dbgobj.probe", &M);
@@ -10283,7 +10287,7 @@ Function *windowsDebugObjectProbe(Module &M, GlobalVariable *State,
         B.CreateAlloca(i32, nullptr, "morok.win.dbgobj.debug.flags.slot");
     AllocaInst *debugObjectCount =
         B.CreateAlloca(i32, nullptr, "morok.win.dbgobj.object.count.slot");
-    auto *typesBufTy = ArrayType::get(i8, 16384);
+    auto *typesBufTy = ArrayType::get(i8, kObjectTypesBufferBytes);
     AllocaInst *typesBuf =
         B.CreateAlloca(typesBufTy, nullptr, "morok.win.dbgobj.types.buf");
     B.CreateStore(ConstantInt::get(i32, 0), retLen)->setVolatile(true);
@@ -10407,7 +10411,7 @@ Function *windowsDebugObjectProbe(Module &M, GlobalVariable *State,
     Value *objectStatus = OB.CreateCall(
         qoTy, qoPtr,
         {ConstantPointerNull::get(ptr), ConstantInt::get(i32, 3), typesBuf,
-         ConstantInt::get(i32, 16384), retLen},
+         ConstantInt::get(i32, kObjectTypesBufferBytes), retLen},
         "morok.win.dbgobj.object.types.status");
     Value *objectOk = OB.CreateICmpSGE(objectStatus, ConstantInt::get(i32, 0),
                                        "morok.win.dbgobj.object.types.ok");
@@ -10424,15 +10428,27 @@ Function *windowsDebugObjectProbe(Module &M, GlobalVariable *State,
     auto *objIdx = LB.CreatePHI(i32, 2, "morok.win.dbgobj.object.idx");
     auto *objOff = LB.CreatePHI(ip, 2, "morok.win.dbgobj.object.off");
     objIdx->addIncoming(ConstantInt::get(i32, 0), queryObjectBB);
-    objOff->addIncoming(ConstantInt::get(ip, 8), queryObjectBB);
+    objOff->addIncoming(ConstantInt::get(ip, kObjectTypesHeaderBytes),
+                        queryObjectBB);
     Value *typeCount =
         loadAt(LB, M, i32, typesBuf, 0ULL, "morok.win.dbgobj.object.types.count");
     Value *typeLimit = LB.CreateSelect(
-        LB.CreateICmpULT(typeCount, ConstantInt::get(i32, 64)), typeCount,
-        ConstantInt::get(i32, 64), "morok.win.dbgobj.object.types.limit");
+        LB.CreateICmpULT(typeCount, ConstantInt::get(i32, kObjectTypeWalkLimit)),
+        typeCount, ConstantInt::get(i32, kObjectTypeWalkLimit),
+        "morok.win.dbgobj.object.types.limit");
     Value *idxOk =
         LB.CreateICmpULT(objIdx, typeLimit, "morok.win.dbgobj.object.idx.ok");
-    Value *offOk = LB.CreateICmpULT(objOff, ConstantInt::get(ip, 16000),
+    Value *returnedLenIp =
+        LB.CreateZExt(returnedLen, ip, "morok.win.dbgobj.object.retlen.ip");
+    Value *walkLimit = LB.CreateSelect(
+        LB.CreateICmpULT(returnedLenIp,
+                         ConstantInt::get(ip, kObjectTypesBufferBytes)),
+        returnedLenIp, ConstantInt::get(ip, kObjectTypesBufferBytes),
+        "morok.win.dbgobj.object.walk.limit");
+    Value *entryEnd =
+        LB.CreateAdd(objOff, ConstantInt::get(ip, kObjectTypeInfoFixedBytes),
+                     "morok.win.dbgobj.object.entry.end");
+    Value *offOk = LB.CreateICmpULE(entryEnd, walkLimit,
                                     "morok.win.dbgobj.object.off.ok");
     LB.CreateCondBr(LB.CreateAnd(idxOk, offOk,
                                  "morok.win.dbgobj.object.keep.walking"),
@@ -10450,10 +10466,49 @@ Function *windowsDebugObjectProbe(Module &M, GlobalVariable *State,
     Value *totalObjects =
         loadAt(TB, M, i32, entryPtr, 16,
                "morok.win.dbgobj.object.total.objects");
+    Value *nameReturnedLenIp =
+        TB.CreateZExt(returnedLen, ip, "morok.win.dbgobj.object.name.retlen.ip");
+    Value *nameWalkLimit = TB.CreateSelect(
+        TB.CreateICmpULT(nameReturnedLenIp,
+                         ConstantInt::get(ip, kObjectTypesBufferBytes)),
+        nameReturnedLenIp, ConstantInt::get(ip, kObjectTypesBufferBytes),
+        "morok.win.dbgobj.object.name.limit");
+    Value *typesBase =
+        TB.CreatePtrToInt(typesBuf, ip, "morok.win.dbgobj.object.types.base");
+    Value *typesEnd = TB.CreateAdd(typesBase, nameWalkLimit,
+                                   "morok.win.dbgobj.object.types.end");
+    Value *nameMaxIp =
+        TB.CreateZExt(nameMax, ip, "morok.win.dbgobj.object.name.max.ip");
+    Value *nameEnd =
+        TB.CreateAdd(nameBuffer, nameMaxIp, "morok.win.dbgobj.object.name.end");
+    Value *nameNoWrap = TB.CreateICmpUGE(
+        nameEnd, nameBuffer, "morok.win.dbgobj.object.name.no.wrap");
+    Value *nameStartOk = TB.CreateICmpUGE(
+        nameBuffer, typesBase, "morok.win.dbgobj.object.name.start.ok");
+    Value *nameEndOk = TB.CreateICmpULE(
+        nameEnd, typesEnd, "morok.win.dbgobj.object.name.end.ok");
+    Value *nameLenOk = TB.CreateICmpULE(
+        nameLen, nameMax, "morok.win.dbgobj.object.name.len.ok");
+    Value *nameRangeOk =
+        TB.CreateAnd(nameStartOk, nameEndOk,
+                     "morok.win.dbgobj.object.name.range.ok");
+    Value *nameSizeOk =
+        TB.CreateAnd(nameNoWrap, nameLenOk,
+                     "morok.win.dbgobj.object.name.size.ok");
+    Value *nameValid =
+        TB.CreateAnd(nameRangeOk, nameSizeOk,
+                     "morok.win.dbgobj.object.name.valid");
+    Value *safeNameBuffer =
+        TB.CreateSelect(nameValid, nameBuffer, ConstantInt::get(ip, 0),
+                        "morok.win.dbgobj.object.name.safe");
+    Value *safeNameLen =
+        TB.CreateSelect(nameValid, nameLen, ConstantInt::get(i16, 0),
+                        "morok.win.dbgobj.object.name.len.safe");
     Value *typeHash = TB.CreateCall(
         wideHash,
-        {TB.CreateIntToPtr(nameBuffer, ptr, "morok.win.dbgobj.object.name.ptr"),
-         nameLen},
+        {TB.CreateIntToPtr(safeNameBuffer, ptr,
+                           "morok.win.dbgobj.object.name.ptr"),
+         safeNameLen},
         "morok.win.dbgobj.object.type.hash");
     Value *isDebugObject = TB.CreateICmpEQ(
         typeHash, ConstantInt::get(i64, fnv1aLowerAsciiName("DebugObject")),
@@ -10486,10 +10541,11 @@ Function *windowsDebugObjectProbe(Module &M, GlobalVariable *State,
                                   "morok.win.dbgobj.object.name.max.pad"),
                      ConstantInt::get(ip, ~7ULL),
                      "morok.win.dbgobj.object.name.max.align");
+    Value *fixedNext =
+        NB.CreateAdd(objOff, ConstantInt::get(ip, kObjectTypeInfoFixedBytes),
+                     "morok.win.dbgobj.object.fixed.next");
     Value *nextOff =
-        NB.CreateAdd(NB.CreateAdd(objOff, ConstantInt::get(ip, 0x60),
-                                  "morok.win.dbgobj.object.fixed.next"),
-                     nameSpan, "morok.win.dbgobj.object.next.off");
+        NB.CreateAdd(fixedNext, nameSpan, "morok.win.dbgobj.object.next.off");
     Value *nextIdx =
         NB.CreateAdd(objIdx, ConstantInt::get(i32, 1),
                      "morok.win.dbgobj.object.next.idx");

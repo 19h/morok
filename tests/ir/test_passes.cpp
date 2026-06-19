@@ -247,6 +247,19 @@ bool hasNamedIcmpWithConstant(Function &F, StringRef name,
     return false;
 }
 
+bool namedInstructionUsesConstant(Function &F, StringRef name,
+                                  std::uint64_t value) {
+    for (Instruction &I : instructions(F)) {
+        if (!I.getName().starts_with(name))
+            continue;
+        for (Value *Op : I.operands())
+            if (auto *CI = dyn_cast<ConstantInt>(Op))
+                if (CI->getZExtValue() == value)
+                    return true;
+    }
+    return false;
+}
+
 std::size_t countOpcode(Module &M, unsigned opcode) {
     std::size_t n = 0;
     for (Function &F : M)
@@ -13480,6 +13493,18 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Probe,
                                  "morok.win.dbgobj.object.debug.count.final") >=
           1u);
+    CHECK(namedInstructionUsesConstant(
+        *Probe, "morok.win.dbgobj.object.fixed.next", 0x68));
+    CHECK_FALSE(namedInstructionUsesConstant(
+        *Probe, "morok.win.dbgobj.object.fixed.next", 0x60));
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.dbgobj.object.entry.end") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.dbgobj.object.name.valid") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.dbgobj.object.name.safe") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.dbgobj.object.name.end.ok") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
