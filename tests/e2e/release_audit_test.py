@@ -69,7 +69,9 @@ def write_synthetic_elf(path: Path, *, sealed: bool, manifest: bool = True) -> N
     path.write_bytes(data)
 
 
-def write_synthetic_ckd_elf(path: Path, *, sealed: bool) -> None:
+def write_synthetic_ckd_elf(
+    path: Path, *, sealed: bool, encoded_value: int | None = None
+) -> None:
     size = 0x900
     data = bytearray(size)
     ident = b"\x7fELF" + bytes([2, 1, 1]) + b"\0" * 9
@@ -117,7 +119,9 @@ def write_synthetic_ckd_elf(path: Path, *, sealed: bool) -> None:
         struct.pack_into("<Q", data, rec_off + rel, value)
 
     if sealed:
-        struct.pack_into("<Q", data, encoded_off, 0x8190A1B2C3D4E5F6)
+        if encoded_value is None:
+            encoded_value = 0x8190A1B2C3D4E5F6
+        struct.pack_into("<Q", data, encoded_off, encoded_value)
         struct.pack_into("<I", data, code_size_off, 16)
         struct.pack_into("<Q", data, rec_off + 40, 0)
         struct.pack_into("<Q", data, rec_off + 48, 0)
@@ -220,6 +224,16 @@ def main(argv: list[str]) -> int:
         require_fail(
             run(tool, ckd_unsealed, "--require-sealed-manifest"),
             "caller-keyed-dispatch",
+        )
+
+        ckd_missing_encoded = tmp / "ckd-missing-encoded"
+        ckd_missing_encoded.mkdir()
+        write_synthetic_ckd_elf(
+            ckd_missing_encoded / "app", sealed=True, encoded_value=0
+        )
+        require_fail(
+            run(tool, ckd_missing_encoded, "--require-sealed-manifest"),
+            "encoded target",
         )
 
         unsealed = tmp / "unsealed"

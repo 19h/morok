@@ -422,12 +422,21 @@ class Auditor:
             )
             sealed = False
         code_size = self.read_u32_at_addr(binary, node.code_size)
+        encoded = self.read_u64_at_addr(binary, node.encoded)
         if code_size in (None, 0, UNSEALED_CODE_SIZE):
             self.emit_finding(
                 "placeholder-manifest",
                 path,
                 f"caller-keyed-dispatch manifest file+0x{manifest.offset:x} node {node.index} "
                 "has unsealed code size",
+            )
+            sealed = False
+        if encoded in (None, 0):
+            self.emit_finding(
+                "placeholder-manifest",
+                path,
+                f"caller-keyed-dispatch manifest file+0x{manifest.offset:x} node {node.index} "
+                "has unsealed encoded target",
             )
             sealed = False
         return sealed
