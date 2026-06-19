@@ -10465,7 +10465,10 @@ Function *windowsThreadHideProbe(Module &M, GlobalVariable *State,
     foldState(RB, State, queryInfo, rng.next(),
               "morok.win.thide.ntqueryinformationthread.mix");
     Value *ready = RB.CreateAnd(
-        RB.CreateICmpNE(getNext, ConstantInt::get(ip, 0)),
+        RB.CreateAnd(RB.CreateICmpNE(getNext, ConstantInt::get(ip, 0)),
+                     RB.CreateICmpNE(closeFn, ConstantInt::get(ip, 0),
+                                     "morok.win.thide.ntclose.ready"),
+                     "morok.win.thide.close.ready"),
         RB.CreateAnd(RB.CreateICmpNE(setInfo, ConstantInt::get(ip, 0)),
                      RB.CreateICmpNE(queryInfo, ConstantInt::get(ip, 0)),
                      "morok.win.thide.info.ready"),
@@ -10505,14 +10508,21 @@ Function *windowsThreadHideProbe(Module &M, GlobalVariable *State,
     LB.CreateCondBr(gotThread, closePrevBB, retBB);
 
     IRBuilder<> CP(closePrevBB);
-    CP.CreateCondBr(CP.CreateICmpNE(current, ConstantInt::get(ip, 0),
-                                    "morok.win.thide.has.previous"),
-                    closePrevCallBB, probeBB);
+    Value *closePrevFn =
+        CP.CreateLoad(ip, closeSlot, "morok.win.thide.close.prev.fn");
+    cast<LoadInst>(closePrevFn)->setVolatile(true);
+    Value *canClosePrevious = CP.CreateAnd(
+        CP.CreateICmpNE(current, ConstantInt::get(ip, 0),
+                        "morok.win.thide.has.previous"),
+        CP.CreateICmpNE(closePrevFn, ConstantInt::get(ip, 0),
+                        "morok.win.thide.close.prev.available"),
+        "morok.win.thide.close.prev.needed");
+    CP.CreateCondBr(canClosePrevious, closePrevCallBB, probeBB);
 
     IRBuilder<> CCB(closePrevCallBB);
     auto *closeTy = FunctionType::get(i32, {ptr}, false);
     Value *closePtr =
-        CCB.CreateIntToPtr(closeFn, ptr, "morok.win.thide.close.prev.ptr");
+        CCB.CreateIntToPtr(closePrevFn, ptr, "morok.win.thide.close.prev.ptr");
     Value *closePrevStatus = CCB.CreateCall(
         closeTy, closePtr,
         {CCB.CreateIntToPtr(current, ptr, "morok.win.thide.close.prev.handle")},

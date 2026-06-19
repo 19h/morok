@@ -12477,13 +12477,29 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Probe,
                                  "morok.win.thide.ntqueryinformationthread") >=
           1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.thide.ntclose.ready") >=
+          1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.thide.getnext.status") >=
           1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.thide.close.prev.available") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.thide.close.prev.needed") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.thide.set.status") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.thide.query.status") >=
           1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.thide.hidden") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.thide.fail.final") >= 1u);
+    BasicBlock *ClosePrev = nullptr;
+    for (BasicBlock &BB : *Probe)
+        if (BB.getName() == "close.prev")
+            ClosePrev = &BB;
+    REQUIRE(ClosePrev != nullptr);
+    auto *ClosePrevBr = dyn_cast<BranchInst>(ClosePrev->getTerminator());
+    REQUIRE(ClosePrevBr != nullptr);
+    REQUIRE(ClosePrevBr->isConditional());
+    CHECK(ClosePrevBr->getCondition()->getName().starts_with(
+        "morok.win.thide.close.prev.needed"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
