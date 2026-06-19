@@ -13748,6 +13748,7 @@ define i32 @main() { ret i32 0 }
           1u);
     CHECK(countNamedInstructions(*Resolve, "morok.win.pe.export.rva") >= 1u);
     CHECK(countNamedInstructions(*Resolve, "morok.win.pe.hash.match") >= 1u);
+    CHECK(Scan->arg_size() == 2u);
     CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.mov.eax") >= 1u);
     CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.syscall.ret") >=
           1u);
@@ -13762,7 +13763,20 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.halo") >= 1u);
     CHECK(countNamedInstructions(*Scan, "morok.win.sys.scan.tartarus") >= 1u);
     CHECK(countNamedInstructions(*Scan,
+                                 "morok.win.sys.scan.neighbor.enabled") >= 1u);
+    CHECK(countNamedInstructions(*Scan,
                                  "morok.win.sys.scan.neighbor.gadget") >= 1u);
+    CallInst *FoundationScan = nullptr;
+    for (Instruction &I : instructions(*Probe))
+        if (auto *CI = dyn_cast<CallInst>(&I))
+            if (CI->getName() == "morok.win.foundation.sys.scan")
+                FoundationScan = CI;
+    REQUIRE(FoundationScan != nullptr);
+    REQUIRE(FoundationScan->arg_size() == 2u);
+    auto *AllowNeighbors =
+        dyn_cast<ConstantInt>(FoundationScan->getArgOperand(1));
+    REQUIRE(AllowNeighbors != nullptr);
+    CHECK(AllowNeighbors->isZero());
     bool scanBoundedToCurrentStub = false;
     BasicBlock *scanBody = nullptr;
     for (BasicBlock &BB : *Scan) {
@@ -14102,6 +14116,20 @@ define i32 @main() { ret i32 0 }
           1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.syscalls.ntclose.pack") >=
           1u);
+    for (StringRef PackName : {"morok.win.syscalls.ntqsi.pack",
+                               "morok.win.syscalls.ntclose.pack"}) {
+        CallInst *PackCall = nullptr;
+        for (Instruction &I : instructions(*Probe))
+            if (auto *CI = dyn_cast<CallInst>(&I))
+                if (CI->getName() == PackName)
+                    PackCall = CI;
+        REQUIRE(PackCall != nullptr);
+        REQUIRE(PackCall->arg_size() == 2u);
+        auto *AllowNeighbors =
+            dyn_cast<ConstantInt>(PackCall->getArgOperand(1));
+        REQUIRE(AllowNeighbors != nullptr);
+        CHECK(AllowNeighbors->isOne());
+    }
     CHECK(countNamedInstructions(*Probe, "morok.win.syscalls.ntqsi.direct") >=
           1u);
     CHECK(countNamedInstructions(*Probe,

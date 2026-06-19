@@ -9838,13 +9838,16 @@ Function *windowsSyscallStubScanner(Module &M) {
     auto *i32 = Type::getInt32Ty(ctx);
     auto *ip = intPtrTy(M);
     auto *ptr = PointerType::getUnqual(ctx);
-    auto *fn = Function::Create(FunctionType::get(ip, {ptr}, false),
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *fn = Function::Create(FunctionType::get(ip, {ptr, i1}, false),
                                 GlobalValue::PrivateLinkage,
                                 "morok.win.sys.scan", &M);
     fn->addFnAttr(Attribute::NoInline);
     fn->setDSOLocal(true);
     Argument *stub = fn->getArg(0);
     stub->setName("stub");
+    Argument *allowNeighbors = fn->getArg(1);
+    allowNeighbors->setName("allow_neighbors");
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
     auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
@@ -9963,9 +9966,13 @@ Function *windowsSyscallStubScanner(Module &M) {
     Value *found =
         GB.CreateLoad(i8, foundSlot, "morok.win.sys.scan.found.final");
     cast<LoadInst>(found)->setVolatile(true);
-    GB.CreateCondBr(GB.CreateICmpNE(found, ConstantInt::get(i8, 0),
-                                    "morok.win.sys.scan.hells.ready"),
-                    retBB, neighborLoopBB);
+    Value *hellsReady =
+        GB.CreateICmpNE(found, ConstantInt::get(i8, 0),
+                        "morok.win.sys.scan.hells.ready");
+    Value *neighborAllowed = GB.CreateAnd(
+        GB.CreateNot(hellsReady), allowNeighbors,
+        "morok.win.sys.scan.neighbor.enabled");
+    GB.CreateCondBr(neighborAllowed, neighborLoopBB, retBB);
 
     IRBuilder<> NLB(neighborLoopBB);
     auto *neighborIdx =
@@ -10283,7 +10290,7 @@ Function *windowsPeFoundationProbe(Module &M, GlobalVariable *State,
          ConstantInt::get(i64, fnv1aName("MorokAbsentExportCanary"))},
         "morok.win.foundation.export.probe");
     foldState(B, State, probeExport, rng.next(), "morok.win.foundation.export");
-    Value *stubScan = B.CreateCall(scanner, {imagePtr},
+    Value *stubScan = B.CreateCall(scanner, {imagePtr, ConstantInt::getFalse(ctx)},
                                    "morok.win.foundation.sys.scan");
     foldState(B, State, stubScan, rng.next(), "morok.win.foundation.sys");
 
@@ -11638,11 +11645,14 @@ Function *windowsSyscallsProbe(Module &M, GlobalVariable *State,
         resolver, {ntdll, ConstantInt::get(i64, fnv1aName("NtClose"))},
         "morok.win.syscalls.ntclose");
     Value *qsiPack = RB.CreateCall(
-        scanner, {RB.CreateIntToPtr(qsi, ptr, "morok.win.syscalls.ntqsi.ptr")},
+        scanner,
+        {RB.CreateIntToPtr(qsi, ptr, "morok.win.syscalls.ntqsi.ptr"),
+         ConstantInt::getTrue(ctx)},
         "morok.win.syscalls.ntqsi.pack");
     Value *closePack = RB.CreateCall(
         scanner,
-        {RB.CreateIntToPtr(ntClose, ptr, "morok.win.syscalls.ntclose.ptr")},
+        {RB.CreateIntToPtr(ntClose, ptr, "morok.win.syscalls.ntclose.ptr"),
+         ConstantInt::getTrue(ctx)},
         "morok.win.syscalls.ntclose.pack");
     Value *qsiSsn = RB.CreateTrunc(qsiPack, i32, "morok.win.syscalls.ntqsi.ssn");
     Value *qsiGadget32 =
