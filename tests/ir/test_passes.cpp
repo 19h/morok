@@ -7296,6 +7296,68 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #27: both passes splice plain helper calls (morok.sc.diff /
+// morok.gf8mul) at selected literal sites, including store-value literals.  A
+// literal store inside a Windows funclet-EH (catch/cleanup) block would get a
+// call inserted without the required ["funclet"(token)] operand bundle, which
+// the verifier rejects (build abort on Windows targets).  Both passes must skip
+// funclet-EH functions; the fixture's store-value literal must stay untouched.
+static const char *kFuncletStoreIR = R"ir(
+declare i32 @__CxxFrameHandler3(...)
+declare void @wineh_may_throw()
+
+define void @wineh_funclet_store(ptr %p) personality ptr @__CxxFrameHandler3 {
+entry:
+  invoke void @wineh_may_throw()
+          to label %done unwind label %catch.dispatch
+
+catch.dispatch:
+  %cs = catchswitch within none [label %handler] unwind to caller
+
+handler:
+  %cp = catchpad within %cs [ptr null, i32 64, ptr null]
+  store i32 42, ptr %p
+  catchret from %cp to label %done
+
+done:
+  ret void
+}
+)ir";
+
+TEST_CASE("selfChecksumConstantsFunction skips Windows funclet-EH functions") {
+    LLVMContext ctx;
+    auto M = parse(ctx, kFuncletStoreIR);
+    Function *F = M->getFunction("wineh_funclet_store");
+    REQUIRE(F);
+    REQUIRE_FALSE(verifyModule(*M, &errs())); // fixture starts valid
+    auto engine = morok::core::Xoshiro256pp::fromSeed(2701);
+    morok::ir::IRRandom rng(engine);
+
+    // No transform (would splice an unbundled call into the catch funclet).
+    CHECK_FALSE(morok::passes::selfChecksumConstantsFunction(
+        *F, {/*probability=*/100, /*max_constants=*/8, /*region_bytes=*/32},
+        rng));
+    CHECK(M->getFunction("morok.sc.diff.wineh_funclet_store") == nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("shamirShareFunction skips Windows funclet-EH functions") {
+    LLVMContext ctx;
+    auto M = parse(ctx, kFuncletStoreIR);
+    Function *F = M->getFunction("wineh_funclet_store");
+    REQUIRE(F);
+    REQUIRE_FALSE(verifyModule(*M, &errs()));
+    auto engine = morok::core::Xoshiro256pp::fromSeed(2702);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::shamirShareFunction(
+        *F, {/*probability=*/100, /*threshold=*/3, /*shares=*/5,
+             /*max_secrets=*/8},
+        rng));
+    CHECK(M->getFunction("morok.gf8mul") == nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("selfChecksumConstantsFunction fuses integer select literals") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

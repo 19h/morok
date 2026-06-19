@@ -715,6 +715,13 @@ bool selfChecksumConstantsFunction(Function &F,
         return false;
     if (directlyRecursive(F))
         return false;
+    // This pass splices plain calls to the diff helper at arbitrary user sites
+    // (including store-value literals).  Calls inside Windows funclet-EH blocks
+    // require a ["funclet"(token)] operand bundle or the verifier rejects them,
+    // so skip funclet-EH functions entirely, matching ArithmeticTables /
+    // DataFlowIntegrity / Virtualization.  A no-op on Itanium (macOS/Linux).
+    if (ir::usesFuncletEH(F))
+        return false;
 
     const std::string DiffName = "morok.sc.diff." + suffixFor(F);
     if (F.getParent()->getFunction(DiffName))

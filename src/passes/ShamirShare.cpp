@@ -14,6 +14,7 @@
 
 #include "morok/core/Galois8.hpp"
 #include "morok/core/ShamirGf256.hpp"
+#include "morok/ir/InstUtil.hpp"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Attributes.h"
@@ -302,6 +303,13 @@ bool shamirShareFunction(Function &F, const ShamirShareParams &Params,
                          ir::IRRandom &Rng) {
     if (F.isDeclaration() || F.getName().starts_with("morok.") ||
         Params.probability == 0 || Params.max_secrets == 0)
+        return false;
+    // Reconstruction splices plain calls to morok.gf8mul at the selected user
+    // sites (including store-value literals).  Calls inside Windows funclet-EH
+    // blocks need a ["funclet"(token)] operand bundle or the verifier rejects
+    // them, so skip funclet-EH functions, mirroring the sibling passes.  No-op
+    // on Itanium (macOS/Linux).
+    if (ir::usesFuncletEH(F))
         return false;
 
     Module &M = *F.getParent();
