@@ -74,6 +74,13 @@ add_test(NAME "e2e/cross_build_seed"
           "${CMAKE_SOURCE_DIR}/cross_build.sh")
 set_tests_properties("e2e/cross_build_seed" PROPERTIES LABELS "e2e")
 
+# Supply-chain regression (issue #36): every external GitHub Action in the
+# privileged CI/release/deploy workflows must be pinned to a full commit SHA.
+add_test(NAME "e2e/workflows_pinned"
+  COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/workflows_pinned.sh"
+          "${CMAKE_SOURCE_DIR}/.github")
+set_tests_properties("e2e/workflows_pinned" PROPERTIES LABELS "e2e")
+
 foreach(preset low mid high)
   add_test(NAME "e2e/differential_${preset}"
     COMMAND bash "${_driver}"

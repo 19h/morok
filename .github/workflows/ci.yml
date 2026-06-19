@@ -26,7 +26,7 @@ jobs:
     outputs:
       llvm_ref: ${{ steps.read.outputs.ref }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - id: read
         shell: bash
         run: |
@@ -53,7 +53,7 @@ jobs:
           - { name: macos-arm64, os: macos-15, arch: arm64 }
           - { name: windows-x86_64, os: windows-2022, arch: x86_64 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install build prerequisites (Linux)
         if: runner.os == 'Linux'
@@ -66,16 +66,16 @@ jobs:
 
       - name: Install CMake + Ninja
         if: runner.os != 'Linux'
-        uses: lukka/get-cmake@latest
+        uses: lukka/get-cmake@f5b8fbb4d77cec1acc5a5f9f0df4beffaf5d98d9 # latest, pinned 2026-06-19
 
       - name: Set up MSVC environment (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
       - name: Install sccache
-        uses: mozilla/sccache-action@v0.0.10
+        uses: mozilla/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Configure sccache (local disk)
         shell: bash
@@ -92,7 +92,7 @@ jobs:
           echo "SCCACHE_CACHE_SIZE=3G" >> "$GITHUB_ENV"
 
       - name: Restore sccache cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: ${{ env.SCCACHE_DIR }}
           # Key on the LLVM recipe (composite action) so any recipe change busts
@@ -186,7 +186,7 @@ jobs:
       # if the tests below fail.
       - name: Save sccache cache
         if: always()
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: sccache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/setup-llvm/action.yml', '.github/workflows/ci.yml') }}-${{ github.run_id }}
@@ -298,7 +298,7 @@ jobs:
           fi
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: morok-${{ matrix.name }}
           path: ${{ steps.pkg.outputs.archive }}
@@ -306,7 +306,7 @@ jobs:
 
       - name: Attach to release (tags only)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           files: ${{ steps.pkg.outputs.archive }}
           fail_on_unmatched_files: true
