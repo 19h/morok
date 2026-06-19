@@ -63,7 +63,11 @@ bool eligible(const GlobalVariable &gv) {
     // by cheap triage such as `strings` while real user strings are encrypted.
     if (gv.getName().starts_with("morok."))
         return false;
-    if (gv.getSection() == "llvm.metadata")
+    // Skip any section-pinned global.  The length-hiding path replaces the
+    // global with a larger one, and re-emitting cipher bytes into a pinned
+    // section (e.g. a mergeable cstring section, or llvm.metadata) changes its
+    // identity/semantics; leave such globals alone rather than mis-rewrite them.
+    if (!gv.getSection().empty())
         return false;
     const auto *cda = dyn_cast<ConstantDataArray>(gv.getInitializer());
     return cda && cda->getElementType()->isIntegerTy(8) &&
@@ -464,12 +468,21 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
             const std::string nm = gv->getName().str();
             const auto addr = gv->getUnnamedAddr();
             const auto linkage = gv->getLinkage();
+            // Preserve the original address space — replaceAllUsesWith requires
+            // the replacement to have the identical pointer type, so a new
+            // global in addrspace(0) replacing an addrspace(N) string is invalid
+            // IR (a verifier/assertion failure).  Preserve the alignment too:
+            // the program's existing loads/GEPs may rely on it, so forcing
+            // Align(1) is undefined behavior.
+            const unsigned addrSpace = gv->getAddressSpace();
+            const Align align = gv->getAlign().valueOrOne();
             gv->setName(""); // free the name for the replacement
             target = new GlobalVariable(M, cipherInit->getType(),
-                                        /*isConstant=*/true, linkage,
-                                        cipherInit, nm);
+                                        /*isConstant=*/true, linkage, cipherInit,
+                                        nm, /*InsertBefore=*/nullptr,
+                                        GlobalValue::NotThreadLocal, addrSpace);
             target->setUnnamedAddr(addr);
-            target->setAlignment(Align(1));
+            target->setAlignment(align);
             gv->replaceAllUsesWith(target);
             gv->eraseFromParent();
         }

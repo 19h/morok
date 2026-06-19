@@ -10652,6 +10652,44 @@ TEST_CASE("cloakSeed rejects a malformed pre-existing seed global") {
 )ir");
 }
 
+// Regression for #39: the length-hiding path replaces a padded C-string global
+// with a larger one.  It dropped the original address space (so RAUW across a
+// mismatched pointer type is invalid IR), forced Align(1) (UB if loads relied
+// on a higher alignment), and dropped any pinned section.  The replacement must
+// keep the address space and alignment, and section-pinned globals are skipped.
+TEST_CASE("stringEncryptModule preserves address space alignment and section") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+@s_as1 = private addrspace(1) constant [6 x i8] c"hello\00"
+@s_align = private constant [6 x i8] c"world\00", align 8
+@s_sec = private constant [4 x i8] c"sec\00", section "mysec"
+)ir");
+    REQUIRE(M);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(3901);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, {/*probability=*/100}, rng));
+
+    // Address space preserved across the padded replacement.
+    GlobalVariable *As1 = M->getGlobalVariable("s_as1", true);
+    REQUIRE(As1);
+    CHECK(As1->getAddressSpace() == 1u);
+
+    // Original alignment preserved (not forced down to 1).
+    GlobalVariable *Aligned = M->getGlobalVariable("s_align", true);
+    REQUIRE(Aligned);
+    CHECK(Aligned->getAlign().valueOrOne().value() >= 8u);
+
+    // Section-pinned string is left untouched (still plaintext, section kept).
+    GlobalVariable *Sec = M->getGlobalVariable("s_sec", true);
+    REQUIRE(Sec);
+    CHECK(Sec->getSection() == "mysec");
+    auto *SecCDA = dyn_cast<ConstantDataArray>(Sec->getInitializer());
+    REQUIRE(SecCDA);
+    CHECK(SecCDA->getRawDataValues().starts_with("sec"));
+
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("stringEncryptModule leaves generated decoy strings as plaintext bait") {
     LLVMContext ctx;
     auto M = std::make_unique<Module>("decoy-strings", ctx);
