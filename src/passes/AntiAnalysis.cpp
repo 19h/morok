@@ -184,6 +184,19 @@ GlobalVariable *watchdogCryptoState(Module &M) {
     return gv;
 }
 
+GlobalVariable *antiAnalysisPoisonState(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.antianalysis.poison",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i64, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i64, 0),
+                                  "morok.antianalysis.poison");
+    gv->setAlignment(Align(8));
+    return gv;
+}
+
 GlobalVariable *antiHookState(Module &M, ir::IRRandom &rng) {
     if (auto *existing =
             M.getGlobalVariable("morok.antihook.state", /*AllowInternal=*/true))
@@ -226,6 +239,34 @@ void foldState(IRBuilderBase &B, GlobalVariable *State, Value *V,
 void foldFlag(IRBuilderBase &B, GlobalVariable *State, Value *Flag,
               std::uint64_t Salt, const Twine &Name) {
     foldState(B, State, B.CreateZExtOrTrunc(Flag, B.getInt64Ty()), Salt, Name);
+}
+
+void foldPoisonFlag(IRBuilderBase &B, Value *Flag, std::uint64_t Salt,
+                    const Twine &Name) {
+    Module *M = B.GetInsertBlock()->getModule();
+    if (!M)
+        return;
+    auto *i64 = B.getInt64Ty();
+    Value *tripped = B.CreateICmpNE(B.CreateZExtOrTrunc(Flag, i64),
+                                    ConstantInt::get(i64, 0),
+                                    Name + ".poison.trip");
+    GlobalVariable *Poison = antiAnalysisPoisonState(*M);
+    auto *old = B.CreateLoad(i64, Poison, Name + ".poison.old");
+    old->setVolatile(true);
+    old->setAlignment(Align(8));
+    Value *rot = B.CreateOr(B.CreateShl(old, ConstantInt::get(i64, 19)),
+                            B.CreateLShr(old, ConstantInt::get(i64, 45)),
+                            Name + ".poison.rot");
+    Value *mixed =
+        B.CreateXor(rot, ConstantInt::get(i64, Salt ^ 0xA24BAED4963EE407ULL),
+                    Name + ".poison.salt");
+    mixed = B.CreateMul(
+        mixed, ConstantInt::get(i64, (Salt ^ 0x9FB21C651E98DF25ULL) | 1ULL),
+        Name + ".poison.mul");
+    Value *next = B.CreateSelect(tripped, mixed, old, Name + ".poison.next");
+    auto *st = B.CreateStore(next, Poison);
+    st->setVolatile(true);
+    st->setAlignment(Align(8));
 }
 
 // The verdict-bound anti-debug seal.  Unlike morok.antidbg.state (a one-way
@@ -2629,6 +2670,8 @@ void emitDarwinDyldCensus(IRBuilder<> &B, Module &M, GlobalVariable *State,
         Value *found = B.CreateICmpNE(B.CreateCall(getenv, {name}),
                                       ConstantPointerNull::get(ptr));
         foldFlag(B, State, found, salts[i], "morok.antidbg.dyld");
+        foldPoisonFlag(B, found, salts[i] ^ 0x7DA3B94C6E1025F1ULL,
+                       "morok.antianalysis.dyld");
         // Any DYLD_* instrumentation var is absent on a clean run, so binding it
         // into the verdict seal is safe and corrupts an injected/keygen run.
         sealFold(B, found, salts[i]);
@@ -2671,6 +2714,8 @@ void emitDarwinImageCensus(IRBuilder<> &B, Module &M, GlobalVariable *State) {
         LB.CreateICmpEQ(first8, ConstantInt::get(i64, 0x2f6d65747379532fULL));
     Value *foreign = LB.CreateNot(LB.CreateOr(isUsrLib, isSystem));
     foldFlag(LB, State, foreign, 0x2D9E64B0A7135CC1ULL, "morok.antidbg.image");
+    foldPoisonFlag(LB, foreign, 0xE57A2C6819D403BFULL,
+                   "morok.antianalysis.image");
     sealFold(LB, foreign, 0x2D9E64B0A7135CC1ULL);
     Value *next = LB.CreateAdd(i, ConstantInt::get(i32, 1), "morok.imgcensus.next");
     i->addIncoming(next, loop);
@@ -12409,6 +12454,8 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
                         "morok.corroborate.confirmed");
     Value *aggressive = B.CreateAnd(hooked, confirmed,
                                     "morok.corroborate.aggressive");
+    foldPoisonFlag(B, aggressive, 0xA4F6C2E91B537D8BULL,
+                   "morok.antihook.corroborated");
 
     auto *bail = BasicBlock::Create(ctx, "bail", ctor);
     auto *cont = BasicBlock::Create(ctx, "cont", ctor);

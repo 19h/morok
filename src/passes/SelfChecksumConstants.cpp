@@ -84,6 +84,7 @@ struct Runtime {
     GlobalVariable *code_size = nullptr;
     GlobalVariable *heartbeat_crypto = nullptr;
     GlobalVariable *antidbg_seal = nullptr;
+    GlobalVariable *anti_analysis_poison = nullptr;
     std::uint64_t antidbg_seal_s0 = 0;
     std::uint64_t expected_hash = 0;
     std::uint64_t seed = 0;
@@ -434,7 +435,9 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
                              GlobalVariable *CodeSize, Function *Target,
                              GlobalVariable *HeartbeatCrypto,
                              GlobalVariable *AntidbgSeal,
-                             std::uint64_t AntidbgSealS0, std::uint64_t Seed) {
+                             std::uint64_t AntidbgSealS0,
+                             GlobalVariable *AntiAnalysisPoison,
+                             std::uint64_t Seed) {
     LLVMContext &Ctx = M.getContext();
     auto *I8 = Type::getInt8Ty(Ctx);
     auto *I32 = Type::getInt32Ty(Ctx);
@@ -537,6 +540,13 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
             Seal, ConstantInt::get(I64, AntidbgSealS0), "morok.sc.antidbg.delta");
         Diff = XB.CreateXor(Diff, SealDelta, "morok.sc.antidbg.diff");
     }
+    if (AntiAnalysisPoison) {
+        auto *Poison =
+            XB.CreateLoad(I64, AntiAnalysisPoison, "morok.sc.antianalysis.poison");
+        Poison->setVolatile(true);
+        Poison->setAlignment(Align(8));
+        Diff = XB.CreateXor(Diff, Poison, "morok.sc.antianalysis.diff");
+    }
     XB.CreateRet(Diff);
     return Fn;
 }
@@ -576,11 +586,13 @@ Runtime createRuntime(Function &F, const SelfChecksumParams &Params,
     if (R.antidbg_seal->hasInitializer())
         if (auto *CI = dyn_cast<ConstantInt>(R.antidbg_seal->getInitializer()))
             R.antidbg_seal_s0 = CI->getZExtValue();
+    R.anti_analysis_poison =
+        M.getGlobalVariable("morok.antianalysis.poison", /*AllowInternal=*/true);
     createPostlinkManifest(M, F, Suffix, R.region, R.expected, R.code_size,
                            RegionSize, R.seed, R.expected_hash);
     R.diff = createDiffFunction(M, Suffix, R.region, R.expected, R.code_size,
                                 &F, R.heartbeat_crypto, R.antidbg_seal,
-                                R.antidbg_seal_s0, Seed);
+                                R.antidbg_seal_s0, R.anti_analysis_poison, Seed);
     return R;
 }
 

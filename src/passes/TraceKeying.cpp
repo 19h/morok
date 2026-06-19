@@ -529,6 +529,15 @@ DelayedSample delayedSample(IRBuilder<NoFolder> &B, GlobalVariable *Latent,
             LoadedKey = B.CreateXor(LoadedKey, CryptoLoad,
                                     "morok.trace.crypto.latent");
         }
+        if (auto *Poison = M->getGlobalVariable("morok.antianalysis.poison",
+                                                /*AllowInternal=*/true)) {
+            auto *PoisonLoad =
+                B.CreateLoad(I64, Poison, "morok.trace.antianalysis.poison");
+            PoisonLoad->setVolatile(true);
+            PoisonLoad->setAlignment(Align(8));
+            LoadedKey = B.CreateXor(LoadedKey, PoisonLoad,
+                                    "morok.trace.antianalysis.latent");
+        }
     }
 
     const std::uint64_t Tag = Rng.next();

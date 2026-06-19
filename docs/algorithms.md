@@ -1136,10 +1136,15 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   probe on a per-build jittered sleep cadence and advances a volatile heartbeat,
   while a second pthread samples that heartbeat and folds repeated staleness into
   `morok.antidbg.state`.  Confirmed staleness also mutates a volatile
-  `morok.watchdog.crypto` drift word.  `SelfChecksumConstants` xors that word
-  into its checksum-derived constant key and `TraceKeying` xors it into delayed
-  latent samples, so a stopped heartbeat changes later data/branch keys instead
-  of exposing a single branch to patch.  On Linux, the startup path also applies
+  `morok.watchdog.crypto` drift word.  High-confidence injected-library and
+  hook-framework evidence also updates a zero-clean
+  `morok.antianalysis.poison` accumulator: Darwin folds DYLD instrumentation and
+  foreign-image evidence, while Linux folds the existing corroborated hook symbol
+  verdict.  `SelfChecksumConstants` xors the watchdog drift and poison words
+  into its checksum-derived constant key, while `TraceKeying` xors the same
+  poison word into delayed latent samples.  A tripped detector therefore changes
+  later data/branch keys instead of exposing a single branch to patch.  On
+  Linux, the startup path also applies
   a Landlock ruleset, when the kernel supports it, to
   deny destructive filesystem rights (writes, creates, removes, renames,
   truncates, and device ioctls by ABI level) while keeping reads/exec available.
@@ -1400,7 +1405,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   single-step, or speculation-constrained environments often alter that
   side-effect/timing envelope.  The measured canary read latency is folded with
   primary/secondary clocks into `morok.microcanary.state`; like the other
-  low-confidence timing signals, it never gates an immediate kill path.
+  low-confidence timing signals, it does not gate an immediate kill path.
+  Release builds reserve downstream checksum and trace-key poisoning for
+  high-confidence injected-library and hook-framework evidence.
 - Nanomites lower selected conditional branches to a volatile predicate
   materialization followed by a synchronous `SIGTRAP` site.  The original
   condition no longer controls a direct branch; a `sigaction` `SA_SIGINFO`

@@ -319,6 +319,21 @@ std::size_t countGlobals(Module &M, StringRef prefix) {
     return n;
 }
 
+GlobalVariable *addAntiAnalysisPoison(Module &M, LLVMContext &ctx) {
+    auto *I64 = Type::getInt64Ty(ctx);
+    auto *GV = new GlobalVariable(
+        M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I64, 0), "morok.antianalysis.poison");
+    GV->setAlignment(Align(8));
+    return GV;
+}
+
+bool isAntiAnalysisPoisonLoad(const LoadInst *LI) {
+    if (!LI || !LI->isVolatile())
+        return false;
+    return LI->getPointerOperand()->getName() == "morok.antianalysis.poison";
+}
+
 bool constantReferencesGlobal(const Constant *C, const GlobalValue *GV) {
     if (!C || !GV)
         return false;
@@ -8288,6 +8303,7 @@ entry:
         *M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
         ConstantInt::get(I64, 0), "morok.watchdog.crypto");
     Crypto->setAlignment(Align(8));
+    addAntiAnalysisPoison(*M, ctx);
     auto engine = morok::core::Xoshiro256pp::fromSeed(181);
     morok::ir::IRRandom rng(engine);
 
@@ -8357,13 +8373,18 @@ entry:
     bool hasAtomicWatchdogCryptoLoad = false;
     bool hasDiffValue = false;
     bool hasCryptoDiff = false;
+    bool hasAntiAnalysisPoisonLoad = false;
+    bool hasAntiAnalysisDiff = false;
     for (Instruction &I : instructions(*Diff)) {
         hasDiffValue |= I.getName().starts_with("morok.sc.diff");
         hasCryptoDiff |= I.getName().starts_with("morok.sc.crypto.diff");
+        hasAntiAnalysisDiff |=
+            I.getName().starts_with("morok.sc.antianalysis.diff");
         if (auto *CI = dyn_cast<CallInst>(&I))
             if (Function *Callee = CI->getCalledFunction())
                 hasTrap |= Callee->getName() == "llvm.trap";
         if (auto *LI = dyn_cast<LoadInst>(&I)) {
+            hasAntiAnalysisPoisonLoad |= isAntiAnalysisPoisonLoad(LI);
             hasVolatileRegionLoad |=
                 LI->isVolatile() &&
                 LI->getPointerOperand()->getName().starts_with(
@@ -8392,6 +8413,8 @@ entry:
     CHECK(hasVolatileCodeSizeLoad);
     CHECK(hasVolatileCodeByteLoad);
     CHECK(hasAtomicWatchdogCryptoLoad);
+    CHECK(hasAntiAnalysisPoisonLoad);
+    CHECK(hasAntiAnalysisDiff);
     CHECK(hasDiffValue);
     CHECK(hasCryptoDiff);
     CHECK_FALSE(hasTrap);
@@ -9740,6 +9763,7 @@ no:
         *M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
         ConstantInt::get(I64, 0), "morok.watchdog.crypto");
     Crypto->setAlignment(Align(8));
+    addAntiAnalysisPoison(*M, ctx);
     auto engine = morok::core::Xoshiro256pp::fromSeed(161);
     morok::ir::IRRandom rng(engine);
 
@@ -9768,6 +9792,8 @@ no:
     std::size_t bodySwitchPoisons = 0;
     std::size_t watchdogCryptoLoads = 0;
     std::size_t watchdogCryptoMixes = 0;
+    std::size_t antiAnalysisPoisonLoads = 0;
+    std::size_t antiAnalysisLatentMixes = 0;
     std::size_t edgeMixes = 0;
     std::size_t valueTerms = 0;
     for (BasicBlock &BB : *F) {
@@ -9786,10 +9812,14 @@ no:
                 ++latentRecordSelects;
             if (I.getName().starts_with("morok.trace.crypto.latent"))
                 ++watchdogCryptoMixes;
+            if (I.getName().starts_with("morok.trace.antianalysis.latent"))
+                ++antiAnalysisLatentMixes;
             if (I.getName().starts_with("morok.trace.value.bits"))
                 ++valueTerms;
             if (auto *LI = dyn_cast<LoadInst>(&I)) {
                 volatileLoads += LI->isVolatile() ? 1u : 0u;
+                if (isAntiAnalysisPoisonLoad(LI))
+                    ++antiAnalysisPoisonLoads;
                 if (isMonotonicAtomicLoadFrom(LI, "morok.watchdog.crypto"))
                     ++watchdogCryptoLoads;
             }
@@ -9847,6 +9877,8 @@ no:
     CHECK(bodyBranchPoisons + bodyReturnPoisons + bodySwitchPoisons >= 1u);
     CHECK(watchdogCryptoLoads >= 1u);
     CHECK(watchdogCryptoMixes >= 1u);
+    CHECK(antiAnalysisPoisonLoads >= 1u);
+    CHECK(antiAnalysisLatentMixes >= 1u);
     CHECK(edgeMixes >= 3u);
     CHECK(valueTerms >= 3u);
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -12485,6 +12517,8 @@ entry:
     morok::ir::IRRandom rng(engine);
 
     CHECK(morok::passes::antiHookingModule(*M, rng));
+    CHECK(M->getGlobalVariable("morok.antianalysis.poison",
+                               /*AllowInternal=*/true) != nullptr);
 
     Function *Clean = M->getFunction("morok.antihook.clean.elf");
     REQUIRE(Clean != nullptr);
