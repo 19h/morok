@@ -212,9 +212,19 @@ void emitShareRound(Module &M, Function &Ctor, IRBuilder<> &B,
     AllocaInst *Slot = B.CreateAlloca(I64, nullptr, "morok.tracer.slot");
     AllocaInst *ParentStatus =
         B.CreateAlloca(I32, nullptr, "morok.tracer.parent.status");
-    auto *ZeroStore = B.CreateStore(ConstantInt::get(I64, 0), Slot);
-    ZeroStore->setVolatile(true);
-    ZeroStore->setAlignment(Align(8));
+    Value *FallbackSeed =
+        B.CreatePtrToInt(Slot, I64, "morok.tracer.fail.slot");
+    FallbackSeed =
+        B.CreateXor(FallbackSeed,
+                    ConstantInt::get(I64, FoldSalt ^ (Index + 1)),
+                    "morok.tracer.fail.seed");
+    Value *Fallback = mix64(B, FallbackSeed, 0xF1357AEA2E62A9C5ULL,
+                            "morok.tracer.fail.mix");
+    Fallback = B.CreateOr(Fallback, ConstantInt::get(I64, 1),
+                          "morok.tracer.fail.nonzero");
+    auto *FallbackStore = B.CreateStore(Fallback, Slot);
+    FallbackStore->setVolatile(true);
+    FallbackStore->setAlignment(Align(8));
 
     Value *Pid = emitLinuxSyscall(B, M, SysFork, {}, "morok.tracer.fork");
     BasicBlock *ChildBB = BasicBlock::Create(Ctx, "morok.tracer.child", &Ctor);
@@ -280,8 +290,14 @@ void emitShareRound(Module &M, Function &Ctor, IRBuilder<> &B,
                          "morok.tracer.child.wait");
     Value *WaitOk = AttachedB.CreateICmpEQ(WaitParent, Parent,
                                            "morok.tracer.child.wait.ok");
-    Value *Word = AttachedB.CreateSelect(
-        WaitOk, Share, ConstantInt::get(I64, 0), "morok.tracer.child.word");
+    Value *BadShare = mix64(AttachedB, Share,
+                            FoldSalt ^ 0xB6A6F89D4D3C7E21ULL,
+                            "morok.tracer.child.fail");
+    BadShare = AttachedB.CreateOr(BadShare, ConstantInt::get(I64, 1),
+                                  "morok.tracer.child.fail.nonzero");
+    Value *Word =
+        AttachedB.CreateSelect(WaitOk, Share, BadShare,
+                               "morok.tracer.child.word");
     Value *WordIP = AttachedB.CreateZExtOrTrunc(Word, IP);
     emitPtrace(AttachedB, M, PtracePokeData, Parent, SlotAddr, WordIP,
                "morok.tracer.poke");

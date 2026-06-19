@@ -438,6 +438,26 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         changed |= passes::externalSecretBindingModule(M, p, rng);
     }
 
+    // Tracer attestation emits only generated helpers/constructors here. Seed
+    // its seal channel before the first user VM wave so VM bytecode keys can
+    // consume the channel; the later protection-helper VM wave can still lift
+    // the generated share helper.
+    if (InitialModuleGrowthOk &&
+        config_.passes.tracer_attestation.enabled.value_or(false)) {
+        passes::TracerAttestationParams p;
+        p.mode =
+            config_.passes.tracer_attestation.mode.value_or("linux_ptrace");
+        p.shares = config_.passes.tracer_attestation.shares.value_or(2);
+        p.renewal =
+            config_.passes.tracer_attestation.renewal.value_or("startup");
+        p.bind_to_runtime_seal =
+            config_.passes.tracer_attestation.bind_to_runtime_seal.value_or(
+                true);
+        p.virtualize_helpers =
+            config_.passes.tracer_attestation.virtualize_helpers.value_or(true);
+        changed |= passes::tracerAttestationModule(M, p, rng);
+    }
+
     if (InitialModuleGrowthOk &&
         config_.passes.sealed_blob.enabled.value_or(false)) {
         passes::SealedBlobParams p =
@@ -445,7 +465,7 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         changed |= passes::sealedBlobModule(M, p, rng);
     }
 
-    // VM lifting runs FIRST, before any other obfuscation touches user code.
+    // VM lifting runs before any later obfuscation touches user code.
     // The virtualizer only lifts pristine integer/pointer computation kernels;
     // later passes rewrite those bodies in ways the bytecode cannot encode and
     // would make them ineligible — decoy-string injection plants references to
@@ -519,20 +539,6 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
     if (config_.passes.anti_dbg.enabled.value_or(false))
         changed |= passes::antiDebuggingModule(
             M, rng, !config_.passes.trap_oracles.enabled.value_or(false));
-    if (config_.passes.tracer_attestation.enabled.value_or(false)) {
-        passes::TracerAttestationParams p;
-        p.mode =
-            config_.passes.tracer_attestation.mode.value_or("linux_ptrace");
-        p.shares = config_.passes.tracer_attestation.shares.value_or(2);
-        p.renewal =
-            config_.passes.tracer_attestation.renewal.value_or("startup");
-        p.bind_to_runtime_seal =
-            config_.passes.tracer_attestation.bind_to_runtime_seal.value_or(
-                true);
-        p.virtualize_helpers =
-            config_.passes.tracer_attestation.virtualize_helpers.value_or(true);
-        changed |= passes::tracerAttestationModule(M, p, rng);
-    }
     if (config_.passes.timing_oracles.enabled.value_or(false))
         changed |= passes::timingOracleModule(M, rng);
     if (config_.passes.scheduler_step_oracles.enabled.value_or(false))

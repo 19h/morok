@@ -77,9 +77,11 @@ struct Runtime {
     GlobalVariable *heartbeat_crypto = nullptr;
     GlobalVariable *runtime_seal = nullptr;
     GlobalVariable *external_proof_seal = nullptr;
+    GlobalVariable *tracer_seal = nullptr;
     GlobalVariable *anti_analysis_poison = nullptr;
     std::uint64_t runtime_seal_s0 = 0;
     std::uint64_t external_proof_s0 = 0;
+    std::uint64_t tracer_s0 = 0;
     std::uint64_t expected_hash = 0;
     std::uint64_t seed = 0;
 };
@@ -393,6 +395,8 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
                              std::uint64_t AntidbgSealS0,
                              GlobalVariable *ExternalProofSeal,
                              std::uint64_t ExternalProofS0,
+                             GlobalVariable *TracerSeal,
+                             std::uint64_t TracerS0,
                              GlobalVariable *AntiAnalysisPoison,
                              std::uint64_t Seed) {
     LLVMContext &Ctx = M.getContext();
@@ -472,6 +476,14 @@ Function *createDiffFunction(Module &M, StringRef Suffix,
             "morok.sc.external_proof.kdf");
         Diff = XB.CreateXor(Diff, ProofKey, "morok.sc.external_proof.diff");
     }
+    if (TracerSeal) {
+        Value *TracerDelta = runtime_seal::emitDelta(
+            XB, TracerSeal, TracerS0, "morok.sc.tracer");
+        Value *TracerKey = runtime_seal::emitKdf64(
+            XB, TracerDelta, Seed ^ 0xC8735F2D9E164AB1ULL,
+            "morok.sc.tracer.kdf");
+        Diff = XB.CreateXor(Diff, TracerKey, "morok.sc.tracer.diff");
+    }
     if (AntiAnalysisPoison) {
         auto *Poison =
             XB.CreateLoad(I64, AntiAnalysisPoison, "morok.sc.antianalysis.poison");
@@ -507,6 +519,8 @@ Runtime createRuntime(Function &F, const SelfChecksumParams &Params,
     R.external_proof_seal =
         runtime_seal::findChannel(M, runtime_seal::kExternalProofChannel);
     R.external_proof_s0 = runtime_seal::initialValue(R.external_proof_seal);
+    R.tracer_seal = runtime_seal::findChannel(M, runtime_seal::kTracerChannel);
+    R.tracer_s0 = runtime_seal::initialValue(R.tracer_seal);
     R.anti_analysis_poison =
         M.getGlobalVariable("morok.antianalysis.poison", /*AllowInternal=*/true);
     createPostlinkManifest(M, F, Suffix, R.region, R.expected, R.code_size,
@@ -514,8 +528,8 @@ Runtime createRuntime(Function &F, const SelfChecksumParams &Params,
     R.diff = createDiffFunction(M, Suffix, R.region, R.expected, R.code_size,
                                 &F, R.heartbeat_crypto, R.runtime_seal,
                                 R.runtime_seal_s0, R.external_proof_seal,
-                                R.external_proof_s0, R.anti_analysis_poison,
-                                Seed);
+                                R.external_proof_s0, R.tracer_seal,
+                                R.tracer_s0, R.anti_analysis_poison, Seed);
     return R;
 }
 

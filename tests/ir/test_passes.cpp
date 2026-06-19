@@ -1319,6 +1319,46 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("MorokPass seeds tracer seal before initial VM lifting") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+
+define i32 @work(i32 %a, i32 %b) {
+entry:
+  %x = add i32 %a, %b
+  %y = xor i32 %x, 305419896
+  ret i32 %y
+}
+)ir");
+
+    morok::config::Config cfg;
+    cfg.seed = 714;
+    cfg.passes.virtualization.enabled = true;
+    cfg.passes.virtualization.probability = 100;
+    cfg.passes.virtualization.max_functions = 1;
+    cfg.passes.virtualization.max_instructions = 32;
+    cfg.passes.virtualization.max_registers = 64;
+    cfg.passes.tracer_attestation.enabled = true;
+    cfg.passes.tracer_attestation.mode = "linux_ptrace";
+    cfg.passes.tracer_attestation.shares = 1;
+    cfg.passes.tracer_attestation.renewal = "startup";
+    cfg.passes.tracer_attestation.bind_to_runtime_seal = true;
+    cfg.passes.tracer_attestation.virtualize_helpers = true;
+
+    ModuleAnalysisManager AM;
+    morok::pipeline::MorokPass(std::move(cfg)).run(*M, AM);
+
+    Function *Helper = M->getFunction("morok.vm.work.exec");
+    REQUIRE(Helper);
+    CHECK(M->getFunction("morok.tracer.attest") != nullptr);
+    CHECK(M->getGlobalVariable("morok.seal.root.tracer", true) != nullptr);
+    CHECK(countNamedInstructions(*Helper, "morok.vm.tracer.seal.kdf.key") >=
+          1u);
+    CHECK(countNamedInstructions(*Helper, "morok.vm.key.tracer") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("MorokPass keeps anti-debug and checksum helpers native") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -8904,7 +8944,22 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.expected") == 2u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.seal.next") == 2u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.antidbg.next") == 2u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.fail.nonzero") == 2u);
+    CHECK(countNamedInstructions(*Ctor,
+                                 "morok.tracer.child.fail.nonzero") == 2u);
     CHECK(countNamedInstructions(*Share, "morok.tracer.share.mix") >= 2u);
+
+    bool childFailurePoisonsShare = false;
+    for (Instruction &I : instructions(*Ctor)) {
+        auto *SI = dyn_cast<SelectInst>(&I);
+        if (!SI || SI->getName() != "morok.tracer.child.word")
+            continue;
+        if (auto *CI = dyn_cast<ConstantInt>(SI->getFalseValue()))
+            childFailurePoisonsShare |= !CI->isZero();
+        else
+            childFailurePoisonsShare = true;
+    }
+    CHECK(childFailurePoisonsShare);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -9038,6 +9093,8 @@ entry:
     morok::ir::IRRandom rng(engine);
     morok::passes::runtime_seal::getChannel(
         *M, morok::passes::runtime_seal::kExternalProofChannel, rng);
+    morok::passes::runtime_seal::getChannel(
+        *M, morok::passes::runtime_seal::kTracerChannel, rng);
 
     CHECK(morok::passes::selfChecksumConstantsFunction(
         *F, {/*probability=*/100, /*max_constants=*/8, /*region_bytes=*/32},
@@ -9051,6 +9108,7 @@ entry:
     CHECK(M->getGlobalVariable("morok.seal.root.anti_debug", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.seal.root.external_proof", true) !=
           nullptr);
+    CHECK(M->getGlobalVariable("morok.seal.root.tracer", true) != nullptr);
 
     GlobalVariable *Region = nullptr;
     GlobalVariable *Expected = nullptr;
@@ -9112,6 +9170,8 @@ entry:
     bool hasRuntimeSealDiff = false;
     bool hasExternalProofKdf = false;
     bool hasExternalProofDiff = false;
+    bool hasTracerKdf = false;
+    bool hasTracerDiff = false;
     bool hasAntiAnalysisPoisonLoad = false;
     bool hasAntiAnalysisDiff = false;
     for (Instruction &I : instructions(*Diff)) {
@@ -9125,6 +9185,8 @@ entry:
             I.getName().starts_with("morok.sc.external_proof.kdf.key");
         hasExternalProofDiff |=
             I.getName().starts_with("morok.sc.external_proof.diff");
+        hasTracerKdf |= I.getName().starts_with("morok.sc.tracer.kdf.key");
+        hasTracerDiff |= I.getName().starts_with("morok.sc.tracer.diff");
         hasAntiAnalysisDiff |=
             I.getName().starts_with("morok.sc.antianalysis.diff");
         if (auto *CI = dyn_cast<CallInst>(&I))
@@ -9168,6 +9230,8 @@ entry:
     CHECK(hasRuntimeSealDiff);
     CHECK(hasExternalProofKdf);
     CHECK(hasExternalProofDiff);
+    CHECK(hasTracerKdf);
+    CHECK(hasTracerDiff);
     CHECK_FALSE(hasTrap);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }

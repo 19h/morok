@@ -1626,6 +1626,9 @@ Value *emitStreamKey(Builder &B, Value *Offset, const Encoding &Enc) {
     foldSealChannel(runtime_seal::kExternalProofChannel, 0x3C3276BA47C1A99DULL,
                     "morok.vm.proof.seal", "morok.vm.proof.seal.kdf",
                     "morok.vm.proof.seal.fold", "morok.vm.key.external_proof");
+    foldSealChannel(runtime_seal::kTracerChannel, 0xD4E7B93A8F15C26DULL,
+                    "morok.vm.tracer.seal", "morok.vm.tracer.seal.kdf",
+                    "morok.vm.tracer.seal.fold", "morok.vm.key.tracer");
     X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 7)),
                     "morok.vm.key.fold7");
     X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 15)),
