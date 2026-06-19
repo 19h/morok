@@ -679,7 +679,25 @@ def resign_macho(binary: "Binary", path: Path) -> None:
         )
 
 
-def seal(path: Path, window: int) -> int:
+def sealed_code_len(
+    target_seg: Segment,
+    target: int,
+    configured_region_size: int,
+    window: int,
+    cover_timing_stubs: bool,
+) -> int:
+    seg_end_addr = target_seg.vmaddr + target_seg.filesize
+    available = max(0, min(window, seg_end_addr - target))
+    if cover_timing_stubs:
+        return available
+    # Keep the normal sealed runtime hash bounded by the pass' configured
+    # native region size. Hot functions may call the diff helper thousands of
+    # times; sealing the whole remaining text segment makes intact binaries
+    # spend most of their time rehashing unrelated code.
+    return max(0, min(configured_region_size, available))
+
+
+def seal(path: Path, window: int, cover_timing_stubs: bool = False) -> int:
     binary = Binary(path)
     manifests = binary.find_sc_manifests()
     sealed_sc = 0
@@ -699,8 +717,9 @@ def seal(path: Path, window: int) -> int:
             or code_size_off is None
         ):
             continue
-        seg_end_addr = target_seg.vmaddr + target_seg.filesize
-        code_len = max(0, min(window, seg_end_addr - m.target))
+        code_len = sealed_code_len(
+            target_seg, m.target, m.region_size, window, cover_timing_stubs
+        )
         if code_len <= 0:
             continue
         code = bytes(binary.data[target_off : target_off + code_len])
@@ -729,8 +748,13 @@ def seal(path: Path, window: int) -> int:
                 or native_expected_off is None
             ):
                 continue
-            seg_end_addr = target_seg.vmaddr + target_seg.filesize
-            code_len = max(0, min(window, seg_end_addr - node.target))
+            code_len = sealed_code_len(
+                target_seg,
+                node.target,
+                manifest.region_size,
+                window,
+                cover_timing_stubs,
+            )
             if code_len <= 0 or code_len == MG_UNSEALED_CODE_SIZE:
                 continue
             code = bytes(binary.data[target_off : target_off + code_len])
@@ -1037,6 +1061,7 @@ def main(argv: list[str]) -> int:
     p_seal = sub.add_parser("seal")
     p_seal.add_argument("binary", type=Path)
     p_seal.add_argument("--window", type=int, default=262144)
+    p_seal.add_argument("--cover-timing-stubs", action="store_true")
 
     p_code = sub.add_parser("patch-selfcheck-code")
     p_code.add_argument("binary", type=Path)
@@ -1060,7 +1085,7 @@ def main(argv: list[str]) -> int:
 
     args = parser.parse_args(argv)
     if args.cmd == "seal":
-        return seal(args.binary, args.window)
+        return seal(args.binary, args.window, args.cover_timing_stubs)
     if args.cmd == "patch-selfcheck-code":
         return patch_selfcheck_code(args.binary)
     if args.cmd == "patch-mutualguard-code":

@@ -112,7 +112,12 @@ if ! env "${MOROK_ENV[@]}" "$CLANG" "${SYSROOT[@]}" -O2 -std=c11 -D_GNU_SOURCE \
   exit 1
 fi
 
-if ! "$PYTHON" "$TOOL" seal "$OBF" --window 262144; then
+SEAL_ARGS=(seal "$OBF" --window 262144)
+if [ "$PATCH_MODE" = "timing" ]; then
+  SEAL_ARGS+=(--cover-timing-stubs)
+fi
+
+if ! "$PYTHON" "$TOOL" "${SEAL_ARGS[@]}"; then
   echo "FAIL post-link seal produced no integrity manifests" >&2
   exit 1
 fi
