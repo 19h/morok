@@ -256,6 +256,22 @@ if(APPLE AND Python3_EXECUTABLE)
       "$<TARGET_FILE:morok_plugin>;${_adversarial_driver};${_adversarial_ckd_config};${_adversarial_ckd_workload}"
     TIMEOUT 120)
 
+  add_test(NAME "e2e/adversarial_ckd_code_reset_size"
+    COMMAND bash "${_adversarial_driver}"
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_C_COMPILER}"
+            "$<TARGET_FILE:morok_plugin>"
+            "${_sysroot}"
+            "${_adversarial_ckd_workload}"
+            "${_adversarial_ckd_config}"
+            "ckd-code-reset-size"
+            4242)
+  set_tests_properties("e2e/adversarial_ckd_code_reset_size" PROPERTIES
+    LABELS "e2e;adversarial;max"
+    REQUIRED_FILES
+      "$<TARGET_FILE:morok_plugin>;${_adversarial_driver};${_adversarial_ckd_config};${_adversarial_ckd_workload}"
+    TIMEOUT 120)
+
   add_test(NAME "e2e/adversarial_timing_probe_patch"
     COMMAND bash "${_adversarial_driver}"
             "${Python3_EXECUTABLE}"

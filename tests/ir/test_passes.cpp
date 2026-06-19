@@ -27,8 +27,8 @@
 #include "morok/passes/DispatcherlessRouting.hpp"
 #include "morok/passes/ExternalOpaquePredicates.hpp"
 #include "morok/passes/ExternalSecretBinding.hpp"
-#include "morok/passes/Flattening.hpp"
 #include "morok/passes/FaultPagedPayload.hpp"
+#include "morok/passes/Flattening.hpp"
 #include "morok/passes/FunctionCallObfuscate.hpp"
 #include "morok/passes/FunctionWrapper.hpp"
 #include "morok/passes/HashGatedSelfDecrypt.hpp"
@@ -57,8 +57,8 @@
 #include "morok/passes/StringEncryption.hpp"
 #include "morok/passes/SubThresholdPersistence.hpp"
 #include "morok/passes/Substitution.hpp"
-#include "morok/passes/TracerAttestation.hpp"
 #include "morok/passes/TraceKeying.hpp"
+#include "morok/passes/TracerAttestation.hpp"
 #include "morok/passes/TypePunning.hpp"
 #include "morok/passes/UniformPrimitiveLowering.hpp"
 #include "morok/passes/VTableIntegrity.hpp"
@@ -574,7 +574,8 @@ TEST_CASE("PlatformRuntime emits direct Linux syscalls without libc import") {
     CHECK_FALSE(verifyModule(M, &errs()));
 }
 
-TEST_CASE("PlatformRuntime falls back to libc syscall on unsupported Linux arch") {
+TEST_CASE(
+    "PlatformRuntime falls back to libc syscall on unsupported Linux arch") {
     LLVMContext ctx;
     Module M("platform-runtime-linux-fallback", ctx);
     M.setTargetTriple(Triple("aarch64-unknown-linux-gnu"));
@@ -7250,9 +7251,9 @@ entry:
     auto engine = morok::core::Xoshiro256pp::fromSeed(95106);
     morok::ir::IRRandom rng(engine);
     morok::passes::VirtualizationParams P{/*probability=*/100,
-                                           /*max_functions=*/4,
-                                           /*max_instructions=*/64,
-                                           /*max_registers=*/64};
+                                          /*max_functions=*/4,
+                                          /*max_instructions=*/64,
+                                          /*max_registers=*/64};
     P.include_protection_helpers = true;
     P.protection_helpers_only = true;
     CHECK(morok::passes::virtualizeModule(*M, P, rng));
@@ -7264,7 +7265,8 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("virtualizeModule lifts sealed blob helpers in protection-helper mode") {
+TEST_CASE(
+    "virtualizeModule lifts sealed blob helpers in protection-helper mode") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 target triple = "x86_64-unknown-linux-gnu"
@@ -7281,9 +7283,9 @@ entry:
     auto engine = morok::core::Xoshiro256pp::fromSeed(95107);
     morok::ir::IRRandom rng(engine);
     morok::passes::VirtualizationParams P{/*probability=*/100,
-                                           /*max_functions=*/4,
-                                           /*max_instructions=*/64,
-                                           /*max_registers=*/64};
+                                          /*max_functions=*/4,
+                                          /*max_instructions=*/64,
+                                          /*max_registers=*/64};
     P.include_protection_helpers = true;
     P.protection_helpers_only = true;
     CHECK(morok::passes::virtualizeModule(*M, P, rng));
@@ -8128,7 +8130,8 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("faultPagedPayloadModule rewrites VM bytecode to page-local accessor") {
+TEST_CASE(
+    "faultPagedPayloadModule rewrites VM bytecode to page-local accessor") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 target triple = "x86_64-unknown-linux-gnu"
@@ -8934,8 +8937,7 @@ entry:
     params.shares = 2;
     CHECK(morok::passes::tracerAttestationModule(*M, params, rng));
 
-    GlobalVariable *Seal =
-        M->getGlobalVariable("morok.seal.root.tracer", true);
+    GlobalVariable *Seal = M->getGlobalVariable("morok.seal.root.tracer", true);
     REQUIRE(Seal != nullptr);
     GlobalVariable *AntiSeal =
         M->getGlobalVariable("morok.seal.root.anti_debug", true);
@@ -8961,8 +8963,8 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.seal.next") == 2u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.antidbg.next") == 2u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.fail.nonzero") == 2u);
-    CHECK(countNamedInstructions(*Ctor,
-                                 "morok.tracer.child.fail.nonzero") == 2u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.child.fail.nonzero") ==
+          2u);
     CHECK(countNamedInstructions(*Share, "morok.tracer.share.mix") >= 2u);
 
     bool childFailurePoisonsShare = false;
@@ -9004,7 +9006,6 @@ entry:
 
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
-
 
 TEST_CASE("sealedBlobModule encrypts explicit byte blobs and rewrites loads") {
     LLVMContext ctx;
@@ -9087,7 +9088,8 @@ TEST_CASE("sealedBlobModule skips escaping marked blobs without encrypting") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("sealedBlobModule skips mutable blobs with writeonly nocapture calls") {
+TEST_CASE(
+    "sealedBlobModule skips mutable blobs with writeonly nocapture calls") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 @secret_blob = private global [5 x i8] c"wipe\00", section ".morok.sealed"
@@ -11507,18 +11509,24 @@ entry:
     CHECK(countGlobals(*M, "morok.ckd.enc") == 2u);
     CHECK(countGlobals(*M, "morok.ckd.cache") == 2u);
     CHECK(countGlobals(*M, "morok.ckd.code.size") == 2u);
+    CHECK(countGlobals(*M, "morok.ckd.seal.state") == 2u);
     CHECK(countGlobals(*M, "morok.postlink.ckd") == 1u);
     CHECK(countNamedInstructions(*Caller, "morok.ckd.target.enc.cached") == 2u);
     CHECK(storesNamedValueToGlobalPrefix(*Caller, "morok.ckd.cache",
                                          "morok.ckd.enc"));
-    CHECK_FALSE(storesNamedValueToGlobalPrefix(
-        *Caller, "morok.ckd.cache", "morok.ckd.target.decoded"));
+    CHECK_FALSE(storesNamedValueToGlobalPrefix(*Caller, "morok.ckd.cache",
+                                               "morok.ckd.target.decoded"));
     CHECK(M->getGlobalVariable("llvm.global_ctors") != nullptr);
     CHECK(countCallsTo(*Init, "morok.ckd.dispatch") == 0u);
+    CHECK(countNamedInstructions(*Init, "morok.ckd.seal.state") == 2u);
+    CHECK(countNamedInstructions(*Init, "morok.ckd.seal.ok") == 2u);
+    CHECK(countNamedInstructions(*Caller, "morok.ckd.target.delta") == 2u);
+    CHECK(countNamedInstructions(*Caller, "morok.ckd.target.decoded") == 2u);
 
     GlobalVariable *Manifest = nullptr;
     std::vector<GlobalVariable *> EncodedSlots;
     std::vector<GlobalVariable *> CodeSizes;
+    std::vector<GlobalVariable *> SealStates;
     for (GlobalVariable &GV : M->globals()) {
         if (GV.getName().starts_with("morok.postlink.ckd"))
             Manifest = &GV;
@@ -11526,6 +11534,8 @@ entry:
             EncodedSlots.push_back(&GV);
         if (GV.getName().starts_with("morok.ckd.code.size"))
             CodeSizes.push_back(&GV);
+        if (GV.getName().starts_with("morok.ckd.seal.state"))
+            SealStates.push_back(&GV);
     }
     REQUIRE(Manifest);
     REQUIRE(Manifest->hasInitializer());
@@ -11538,6 +11548,8 @@ entry:
         CHECK(constantReferencesGlobal(Manifest->getInitializer(), Slot));
     for (GlobalVariable *CodeSize : CodeSizes)
         CHECK(constantReferencesGlobal(Manifest->getInitializer(), CodeSize));
+    for (GlobalVariable *SealState : SealStates)
+        CHECK(constantReferencesGlobal(Manifest->getInitializer(), SealState));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -11598,9 +11610,9 @@ entry:
         CHECK_FALSE(verifyModule(*M, &errs()));
     }
 
-    // Default (unsealed dev) mode keeps the self-recovering fallback so unsealed
-    // builds still run: the constructor recomputes from live bytes and never
-    // poisons.
+    // Default (unsealed dev) mode keeps the self-recovering fallback so
+    // unsealed builds still run: the constructor recomputes from live bytes and
+    // never poisons.
     {
         LLVMContext ctx;
         auto M = build(ctx);
@@ -11712,6 +11724,9 @@ entry:
     CHECK(countCallsThroughOperand(*Caller, Dispatch) == 1u);
     CHECK(countGlobals(*M, "morok.ckd.enc") == 1u);
     CHECK(countGlobals(*M, "morok.ckd.cache") == 1u);
+    CHECK(countGlobals(*M, "morok.ckd.seal.state") == 1u);
+    CHECK(countNamedInstructions(*Caller, "morok.ckd.target.delta") == 1u);
+    CHECK(countNamedInstructions(*Caller, "morok.ckd.target.decoded") == 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -15422,10 +15437,11 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("syscall") == nullptr);
     CHECK(hasInlineAsmCall(*Oracle));
     CHECK(functionHasConstantInt(*Oracle, 298u)); // perf_event_open syscall
-    CHECK(functionHasConstantInt(*Oracle, 3u));   // PERF_COUNT_SW_CONTEXT_SWITCHES
+    CHECK(
+        functionHasConstantInt(*Oracle, 3u)); // PERF_COUNT_SW_CONTEXT_SWITCHES
     CHECK(countNamedInstructions(*Oracle, "morok.step.perf.open.ready") >= 1u);
-    CHECK(countNamedInstructions(*Oracle, "morok.step.getrusage.before.total") >=
-          1u);
+    CHECK(countNamedInstructions(*Oracle,
+                                 "morok.step.getrusage.before.total") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.step.getrusage.after.total") >=
           1u);
     CHECK(countNamedInstructions(*Oracle, "morok.step.switch.anomaly") >= 1u);
@@ -15457,7 +15473,8 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("schedulerStepOracleModule emits Windows thread-time and cycle sampling") {
+TEST_CASE(
+    "schedulerStepOracleModule emits Windows thread-time and cycle sampling") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 target triple = "x86_64-pc-windows-msvc"

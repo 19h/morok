@@ -407,10 +407,19 @@ class Auditor:
         node: adv.CkdNodeManifest,
     ) -> bool:
         sealed = True
+        if manifest.version != 2:
+            self.emit_finding(
+                "legacy-ckd-manifest",
+                path,
+                f"caller-keyed-dispatch manifest file+0x{manifest.offset:x} "
+                "is not seal-state v2",
+            )
+            sealed = False
         if (
             node.salt != 0
             or node.mul != 0
             or node.add != 0
+            or node.seal_salt != 0
             or node.rot != 0
             or node.region_bytes != 0
         ):
@@ -423,6 +432,7 @@ class Auditor:
             sealed = False
         code_size = self.read_u32_at_addr(binary, node.code_size)
         encoded = self.read_u64_at_addr(binary, node.encoded)
+        seal_state = self.read_u64_at_addr(binary, node.seal_state)
         if code_size in (None, 0, UNSEALED_CODE_SIZE):
             self.emit_finding(
                 "placeholder-manifest",
@@ -437,6 +447,14 @@ class Auditor:
                 path,
                 f"caller-keyed-dispatch manifest file+0x{manifest.offset:x} node {node.index} "
                 "has unsealed encoded target",
+            )
+            sealed = False
+        if seal_state in (None, 0):
+            self.emit_finding(
+                "placeholder-manifest",
+                path,
+                f"caller-keyed-dispatch manifest file+0x{manifest.offset:x} node {node.index} "
+                "has unsealed seal state",
             )
             sealed = False
         return sealed

@@ -100,6 +100,7 @@ def write_synthetic_ckd_elf(
     rec_off = manifest_off + 16
     encoded_off = 0x300
     code_size_off = 0x308
+    seal_state_off = 0x310
     dispatcher_off = 0x400
     site_off = 0x410
     target_off = 0x430
@@ -107,14 +108,15 @@ def write_synthetic_ckd_elf(
     data[target_off : target_off + 16] = b"\x55\x48\x89\xe5\x90\x90\x90\xc3" * 2
 
     struct.pack_into("<Q", data, manifest_off, CKD_MAGIC)
-    struct.pack_into("<I", data, manifest_off + 8, 1)
+    struct.pack_into("<I", data, manifest_off + 8, 2)
     struct.pack_into("<I", data, manifest_off + 12, 1)
     for rel, value in (
         (0, BASE + encoded_off),
         (8, BASE + code_size_off),
-        (16, BASE + dispatcher_off),
-        (24, BASE + site_off),
-        (32, BASE + target_off),
+        (16, BASE + seal_state_off),
+        (24, BASE + dispatcher_off),
+        (32, BASE + site_off),
+        (40, BASE + target_off),
     ):
         struct.pack_into("<Q", data, rec_off + rel, value)
 
@@ -123,19 +125,23 @@ def write_synthetic_ckd_elf(
             encoded_value = 0x8190A1B2C3D4E5F6
         struct.pack_into("<Q", data, encoded_off, encoded_value)
         struct.pack_into("<I", data, code_size_off, 16)
-        struct.pack_into("<Q", data, rec_off + 40, 0)
+        struct.pack_into("<Q", data, seal_state_off, 0xA91357E28BC4D6F0)
         struct.pack_into("<Q", data, rec_off + 48, 0)
         struct.pack_into("<Q", data, rec_off + 56, 0)
-        struct.pack_into("<I", data, rec_off + 64, 0)
-        struct.pack_into("<I", data, rec_off + 68, 0)
+        struct.pack_into("<Q", data, rec_off + 64, 0)
+        struct.pack_into("<Q", data, rec_off + 72, 0)
+        struct.pack_into("<I", data, rec_off + 80, 0)
+        struct.pack_into("<I", data, rec_off + 84, 0)
     else:
         struct.pack_into("<Q", data, encoded_off, 0)
         struct.pack_into("<I", data, code_size_off, UNSEALED_CODE_SIZE)
-        struct.pack_into("<Q", data, rec_off + 40, 0x1111222233334444)
-        struct.pack_into("<Q", data, rec_off + 48, 0x5555666677778889)
-        struct.pack_into("<Q", data, rec_off + 56, 0x9999AAAABBBBCCCD)
-        struct.pack_into("<I", data, rec_off + 64, 17)
-        struct.pack_into("<I", data, rec_off + 68, 16)
+        struct.pack_into("<Q", data, seal_state_off, 0)
+        struct.pack_into("<Q", data, rec_off + 48, 0x1111222233334444)
+        struct.pack_into("<Q", data, rec_off + 56, 0x5555666677778889)
+        struct.pack_into("<Q", data, rec_off + 64, 0x9999AAAABBBBCCCD)
+        struct.pack_into("<Q", data, rec_off + 72, 0xDDDD111122223333)
+        struct.pack_into("<I", data, rec_off + 80, 17)
+        struct.pack_into("<I", data, rec_off + 84, 16)
     path.write_bytes(data)
 
 

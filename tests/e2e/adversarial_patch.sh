@@ -151,6 +151,10 @@ case "$PATCH_MODE" in
     "$PYTHON" "$TOOL" patch-ckd-downgrade "$PATCHED"
     patch_rc="$?"
     ;;
+  ckd-code-reset-size)
+    "$PYTHON" "$TOOL" patch-ckd-code-reset-size "$PATCHED"
+    patch_rc="$?"
+    ;;
   timing)
     "$PYTHON" "$TOOL" patch-timing "$PATCHED"
     patch_rc="$?"

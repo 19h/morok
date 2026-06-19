@@ -28,8 +28,10 @@ MG_RECORD_V3_SIZE = 56
 MG_UNSEALED_CODE_SIZE = 0xFFFFFFFF
 CKD_MAGIC = 0xC30D5B11A6E48F27
 CKD_HEADER_SIZE = 16
-CKD_RECORD_SIZE = 72
+CKD_RECORD_V1_SIZE = 72
+CKD_RECORD_V2_SIZE = 88
 CKD_MAX_REGION_BYTES = 32
+CKD_UNSEALED_CODE_SIZE = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
 
 CPU_TYPE_X86_64 = 0x01000007
@@ -107,12 +109,14 @@ class CkdNodeManifest:
     index: int
     encoded: int
     code_size: int
+    seal_state: int
     dispatcher: int
     site: int
     target: int
     salt: int
     mul: int
     add: int
+    seal_salt: int
     rot: int
     region_bytes: int
 
@@ -466,34 +470,50 @@ class Binary:
                 continue
             version = self.u32(off + 8)
             count = self.u32(off + 12)
-            if version != 1 or count == 0 or count > 4096:
+            if version not in (1, 2) or count == 0 or count > 4096:
                 continue
-            total_size = CKD_HEADER_SIZE + count * CKD_RECORD_SIZE
+            record_size = CKD_RECORD_V2_SIZE if version == 2 else CKD_RECORD_V1_SIZE
+            total_size = CKD_HEADER_SIZE + count * record_size
             if off + total_size > len(self.data):
                 continue
 
             nodes: list[CkdNodeManifest] = []
             for i in range(count):
-                rec = off + CKD_HEADER_SIZE + i * CKD_RECORD_SIZE
+                rec = off + CKD_HEADER_SIZE + i * record_size
                 def manifest_ptr(rel: int) -> int:
                     raw = self.u64(rec + rel)
                     return 0 if raw == 0 else self.decode_pointer(raw)
 
                 encoded = manifest_ptr(0)
                 code_size = manifest_ptr(8)
-                dispatcher = manifest_ptr(16)
-                site = manifest_ptr(24)
-                target = manifest_ptr(32)
-                salt = self.u64(rec + 40)
-                mul = self.u64(rec + 48)
-                add = self.u64(rec + 56)
-                rot = self.u32(rec + 64)
-                region_bytes = self.u32(rec + 68)
+                if version == 2:
+                    seal_state = manifest_ptr(16)
+                    dispatcher = manifest_ptr(24)
+                    site = manifest_ptr(32)
+                    target = manifest_ptr(40)
+                    salt = self.u64(rec + 48)
+                    mul = self.u64(rec + 56)
+                    add = self.u64(rec + 64)
+                    seal_salt = self.u64(rec + 72)
+                    rot = self.u32(rec + 80)
+                    region_bytes = self.u32(rec + 84)
+                else:
+                    seal_state = 0
+                    dispatcher = manifest_ptr(16)
+                    site = manifest_ptr(24)
+                    target = manifest_ptr(32)
+                    salt = self.u64(rec + 40)
+                    mul = self.u64(rec + 48)
+                    add = self.u64(rec + 56)
+                    seal_salt = 0
+                    rot = self.u32(rec + 64)
+                    region_bytes = self.u32(rec + 68)
                 if self.fileoff_for_addr(site) is None:
                     continue
                 if require_patchable and (
                     self.fileoff_for_addr(encoded) is None
                     or self.fileoff_for_addr(code_size) is None
+                    or (version == 2 and self.fileoff_for_addr(seal_state) is None)
                     or self.fileoff_for_addr(dispatcher) is None
                     or self.fileoff_for_addr(target) is None
                     or region_bytes == 0
@@ -507,12 +527,14 @@ class Binary:
                         index=i,
                         encoded=encoded,
                         code_size=code_size,
+                        seal_state=seal_state,
                         dispatcher=dispatcher,
                         site=site,
                         target=target,
                         salt=salt,
                         mul=mul,
                         add=add,
+                        seal_salt=seal_salt,
                         rot=rot,
                         region_bytes=region_bytes,
                     )
@@ -597,6 +619,30 @@ def ckd_site_hash(blob: bytes, site_delta: int, node: CkdNodeManifest) -> int:
         h ^= h >> 29
         h &= MASK64
     return h
+
+
+def ckd_seal_mix(value: int) -> int:
+    value ^= value >> 33
+    value = (value * 0xFF51AFD7ED558CCD) & MASK64
+    value ^= value >> 29
+    value = (value * 0xC4CEB9FE1A85EC53) & MASK64
+    value ^= value >> 32
+    return value & MASK64
+
+
+def ckd_seal_state(
+    encoded: int, code_size: int, site_delta: int, target_delta: int, node: CkdNodeManifest
+) -> int:
+    h = (encoded ^ node.seal_salt) & MASK64
+    h = ckd_seal_mix(h ^ code_size)
+    h = ckd_seal_mix((h + site_delta) & MASK64)
+    h = ckd_seal_mix(h ^ target_delta)
+    h = ckd_seal_mix((h + node.salt) & MASK64)
+    h = ckd_seal_mix(h ^ (node.mul | 1))
+    h = ckd_seal_mix((h + node.add) & MASK64)
+    shape = ((node.rot & 0xFFFFFFFF) << 32) | (node.region_bytes & 0xFFFFFFFF)
+    h = ckd_seal_mix(h ^ shape)
+    return h or 0xA5A5D13C5EEDC0DE
 
 
 def mg_native_seed(region_hash: int, index: int) -> int:
@@ -701,7 +747,14 @@ def seal(path: Path, window: int) -> int:
         for node in manifest.nodes:
             encoded_off = binary.fileoff_for_addr(node.encoded)
             code_size_off = binary.fileoff_for_addr(node.code_size)
+            seal_state_off = (
+                binary.fileoff_for_addr(node.seal_state)
+                if manifest.version == 2
+                else None
+            )
             if encoded_off is None or code_size_off is None:
+                continue
+            if manifest.version == 2 and seal_state_off is None:
                 continue
             if node.region_bytes == 0 or node.region_bytes > window:
                 continue
@@ -713,14 +766,25 @@ def seal(path: Path, window: int) -> int:
             encoded = (target_delta + ckd_site_hash(code, site_delta, node)) & MASK64
             binary.put_u64(encoded_off, encoded)
             binary.put_u32(code_size_off, node.region_bytes)
+            if manifest.version == 2:
+                seal_value = ckd_seal_state(
+                    encoded, node.region_bytes, site_delta, target_delta, node
+                )
+                binary.put_u64(seal_state_off, seal_value)
             # Do not rewrite pointer fields in Mach-O manifests: they
             # participate in dyld chained-fixup metadata on arm64 and zeroing
             # them can break later GOT binds on the same page.  Scrub only the
             # scalar hash material needed to recompute the encoded target.
-            for rel in (40, 48, 56):
-                binary.put_u64(node.offset + rel, 0)
-            binary.put_u32(node.offset + 64, 0)
-            binary.put_u32(node.offset + 68, 0)
+            if manifest.version == 2:
+                for rel in (48, 56, 64, 72):
+                    binary.put_u64(node.offset + rel, 0)
+                binary.put_u32(node.offset + 80, 0)
+                binary.put_u32(node.offset + 84, 0)
+            else:
+                for rel in (40, 48, 56):
+                    binary.put_u64(node.offset + rel, 0)
+                binary.put_u32(node.offset + 64, 0)
+                binary.put_u32(node.offset + 68, 0)
             sealed_ckd += 1
 
     if sealed_sc or sealed_mg or sealed_ckd:
@@ -757,6 +821,7 @@ def postlink_oracle_findings(binary: Binary) -> list[str]:
                 node.salt != 0
                 or node.mul != 0
                 or node.add != 0
+                or node.seal_salt != 0
                 or node.rot != 0
                 or node.region_bytes != 0
             ):
@@ -867,15 +932,42 @@ def patch_ckd_downgrade(path: Path) -> int:
             code_size_off = binary.fileoff_for_addr(node.code_size)
             if code_size_off is None:
                 continue
-            binary.put_u32(code_size_off, MG_UNSEALED_CODE_SIZE)
+            binary.put_u32(code_size_off, CKD_UNSEALED_CODE_SIZE)
             reset += 1
     if reset == 0:
-        print("caller-keyed-dispatch code_size slot not addressable",
-              file=sys.stderr)
+        print(
+            "caller-keyed-dispatch code_size slot not addressable",
+            file=sys.stderr,
+        )
         return 1
     binary.write()
-    print(f"reset caller-keyed-dispatch code_size slots={reset} to unsealed "
-          "sentinel")
+    print(
+        f"reset caller-keyed-dispatch code_size slots={reset} to unsealed "
+        "sentinel"
+    )
+    return 0
+
+
+def patch_ckd_code_reset_size(path: Path) -> int:
+    binary = Binary(path)
+    manifests = binary.find_ckd_manifests(require_patchable=False)
+    if not manifests or not manifests[0].nodes:
+        print("no caller-keyed-dispatch manifests to patch", file=sys.stderr)
+        return 1
+    node = manifests[0].nodes[0]
+    rc = patch_code_at(binary, node.site, "caller-keyed-dispatch")
+    if rc != 0:
+        return rc
+    code_size_off = binary.fileoff_for_addr(node.code_size)
+    if code_size_off is None:
+        print(
+            "caller-keyed-dispatch code_size is not file-backed",
+            file=sys.stderr,
+        )
+        return 1
+    binary.put_u32(code_size_off, CKD_UNSEALED_CODE_SIZE)
+    print("reset caller-keyed-dispatch code_size to unsealed sentinel")
+    binary.write()
     return 0
 
 
@@ -954,6 +1046,8 @@ def main(argv: list[str]) -> int:
 
     p_ckd_code = sub.add_parser("patch-ckd-code")
     p_ckd_code.add_argument("binary", type=Path)
+    p_ckd_reset = sub.add_parser("patch-ckd-code-reset-size")
+    p_ckd_reset.add_argument("binary", type=Path)
 
     p_ckd_downgrade = sub.add_parser("patch-ckd-downgrade")
     p_ckd_downgrade.add_argument("binary", type=Path)
@@ -975,6 +1069,8 @@ def main(argv: list[str]) -> int:
         return patch_ckd_code(args.binary)
     if args.cmd == "patch-ckd-downgrade":
         return patch_ckd_downgrade(args.binary)
+    if args.cmd == "patch-ckd-code-reset-size":
+        return patch_ckd_code_reset_size(args.binary)
     if args.cmd == "patch-timing":
         return patch_timing(args.binary)
     if args.cmd == "assert-no-postlink-oracles":

@@ -824,6 +824,22 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   encryption, so it sees late control/data shape while ordinary literal
   encryption can still obscure constants introduced in the user function.
 
+## Caller-keyed dispatch — live caller-byte binding
+- Eligible direct internal calls are routed through one native dispatcher.  Each
+  call site carries an encoded dispatcher-relative target value and recomputes a
+  volatile hash over its own native bytes before every dispatch.  The per-site
+  cache stores only that encoded value; it never stores the final absolute
+  target, so warmed sites still require the live caller-byte hash and post-
+  warmup breakpoints or inline patches corrupt the recovered target.
+- The pass emits retained `morok.postlink.ckd` v2 records containing the encoded
+  slot, code-size slot, seal-state slot, dispatcher, site, target, and per-site
+  hash material.  The post-link sealer writes the encoded value, final code
+  window size, and a keyed seal-state word, then scrubs the scalar hash recipe
+  from the retained manifest.  At startup, a sealed site only accepts the
+  existing encoded value when the code-size and seal-state word agree; resetting
+  the mutable code-size slot back to the unsealed sentinel no longer re-enables
+  live-byte self-sealing.
+
 ## Shamir threshold sharing — `core/ShamirGf256` / `core/Galois8`
 - The pure core implements GF(2^8) polynomial evaluation, `(k,n)` splitting,
   and Lagrange reconstruction at zero.  Tests cover a fixed reference vector,

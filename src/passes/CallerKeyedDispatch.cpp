@@ -11,10 +11,10 @@
 // recomputed on every call so warmed sites remain sensitive to live patches.
 //
 // Each routed site also emits a post-link manifest.  The sealer patches the
-// encoded target against final native bytes and marks the site sealed; sealed
-// binaries therefore cannot self-adapt to pre-start static patches, while
-// unsealed dev/test builds still compute their encoded targets in the
-// constructor.
+// encoded target against final native bytes and flips a per-site seal-state
+// word.  Sealed binaries therefore cannot self-adapt to pre-start static
+// patches by resetting the mutable code-size slot, while unsealed dev/test
+// builds still compute their encoded targets in the constructor.
 
 #include "morok/passes/CallerKeyedDispatch.hpp"
 
@@ -55,6 +55,7 @@ using Builder = IRBuilder<NoFolder>;
 constexpr std::uint32_t kMaxCallsPerModule = 4096;
 constexpr std::uint32_t kMaxRegionBytes = 32;
 constexpr std::uint64_t kPostlinkMagic = 0xC30D5B11A6E48F27ULL;
+constexpr std::uint32_t kPostlinkVersion = 2;
 
 struct ArchLayout {
     StringRef dispatcher_asm;
@@ -72,21 +73,22 @@ struct Site {
     GlobalVariable *encoded = nullptr;
     GlobalVariable *cache = nullptr;
     GlobalVariable *code_size = nullptr;
+    GlobalVariable *seal_state = nullptr;
     std::uint64_t salt = 0;
     std::uint64_t mul = 0;
     std::uint64_t add = 0;
+    std::uint64_t seal_unsealed = 0;
+    std::uint64_t seal_salt = 0;
     std::uint32_t rot = 0;
 };
 
 std::optional<ArchLayout> layoutFor(const Triple &TT) {
     switch (TT.getArch()) {
     case Triple::x86_64:
-        return ArchLayout{
-            "jmpq *%r14",
-            "~{memory},~{dirflag},~{fpsr},~{flags}",
-            "movq $1, $0",
-            "={r14},r,~{memory},~{dirflag},~{fpsr},~{flags}",
-            "{r14},~{memory},~{dirflag},~{fpsr},~{flags}"};
+        return ArchLayout{"jmpq *%r14", "~{memory},~{dirflag},~{fpsr},~{flags}",
+                          "movq $1, $0",
+                          "={r14},r,~{memory},~{dirflag},~{fpsr},~{flags}",
+                          "{r14},~{memory},~{dirflag},~{fpsr},~{flags}"};
     case Triple::aarch64:
     case Triple::aarch64_be:
         return ArchLayout{"br x19", "~{memory}", "mov $0, $1",
@@ -171,9 +173,58 @@ Value *rotl64(Builder &B, Value *V, std::uint32_t Bits, const Twine &Name) {
         B.CreateLShr(V, ConstantInt::get(I64, 64u - Bits), Name + ".r"), Name);
 }
 
+Value *mixSeal64(Builder &B, Value *V, const Twine &Name) {
+    auto *I64 = B.getInt64Ty();
+    V = B.CreateXor(V, B.CreateLShr(V, ConstantInt::get(I64, 33)),
+                    Name + ".x0");
+    V = B.CreateMul(V, ConstantInt::get(I64, 0xff51afd7ed558ccdULL),
+                    Name + ".m0");
+    V = B.CreateXor(V, B.CreateLShr(V, ConstantInt::get(I64, 29)),
+                    Name + ".x1");
+    V = B.CreateMul(V, ConstantInt::get(I64, 0xc4ceb9fe1a85ec53ULL),
+                    Name + ".m1");
+    return B.CreateXor(V, B.CreateLShr(V, ConstantInt::get(I64, 32)), Name);
+}
+
+Value *emitSealState(Builder &B, Function *Dispatcher, const Site &S,
+                     Value *Encoded, Value *CodeSize, std::uint32_t RegionBytes,
+                     const Twine &Name) {
+    auto *I64 = B.getInt64Ty();
+    Value *CodeSize64 = B.CreateZExt(CodeSize, I64, Name + ".code.size");
+    Value *Disp = ptrToI64(B, Dispatcher);
+    Value *Site = ptrToI64(B, BlockAddress::get(S.caller, S.block));
+    Value *Target = ptrToI64(B, S.callee);
+    Value *SiteDelta = B.CreateSub(Site, Disp, Name + ".site.delta");
+    Value *TargetDelta = B.CreateSub(Target, Disp, Name + ".target.delta");
+    Value *X = B.CreateXor(Encoded, ConstantInt::get(I64, S.seal_salt),
+                           Name + ".seed");
+    X = mixSeal64(B, B.CreateXor(X, CodeSize64, Name + ".fold.size"),
+                  Name + ".mix.size");
+    X = mixSeal64(B, B.CreateAdd(X, SiteDelta, Name + ".fold.site"),
+                  Name + ".mix.site");
+    X = mixSeal64(B, B.CreateXor(X, TargetDelta, Name + ".fold.target"),
+                  Name + ".mix.target");
+    X = mixSeal64(
+        B, B.CreateAdd(X, ConstantInt::get(I64, S.salt), Name + ".fold.salt"),
+        Name + ".mix.salt");
+    X = mixSeal64(
+        B,
+        B.CreateXor(X, ConstantInt::get(I64, S.mul | 1ULL), Name + ".fold.mul"),
+        Name + ".mix.mul");
+    X = mixSeal64(
+        B, B.CreateAdd(X, ConstantInt::get(I64, S.add), Name + ".fold.add"),
+        Name + ".mix.add");
+    std::uint64_t Shape =
+        (static_cast<std::uint64_t>(S.rot) << 32) | RegionBytes;
+    X = mixSeal64(
+        B, B.CreateXor(X, ConstantInt::get(I64, Shape), Name + ".fold.shape"),
+        Name + ".mix.shape");
+    return X;
+}
+
 Value *emitSiteHash(Builder &B, Module &M, Function *Dispatcher,
-                    Function *Caller, BasicBlock *SiteBlock,
-                    const Site &S, std::uint32_t RegionBytes) {
+                    Function *Caller, BasicBlock *SiteBlock, const Site &S,
+                    std::uint32_t RegionBytes) {
     auto *I8 = B.getInt8Ty();
     auto *I64 = B.getInt64Ty();
     auto *Ptr = PointerType::getUnqual(M.getContext());
@@ -181,15 +232,15 @@ Value *emitSiteHash(Builder &B, Module &M, Function *Dispatcher,
     Value *Base = ptrToI64(B, Dispatcher);
     Value *Start = ptrToI64(B, BlockAddress::get(Caller, SiteBlock));
     Value *SiteDelta = B.CreateSub(Start, Base, "morok.ckd.site.delta");
-    Value *H = B.CreateXor(ConstantInt::get(I64, S.salt), SiteDelta,
-                           "morok.ckd.hash");
+    Value *H =
+        B.CreateXor(ConstantInt::get(I64, S.salt), SiteDelta, "morok.ckd.hash");
 
     for (std::uint32_t I = 0; I != RegionBytes; ++I) {
-        Value *Addr = B.CreateAdd(Start, ConstantInt::get(I64, I),
-                                  "morok.ckd.byte.addr");
+        Value *Addr =
+            B.CreateAdd(Start, ConstantInt::get(I64, I), "morok.ckd.byte.addr");
         Value *BytePtr = B.CreateIntToPtr(Addr, Ptr, "morok.ckd.byte.ptr");
-        LoadInst *Byte = B.CreateLoad(I8, BytePtr, /*isVolatile=*/true,
-                                      "morok.ckd.byte");
+        LoadInst *Byte =
+            B.CreateLoad(I8, BytePtr, /*isVolatile=*/true, "morok.ckd.byte");
         Value *Wide = B.CreateZExt(Byte, I64, "morok.ckd.byte.wide");
         Value *Salted = B.CreateAdd(
             Wide, ConstantInt::get(I64, S.add + (0x9e3779b97f4a7c15ULL * I)),
@@ -217,9 +268,9 @@ GlobalVariable *makeEncodedSlot(Module &M, ir::IRRandom &Rng) {
 
 GlobalVariable *makeCacheSlot(Module &M) {
     auto *I64 = Type::getInt64Ty(M.getContext());
-    auto *GV = new GlobalVariable(
-        M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
-        ConstantInt::get(I64, 0), "morok.ckd.cache");
+    auto *GV = new GlobalVariable(M, I64, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(I64, 0), "morok.ckd.cache");
     GV->setAlignment(Align(8));
     appendToCompilerUsed(M, {GV});
     return GV;
@@ -236,8 +287,17 @@ GlobalVariable *makeCodeSizeSlot(Module &M) {
     return GV;
 }
 
-void emitPostlinkManifest(Module &M, Function *Dispatcher,
-                          ArrayRef<Site> Sites,
+GlobalVariable *makeSealStateSlot(Module &M, std::uint64_t Unsealed) {
+    auto *I64 = Type::getInt64Ty(M.getContext());
+    auto *GV = new GlobalVariable(
+        M, I64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(I64, Unsealed), "morok.ckd.seal.state");
+    GV->setAlignment(Align(8));
+    appendToCompilerUsed(M, {GV});
+    return GV;
+}
+
+void emitPostlinkManifest(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
                           std::uint32_t RegionBytes) {
     if (Sites.empty())
         return;
@@ -248,29 +308,29 @@ void emitPostlinkManifest(Module &M, Function *Dispatcher,
     auto *Ptr = PointerType::getUnqual(Ctx);
 
     auto *RecordTy = StructType::get(
-        Ctx, {Ptr, Ptr, Ptr, Ptr, Ptr, I64, I64, I64, I32, I32});
+        Ctx, {Ptr, Ptr, Ptr, Ptr, Ptr, Ptr, I64, I64, I64, I64, I32, I32});
     SmallVector<Constant *, 16> Records;
     Records.reserve(Sites.size());
     for (const Site &S : Sites) {
         Records.push_back(ConstantStruct::get(
             RecordTy,
-            {S.encoded, S.code_size, Dispatcher,
+            {S.encoded, S.code_size, S.seal_state, Dispatcher,
              BlockAddress::get(S.caller, S.block), S.callee,
              ConstantInt::get(I64, S.salt), ConstantInt::get(I64, S.mul),
-             ConstantInt::get(I64, S.add), ConstantInt::get(I32, S.rot),
+             ConstantInt::get(I64, S.add), ConstantInt::get(I64, S.seal_salt),
+             ConstantInt::get(I32, S.rot),
              ConstantInt::get(I32, RegionBytes)}));
     }
 
     auto *RecordsTy = ArrayType::get(RecordTy, Records.size());
-    auto *ManifestTy =
-        StructType::get(Ctx, {I64, I32, I32, RecordsTy});
+    auto *ManifestTy = StructType::get(Ctx, {I64, I32, I32, RecordsTy});
     auto *Manifest = new GlobalVariable(
         M, ManifestTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
-        ConstantStruct::get(
-            ManifestTy,
-            {ConstantInt::get(I64, kPostlinkMagic), ConstantInt::get(I32, 1),
-             ConstantInt::get(I32, Records.size()),
-             ConstantArray::get(RecordsTy, Records)}),
+        ConstantStruct::get(ManifestTy,
+                            {ConstantInt::get(I64, kPostlinkMagic),
+                             ConstantInt::get(I32, kPostlinkVersion),
+                             ConstantInt::get(I32, Records.size()),
+                             ConstantArray::get(RecordsTy, Records)}),
         "morok.postlink.ckd");
     Manifest->setAlignment(Align(8));
     appendToCompilerUsed(M, {Manifest});
@@ -278,8 +338,8 @@ void emitPostlinkManifest(Module &M, Function *Dispatcher,
 
 Value *emitCarrierDefine(IRBuilder<> &B, Value *Target,
                          const ArchLayout &Layout) {
-    auto *FTy = FunctionType::get(Target->getType(), {Target->getType()},
-                                  false);
+    auto *FTy =
+        FunctionType::get(Target->getType(), {Target->getType()}, false);
     InlineAsm *IA = InlineAsm::get(FTy, Layout.carrier_def_asm,
                                    Layout.carrier_def_constraints,
                                    /*hasSideEffects=*/true);
@@ -288,9 +348,8 @@ Value *emitCarrierDefine(IRBuilder<> &B, Value *Target,
 
 void emitCarrierAnchor(IRBuilder<> &B, Value *Carrier,
                        const ArchLayout &Layout) {
-    auto *FTy =
-        FunctionType::get(Type::getVoidTy(B.getContext()),
-                          {Carrier->getType()}, false);
+    auto *FTy = FunctionType::get(Type::getVoidTy(B.getContext()),
+                                  {Carrier->getType()}, false);
     InlineAsm *IA = InlineAsm::get(FTy, "", Layout.carrier_anchor_constraints,
                                    /*hasSideEffects=*/true);
     B.CreateCall(FTy, IA, {Carrier});
@@ -311,54 +370,116 @@ void emitInit(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
     Init->setDSOLocal(true);
     Init->addFnAttr(Attribute::NoInline);
 
-    Builder B(BasicBlock::Create(Ctx, "entry", Init));
-    Value *Disp = ptrToI64(B, Dispatcher);
-    for (const Site &S : Sites) {
-        LoadInst *CodeSize =
-            B.CreateLoad(I32, S.code_size, /*isVolatile=*/true,
-                         "morok.ckd.code.size.load");
+    BasicBlock *CurBB = BasicBlock::Create(Ctx, "entry", Init);
+    for (std::size_t I = 0; I != Sites.size(); ++I) {
+        const Site &S = Sites[I];
+        BasicBlock *FallbackBB =
+            SealRequired
+                ? nullptr
+                : BasicBlock::Create(Ctx, "morok.ckd.init.fallback", Init);
+        BasicBlock *SealedBB =
+            BasicBlock::Create(Ctx, "morok.ckd.init.sealed", Init);
+        BasicBlock *StoreBB =
+            SealRequired
+                ? nullptr
+                : BasicBlock::Create(Ctx, "morok.ckd.init.store", Init);
+        BasicBlock *NextBB =
+            (I + 1 == Sites.size())
+                ? nullptr
+                : BasicBlock::Create(Ctx, "morok.ckd.init.next", Init);
+
+        Builder B(CurBB);
+        LoadInst *CodeSize = B.CreateLoad(I32, S.code_size, /*isVolatile=*/true,
+                                          "morok.ckd.code.size.load");
         CodeSize->setAlignment(Align(4));
+        LoadInst *Existing = B.CreateLoad(I64, S.encoded, /*isVolatile=*/true,
+                                          "morok.ckd.enc.sealed");
+        Existing->setAlignment(Align(8));
+        LoadInst *SealState = B.CreateLoad(
+            I64, S.seal_state, /*isVolatile=*/true, "morok.ckd.seal.state");
+        SealState->setAlignment(Align(8));
         Value *NonZero = B.CreateICmpNE(CodeSize, ConstantInt::get(I32, 0),
                                         "morok.ckd.code.nz");
         Value *Sealed = B.CreateICmpNE(
-            CodeSize,
-            ConstantInt::get(I32, code_region_kdf::kUnsealedCodeSize),
+            CodeSize, ConstantInt::get(I32, code_region_kdf::kUnsealedCodeSize),
             "morok.ckd.code.sealed");
         Value *HasCode = B.CreateAnd(NonZero, Sealed, "morok.ckd.code.has");
-        LoadInst *Existing =
-            B.CreateLoad(I64, S.encoded, /*isVolatile=*/true,
-                         "morok.ckd.enc.sealed");
-        Value *Fallback;
+        Value *UnsealedState =
+            B.CreateICmpEQ(SealState, ConstantInt::get(I64, S.seal_unsealed),
+                           "morok.ckd.seal.unsealed");
+        Value *ExpectedSeal =
+            emitSealState(B, Dispatcher, S, Existing, CodeSize, RegionBytes,
+                          "morok.ckd.seal.expected");
+        Value *SealOk =
+            B.CreateICmpEQ(SealState, ExpectedSeal, "morok.ckd.seal.ok");
+        Value *ValidSealed =
+            B.CreateAnd(B.CreateNot(UnsealedState, "morok.ckd.seal.engaged"),
+                        HasCode, "morok.ckd.seal.has.code");
+        ValidSealed = B.CreateAnd(ValidSealed, SealOk, "morok.ckd.seal.valid");
+
         if (SealRequired) {
-            // Sealed-release build: the post-link sealer is the sole source of
-            // the encoded target, so NEVER recompute it from the live code
-            // bytes.  Recomputing is exactly the self-seal hole (#21): a static
-            // attacker who patches a caller region and also resets the mutable
-            // code_size slot back to the unsealed sentinel would otherwise make
-            // this constructor re-hash and re-seal the tampered bytes at start.
-            // When the slot reads unsealed here — never sealed, or a downgrade
-            // patch reset the sentinel — poison the encoded target so the
-            // dispatcher decodes a wrong address (silent mis-dispatch) instead
-            // of adapting to the patch.  A nonzero per-site twist guarantees the
-            // poisoned value differs from any genuine sealed target.
-            Fallback = B.CreateXor(Existing,
-                                   ConstantInt::get(I64, S.salt | 1ULL),
-                                   "morok.ckd.enc.poison");
-        } else {
-            // Unsealed dev/differential build: no sealer ran, so recover the
-            // encoded target from the live bytes at startup.  This mode makes no
-            // tamper-resistance claim; it only keeps unsealed builds runnable.
-            Value *Target = ptrToI64(B, S.callee);
-            Value *Delta = B.CreateSub(Target, Disp, "morok.ckd.target.delta");
-            Value *H = emitSiteHash(B, M, Dispatcher, S.caller, S.block, S,
-                                    RegionBytes);
-            Fallback = B.CreateAdd(Delta, H, "morok.ckd.target.enc");
+            B.CreateBr(SealedBB);
+
+            Builder SB(SealedBB);
+            Value *Poison = SB.CreateXor(
+                Existing,
+                SB.CreateXor(SealState,
+                             ConstantInt::get(I64, 0xC1D64E5B8A17F239ULL),
+                             "morok.ckd.enc.poison.mix"),
+                "morok.ckd.enc.poison");
+            Value *SealedEncoded = SB.CreateSelect(
+                ValidSealed, Existing, Poison, "morok.ckd.target.sealed");
+            auto *Store = SB.CreateStore(SealedEncoded, S.encoded,
+                                         /*isVolatile=*/true);
+            Store->setAlignment(Align(8));
+            if (NextBB) {
+                SB.CreateBr(NextBB);
+                CurBB = NextBB;
+            } else {
+                SB.CreateRetVoid();
+            }
+            continue;
         }
-        Value *Encoded =
-            B.CreateSelect(HasCode, Existing, Fallback, "morok.ckd.target.sel");
-        B.CreateStore(Encoded, S.encoded, /*isVolatile=*/true);
+
+        Value *MissingCode = B.CreateNot(HasCode, "morok.ckd.code.missing");
+        Value *UseFallback = B.CreateAnd(UnsealedState, MissingCode,
+                                         "morok.ckd.init.allow.fallback");
+        B.CreateCondBr(UseFallback, FallbackBB, SealedBB);
+
+        Builder FB(FallbackBB);
+        Value *Disp = ptrToI64(FB, Dispatcher);
+        Value *Target = ptrToI64(FB, S.callee);
+        Value *Delta = FB.CreateSub(Target, Disp, "morok.ckd.target.delta");
+        Value *H =
+            emitSiteHash(FB, M, Dispatcher, S.caller, S.block, S, RegionBytes);
+        Value *Computed = FB.CreateAdd(Delta, H, "morok.ckd.target.enc");
+        FB.CreateBr(StoreBB);
+
+        Builder SB(SealedBB);
+        Value *Poison = SB.CreateXor(
+            Existing,
+            SB.CreateXor(SealState,
+                         ConstantInt::get(I64, 0xC1D64E5B8A17F239ULL),
+                         "morok.ckd.seal.bad.mix"),
+            "morok.ckd.seal.bad");
+        Value *SealedEncoded = SB.CreateSelect(ValidSealed, Existing, Poison,
+                                               "morok.ckd.target.sealed");
+        SB.CreateBr(StoreBB);
+
+        Builder StoreB(StoreBB);
+        PHINode *Encoded = StoreB.CreatePHI(I64, 2, "morok.ckd.target.enc");
+        Encoded->addIncoming(Computed, FallbackBB);
+        Encoded->addIncoming(SealedEncoded, SealedBB);
+        auto *Store = StoreB.CreateStore(Encoded, S.encoded,
+                                         /*isVolatile=*/true);
+        Store->setAlignment(Align(8));
+        if (NextBB) {
+            StoreB.CreateBr(NextBB);
+            CurBB = NextBB;
+        } else {
+            StoreB.CreateRetVoid();
+        }
     }
-    B.CreateRetVoid();
     appendToGlobalCtors(M, Init, 0);
     appendToUsed(M, {Init});
     appendToCompilerUsed(M, {Init});
@@ -380,13 +501,12 @@ void rewriteSite(Module &M, Function *Dispatcher, const Site &S,
         BasicBlock::Create(Ctx, "morok.ckd.cache.miss", S.caller, JoinBB);
 
     Builder EntryB(EntryBB);
-    Value *H = emitSiteHash(EntryB, M, Dispatcher, S.caller, S.block, S,
-                            RegionBytes);
-    LoadInst *Cached = EntryB.CreateLoad(I64, S.cache, /*isVolatile=*/true,
-                                         "morok.ckd.cache");
-    Value *CachedReady =
-        EntryB.CreateICmpNE(Cached, ConstantInt::get(I64, 0),
-                            "morok.ckd.cache.ready");
+    Value *H =
+        emitSiteHash(EntryB, M, Dispatcher, S.caller, S.block, S, RegionBytes);
+    LoadInst *Cached =
+        EntryB.CreateLoad(I64, S.cache, /*isVolatile=*/true, "morok.ckd.cache");
+    Value *CachedReady = EntryB.CreateICmpNE(Cached, ConstantInt::get(I64, 0),
+                                             "morok.ckd.cache.ready");
     EntryB.CreateCondBr(CachedReady, HitBB, MissBB);
 
     Builder HitB(HitBB);
@@ -403,8 +523,7 @@ void rewriteSite(Module &M, Function *Dispatcher, const Site &S,
         CallB.CreatePHI(I64, 2, "morok.ckd.target.enc.cached");
     EncodedForCall->addIncoming(Cached, HitBB);
     EncodedForCall->addIncoming(Encoded, MissBB);
-    Value *Delta =
-        CallB.CreateSub(EncodedForCall, H, "morok.ckd.target.delta");
+    Value *Delta = CallB.CreateSub(EncodedForCall, H, "morok.ckd.target.delta");
     Value *Base = ptrToI64(CallB, Dispatcher);
     Value *TargetInt = CallB.CreateAdd(Base, Delta, "morok.ckd.target.decoded");
     Value *Target = CallB.CreateIntToPtr(
@@ -444,8 +563,7 @@ bool callerKeyedDispatchModule(Module &M,
     if (!Layout)
         return false;
 
-    const std::uint32_t Limit =
-        std::min(params.max_calls, kMaxCallsPerModule);
+    const std::uint32_t Limit = std::min(params.max_calls, kMaxCallsPerModule);
     std::vector<CallInst *> Calls;
     Calls.reserve(Limit);
     for (Function &F : M) {
@@ -490,13 +608,16 @@ bool callerKeyedDispatchModule(Module &M,
         S.caller = Caller;
         S.callee = Callee;
         S.block = SiteBlock;
-        S.encoded = makeEncodedSlot(M, rng);
-        S.cache = makeCacheSlot(M);
-        S.code_size = makeCodeSizeSlot(M);
         S.salt = rng.next();
         S.mul = rng.next() | 1ULL;
         S.add = rng.next();
+        S.seal_unsealed = rng.next() | 1ULL;
+        S.seal_salt = rng.next();
         S.rot = (rng.range(63) + 1u) & 63u;
+        S.encoded = makeEncodedSlot(M, rng);
+        S.cache = makeCacheSlot(M);
+        S.code_size = makeCodeSizeSlot(M);
+        S.seal_state = makeSealStateSlot(M, S.seal_unsealed);
         Sites.push_back(S);
     }
     if (Sites.empty())
