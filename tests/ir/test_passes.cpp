@@ -13340,7 +13340,9 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.decoded.20") >= 1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.handler.foreign") >=
           1u);
-    CHECK(countNamedInstructions(*Audit, "morok.win.veh.remove.status") >= 1u);
+    CHECK(countNamedInstructions(*Audit, "morok.win.veh.bad.next") >= 1u);
+    CHECK(countNamedInstructions(*Audit, "morok.win.veh.remove.status") == 0u);
+    CHECK(countNamedInstructions(*Audit, "morok.win.veh.remove.ready") == 0u);
     CHECK(countNamedInstructions(*Contains, "morok.win.ldr.contains.match") >=
           1u);
     CHECK_FALSE(verifyModule(*M, &errs()));

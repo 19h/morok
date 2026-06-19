@@ -9460,7 +9460,7 @@ Function *windowsVehAuditListHelper(Module &M) {
     auto *ip = intPtrTy(M);
     auto *ptr = PointerType::getUnqual(ctx);
     auto *fn = Function::Create(
-        FunctionType::get(i64, {ip, ip, ip, ip, ip}, false),
+        FunctionType::get(i64, {ip, ip, ip, ip}, false),
         GlobalValue::PrivateLinkage, "morok.win.veh.audit.list", &M);
     fn->addFnAttr(Attribute::NoInline);
     fn->setDSOLocal(true);
@@ -9470,9 +9470,7 @@ Function *windowsVehAuditListHelper(Module &M) {
     head->setName("head");
     Argument *decode = fn->getArg(2);
     decode->setName("decode");
-    Argument *remove = fn->getArg(3);
-    remove->setName("remove");
-    Argument *queryVm = fn->getArg(4);
+    Argument *queryVm = fn->getArg(3);
     queryVm->setName("query_vm");
 
     Function *contains = windowsAddressInLdrModule(M);
@@ -9485,7 +9483,6 @@ Function *windowsVehAuditListHelper(Module &M) {
     auto *readCursorBB = BasicBlock::Create(ctx, "read.cursor", fn);
     auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
     auto *evalBB = BasicBlock::Create(ctx, "eval", fn);
-    auto *removeBB = BasicBlock::Create(ctx, "remove", fn);
     auto *nextBB = BasicBlock::Create(ctx, "next", fn);
     auto *doneBB = BasicBlock::Create(ctx, "done", fn);
 
@@ -9593,19 +9590,7 @@ Function *windowsVehAuditListHelper(Module &M) {
                                 "morok.win.veh.bad.next"),
                    bad)
         ->setVolatile(true);
-    Value *canRemove =
-        EB.CreateAnd(foreign, EB.CreateICmpNE(remove, ConstantInt::get(ip, 0)),
-                     "morok.win.veh.remove.ready");
-    EB.CreateCondBr(canRemove, removeBB, nextBB);
-
-    IRBuilder<> RMB(removeBB);
-    auto *removeTy = FunctionType::get(i32, {ptr}, false);
-    Value *removeStatus = RMB.CreateCall(
-        removeTy, RMB.CreateIntToPtr(remove, ptr, "morok.win.veh.remove.ptr"),
-        {RMB.CreateIntToPtr(cursor, ptr, "morok.win.veh.remove.handle")},
-        "morok.win.veh.remove.status");
-    (void)removeStatus;
-    RMB.CreateBr(nextBB);
+    EB.CreateBr(nextBB);
 
     IRBuilder<> NB(nextBB);
     Value *nextIdx =
@@ -11670,10 +11655,10 @@ Function *windowsVehAuditProbe(Module &M, GlobalVariable *State,
         ConstantInt::get(ip, 0), "morok.win.veh.list.shifted");
     auto *auditTy = auditList->getFunctionType();
     Value *audit0 = AB.CreateCall(
-        auditTy, auditList, {peb, listBase, rtlDecode, rtlRemove, ntQueryVm},
+        auditTy, auditList, {peb, listBase, rtlDecode, ntQueryVm},
         "morok.win.veh.audit.primary");
     Value *audit1 = AB.CreateCall(
-        auditTy, auditList, {peb, shiftedHead, rtlDecode, rtlRemove, ntQueryVm},
+        auditTy, auditList, {peb, shiftedHead, rtlDecode, ntQueryVm},
         "morok.win.veh.audit.shifted");
     Value *bad0 =
         AB.CreateTrunc(AB.CreateLShr(audit0, ConstantInt::get(i64, 32)),
