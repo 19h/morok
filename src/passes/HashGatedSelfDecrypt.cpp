@@ -41,6 +41,7 @@ namespace morok::passes {
 namespace {
 
 constexpr StringLiteral kBytecodePrefix("morok.vm.bytecode.");
+constexpr std::uint32_t kVmInstrStride = 16;
 
 using Builder = IRBuilder<NoFolder>;
 
@@ -279,6 +280,31 @@ GlobalVariable *createI32State(Module &M, StringRef Name,
         ConstantInt::get(I32, Initial), Name.str());
     State->setAlignment(Align(4));
     return State;
+}
+
+GlobalVariable *createPoisonPayload(Module &M, StringRef Suffix,
+                                    ArrayRef<std::uint8_t> Original) {
+    std::vector<std::uint8_t> Poisoned(Original.begin(), Original.end());
+    for (std::uint32_t I = 0; I < Poisoned.size(); ++I) {
+        std::uint8_t Mask =
+            static_cast<std::uint8_t>(0xA5u + (I * 0x3Du) + (I >> 1));
+        if ((I % kVmInstrStride) == 0)
+            Mask ^= 0x80u;
+        if (Mask == 0)
+            Mask = 0x5Au;
+        Poisoned[I] ^= Mask;
+    }
+
+    LLVMContext &Ctx = M.getContext();
+    auto *I8 = Type::getInt8Ty(Ctx);
+    auto *ArrTy = ArrayType::get(I8, Poisoned.size());
+    auto *Init = ConstantDataArray::get(Ctx, Poisoned);
+    auto *GV = new GlobalVariable(
+        M, ArrTy, /*isConstant=*/true, GlobalValue::PrivateLinkage, Init,
+        ("morok.sdb.poison." + Suffix).str());
+    GV->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
+    GV->setAlignment(Align(1));
+    return GV;
 }
 
 Value *payloadPtr(Builder &B, GlobalVariable *Payload, Value *Idx) {
@@ -673,7 +699,8 @@ Value *emitContextZero(Builder &B, Function *Fn) {
 Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
                        GlobalVariable *Bound, GlobalVariable *CurrentHash,
                        GlobalVariable *CurrentKeyMask,
-                       GlobalVariable *CurrentRot, const StreamSchedule &S,
+                       GlobalVariable *CurrentRot, GlobalVariable *PoisonPayload,
+                       const StreamSchedule &S,
                        bool ContextKeying) {
     LLVMContext &Ctx = M.getContext();
     auto *VoidTy = Type::getVoidTy(Ctx);
@@ -703,6 +730,8 @@ Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
     BasicBlock *DecryptLoop = BasicBlock::Create(Ctx, "decrypt", Fn);
     BasicBlock *Decide = BasicBlock::Create(Ctx, "decide", Fn);
     BasicBlock *Fail = BasicBlock::Create(Ctx, "fail", Fn);
+    BasicBlock *FailPoison = BasicBlock::Create(Ctx, "fail.poison", Fn);
+    BasicBlock *FailPublish = BasicBlock::Create(Ctx, "fail.publish", Fn);
     BasicBlock *MarkReady = BasicBlock::Create(Ctx, "ready", Fn);
     BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
 
@@ -826,21 +855,39 @@ Function *createEnsure(Module &M, Payload &P, GlobalVariable *Ready,
     FailMix = FB.CreateXor(
         FailMix, FB.CreateLShr(FailMix, ConstantInt::get(I64, 8)),
         "morok.sdb.fail.mix");
-    Value *PoisonByte =
-        FB.CreateOr(FB.CreateTrunc(FailMix, I8, "morok.sdb.fail.byte"),
-                    ConstantInt::get(I8, 1), "morok.sdb.fail.byte");
-    Value *First = payloadPtr(FB, P.bytecode, ConstantInt::get(I32, 0));
-    auto *OldFirst = FB.CreateLoad(I8, First, "morok.sdb.fail.old");
-    OldFirst->setVolatile(true);
-    OldFirst->setAlignment(Align(1));
-    auto *PoisonStore = FB.CreateStore(
-        FB.CreateXor(OldFirst, PoisonByte, "morok.sdb.fail.poison"), First);
+    Value *FailStart = FB.CreateTrunc(
+        FB.CreateXor(FailMix, FailMix, "morok.sdb.fail.zero"), I32,
+        "morok.sdb.fail.start");
+    FB.CreateBr(FailPoison);
+
+    Builder FPB(FailPoison);
+    PHINode *FailI = FPB.CreatePHI(I32, 2, "morok.sdb.fail.i");
+    FailI->addIncoming(FailStart, Fail);
+    auto *PoisonTy = cast<ArrayType>(PoisonPayload->getValueType());
+    Value *PoisonPtr = FPB.CreateInBoundsGEP(
+        PoisonTy, PoisonPayload, {ConstantInt::get(I32, 0), FailI},
+        "morok.sdb.fail.poison.ptr");
+    auto *PoisonByte =
+        FPB.CreateLoad(I8, PoisonPtr, "morok.sdb.fail.poison.byte");
+    PoisonByte->setVolatile(true);
+    PoisonByte->setAlignment(Align(1));
+    auto *PoisonStore =
+        FPB.CreateStore(PoisonByte, payloadPtr(FPB, P.bytecode, FailI));
     PoisonStore->setVolatile(true);
     PoisonStore->setAlignment(Align(1));
-    auto *FailReady = FB.CreateStore(ConstantInt::get(I32, 2), Ready);
+    Value *NextFailI =
+        FPB.CreateAdd(FailI, ConstantInt::get(I32, 1), "morok.sdb.fail.next");
+    FailI->addIncoming(NextFailI, FailPoison);
+    Value *FailDone =
+        FPB.CreateICmpEQ(NextFailI, ConstantInt::get(I32, Size),
+                         "morok.sdb.fail.done");
+    FPB.CreateCondBr(FailDone, FailPublish, FailPoison);
+
+    Builder FPuB(FailPublish);
+    auto *FailReady = FPuB.CreateStore(ConstantInt::get(I32, 2), Ready);
     FailReady->setAtomic(AtomicOrdering::Release);
     FailReady->setAlignment(Align(4));
-    FB.CreateBr(Exit);
+    FPuB.CreateBr(Exit);
 
     Builder DB(DecryptLoop);
     PHINode *DecI = DB.CreatePHI(I32, 2, "morok.sdb.dec.i");
@@ -1108,9 +1155,13 @@ bool wrapPayload(Module &M, Payload &P,
         createI32State(M, "morok.sdb.move.rot." + P.suffix, Move.initial_rot);
     GlobalVariable *MoveEpoch =
         createI64State(M, "morok.sdb.move.epoch." + P.suffix, Move.epoch);
+    GlobalVariable *PoisonPayload =
+        createPoisonPayload(M, P.suffix,
+                            ArrayRef<std::uint8_t>(P.original.data(),
+                                                   P.original.size()));
     Function *Ensure =
         createEnsure(M, P, Ready, Bound, CurrentHash, CurrentKeyMask,
-                     CurrentRot, S, Params.context_keying);
+                     CurrentRot, PoisonPayload, S, Params.context_keying);
     Function *Seal =
         createSeal(M, P, Ready, Bound, CurrentHash, CurrentKeyMask, CurrentRot,
                    MoveEpoch, S, Move, Params.context_keying);

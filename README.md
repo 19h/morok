@@ -627,7 +627,9 @@ closed instead of keeping the clean seal state.
 VM dispatch is total over all 256 decoded handler IDs. Invalid decoded opcodes,
 registers, pointer-table indexes, branch targets, and unsafe div/rem operands
 are folded into a local poison accumulator and canonicalized to in-bounds state
-instead of trapping or indexing out of range. Fault-paged payload delivery is
+instead of trapping or indexing out of range. A guarded per-PC opcode check also
+poisons valid-but-wrong handler IDs, so a wrong key cannot cleanly land on
+another real handler. Fault-paged payload delivery is
 preferred for configured VM payloads and leaves already protected bytecode
 mutable, so hash-gated self-decrypt only wraps remaining eager payloads. It does
 not allocate a full-payload plaintext scratch buffer; the accessor decrypts the

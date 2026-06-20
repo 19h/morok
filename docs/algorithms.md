@@ -584,6 +584,11 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - Dispatch is threaded computed-goto: the decoded opcode indexes a private
   `morok.vm.targets.*` blockaddress table, loads the target pointer, and reaches
   handlers through `indirectbr`.  There is no central `switch` decode anchor.
+- A private guarded expected-opcode table binds each PC to the handler ID that
+  was emitted for that instruction.  If a wrong key or bytecode patch decodes to
+  any other handler ID, even another valid in-range handler, the VM records
+  poison and dispatches through the poison handler instead of treating the
+  wrong opcode as normal code.
 - Arithmetic handlers are duplicated and shuffled per build.  Alternate
   variants use equivalent formulas for add/sub/xor/and/or and PC-neutralized
   polymorphic forms for the remaining operations, so one opcode does not map to
@@ -649,9 +654,11 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - The ensure function first hashes the still-encrypted payload through volatile
   byte loads.  A `morok.sdb.gate` compare is computed, but it does not branch
   before decryption: the fixed-length decrypt loop always runs, then a
-  post-decrypt decision either marks the payload ready or calls `llvm.trap`.
-  This keeps the payload-key work shape constant and makes a patched failure
-  path carry corrupted bytecode instead of a cleanly skipped decryptor.
+  post-decrypt decision either marks the payload ready or copies a private
+  `morok.sdb.poison.*` bytecode image into the payload before publishing it as
+  ready.  That poisoned image differs at every byte and trips the VM opcode
+  guard at the first fetched instruction, so tamper takes a data-flow poison
+  path rather than a fixed `llvm.trap` oracle or a cleanly skipped decryptor.
 - With `context_keying=true`, the ensure helper also folds VM call context into
   the stream key: each argument is volatile-stored to a local context slot,
   loaded twice, xored to a runtime zero, and mixed as `morok.sdb.key.context`.
@@ -682,12 +689,13 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   layout, and stores the new rotation/epoch.  A fixed byte offset learned from
   one invocation therefore names a different encrypted byte after the next seal.
 - The ensure helper derives the stream key from the computed hash, decrypts each
-  payload byte with volatile stores, sets the active flag volatile only after
-  the post-decrypt gate succeeds, and returns.  The seal helper derives the same
-  stream from the expected encrypted-payload hash, volatile-xors the plaintext
-  bytes back to ciphertext before VM helper return, and clears the active flag.
-  Later calls therefore re-hash encrypted bytes and expose plaintext only for
-  the current helper invocation.
+  payload byte with volatile stores, and sets the active flag only after either
+  the post-decrypt gate succeeds or the deterministic poison image has been
+  published.  The seal helper derives the same stream from the expected
+  encrypted-payload hash, volatile-xors the plaintext bytes back to ciphertext
+  before VM helper return, and clears the active flag.  Later calls therefore
+  re-hash encrypted bytes and expose plaintext only for the current helper
+  invocation.
 - Scheduler placement is after fault-paged payload delivery and before the
   per-function pipeline, so VM bytecode exists and generated `morok.*` helpers
   remain outside later function-local transforms.  Already FPP-protected

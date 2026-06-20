@@ -8099,6 +8099,22 @@ entry:
     REQUIRE(Helper);
     CHECK(Helper->getReturnType()->isVoidTy());
     CHECK(countGlobals(*M, "morok.vm.bytecode") == 1u);
+    CHECK(countGlobals(*M, "morok.vm.opguard") == 1u);
+    CHECK(M->getGlobalVariable("morok.seal.root.anti_debug", true) != nullptr);
+    bool hasOpcodeGuard = false;
+    bool recordsOpcodePoison = false;
+    bool foldsVoidPoison = false;
+    for (Instruction &I : instructions(*Helper)) {
+        hasOpcodeGuard |= I.getName().starts_with("morok.vm.op.expected") ||
+                          I.getName().starts_with("morok.vm.op.bad");
+        recordsOpcodePoison |= I.getName().starts_with("morok.vm.op.guard");
+        foldsVoidPoison |=
+            I.getName().starts_with("morok.vm.void.poison.seal") ||
+            I.getName().starts_with("morok.vm.ret.void.poison.seal");
+    }
+    CHECK(hasOpcodeGuard);
+    CHECK(recordsOpcodePoison);
+    CHECK(foldsVoidPoison);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -8513,6 +8529,20 @@ entry:
     CHECK(countGlobals(*M, "morok.sdb.bound.keymask.") == 1u);
     CHECK(countGlobals(*M, "morok.sdb.move.rot.") == 1u);
     CHECK(countGlobals(*M, "morok.sdb.move.epoch.") == 1u);
+    CHECK(countGlobals(*M, "morok.sdb.poison.") == 1u);
+    GlobalVariable *PoisonPayload =
+        M->getGlobalVariable("morok.sdb.poison.vm_secret", true);
+    REQUIRE(PoisonPayload);
+    auto *PoisonData =
+        dyn_cast<ConstantDataArray>(PoisonPayload->getInitializer());
+    REQUIRE(PoisonData);
+    REQUIRE(PoisonData->getNumElements() == Before.size());
+    bool poisonDiffersEveryByte = true;
+    for (unsigned I = 0; I < PoisonData->getNumElements(); ++I)
+        poisonDiffersEveryByte &=
+            Before[I] !=
+            static_cast<std::uint8_t>(PoisonData->getElementAsInteger(I));
+    CHECK(poisonDiffersEveryByte);
     Function *Ensure = M->getFunction("morok.sdb.ensure.vm_secret");
     REQUIRE(Ensure);
     Function *Seal = M->getFunction("morok.sdb.seal.vm_secret");
@@ -8536,7 +8566,9 @@ entry:
     bool hasGate = false;
     bool hasTrap = false;
     bool hasSilentFailPoison = false;
-    bool failBranchesToExit = false;
+    bool failBranchesToPoison = false;
+    bool failPoisonLoops = false;
+    bool failPoisonPublishes = false;
     bool hasAtomicReadyLoad = false;
     bool hasReadyClaim = false;
     bool hasReadyWait = false;
@@ -8731,8 +8763,20 @@ entry:
                      (BI->getSuccessor(0)->getName() == "fail" &&
                       BI->getSuccessor(1)->getName() == "ready"));
             if (BB.getName() == "fail")
-                failBranchesToExit = BI->isUnconditional() &&
-                                     BI->getSuccessor(0)->getName() == "exit";
+                failBranchesToPoison =
+                    BI->isUnconditional() &&
+                    BI->getSuccessor(0)->getName() == "fail.poison";
+            if (BB.getName() == "fail.poison")
+                failPoisonLoops =
+                    BI->isConditional() &&
+                    ((BI->getSuccessor(0)->getName() == "fail.publish" &&
+                      BI->getSuccessor(1)->getName() == "fail.poison") ||
+                     (BI->getSuccessor(0)->getName() == "fail.poison" &&
+                      BI->getSuccessor(1)->getName() == "fail.publish"));
+            if (BB.getName() == "fail.publish")
+                failPoisonPublishes =
+                    BI->isUnconditional() &&
+                    BI->getSuccessor(0)->getName() == "exit";
         }
     }
     for (Instruction &I : instructions(*Seal)) {
@@ -8817,7 +8861,9 @@ entry:
     CHECK(hasGate);
     CHECK_FALSE(hasTrap);
     CHECK(hasSilentFailPoison);
-    CHECK(failBranchesToExit);
+    CHECK(failBranchesToPoison);
+    CHECK(failPoisonLoops);
+    CHECK(failPoisonPublishes);
     CHECK(hasAtomicReadyLoad);
     CHECK(hasReadyClaim);
     CHECK(hasReadyWait);
