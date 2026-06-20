@@ -3850,6 +3850,284 @@ Function *linuxGotPltProbe(Module &M, const Triple &TT) {
     return fn;
 }
 
+Function *darwinDylibNameForOrdinal(Module &M) {
+    if (Function *existing = M.getFunction("morok.antihook.macho.dylib.ordinal"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+
+    auto *fn = Function::Create(FunctionType::get(ptr, {ptr, i32}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.macho.dylib.ordinal", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    auto *hdr = fn->getArg(0);
+    hdr->setName("hdr");
+    auto *wantedOrdinal = fn->getArg(1);
+    wantedOrdinal->setName("ordinal");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
+    auto *matchBB = BasicBlock::Create(ctx, "match", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
+
+    IRBuilder<> B(entry);
+    Value *ncmds = loadAt(B, M, i32, hdr, 16, "morok.antihook.macho.dylib.ncmds");
+    Value *valid = B.CreateAnd(
+        B.CreateICmpNE(hdr, ConstantPointerNull::get(ptr)),
+        B.CreateAnd(B.CreateICmpUGT(wantedOrdinal, ConstantInt::get(i32, 0)),
+                    B.CreateICmpULT(wantedOrdinal, ConstantInt::get(i32, 0xFE)),
+                    "morok.antihook.macho.dylib.ordinal.public"),
+        "morok.antihook.macho.dylib.valid");
+    B.CreateCondBr(valid, loopBB, ret0BB);
+
+    IRBuilder<> LB(loopBB);
+    auto *cmdIdx = LB.CreatePHI(i32, 2, "morok.antihook.macho.dylib.cmd.idx");
+    auto *cmdOff = LB.CreatePHI(ip, 2, "morok.antihook.macho.dylib.cmd.off");
+    auto *ordinal = LB.CreatePHI(i32, 2, "morok.antihook.macho.dylib.ordinal.cur");
+    cmdIdx->addIncoming(ConstantInt::get(i32, 0), entry);
+    cmdOff->addIncoming(ConstantInt::get(ip, 32), entry);
+    ordinal->addIncoming(ConstantInt::get(i32, 0), entry);
+    Value *cmdInRange =
+        LB.CreateAnd(LB.CreateICmpULT(cmdIdx, ncmds),
+                     LB.CreateICmpULT(cmdIdx, ConstantInt::get(i32, 128)),
+                     "morok.antihook.macho.dylib.cmd.range");
+    LB.CreateCondBr(cmdInRange, bodyBB, ret0BB);
+
+    IRBuilder<> BB(bodyBB);
+    Value *cmdPtr = gepI8(BB, M, hdr, cmdOff, "morok.antihook.macho.dylib.cmd");
+    Value *cmd = loadAt(BB, M, i32, cmdPtr, 0ULL,
+                        "morok.antihook.macho.dylib.cmd.id");
+    Value *cmdSize32 = loadAt(BB, M, i32, cmdPtr, 4,
+                              "morok.antihook.macho.dylib.cmd.size");
+    Value *cmdSize =
+        BB.CreateZExt(cmdSize32, ip, "morok.antihook.macho.dylib.cmd.size.w");
+    Value *cmdBase = BB.CreateAnd(
+        cmd, ConstantInt::get(i32, 0x7FFFFFFF),
+        "morok.antihook.macho.dylib.cmd.base");
+    Value *isLoadDylib =
+        BB.CreateOr(BB.CreateOr(BB.CreateICmpEQ(cmdBase, ConstantInt::get(i32, 0xC)),
+                                BB.CreateICmpEQ(cmdBase, ConstantInt::get(i32, 0x18))),
+                    BB.CreateOr(
+                        BB.CreateICmpEQ(cmdBase, ConstantInt::get(i32, 0x1F)),
+                        BB.CreateOr(
+                            BB.CreateICmpEQ(cmdBase, ConstantInt::get(i32, 0x20)),
+                            BB.CreateICmpEQ(cmdBase, ConstantInt::get(i32, 0x23)))),
+                    "morok.antihook.macho.dylib.loadcmd");
+    Value *nextOrdinal =
+        BB.CreateAdd(ordinal, BB.CreateZExt(isLoadDylib, i32),
+                     "morok.antihook.macho.dylib.ordinal.next");
+    Value *wanted = BB.CreateAnd(
+        isLoadDylib, BB.CreateICmpEQ(nextOrdinal, wantedOrdinal),
+        "morok.antihook.macho.dylib.ordinal.match");
+    BB.CreateCondBr(wanted, matchBB, nextBB);
+
+    IRBuilder<> MB(matchBB);
+    Value *nameOff32 =
+        loadAt(MB, M, i32, cmdPtr, 8, "morok.antihook.macho.dylib.name.off");
+    Value *nameOff =
+        MB.CreateZExt(nameOff32, ip, "morok.antihook.macho.dylib.name.off.w");
+    Value *nameValid = MB.CreateICmpULT(nameOff, cmdSize,
+                                        "morok.antihook.macho.dylib.name.valid");
+    Value *namePtr = gepI8(MB, M, cmdPtr, nameOff,
+                           "morok.antihook.macho.dylib.name");
+    MB.CreateRet(MB.CreateSelect(nameValid, namePtr,
+                                 ConstantPointerNull::get(ptr)));
+
+    IRBuilder<> NB(nextBB);
+    Value *nextCmdIdx = NB.CreateAdd(cmdIdx, ConstantInt::get(i32, 1),
+                                     "morok.antihook.macho.dylib.cmd.next");
+    Value *nextCmdOff =
+        NB.CreateAdd(cmdOff, cmdSize, "morok.antihook.macho.dylib.off.next");
+    NB.CreateBr(loopBB);
+    cmdIdx->addIncoming(nextCmdIdx, nextBB);
+    cmdOff->addIncoming(nextCmdOff, nextBB);
+    ordinal->addIncoming(nextOrdinal, nextBB);
+
+    IRBuilder<> R0(ret0BB);
+    R0.CreateRet(ConstantPointerNull::get(ptr));
+    return fn;
+}
+
+Function *darwinExpectedDylibSymbol(Module &M) {
+    if (Function *existing = M.getFunction("morok.antihook.macho.expected"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+
+    auto *fn = Function::Create(FunctionType::get(ptr, {ptr, ptr}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.macho.expected", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    auto *symName = fn->getArg(0);
+    symName->setName("symbol");
+    auto *dylibName = fn->getArg(1);
+    dylibName->setName("dylib");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *openBB = BasicBlock::Create(ctx, "open", fn);
+    auto *symBB = BasicBlock::Create(ctx, "sym", fn);
+    auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
+
+    FunctionCallee dlopen =
+        M.getOrInsertFunction("dlopen", FunctionType::get(ptr, {ptr, i32}, false));
+    FunctionCallee dlsym =
+        M.getOrInsertFunction("dlsym", FunctionType::get(ptr, {ptr, ptr}, false));
+
+    IRBuilder<> B(entry);
+    Value *valid = B.CreateAnd(
+        B.CreateICmpNE(symName, ConstantPointerNull::get(ptr)),
+        B.CreateICmpNE(dylibName, ConstantPointerNull::get(ptr)),
+        "morok.antihook.macho.expected.valid");
+    B.CreateCondBr(valid, openBB, ret0BB);
+
+    IRBuilder<> OB(openBB);
+    Value *first = OB.CreateAlignedLoad(i8, symName, Align(1),
+                                        "morok.antihook.macho.expected.first");
+    Value *dlsymName = OB.CreateSelect(
+        OB.CreateICmpEQ(first, ConstantInt::get(i8, '_')),
+        gepI8(OB, M, symName, ConstantInt::get(intPtrTy(M), 1),
+              "morok.antihook.macho.expected.no_uscore"),
+        symName, "morok.antihook.macho.expected.name");
+    Value *handle =
+        OB.CreateCall(dlopen, {dylibName, ConstantInt::get(i32, 0x1)},
+                      "morok.antihook.macho.expected.handle");
+    OB.CreateCondBr(OB.CreateICmpNE(handle, ConstantPointerNull::get(ptr)),
+                    symBB, ret0BB);
+
+    IRBuilder<> SB(symBB);
+    SB.CreateRet(SB.CreateCall(dlsym, {handle, dlsymName},
+                               "morok.antihook.macho.expected.sym"));
+
+    IRBuilder<> R0(ret0BB);
+    R0.CreateRet(ConstantPointerNull::get(ptr));
+    return fn;
+}
+
+Function *darwinTextTargetInImageIndex(Module &M) {
+    if (Function *existing = M.getFunction("morok.antihook.macho.image.text"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+
+    auto *fn = Function::Create(FunctionType::get(i32, {ip, i32}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.macho.image.text", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    auto *target = fn->getArg(0);
+    target->setName("target");
+    auto *imageIdx = fn->getArg(1);
+    imageIdx->setName("image");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *cmdLoopBB = BasicBlock::Create(ctx, "cmd.loop", fn);
+    auto *cmdBodyBB = BasicBlock::Create(ctx, "cmd.body", fn);
+    auto *cmdNextBB = BasicBlock::Create(ctx, "cmd.next", fn);
+    auto *ret1BB = BasicBlock::Create(ctx, "ret1", fn);
+    auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
+
+    FunctionCallee imageCount = M.getOrInsertFunction(
+        "_dyld_image_count", FunctionType::get(i32, false));
+    FunctionCallee imageHeader = M.getOrInsertFunction(
+        "_dyld_get_image_header", FunctionType::get(ptr, {i32}, false));
+    FunctionCallee imageSlide = M.getOrInsertFunction(
+        "_dyld_get_image_vmaddr_slide", FunctionType::get(ip, {i32}, false));
+
+    IRBuilder<> B(entry);
+    Value *count = B.CreateCall(imageCount, {}, "morok.macho.image.text.count");
+    Value *hdr = B.CreateCall(imageHeader, {imageIdx},
+                              "morok.macho.image.text.hdr");
+    Value *slide = B.CreateCall(imageSlide, {imageIdx},
+                                "morok.macho.image.text.slide");
+    Value *magic =
+        loadAt(B, M, i32, hdr, 0ULL, "morok.antihook.macho.image.text.magic");
+    Value *ncmds =
+        loadAt(B, M, i32, hdr, 16, "morok.antihook.macho.image.text.ncmds");
+    Value *valid = B.CreateAnd(
+        B.CreateAnd(B.CreateICmpNE(target, ConstantInt::get(ip, 0)),
+                    B.CreateICmpULT(imageIdx, count)),
+        B.CreateAnd(B.CreateICmpNE(hdr, ConstantPointerNull::get(ptr)),
+                    B.CreateICmpEQ(magic, ConstantInt::get(i32, 0xFEEDFACF))),
+        "morok.antihook.macho.image.text.valid");
+    B.CreateCondBr(valid, cmdLoopBB, ret0BB);
+
+    IRBuilder<> CLB(cmdLoopBB);
+    auto *cmdIdx = CLB.CreatePHI(i32, 2, "morok.antihook.macho.image.text.cmd.idx");
+    auto *cmdOff = CLB.CreatePHI(ip, 2, "morok.antihook.macho.image.text.cmd.off");
+    cmdIdx->addIncoming(ConstantInt::get(i32, 0), entry);
+    cmdOff->addIncoming(ConstantInt::get(ip, 32), entry);
+    Value *cmdInRange =
+        CLB.CreateAnd(CLB.CreateICmpULT(cmdIdx, ncmds),
+                      CLB.CreateICmpULT(cmdIdx, ConstantInt::get(i32, 128)),
+                      "morok.antihook.macho.image.text.cmd.range");
+    CLB.CreateCondBr(cmdInRange, cmdBodyBB, ret0BB);
+
+    IRBuilder<> CBB(cmdBodyBB);
+    Value *cmdPtr =
+        gepI8(CBB, M, hdr, cmdOff, "morok.antihook.macho.image.text.cmd.ptr");
+    Value *cmd = loadAt(CBB, M, i32, cmdPtr, 0ULL,
+                        "morok.antihook.macho.image.text.cmd");
+    Value *cmdSize32 = loadAt(CBB, M, i32, cmdPtr, 4,
+                              "morok.antihook.macho.image.text.cmd.size");
+    Value *cmdSize =
+        CBB.CreateZExt(cmdSize32, ip, "morok.antihook.macho.image.text.cmd.size.w");
+    Value *vmaddr =
+        loadAt(CBB, M, i64, cmdPtr, 24,
+               "morok.antihook.macho.image.text.seg.vmaddr");
+    Value *vmsize =
+        loadAt(CBB, M, i64, cmdPtr, 32,
+               "morok.antihook.macho.image.text.seg.vmsize");
+    Value *initprot =
+        loadAt(CBB, M, i32, cmdPtr, 60,
+               "morok.antihook.macho.image.text.seg.initprot");
+    Value *isSegment = CBB.CreateICmpEQ(cmd, ConstantInt::get(i32, 0x19),
+                                        "morok.antihook.macho.image.text.seg");
+    Value *isExec = CBB.CreateICmpNE(
+        CBB.CreateAnd(initprot, ConstantInt::get(i32, 4)),
+        ConstantInt::get(i32, 0), "morok.antihook.macho.image.text.exec");
+    Value *segStart =
+        CBB.CreateAdd(slide, vmaddr, "morok.antihook.macho.image.text.start");
+    Value *segEnd =
+        CBB.CreateAdd(segStart, vmsize, "morok.antihook.macho.image.text.end");
+    Value *hit =
+        CBB.CreateAnd(CBB.CreateAnd(isSegment, isExec),
+                      CBB.CreateAnd(CBB.CreateICmpUGE(target, segStart),
+                                    CBB.CreateICmpULT(target, segEnd)),
+                      "morok.antihook.macho.image.text.hit");
+    CBB.CreateCondBr(hit, ret1BB, cmdNextBB);
+
+    IRBuilder<> CNB(cmdNextBB);
+    Value *nextCmdIdx = CNB.CreateAdd(cmdIdx, ConstantInt::get(i32, 1),
+                                      "morok.antihook.macho.image.text.cmd.next");
+    Value *nextCmdOff =
+        CNB.CreateAdd(cmdOff, cmdSize,
+                      "morok.antihook.macho.image.text.cmd.off.next");
+    CNB.CreateBr(cmdLoopBB);
+    cmdIdx->addIncoming(nextCmdIdx, cmdNextBB);
+    cmdOff->addIncoming(nextCmdOff, cmdNextBB);
+
+    IRBuilder<> R1(ret1BB);
+    R1.CreateRet(ConstantInt::get(i32, 1));
+
+    IRBuilder<> R0(ret0BB);
+    R0.CreateRet(ConstantInt::get(i32, 0));
+    return fn;
+}
+
 Function *darwinTextTargetInDyldImages(Module &M) {
     if (Function *existing = M.getFunction("morok.antihook.macho.text"))
         return existing;
@@ -3998,7 +4276,9 @@ Function *darwinFixupProbe(Module &M, const Triple &TT) {
     auto *i64 = Type::getInt64Ty(ctx);
     auto *ip = intPtrTy(M);
     auto *ptr = PointerType::getUnqual(ctx);
-    Function *textCheck = darwinTextTargetInDyldImages(M);
+    Function *dylibNameForOrdinal = darwinDylibNameForOrdinal(M);
+    Function *expectedSymbol = darwinExpectedDylibSymbol(M);
+    Function *imageTextCheck = darwinTextTargetInImageIndex(M);
 
     auto *fn = Function::Create(FunctionType::get(i64, false),
                                 GlobalValue::PrivateLinkage,
@@ -4014,6 +4294,9 @@ Function *darwinFixupProbe(Module &M, const Triple &TT) {
     auto *entryLoopBB = BasicBlock::Create(ctx, "entry.loop", fn);
     auto *entryBodyBB = BasicBlock::Create(ctx, "entry.body", fn);
     auto *entryCheckBB = BasicBlock::Create(ctx, "entry.check", fn);
+    auto *entryIndirectBB = BasicBlock::Create(ctx, "entry.indirect", fn);
+    auto *entryExpectedBB = BasicBlock::Create(ctx, "entry.expected", fn);
+    auto *entryValidateBB = BasicBlock::Create(ctx, "entry.validate", fn);
     auto *entryNextBB = BasicBlock::Create(ctx, "entry.next", fn);
     auto *secNextBB = BasicBlock::Create(ctx, "section.next", fn);
     auto *cmdNextBB = BasicBlock::Create(ctx, "cmd.next", fn);
@@ -4023,6 +4306,24 @@ Function *darwinFixupProbe(Module &M, const Triple &TT) {
     AllocaInst *diff =
         B.CreateAlloca(i64, nullptr, "morok.antihook.macho.fixup.diff");
     B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
+    AllocaInst *linkeditVmaddrSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.fixup.linkedit.vmaddr");
+    AllocaInst *linkeditFileoffSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.fixup.linkedit.fileoff");
+    AllocaInst *symOffSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.fixup.symoff");
+    AllocaInst *nSymsSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.fixup.nsyms");
+    AllocaInst *strOffSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.fixup.stroff");
+    AllocaInst *indirectSymOffSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.fixup.indirectsymoff");
+    AllocaInst *nIndirectSymsSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.fixup.nindirectsyms");
+    for (AllocaInst *slot :
+         {linkeditVmaddrSlot, linkeditFileoffSlot, symOffSlot, nSymsSlot,
+          strOffSlot, indirectSymOffSlot, nIndirectSymsSlot})
+        B.CreateStore(ConstantInt::get(ip, 0), slot);
     FunctionCallee imageHeader = M.getOrInsertFunction(
         "_dyld_get_image_header", FunctionType::get(ptr, {i32}, false));
     FunctionCallee imageSlide = M.getOrInsertFunction(
@@ -4059,6 +4360,56 @@ Function *darwinFixupProbe(Module &M, const Triple &TT) {
         loadAt(CBB, M, i32, cmdPtr, 64, "morok.antihook.fixup.nsects");
     Value *isSegment = CBB.CreateICmpEQ(cmd, ConstantInt::get(i32, 0x19),
                                         "morok.antihook.fixup.segment");
+    Value *cmdBase = CBB.CreateAnd(cmd, ConstantInt::get(i32, 0x7FFFFFFF),
+                                   "morok.antihook.fixup.cmd.base");
+    Value *isSymtab = CBB.CreateICmpEQ(cmdBase, ConstantInt::get(i32, 0x2),
+                                       "morok.antihook.fixup.symtab.cmd");
+    Value *isDysymtab = CBB.CreateICmpEQ(cmdBase, ConstantInt::get(i32, 0xB),
+                                         "morok.antihook.fixup.dysymtab.cmd");
+    Value *symOff32 =
+        loadAt(CBB, M, i32, cmdPtr, 8, "morok.antihook.fixup.symoff.cmd");
+    Value *nSyms32 =
+        loadAt(CBB, M, i32, cmdPtr, 12, "morok.antihook.fixup.nsyms.cmd");
+    Value *strOff32 =
+        loadAt(CBB, M, i32, cmdPtr, 16, "morok.antihook.fixup.stroff.cmd");
+    Value *indirectOff32 = loadAt(CBB, M, i32, cmdPtr, 56,
+                                  "morok.antihook.fixup.indirectsymoff.cmd");
+    Value *nIndirect32 = loadAt(CBB, M, i32, cmdPtr, 60,
+                                "morok.antihook.fixup.nindirectsyms.cmd");
+    auto storeIf = [&](AllocaInst *Slot, Value *Condition, Value *NewValue) {
+        Value *old = CBB.CreateLoad(ip, Slot);
+        CBB.CreateStore(CBB.CreateSelect(Condition, NewValue, old), Slot);
+    };
+    storeIf(symOffSlot, isSymtab,
+            CBB.CreateZExt(symOff32, ip, "morok.antihook.fixup.symoff.w"));
+    storeIf(nSymsSlot, isSymtab,
+            CBB.CreateZExt(nSyms32, ip, "morok.antihook.fixup.nsyms.w"));
+    storeIf(strOffSlot, isSymtab,
+            CBB.CreateZExt(strOff32, ip, "morok.antihook.fixup.stroff.w"));
+    storeIf(indirectSymOffSlot, isDysymtab,
+            CBB.CreateZExt(indirectOff32, ip,
+                           "morok.antihook.fixup.indirectsymoff.w"));
+    storeIf(nIndirectSymsSlot, isDysymtab,
+            CBB.CreateZExt(nIndirect32, ip,
+                           "morok.antihook.fixup.nindirectsyms.w"));
+    Value *segName8 = CBB.CreateAlignedLoad(
+        i64, gepI8(CBB, M, cmdPtr, constIp(M, 8),
+                   "morok.antihook.fixup.segname.ptr"),
+        Align(1), "morok.antihook.fixup.segname8");
+    Value *isLinkedit = CBB.CreateAnd(
+        isSegment,
+        CBB.CreateICmpEQ(segName8, ConstantInt::get(i64, 0x44454B4E494C5F5FULL)),
+        "morok.antihook.fixup.linkedit.segment");
+    Value *segVmaddr =
+        loadAt(CBB, M, i64, cmdPtr, 24, "morok.antihook.fixup.seg.vmaddr");
+    Value *segFileoff =
+        loadAt(CBB, M, i64, cmdPtr, 40, "morok.antihook.fixup.seg.fileoff");
+    storeIf(linkeditVmaddrSlot, isLinkedit,
+            CBB.CreateZExtOrTrunc(segVmaddr, ip,
+                                  "morok.antihook.fixup.linkedit.vmaddr.w"));
+    storeIf(linkeditFileoffSlot, isLinkedit,
+            CBB.CreateZExtOrTrunc(segFileoff, ip,
+                                  "morok.antihook.fixup.linkedit.fileoff.w"));
     Value *canScanSections = CBB.CreateAnd(
         isSegment,
         CBB.CreateAnd(CBB.CreateICmpUGT(nsects, ConstantInt::get(i32, 0)),
@@ -4125,13 +4476,141 @@ Function *darwinFixupProbe(Module &M, const Triple &TT) {
                      entryCheckBB, entryNextBB);
 
     IRBuilder<> ECB(entryCheckBB);
-    Value *textOk =
-        ECB.CreateCall(textCheck, {targetAddr}, "morok.antihook.fixup.text");
-    incrementDiff(
-        ECB, diff,
-        ECB.CreateICmpEQ(textOk, ConstantInt::get(Type::getInt32Ty(ctx), 0)),
-        "morok.antihook.fixup.violation");
-    ECB.CreateBr(entryNextBB);
+    Value *linkeditVm = ECB.CreateLoad(ip, linkeditVmaddrSlot,
+                                       "morok.antihook.fixup.linkedit.vmaddr.v");
+    Value *linkeditFile = ECB.CreateLoad(ip, linkeditFileoffSlot,
+                                         "morok.antihook.fixup.linkedit.fileoff.v");
+    Value *linkeditBase =
+        ECB.CreateSub(ECB.CreateAdd(slide, linkeditVm,
+                                    "morok.antihook.fixup.linkedit.slide"),
+                      linkeditFile, "morok.antihook.fixup.linkedit.base");
+    Value *symOff =
+        ECB.CreateLoad(ip, symOffSlot, "morok.antihook.fixup.symoff.v");
+    Value *nSyms = ECB.CreateLoad(ip, nSymsSlot,
+                                  "morok.antihook.fixup.nsyms.v");
+    Value *strOff =
+        ECB.CreateLoad(ip, strOffSlot, "morok.antihook.fixup.stroff.v");
+    Value *indirectOff = ECB.CreateLoad(
+        ip, indirectSymOffSlot, "morok.antihook.fixup.indirectsymoff.v");
+    Value *nIndirect = ECB.CreateLoad(
+        ip, nIndirectSymsSlot, "morok.antihook.fixup.nindirectsyms.v");
+    Value *reserved1Raw = loadAt(ECB, M, i32, secPtr, 68,
+                                 "morok.antihook.fixup.section.reserved1");
+    Value *indirectIndex = ECB.CreateAdd(
+        ECB.CreateZExt(reserved1Raw, ip,
+                       "morok.antihook.fixup.indirect.base"),
+        entryIdx, "morok.antihook.fixup.indirect.index");
+    Value *mainText =
+        ECB.CreateCall(imageTextCheck, {targetAddr, ConstantInt::get(i32, 0)},
+                       "morok.antihook.fixup.main.text");
+    Value *hasTables = ECB.CreateAnd(
+        ECB.CreateICmpNE(linkeditVm, ConstantInt::get(ip, 0)),
+        ECB.CreateAnd(
+            ECB.CreateICmpNE(symOff, ConstantInt::get(ip, 0)),
+            ECB.CreateAnd(
+                ECB.CreateICmpNE(strOff, ConstantInt::get(ip, 0)),
+                ECB.CreateAnd(ECB.CreateICmpNE(indirectOff,
+                                               ConstantInt::get(ip, 0)),
+                              ECB.CreateICmpNE(nIndirect,
+                                               ConstantInt::get(ip, 0))))),
+        "morok.antihook.fixup.tables.present");
+    Value *canReadIndirect = ECB.CreateAnd(
+        hasTables, ECB.CreateICmpULT(indirectIndex, nIndirect),
+        "morok.antihook.fixup.indirect.inrange");
+    ECB.CreateCondBr(canReadIndirect, entryIndirectBB, entryValidateBB);
+
+    IRBuilder<> EIB(entryIndirectBB);
+    Value *indirectPtr = EIB.CreateIntToPtr(
+        EIB.CreateAdd(linkeditBase,
+                      EIB.CreateAdd(indirectOff,
+                                    EIB.CreateMul(indirectIndex,
+                                                  ConstantInt::get(ip, 4))),
+                      "morok.antihook.fixup.indirect.ptr.addr"),
+        ptr, "morok.antihook.fixup.indirect.ptr");
+    Value *indirectRaw =
+        loadAt(EIB, M, i32, indirectPtr, 0ULL,
+               "morok.antihook.fixup.indirect.raw");
+    Value *indirectLocal = EIB.CreateICmpNE(
+        EIB.CreateAnd(indirectRaw, ConstantInt::get(i32, 0x80000000)),
+        ConstantInt::get(i32, 0), "morok.antihook.fixup.indirect.local");
+    Value *indirectAbs = EIB.CreateICmpNE(
+        EIB.CreateAnd(indirectRaw, ConstantInt::get(i32, 0x40000000)),
+        ConstantInt::get(i32, 0), "morok.antihook.fixup.indirect.abs");
+    Value *indirectSpecial = EIB.CreateOr(
+        indirectLocal, indirectAbs, "morok.antihook.fixup.indirect.special");
+    Value *symIndex = EIB.CreateZExt(
+        EIB.CreateAnd(indirectRaw, ConstantInt::get(i32, 0x3FFFFFFF)), ip,
+        "morok.antihook.fixup.sym.index");
+    Value *canReadSymbol = EIB.CreateAnd(
+        EIB.CreateNot(indirectSpecial,
+                      "morok.antihook.fixup.indirect.external"),
+        EIB.CreateAnd(EIB.CreateICmpULT(symIndex, nSyms),
+                      EIB.CreateICmpNE(nSyms, ConstantInt::get(ip, 0))),
+        "morok.antihook.fixup.sym.inrange");
+    EIB.CreateCondBr(canReadSymbol, entryExpectedBB, entryValidateBB);
+
+    IRBuilder<> EXB(entryExpectedBB);
+    Value *symPtr = EXB.CreateIntToPtr(
+        EXB.CreateAdd(linkeditBase,
+                      EXB.CreateAdd(symOff,
+                                    EXB.CreateMul(symIndex,
+                                                  ConstantInt::get(ip, 16))),
+                      "morok.antihook.fixup.sym.ptr.addr"),
+        ptr, "morok.antihook.fixup.sym.ptr");
+    Value *strx32 =
+        loadAt(EXB, M, i32, symPtr, 0ULL, "morok.antihook.fixup.sym.strx");
+    Value *nDesc =
+        loadAt(EXB, M, Type::getInt16Ty(ctx), symPtr, 6,
+               "morok.antihook.fixup.sym.desc");
+    Value *symName = EXB.CreateIntToPtr(
+        EXB.CreateAdd(linkeditBase,
+                      EXB.CreateAdd(strOff, EXB.CreateZExt(strx32, ip)),
+                      "morok.antihook.fixup.sym.name.addr"),
+        ptr, "morok.antihook.fixup.sym.name");
+    Value *ordinal = EXB.CreateZExt(
+        EXB.CreateLShr(nDesc, ConstantInt::get(Type::getInt16Ty(ctx), 8)),
+        i32, "morok.antihook.fixup.sym.ordinal");
+    Value *dylibName = EXB.CreateCall(
+        dylibNameForOrdinal, {hdr, ordinal},
+        "morok.antihook.fixup.expected.dylib");
+    Value *expectedPtr = EXB.CreateCall(
+        expectedSymbol, {symName, dylibName},
+        "morok.antihook.fixup.expected.symbol");
+    Value *expectedOk = EXB.CreateAnd(
+        EXB.CreateICmpNE(expectedPtr, ConstantPointerNull::get(ptr),
+                         "morok.antihook.fixup.expected.present"),
+        EXB.CreateICmpEQ(expectedPtr, targetPtr,
+                         "morok.antihook.fixup.expected.eq"),
+        "morok.antihook.fixup.expected.ok");
+    EXB.CreateBr(entryValidateBB);
+
+    IRBuilder<> EVB(entryValidateBB);
+    auto *expectedOkPhi =
+        EVB.CreatePHI(Type::getInt1Ty(ctx), 3,
+                      "morok.antihook.fixup.expected.phi");
+    expectedOkPhi->addIncoming(ConstantInt::getFalse(ctx), entryCheckBB);
+    expectedOkPhi->addIncoming(ConstantInt::getFalse(ctx), entryIndirectBB);
+    expectedOkPhi->addIncoming(expectedOk, entryExpectedBB);
+    auto *specialPhi =
+        EVB.CreatePHI(Type::getInt1Ty(ctx), 3,
+                      "morok.antihook.fixup.special.phi");
+    specialPhi->addIncoming(ConstantInt::getFalse(ctx), entryCheckBB);
+    specialPhi->addIncoming(indirectSpecial, entryIndirectBB);
+    specialPhi->addIncoming(ConstantInt::getFalse(ctx), entryExpectedBB);
+    Value *mainTextOk =
+        EVB.CreateICmpNE(mainText, ConstantInt::get(i32, 0),
+                         "morok.antihook.fixup.main.text.ok");
+    Value *lazyMainOk =
+        EVB.CreateAnd(isLazy, mainTextOk, "morok.antihook.fixup.lazy.main");
+    Value *localMainOk =
+        EVB.CreateAnd(specialPhi, mainTextOk, "morok.antihook.fixup.local.main");
+    Value *targetOk =
+        EVB.CreateOr(expectedOkPhi, EVB.CreateOr(lazyMainOk, localMainOk),
+                     "morok.antihook.fixup.target.ok");
+    incrementDiff(EVB, diff,
+                  EVB.CreateNot(targetOk, "morok.antihook.fixup.violation.pred"),
+                  "morok.antihook.fixup.violation");
+    EVB.CreateBr(entryNextBB);
 
     IRBuilder<> ENB(entryNextBB);
     Value *nextEntryIdx = ENB.CreateAdd(entryIdx, ConstantInt::get(i64, 1),
