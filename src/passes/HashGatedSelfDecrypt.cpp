@@ -282,13 +282,27 @@ GlobalVariable *createI32State(Module &M, StringRef Name,
     return State;
 }
 
+std::uint8_t nonZeroByteDifferentFrom(std::uint8_t Byte,
+                                      std::uint8_t Avoid) {
+    if (Byte != 0 && Byte != Avoid)
+        return Byte;
+    Byte = static_cast<std::uint8_t>(Avoid ^ 0x5Au);
+    if (Byte != 0 && Byte != Avoid)
+        return Byte;
+    Byte = static_cast<std::uint8_t>(Avoid ^ 0xA5u);
+    if (Byte != 0 && Byte != Avoid)
+        return Byte;
+    return Avoid == 1u ? 2u : 1u;
+}
+
 GlobalVariable *createPoisonPayload(Module &M, StringRef Suffix,
-                                    std::uint32_t Size, ir::IRRandom &Rng) {
+                                    ArrayRef<std::uint8_t> Original,
+                                    ir::IRRandom &Rng) {
     std::vector<std::uint8_t> Poisoned;
-    Poisoned.reserve(Size);
+    Poisoned.reserve(Original.size());
     std::uint64_t Mixer = Rng.next() | 1ULL;
     std::uint64_t Lane = Rng.next();
-    for (std::uint32_t I = 0; I < Size; ++I) {
+    for (std::uint32_t I = 0; I < Original.size(); ++I) {
         if ((I & 7u) == 0) {
             Lane = Rng.next() ^
                    (Mixer + (static_cast<std::uint64_t>(I) + 1) *
@@ -303,10 +317,11 @@ GlobalVariable *createPoisonPayload(Module &M, StringRef Suffix,
             static_cast<std::uint8_t>(Lane >> ((I & 7u) * 8u));
         Byte ^= static_cast<std::uint8_t>(
             (Mixer >> (((I + 3u) & 7u) * 8u)) + (I * 0x6Du) + (I >> 2));
-        if ((I % kVmInstrStride) == 0)
-            Byte |= 0x80u;
-        if (Byte == 0)
+        if ((I % kVmInstrStride) == 0) {
+            Byte = nonZeroByteDifferentFrom(Byte, Original[I]);
+        } else if (Byte == 0) {
             Byte = 0xA5u;
+        }
         Poisoned.push_back(Byte);
     }
 
@@ -1171,7 +1186,8 @@ bool wrapPayload(Module &M, Payload &P,
     GlobalVariable *MoveEpoch =
         createI64State(M, "morok.sdb.move.epoch." + P.suffix, Move.epoch);
     GlobalVariable *PoisonPayload = createPoisonPayload(
-        M, P.suffix, static_cast<std::uint32_t>(P.original.size()), Rng);
+        M, P.suffix, ArrayRef<std::uint8_t>(P.original.data(), P.original.size()),
+        Rng);
     Function *Ensure =
         createEnsure(M, P, Ready, Bound, CurrentHash, CurrentKeyMask,
                      CurrentRot, PoisonPayload, S, Params.context_keying);

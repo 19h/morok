@@ -8652,16 +8652,16 @@ entry:
         return Mask;
     };
     bool publicMaskRecoversPlaintext = true;
-    bool opcodeBoundariesCarryPoison = true;
+    bool opcodeBoundariesDecodeToPoison = true;
     for (unsigned I = 0; I < Poison.size(); ++I) {
         publicMaskRecoversPlaintext &=
             static_cast<std::uint8_t>(Poison[I] ^ publicPoisonMask(I)) ==
             Before[I];
         if ((I % 16u) == 0)
-            opcodeBoundariesCarryPoison &= (Poison[I] & 0x80u) != 0;
+            opcodeBoundariesDecodeToPoison &= Poison[I] != Before[I];
     }
     CHECK_FALSE(publicMaskRecoversPlaintext);
-    CHECK(opcodeBoundariesCarryPoison);
+    CHECK(opcodeBoundariesDecodeToPoison);
     Function *Ensure = M->getFunction("morok.sdb.ensure.vm_secret");
     REQUIRE(Ensure);
     Function *Seal = M->getFunction("morok.sdb.seal.vm_secret");

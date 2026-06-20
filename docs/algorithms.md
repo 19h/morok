@@ -659,10 +659,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   before decryption: the fixed-length decrypt loop always runs, then a
   post-decrypt decision either marks the payload ready or copies a private
   per-build `morok.sdb.poison.*` bytecode image into the payload before
-  publishing it as ready.  That independent poisoned image is not derived from
-  the plaintext bytecode and trips the VM opcode guard at the first fetched
-  instruction, so tamper takes a data-flow poison path rather than a fixed
-  `llvm.trap` oracle or a cleanly skipped decryptor.
+  publishing it as ready.  That independent poisoned image is RNG-derived, not
+  a reversible transform of the plaintext bytecode; at each VM instruction
+  boundary generation only rejects the original encoded opcode byte, which
+  guarantees the normal VM stream decode trips the opcode guard instead of
+  dispatching a valid handler.  Tamper therefore takes a data-flow poison path
+  rather than a fixed `llvm.trap` oracle or a cleanly skipped decryptor.
 - With `context_keying=true`, the ensure helper also folds VM call context into
   the stream key: each argument is volatile-stored to a local context slot,
   loaded twice, xored to a runtime zero, and mixed as `morok.sdb.key.context`.
