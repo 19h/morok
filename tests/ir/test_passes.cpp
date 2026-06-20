@@ -196,15 +196,6 @@ std::size_t countNamedInstructions(Function &F, StringRef prefix) {
     return n;
 }
 
-std::size_t countNamedInstructionsWithOpcode(Function &F, StringRef prefix,
-                                             unsigned opcode) {
-    std::size_t n = 0;
-    for (Instruction &I : instructions(F))
-        if (I.getName().starts_with(prefix) && I.getOpcode() == opcode)
-            ++n;
-    return n;
-}
-
 void checkSealEnforcement(Module &M, Function &F) {
     CHECK(M.getGlobalVariable("morok.seal.root.anti_debug", true) != nullptr);
     CHECK(countNamedInstructions(F, "morok.seal.fold.anti_debug.trip") >= 1u);
@@ -410,6 +401,41 @@ bool pointerReferencesGlobal(Value *V, const GlobalValue *GV) {
             return true;
     if (auto *C = dyn_cast<Constant>(V))
         return constantReferencesGlobal(C, GV);
+    return false;
+}
+
+bool valueDependsOnGlobalPrefix(Value *V, StringRef globalPrefix) {
+    SmallVector<Value *, 32> Work;
+    SmallPtrSet<Value *, 32> Seen;
+    Work.push_back(V);
+    while (!Work.empty()) {
+        Value *Cur = Work.pop_back_val();
+        if (!Cur || !Seen.insert(Cur).second)
+            continue;
+        Value *Stripped =
+            Cur->getType()->isPointerTy() ? Cur->stripPointerCasts() : Cur;
+        if (auto *GV = dyn_cast<GlobalVariable>(Stripped))
+            if (GV->getName().starts_with(globalPrefix))
+                return true;
+        if (auto *I = dyn_cast<Instruction>(Cur)) {
+            for (Use &U : I->operands())
+                Work.push_back(U.get());
+            continue;
+        }
+        if (auto *C = dyn_cast<Constant>(Cur))
+            for (const Use &U : C->operands())
+                Work.push_back(U.get());
+    }
+    return false;
+}
+
+bool namedInstructionDependsOnGlobalPrefix(Function &F,
+                                           StringRef instructionPrefix,
+                                           StringRef globalPrefix) {
+    for (Instruction &I : instructions(F))
+        if (I.getName().starts_with(instructionPrefix) &&
+            valueDependsOnGlobalPrefix(&I, globalPrefix))
+            return true;
     return false;
 }
 
@@ -12058,10 +12084,12 @@ entry:
         CHECK(countNamedInstructions(*Init, "morok.ckd.byte") == 0u);
         CHECK(countNamedInstructions(*Init, "morok.ckd.target.enc") == 0u);
         CHECK(countNamedInstructions(*Init, "morok.ckd.enc.poison") >= 1u);
-        CHECK(countNamedInstructionsWithOpcode(
-                  *Init, "morok.ckd.enc.poison", Instruction::Add) >= 1u);
-        CHECK(countNamedInstructionsWithOpcode(
-                  *Init, "morok.ckd.enc.poison.delta", Instruction::Or) >= 1u);
+        CHECK(countNamedInstructions(*Init, "morok.ckd.enc.poison.delta") ==
+              0u);
+        CHECK_FALSE(namedInstructionDependsOnGlobalPrefix(
+            *Init, "morok.ckd.enc.poison", "morok.ckd.enc"));
+        CHECK_FALSE(namedInstructionDependsOnGlobalPrefix(
+            *Init, "morok.ckd.enc.poison", "morok.ckd.seal.state"));
         // The dispatch-site decode still hashes the live bytes, so a patched
         // caller region still decodes a wrong target.
         CHECK(countNamedInstructions(*Caller, "morok.ckd.byte") >= 1u);
@@ -12088,10 +12116,12 @@ entry:
         CHECK(countNamedInstructions(*Init, "morok.ckd.byte") >= 1u);
         CHECK(countNamedInstructions(*Init, "morok.ckd.target.enc") >= 1u);
         CHECK(countNamedInstructions(*Init, "morok.ckd.enc.poison") == 0u);
-        CHECK(countNamedInstructionsWithOpcode(*Init, "morok.ckd.seal.bad",
-                                               Instruction::Add) >= 1u);
-        CHECK(countNamedInstructionsWithOpcode(
-                  *Init, "morok.ckd.seal.bad.delta", Instruction::Or) >= 1u);
+        CHECK(countNamedInstructions(*Init, "morok.ckd.seal.bad") >= 1u);
+        CHECK(countNamedInstructions(*Init, "morok.ckd.seal.bad.delta") == 0u);
+        CHECK_FALSE(namedInstructionDependsOnGlobalPrefix(
+            *Init, "morok.ckd.seal.bad", "morok.ckd.enc"));
+        CHECK_FALSE(namedInstructionDependsOnGlobalPrefix(
+            *Init, "morok.ckd.seal.bad", "morok.ckd.seal.state"));
         CHECK_FALSE(verifyModule(*M, &errs()));
     }
 }

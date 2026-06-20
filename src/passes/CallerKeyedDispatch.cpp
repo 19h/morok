@@ -186,6 +186,34 @@ Value *mixSeal64(Builder &B, Value *V, const Twine &Name) {
     return B.CreateXor(V, B.CreateLShr(V, ConstantInt::get(I64, 32)), Name);
 }
 
+std::uint64_t mixSealConstant(std::uint64_t V) {
+    V ^= V >> 33;
+    V *= 0xff51afd7ed558ccdULL;
+    V ^= V >> 29;
+    V *= 0xc4ceb9fe1a85ec53ULL;
+    V ^= V >> 32;
+    return V;
+}
+
+std::uint64_t sealFailurePoison(const Site &S, std::uint32_t RegionBytes) {
+    std::uint64_t X = kPostlinkMagic ^ S.seal_salt;
+    X = mixSealConstant(X + S.salt);
+    X = mixSealConstant(X ^ (S.mul | 1ULL));
+    X = mixSealConstant(X + S.add);
+    std::uint64_t Shape =
+        (static_cast<std::uint64_t>(S.rot) << 32) | RegionBytes;
+    X = mixSealConstant(X ^ Shape);
+    return X | 1ULL;
+}
+
+Value *emitSealFailurePoison(Builder &B, const Site &S,
+                             std::uint32_t RegionBytes, const Twine &Name) {
+    auto *I64 = B.getInt64Ty();
+    std::uint64_t Poison = sealFailurePoison(S, RegionBytes);
+    return B.CreateXor(ConstantInt::get(I64, Poison),
+                       ConstantInt::get(I64, 0), Name);
+}
+
 Value *emitSealState(Builder &B, Function *Dispatcher, const Site &S,
                      Value *Encoded, Value *CodeSize, std::uint32_t RegionBytes,
                      const Twine &Name) {
@@ -421,12 +449,9 @@ void emitInit(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
             B.CreateBr(SealedBB);
 
             Builder SB(SealedBB);
-            Value *PoisonDelta = SB.CreateOr(
-                SB.CreateXor(SealState, ExpectedSeal,
-                             "morok.ckd.enc.poison.mix"),
-                ConstantInt::get(I64, 1), "morok.ckd.enc.poison.delta");
             Value *Poison =
-                SB.CreateAdd(Existing, PoisonDelta, "morok.ckd.enc.poison");
+                emitSealFailurePoison(SB, S, RegionBytes,
+                                      "morok.ckd.enc.poison");
             Value *SealedEncoded = SB.CreateSelect(
                 ValidSealed, Existing, Poison, "morok.ckd.target.sealed");
             auto *Store = SB.CreateStore(SealedEncoded, S.encoded,
@@ -456,13 +481,8 @@ void emitInit(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
         FB.CreateBr(StoreBB);
 
         Builder SB(SealedBB);
-        Value *PoisonDelta =
-            SB.CreateOr(SB.CreateXor(SealState, ExpectedSeal,
-                                     "morok.ckd.seal.bad.mix"),
-                        ConstantInt::get(I64, 1),
-                        "morok.ckd.seal.bad.delta");
         Value *Poison =
-            SB.CreateAdd(Existing, PoisonDelta, "morok.ckd.seal.bad");
+            emitSealFailurePoison(SB, S, RegionBytes, "morok.ckd.seal.bad");
         Value *SealedEncoded = SB.CreateSelect(ValidSealed, Existing, Poison,
                                                "morok.ckd.target.sealed");
         SB.CreateBr(StoreBB);
