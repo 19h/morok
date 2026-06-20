@@ -2151,6 +2151,18 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                          0xC7A45A6E03D27A41ULL, "morok.vm.poison.op");
         Value *Ret = loadPoison(B, PoisonSlot, "morok.vm.ret.poison");
         if (P.ret_kind == RetKind::Void) {
+            // Zero-on-clean enforcement (#100): a tampered void function trips
+            // the poison slot but has no return value to carry it, and its
+            // stores are redirected to a safe scratch, so it would otherwise
+            // return as a clean no-op (fail-open).  Fold the poison word into
+            // the anti_debug seal: a clean run (poison == 0) leaves the seal at
+            // S0 (no-op), while a tampered run (poison != 0) moves the seal off
+            // S0, so every seal-dependent consumer (VM keystream, self-checksum)
+            // reconstructs garbage and the program fails closed instead of
+            // silently skipping the protected function.
+            runtime_seal::foldWord(B, runtime_seal::kAntiDebugChannel, Ret,
+                                   0x56F0D1A739B842C5ULL,
+                                   "morok.vm.void.poison.seal");
             B.CreateRetVoid();
             return;
         }
@@ -2207,6 +2219,15 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
         }
         case VmOp::Ret: {
             if (P.ret_kind == RetKind::Void) {
+                // Same zero-on-clean enforcement as the poison handler (#100):
+                // fold any accumulated poison into the anti_debug seal before a
+                // void return, so a tampered run that reaches Ret with poison set
+                // fails closed instead of returning as a clean no-op.
+                Value *VoidPoison =
+                    loadPoison(B, PoisonSlot, "morok.vm.ret.void.poison");
+                runtime_seal::foldWord(B, runtime_seal::kAntiDebugChannel,
+                                       VoidPoison, 0x56F0D1A739B842C5ULL,
+                                       "morok.vm.ret.void.poison.seal");
                 B.CreateRetVoid();
                 continue;
             }

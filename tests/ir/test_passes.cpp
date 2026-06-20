@@ -7133,6 +7133,46 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #100: a virtualized VOID function has no return value to carry
+// the poison slot, and its stores are redirected to a safe scratch, so on
+// tamper it would otherwise return as a clean no-op (fail-open).  The VM must
+// fold the poison into the anti_debug seal at every void return — zero on a
+// clean run (poison == 0 leaves the seal at S0), non-zero on tamper (the seal
+// moves off S0 and every seal-dependent consumer fails closed).
+TEST_CASE("virtualizeModule folds void poison into the anti-debug seal") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+@g = global i32 0
+define void @vm_void(i32 %a) {
+entry:
+  %x = add i32 %a, 7
+  store i32 %x, ptr @g
+  ret void
+}
+)ir");
+    Function *F = M->getFunction("vm_void");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(207);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::virtualizeModule(
+        *M,
+        {/*probability=*/100, /*max_functions=*/1,
+         /*max_instructions=*/16, /*max_registers=*/32},
+        rng));
+
+    Function *Helper = M->getFunction("morok.vm.vm_void.exec");
+    REQUIRE(Helper);
+    std::size_t voidPoisonSeal = 0;
+    for (Instruction &I : instructions(*Helper))
+        if (I.getName().starts_with("morok.vm.void.poison.seal") ||
+            I.getName().starts_with("morok.vm.ret.void.poison.seal"))
+            ++voidPoisonSeal;
+    CHECK(voidPoisonSeal >= 1u);
+    CHECK(M->getGlobalVariable("morok.seal.root.anti_debug", true) != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("virtualizeModule removes stolen native code from lifted functions") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
