@@ -42,8 +42,6 @@ jobs:
     # The matrix runs all four platforms in parallel; within a job the LLVM build
     # uses every core. Cold builds are long; cached runs are minutes.
     timeout-minutes: 360
-    permissions:
-      contents: write # attach archives to the release on tags
     strategy:
       fail-fast: false
       matrix:
@@ -304,9 +302,22 @@ jobs:
           path: ${{ steps.pkg.outputs.archive }}
           if-no-files-found: error
 
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: dist
+          pattern: morok-*
+          merge-multiple: true
+
       - name: Attach to release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
-          files: ${{ steps.pkg.outputs.archive }}
+          files: dist/*
           fail_on_unmatched_files: true
