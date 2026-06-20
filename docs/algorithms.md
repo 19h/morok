@@ -1378,17 +1378,24 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   segments, but undefined external imports do not accept arbitrary in-image
   stubs or `LD_PRELOAD` interposers.  A still-unresolved lazy PLT slot is
   tolerated only when it points at its own in-image PLT jump stub; the checker
-  does not write a guessed `dlsym` result into the live GOT.  When the binary
-  advertises `BIND_NOW` and the slot lies in `PT_GNU_RELRO`, the checker
-  re-applies read-only protection to the slot page with an inline x86_64
-  `mprotect` syscall path; bad targets or failed reprotection are folded into
-  delayed anti-hook state.
+  does not write a guessed `dlsym` result into the live GOT.  That lazy verdict
+  is treated as pending: bounded one-shot exit-site probes re-run the GOT walk
+  after normal user code has had a chance to bind lazy imports, so an interposed
+  post-constructor resolution is compared against the direct `DT_NEEDED`
+  provider instead of being permanently accepted.  When the binary advertises
+  `BIND_NOW` and the slot lies in `PT_GNU_RELRO`, the checker re-applies
+  read-only protection to the slot page with an inline x86_64 `mprotect`
+  syscall path; bad targets or failed reprotection are folded into delayed
+  anti-hook state.
   On macOS, AntiHooking walks the main Mach-O load commands, scans
   `S_NON_LAZY_SYMBOL_POINTERS` and `S_LAZY_SYMBOL_POINTERS` sections such as
   `__got` and `__la_symbol_ptr`, volatile-loads each non-null pointer, and
-  checks it against executable segments from dyld's loaded image list.  Pointers
-  that do not land in any loaded image `__TEXT`-style executable range are
-  folded into the delayed anti-hook state.
+  resolves each indirect-symbol entry's library ordinal to the expected
+  `LC_LOAD_DYLIB` name.  External fixups are accepted only when the live target
+  lands in executable segments of the already loaded dyld image with that exact
+  dylib name; the expected-address oracle does not call `dlopen` or `dlsym`.
+  Pointers that do not land in the expected image's `__TEXT`-style executable
+  range are folded into the delayed anti-hook state.
   AntiHooking also emits a bounded address-space census.  Linux parses a cloaked
   `/proc/self/maps` buffer with direct syscalls where available, flags `rwx`
   mappings, executable non-readable mappings, anonymous/private executable

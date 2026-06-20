@@ -14226,6 +14226,8 @@ entry:
     REQUIRE(Clean != nullptr);
     Function *Got = M->getFunction("morok.antihook.got.plt");
     REQUIRE(Got != nullptr);
+    Function *GotRecheck = M->getFunction("morok.antihook.got.recheck");
+    REQUIRE(GotRecheck != nullptr);
     Function *Rx = M->getFunction("morok.antihook.elf.rx");
     REQUIRE(Rx != nullptr);
     Function *Lazy = M->getFunction("morok.antihook.got.lazy");
@@ -14339,7 +14341,9 @@ entry:
           0u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.lazy.writable") >=
           1u);
-    CHECK(countNamedInstructions(*Got, "morok.antihook.got.lazy.ok") >= 1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.lazy.ok") == 0u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.lazy.pending") >=
+          1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.lazy.notnow") >=
           1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.lazy.bound") == 0u);
@@ -14352,6 +14356,11 @@ entry:
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.protect.ok") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.rx") >= 1u);
+    CHECK(countNamedInstructions(*GotRecheck,
+                                 "morok.antihook.got.recheck.diff") >= 1u);
+    CHECK(countNamedInstructions(*GotRecheck,
+                                 "morok.antihook.got.recheck.changed") >= 1u);
+    CHECK(countNamedInstructions(*Work, "morok.antihook.got.site.seen") >= 1u);
     CHECK(countNamedInstructions(*Rx, "morok.antihook.got.self.seg.hit") >= 1u);
     CHECK(countNamedInstructions(*Rx, "morok.antihook.got.map.seg.hit") == 0u);
     CHECK(countNamedInstructions(*Lazy, "morok.antihook.got.lazy.seg.hit") >=
@@ -14530,8 +14539,10 @@ entry:
     REQUIRE(ImageText != nullptr);
     Function *DylibOrdinal = M->getFunction("morok.antihook.macho.dylib.ordinal");
     REQUIRE(DylibOrdinal != nullptr);
-    Function *Expected = M->getFunction("morok.antihook.macho.expected");
+    Function *Expected = M->getFunction("morok.antihook.macho.expected.text");
     REQUIRE(Expected != nullptr);
+    Function *StringEq = M->getFunction("morok.antihook.str.eq");
+    REQUIRE(StringEq != nullptr);
     Function *Vm = M->getFunction("morok.antihook.vm.darwin");
     REQUIRE(Vm != nullptr);
     Function *Wx = M->getFunction("morok.antihook.wxorx.darwin");
@@ -14562,8 +14573,8 @@ entry:
     CHECK(M->getFunction("morok.antihook.got.plt") == nullptr);
     CHECK(hasInlineAsmCall(*Clean));
     CHECK(hasInlineAsmCall(*Sandbox));
-    CHECK(M->getFunction("dlopen") != nullptr);
-    CHECK(M->getFunction("dlsym") != nullptr);
+    CHECK(M->getFunction("dlopen") == nullptr);
+    CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(M->getFunction("open") == nullptr);
     CHECK(M->getFunction("lseek") == nullptr);
     CHECK(M->getFunction("mmap") == nullptr);
@@ -14591,9 +14602,9 @@ entry:
     CHECK(countNamedInstructions(*Fixups,
                                  "morok.antihook.fixup.expected.dylib") >= 1u);
     CHECK(countNamedInstructions(*Fixups,
-                                 "morok.antihook.fixup.expected.symbol") >= 1u);
+                                 "morok.antihook.fixup.expected.text") >= 1u);
     CHECK(countNamedInstructions(*Fixups,
-                                 "morok.antihook.fixup.expected.eq") >= 1u);
+                                 "morok.antihook.fixup.expected.eq") == 0u);
     CHECK(countNamedInstructions(*Fixups,
                                  "morok.antihook.fixup.target.ok") >= 1u);
     CHECK(countNamedInstructions(*Fixups,
@@ -14604,7 +14615,12 @@ entry:
                                  "morok.antihook.macho.dylib.ordinal.match") >=
           1u);
     CHECK(countNamedInstructions(*Expected,
-                                 "morok.antihook.macho.expected.sym") >= 1u);
+                                 "morok.antihook.macho.expected.image.name.eq") >=
+          1u);
+    CHECK(countNamedInstructions(*Expected,
+                                 "morok.antihook.macho.expected.image.text") >=
+          1u);
+    CHECK(countNamedInstructions(*StringEq, "morok.antihook.str.eq.byte") >= 1u);
     CHECK(countNamedInstructions(*Text, "morok.antihook.macho.text.hit") >= 1u);
     CHECK(countNamedInstructions(*ImageText,
                                  "morok.antihook.macho.image.text.hit") >= 1u);
@@ -14795,8 +14811,8 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.corroborate.antidump.changed") >=
           1u);
     CHECK(M->getFunction("morok.antihook.diverge.posix") == nullptr);
-    CHECK(M->getFunction("dlopen") != nullptr);
-    CHECK(M->getFunction("dlsym") != nullptr);
+    CHECK(M->getFunction("dlopen") == nullptr);
+    CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(M->getFunction("open") != nullptr);
     CHECK(M->getFunction("mmap") != nullptr);
     CHECK(M->getFunction("mprotect") != nullptr);

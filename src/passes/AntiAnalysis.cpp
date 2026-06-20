@@ -3448,6 +3448,106 @@ Function *linuxGotTargetInNeeded(Module &M) {
     return fn;
 }
 
+Function *linuxGotRecheckProbe(Module &M, Function *Got,
+                               GlobalVariable *State) {
+    if (!Got || !State)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.got.recheck"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *voidTy = Type::getVoidTy(ctx);
+    auto *fn = Function::Create(FunctionType::get(voidTy, {i64}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.got.recheck", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    auto *tag = fn->getArg(0);
+    tag->setName("tag");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    Value *diff = B.CreateCall(Got, {}, "morok.antihook.got.recheck.diff");
+    Value *changed =
+        B.CreateICmpNE(diff, ConstantInt::get(i64, 0),
+                       "morok.antihook.got.recheck.changed");
+    foldState(B, State, B.CreateXor(diff, tag, "morok.antihook.got.recheck.mix"),
+              0x6F13D9C4B825A7E1ULL, "morok.antihook.got.recheck");
+    foldEnforcedFlag(B, State, changed, 0xA6C12D8F49E35B70ULL,
+                     "morok.antihook.got.recheck.changed");
+    B.CreateRetVoid();
+    return fn;
+}
+
+void insertAntiHookGotRecheckSite(Module &M, Instruction &I, Function *Probe,
+                                  std::uint64_t Tag, std::uint8_t ArmedByte,
+                                  std::uint32_t SiteId) {
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+
+    auto *gate = new GlobalVariable(
+        M, i8, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i8, 0), "morok.antihook.got.site");
+    gate->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+
+    Function *parent = I.getFunction();
+    BasicBlock *headBB = I.getParent();
+    BasicBlock *contBB = headBB->splitBasicBlock(
+        I.getIterator(), "morok.antihook.got.site.cont");
+    headBB->getTerminator()->eraseFromParent();
+    auto *callBB =
+        BasicBlock::Create(ctx, "morok.antihook.got.site.call", parent, contBB);
+
+    IRBuilder<> HB(headBB);
+    auto *seen = HB.CreateLoad(i8, gate, "morok.antihook.got.site.seen");
+    seen->setVolatile(true);
+    Value *shouldRun = HB.CreateICmpEQ(seen, ConstantInt::get(i8, 0),
+                                       "morok.antihook.got.site.armed");
+    HB.CreateCondBr(shouldRun, callBB, contBB);
+
+    IRBuilder<> CB(callBB);
+    auto *armed = CB.CreateStore(ConstantInt::get(i8, ArmedByte), gate);
+    armed->setVolatile(true);
+    CB.CreateCall(
+        Probe->getFunctionType(), Probe,
+        {ConstantInt::get(CB.getInt64Ty(),
+                          Tag ^ (0x9E3779B97F4A7C15ULL * SiteId))});
+    CB.CreateBr(contBB);
+}
+
+bool insertAntiHookGotRecheckSites(Module &M, Function *Probe,
+                                   ir::IRRandom &rng) {
+    if (!Probe)
+        return false;
+    constexpr std::uint32_t kMaxProbeSites = 16;
+
+    std::vector<Instruction *> sites;
+    sites.reserve(kMaxProbeSites);
+    for (Function &F : M) {
+        if (sites.size() >= kMaxProbeSites)
+            break;
+        if (!isPrologueProbeCandidate(F) || directlyRecursive(F))
+            continue;
+        SmallPtrSet<BasicBlock *, 32> loopBlocks = naturalLoopBlocks(F);
+        for (BasicBlock &BB : F) {
+            if (sites.size() >= kMaxProbeSites)
+                break;
+            if (BB.isEHPad() || BB.isLandingPad() || loopBlocks.contains(&BB))
+                continue;
+            if (auto *ret = dyn_cast<ReturnInst>(BB.getTerminator()))
+                sites.push_back(ret);
+        }
+    }
+
+    std::uint32_t siteId = 1;
+    for (Instruction *I : sites)
+        insertAntiHookGotRecheckSite(
+            M, *I, Probe, rng.next(),
+            static_cast<std::uint8_t>((rng.next() | 1) & 0xffu), siteId++);
+    return !sites.empty();
+}
+
 Function *linuxGotPltProbe(Module &M, const Triple &TT) {
     if (!TT.isOSLinux())
         return nullptr;
@@ -3781,15 +3881,15 @@ Function *linuxGotPltProbe(Module &M, const Triple &TT) {
         "morok.antihook.got.relro.slot");
     Value *lazyWritable = RBB.CreateNot(slotInAnyRelro,
                                         "morok.antihook.got.lazy.writable");
-    Value *lazyOk = RBB.CreateAnd(lazyShape, lazyWritable,
-                                  "morok.antihook.got.lazy.ok");
+    Value *lazyPending = RBB.CreateAnd(lazyShape, lazyWritable,
+                                       "morok.antihook.got.lazy.pending");
     Value *localRxOk = RBB.CreateAnd(
         RBB.CreateNot(externalSym, "morok.antihook.got.sym.local"),
         RBB.CreateICmpNE(rxOk, ConstantInt::get(Type::getInt32Ty(ctx), 0)),
         "morok.antihook.got.local.rx");
     Value *targetOk = RBB.CreateOr(
-        expectedOk, RBB.CreateOr(localRxOk, lazyOk,
-                                 "morok.antihook.got.local.or.lazy"),
+        expectedOk, RBB.CreateOr(localRxOk, lazyPending,
+                                 "morok.antihook.got.local.or.lazy.pending"),
         "morok.antihook.got.target.ok");
     RBB.CreateBr(relValidateBB);
 
@@ -3936,62 +4036,71 @@ Function *darwinDylibNameForOrdinal(Module &M) {
     return fn;
 }
 
-Function *darwinExpectedDylibSymbol(Module &M) {
-    if (Function *existing = M.getFunction("morok.antihook.macho.expected"))
+Function *boundedRuntimeStringEq(Module &M) {
+    if (Function *existing = M.getFunction("morok.antihook.str.eq"))
         return existing;
 
     LLVMContext &ctx = M.getContext();
     auto *i8 = Type::getInt8Ty(ctx);
     auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
     auto *ptr = PointerType::getUnqual(ctx);
 
-    auto *fn = Function::Create(FunctionType::get(ptr, {ptr, ptr}, false),
+    auto *fn = Function::Create(FunctionType::get(i32, {ptr, ptr}, false),
                                 GlobalValue::PrivateLinkage,
-                                "morok.antihook.macho.expected", &M);
+                                "morok.antihook.str.eq", &M);
     fn->addFnAttr(Attribute::NoInline);
     fn->setDSOLocal(true);
-    auto *symName = fn->getArg(0);
-    symName->setName("symbol");
-    auto *dylibName = fn->getArg(1);
-    dylibName->setName("dylib");
+    auto *lhs = fn->getArg(0);
+    lhs->setName("lhs");
+    auto *rhs = fn->getArg(1);
+    rhs->setName("rhs");
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
-    auto *openBB = BasicBlock::Create(ctx, "open", fn);
-    auto *symBB = BasicBlock::Create(ctx, "sym", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *ret1BB = BasicBlock::Create(ctx, "ret1", fn);
     auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
-
-    FunctionCallee dlopen =
-        M.getOrInsertFunction("dlopen", FunctionType::get(ptr, {ptr, i32}, false));
-    FunctionCallee dlsym =
-        M.getOrInsertFunction("dlsym", FunctionType::get(ptr, {ptr, ptr}, false));
 
     IRBuilder<> B(entry);
     Value *valid = B.CreateAnd(
-        B.CreateICmpNE(symName, ConstantPointerNull::get(ptr)),
-        B.CreateICmpNE(dylibName, ConstantPointerNull::get(ptr)),
-        "morok.antihook.macho.expected.valid");
-    B.CreateCondBr(valid, openBB, ret0BB);
+        B.CreateICmpNE(lhs, ConstantPointerNull::get(ptr)),
+        B.CreateICmpNE(rhs, ConstantPointerNull::get(ptr)),
+        "morok.antihook.str.eq.valid");
+    B.CreateCondBr(valid, loopBB, ret0BB);
 
-    IRBuilder<> OB(openBB);
-    Value *first = OB.CreateAlignedLoad(i8, symName, Align(1),
-                                        "morok.antihook.macho.expected.first");
-    Value *dlsymName = OB.CreateSelect(
-        OB.CreateICmpEQ(first, ConstantInt::get(i8, '_')),
-        gepI8(OB, M, symName, ConstantInt::get(intPtrTy(M), 1),
-              "morok.antihook.macho.expected.no_uscore"),
-        symName, "morok.antihook.macho.expected.name");
-    Value *handle =
-        OB.CreateCall(dlopen, {dylibName, ConstantInt::get(i32, 0x1)},
-                      "morok.antihook.macho.expected.handle");
-    OB.CreateCondBr(OB.CreateICmpNE(handle, ConstantPointerNull::get(ptr)),
-                    symBB, ret0BB);
+    IRBuilder<> LB(loopBB);
+    auto *idx = LB.CreatePHI(ip, 2, "morok.antihook.str.eq.idx");
+    idx->addIncoming(ConstantInt::get(ip, 0), entry);
+    Value *lhsCh = LB.CreateAlignedLoad(
+        i8, gepI8(LB, M, lhs, idx, "morok.antihook.str.eq.lhs.ptr"), Align(1),
+        "morok.antihook.str.eq.lhs");
+    Value *rhsCh = LB.CreateAlignedLoad(
+        i8, gepI8(LB, M, rhs, idx, "morok.antihook.str.eq.rhs.ptr"), Align(1),
+        "morok.antihook.str.eq.rhs");
+    Value *same =
+        LB.CreateICmpEQ(lhsCh, rhsCh, "morok.antihook.str.eq.byte");
+    Value *atEnd =
+        LB.CreateICmpEQ(lhsCh, ConstantInt::get(i8, 0),
+                        "morok.antihook.str.eq.end");
+    Value *done =
+        LB.CreateAnd(same, atEnd, "morok.antihook.str.eq.done");
+    LB.CreateCondBr(done, ret1BB, nextBB);
 
-    IRBuilder<> SB(symBB);
-    SB.CreateRet(SB.CreateCall(dlsym, {handle, dlsymName},
-                               "morok.antihook.macho.expected.sym"));
+    IRBuilder<> NB(nextBB);
+    Value *next = NB.CreateAdd(idx, ConstantInt::get(ip, 1),
+                               "morok.antihook.str.eq.next");
+    Value *keepGoing = NB.CreateAnd(
+        same, NB.CreateICmpULT(idx, ConstantInt::get(ip, 511)),
+        "morok.antihook.str.eq.keep");
+    NB.CreateCondBr(keepGoing, loopBB, ret0BB);
+    idx->addIncoming(next, nextBB);
+
+    IRBuilder<> R1(ret1BB);
+    R1.CreateRet(ConstantInt::get(i32, 1));
 
     IRBuilder<> R0(ret0BB);
-    R0.CreateRet(ConstantPointerNull::get(ptr));
+    R0.CreateRet(ConstantInt::get(i32, 0));
     return fn;
 }
 
@@ -4101,6 +4210,94 @@ Function *darwinTextTargetInImageIndex(Module &M) {
     CNB.CreateBr(cmdLoopBB);
     cmdIdx->addIncoming(nextCmdIdx, cmdNextBB);
     cmdOff->addIncoming(nextCmdOff, cmdNextBB);
+
+    IRBuilder<> R1(ret1BB);
+    R1.CreateRet(ConstantInt::get(i32, 1));
+
+    IRBuilder<> R0(ret0BB);
+    R0.CreateRet(ConstantInt::get(i32, 0));
+    return fn;
+}
+
+Function *darwinTargetInExpectedDylibText(Module &M) {
+    if (Function *existing = M.getFunction("morok.antihook.macho.expected.text"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    Function *stringEq = boundedRuntimeStringEq(M);
+    Function *imageText = darwinTextTargetInImageIndex(M);
+
+    auto *fn = Function::Create(FunctionType::get(i32, {ip, ptr}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.macho.expected.text", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    auto *target = fn->getArg(0);
+    target->setName("target");
+    auto *dylibName = fn->getArg(1);
+    dylibName->setName("dylib");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *imageLoopBB = BasicBlock::Create(ctx, "image.loop", fn);
+    auto *imageBodyBB = BasicBlock::Create(ctx, "image.body", fn);
+    auto *textBB = BasicBlock::Create(ctx, "text", fn);
+    auto *imageNextBB = BasicBlock::Create(ctx, "image.next", fn);
+    auto *ret1BB = BasicBlock::Create(ctx, "ret1", fn);
+    auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
+
+    FunctionCallee imageCount = M.getOrInsertFunction(
+        "_dyld_image_count", FunctionType::get(i32, false));
+    FunctionCallee imageName = M.getOrInsertFunction(
+        "_dyld_get_image_name", FunctionType::get(ptr, {i32}, false));
+
+    IRBuilder<> B(entry);
+    Value *count =
+        B.CreateCall(imageCount, {}, "morok.antihook.macho.expected.count");
+    Value *valid = B.CreateAnd(
+        B.CreateICmpNE(target, ConstantInt::get(ip, 0)),
+        B.CreateAnd(B.CreateICmpNE(dylibName, ConstantPointerNull::get(ptr)),
+                    B.CreateICmpUGT(count, ConstantInt::get(i32, 0))),
+        "morok.antihook.macho.expected.valid");
+    B.CreateCondBr(valid, imageLoopBB, ret0BB);
+
+    IRBuilder<> ILB(imageLoopBB);
+    auto *imageIdx =
+        ILB.CreatePHI(i32, 2, "morok.antihook.macho.expected.image.idx");
+    imageIdx->addIncoming(ConstantInt::get(i32, 0), entry);
+    Value *imageInRange =
+        ILB.CreateAnd(ILB.CreateICmpULT(imageIdx, count),
+                      ILB.CreateICmpULT(imageIdx, ConstantInt::get(i32, 128)),
+                      "morok.antihook.macho.expected.image.range");
+    ILB.CreateCondBr(imageInRange, imageBodyBB, ret0BB);
+
+    IRBuilder<> IBB(imageBodyBB);
+    Value *loadedName = IBB.CreateCall(
+        imageName, {imageIdx}, "morok.antihook.macho.expected.image.name");
+    Value *nameMatch = IBB.CreateCall(
+        stringEq, {loadedName, dylibName},
+        "morok.antihook.macho.expected.image.name.eq");
+    IBB.CreateCondBr(
+        IBB.CreateICmpNE(nameMatch, ConstantInt::get(i32, 0),
+                         "morok.antihook.macho.expected.image.match"),
+        textBB, imageNextBB);
+
+    IRBuilder<> TB(textBB);
+    Value *textHit = TB.CreateCall(
+        imageText, {target, imageIdx},
+        "morok.antihook.macho.expected.image.text");
+    TB.CreateCondBr(TB.CreateICmpNE(textHit, ConstantInt::get(i32, 0),
+                                    "morok.antihook.macho.expected.text.ok"),
+                    ret1BB, imageNextBB);
+
+    IRBuilder<> INB(imageNextBB);
+    Value *nextImage =
+        INB.CreateAdd(imageIdx, ConstantInt::get(i32, 1),
+                      "morok.antihook.macho.expected.image.next");
+    INB.CreateBr(imageLoopBB);
+    imageIdx->addIncoming(nextImage, imageNextBB);
 
     IRBuilder<> R1(ret1BB);
     R1.CreateRet(ConstantInt::get(i32, 1));
@@ -4259,7 +4456,7 @@ Function *darwinFixupProbe(Module &M, const Triple &TT) {
     auto *ip = intPtrTy(M);
     auto *ptr = PointerType::getUnqual(ctx);
     Function *dylibNameForOrdinal = darwinDylibNameForOrdinal(M);
-    Function *expectedSymbol = darwinExpectedDylibSymbol(M);
+    Function *expectedText = darwinTargetInExpectedDylibText(M);
     Function *imageTextCheck = darwinTextTargetInImageIndex(M);
 
     auto *fn = Function::Create(FunctionType::get(i64, false),
@@ -4539,31 +4736,21 @@ Function *darwinFixupProbe(Module &M, const Triple &TT) {
                                                   ConstantInt::get(ip, 16))),
                       "morok.antihook.fixup.sym.ptr.addr"),
         ptr, "morok.antihook.fixup.sym.ptr");
-    Value *strx32 =
-        loadAt(EXB, M, i32, symPtr, 0ULL, "morok.antihook.fixup.sym.strx");
     Value *nDesc =
         loadAt(EXB, M, Type::getInt16Ty(ctx), symPtr, 6,
                "morok.antihook.fixup.sym.desc");
-    Value *symName = EXB.CreateIntToPtr(
-        EXB.CreateAdd(linkeditBase,
-                      EXB.CreateAdd(strOff, EXB.CreateZExt(strx32, ip)),
-                      "morok.antihook.fixup.sym.name.addr"),
-        ptr, "morok.antihook.fixup.sym.name");
     Value *ordinal = EXB.CreateZExt(
         EXB.CreateLShr(nDesc, ConstantInt::get(Type::getInt16Ty(ctx), 8)),
         i32, "morok.antihook.fixup.sym.ordinal");
     Value *dylibName = EXB.CreateCall(
         dylibNameForOrdinal, {hdr, ordinal},
         "morok.antihook.fixup.expected.dylib");
-    Value *expectedPtr = EXB.CreateCall(
-        expectedSymbol, {symName, dylibName},
-        "morok.antihook.fixup.expected.symbol");
-    Value *expectedOk = EXB.CreateAnd(
-        EXB.CreateICmpNE(expectedPtr, ConstantPointerNull::get(ptr),
-                         "morok.antihook.fixup.expected.present"),
-        EXB.CreateICmpEQ(expectedPtr, targetPtr,
-                         "morok.antihook.fixup.expected.eq"),
-        "morok.antihook.fixup.expected.ok");
+    Value *expectedTextHit = EXB.CreateCall(
+        expectedText, {targetAddr, dylibName},
+        "morok.antihook.fixup.expected.text");
+    Value *expectedOk =
+        EXB.CreateICmpNE(expectedTextHit, ConstantInt::get(i32, 0),
+                         "morok.antihook.fixup.expected.ok");
     EXB.CreateBr(entryValidateBB);
 
     IRBuilder<> EVB(entryValidateBB);
@@ -13220,8 +13407,9 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
                  "morok.antihook.clean.changed");
         prologueTargets.push_back(clean);
     }
-    if (Function *got = linuxGotPltProbe(M, tt)) {
-        Value *diff = B.CreateCall(got, {}, "morok.antihook.got.diff");
+    Function *gotProbe = linuxGotPltProbe(M, tt);
+    if (gotProbe) {
+        Value *diff = B.CreateCall(gotProbe, {}, "morok.antihook.got.diff");
         Value *changed =
             B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0),
                            "morok.corroborate.got.changed");
@@ -13352,6 +13540,9 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
     }
     insertStackOriginChecks(M, stackOriginCheck(M), state, prologueTargets, rng);
     emitProloguePatternChecks(B, M, tt, state, prologueTargets, rng);
+    if (gotProbe)
+        insertAntiHookGotRecheckSites(M, linuxGotRecheckProbe(M, gotProbe, state),
+                                      rng);
 
     if (tt.isOSDarwin()) {
         B.CreateRetVoid();
