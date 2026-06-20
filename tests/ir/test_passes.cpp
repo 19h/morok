@@ -94,6 +94,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -2411,6 +2412,78 @@ entry:
         if (gv.getName().starts_with("morok.subkey"))
             ++subkeys;
     CHECK(subkeys >= 1);
+}
+
+TEST_CASE("constantEncryptFunction honors globalize layer probability") {
+    auto globalizedAccesses = [](Module &M) {
+        std::size_t globals = 0;
+        std::size_t volatileLoads = 0;
+        std::size_t volatileStores = 0;
+        for (GlobalVariable &GV : M.globals()) {
+            if (!GV.getName().starts_with("morok.const.global"))
+                continue;
+            ++globals;
+            for (User *U : GV.users()) {
+                if (auto *LI = dyn_cast<LoadInst>(U)) {
+                    if (LI->isVolatile())
+                        ++volatileLoads;
+                    continue;
+                }
+                if (auto *SI = dyn_cast<StoreInst>(U))
+                    if (SI->isVolatile())
+                        ++volatileStores;
+            }
+        }
+        return std::tuple<std::size_t, std::size_t, std::size_t>(
+            globals, volatileLoads, volatileStores);
+    };
+    const char *ir = R"ir(
+define i32 @withconst(i32 %a) {
+entry:
+  %0 = add i32 %a, 305419896
+  ret i32 %0
+}
+)ir";
+
+    {
+        LLVMContext ctx;
+        auto M = parse(ctx, ir);
+        Function *F = M->getFunction("withconst");
+        REQUIRE(F);
+        auto engine = morok::core::Xoshiro256pp::fromSeed(2017);
+        morok::ir::IRRandom rng(engine);
+        morok::passes::ConstEncParams p;
+        p.probability = 100;
+        p.share_count = 2;
+        p.globalize = true;
+        p.globalize_prob = 100;
+        CHECK(morok::passes::constantEncryptFunction(*F, p, rng));
+        auto [globals, volatileLoads, volatileStores] = globalizedAccesses(*M);
+        CHECK(globals >= 1u);
+        CHECK(volatileLoads >= 1u);
+        CHECK(volatileStores >= 1u);
+        CHECK_FALSE(verifyModule(*M, &errs()));
+    }
+
+    {
+        LLVMContext ctx;
+        auto M = parse(ctx, ir);
+        Function *F = M->getFunction("withconst");
+        REQUIRE(F);
+        auto engine = morok::core::Xoshiro256pp::fromSeed(2017);
+        morok::ir::IRRandom rng(engine);
+        morok::passes::ConstEncParams p;
+        p.probability = 100;
+        p.share_count = 2;
+        p.globalize = true;
+        p.globalize_prob = 0;
+        CHECK(morok::passes::constantEncryptFunction(*F, p, rng));
+        auto [globals, volatileLoads, volatileStores] = globalizedAccesses(*M);
+        CHECK(globals == 0u);
+        CHECK(volatileLoads == 0u);
+        CHECK(volatileStores == 0u);
+        CHECK_FALSE(verifyModule(*M, &errs()));
+    }
 }
 
 // Regression for #20: constant_encryption skip_value / force_value (regexes on

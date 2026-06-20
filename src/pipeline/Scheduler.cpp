@@ -1048,6 +1048,8 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
                 p.substitute_xor = eff.const_enc.substitute_xor.value_or(false);
                 p.substitute_xor_prob =
                     eff.const_enc.substitute_xor_prob.value_or(100);
+                p.globalize = eff.const_enc.globalize.value_or(false);
+                p.globalize_prob = eff.const_enc.globalize_prob.value_or(100);
                 p.skip_value = eff.const_enc.skip_value;
                 p.force_value = eff.const_enc.force_value;
                 changed |= passes::constantEncryptFunction(F, p, rng);
@@ -1074,6 +1076,8 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
                 p.substitute_xor = eff.const_enc.substitute_xor.value_or(false);
                 p.substitute_xor_prob =
                     eff.const_enc.substitute_xor_prob.value_or(100);
+                p.globalize = eff.const_enc.globalize.value_or(false);
+                p.globalize_prob = eff.const_enc.globalize_prob.value_or(100);
                 p.skip_value = eff.const_enc.skip_value;
                 p.force_value = eff.const_enc.force_value;
                 changed |= passes::constantEncryptFunction(F, p, rng);

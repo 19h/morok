@@ -736,9 +736,9 @@ unsealed manifest sentinels instead of sealed code-window metadata.
 | `type_punning` | `enabled`, `probability`, `include_floating`, `max_targets` |
 | `phi_tangling` | `enabled`, `probability`, `layers`, `max_phis` |
 
-`constant_encryption.globalize` and `globalize_prob` are parsed for forward
-compatibility. Current constant encryption always emits private volatile global
-shares where needed.
+`constant_encryption.globalize` routes selected reconstructed carrier values
+through private volatile globals after share folding; `globalize_prob` controls
+that extra layer per rewritten literal.
 
 `vector_obfuscation.width` accepts the pass-supported SIMD width values
 `128`, `256`, and `512`.

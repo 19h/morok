@@ -117,7 +117,9 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 
 ## Constant encryption — `core/XorShare`, `core/Feistel`
 - Pipeline: `origC ─[Feistel if feistel && bits>=16]→ workC ─[k-share XOR or single XOR]→ shares`.
-  Runtime reverses: XOR-fold shares → workC → inverse Feistel → origC.
+  Runtime reverses: XOR-fold shares → workC → inverse Feistel → optional
+  volatile private global store/load (`globalize`, controlled by
+  `globalize_prob`) → origC.
 - k-share when `k>=3` (k clamp 2..8), else classic single-XOR for selected
   `i1` through `i64` integer constants and scalar `half`/`bfloat`/`float`/
   `double` constants in binary, comparison, `select`, cast, PHI incoming,
@@ -134,7 +136,8 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   half width). `feistelEncrypt/Decrypt(value, bits, keys)`.
 - Flags: `constenc_times` 1, `constenc_kshare` 2, `constenc_feistel` off,
   `constenc_subxor` off / `_prob` 40, `constenc_togv` off / `_prob` 50.
-  Max-mode forces kshare=4, feistel=true. `skip_value`/`force_value` regex on hex.
+  `globalize` stays opt-in in presets. Max-mode forces kshare=4,
+  feistel=true. `skip_value`/`force_value` regex on hex.
 - Direct memory cap: each constant-encryption sweep rewrites at most 128
   literal operands.  With the default two-share mode that bounds new share
   globals to 256 per function per sweep.

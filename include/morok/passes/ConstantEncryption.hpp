@@ -37,6 +37,8 @@ struct ConstEncParams {
     bool feistel = false;            ///< 4-round Feistel layer before XOR shares
     bool substitute_xor = false;     ///< extra runtime-keyed XOR substitution layer
     std::uint32_t substitute_xor_prob = 100; ///< per-constant chance, sub layer
+    bool globalize = false;          ///< route reconstructed carrier via a global
+    std::uint32_t globalize_prob = 100; ///< per-constant chance, global layer
     /// Restrict to decision-gate constants only: the operands of comparisons and
     /// of constant branch/switch conditions.  Used for an early sweep that hides
     /// a license gate's `cmp reg, #imm` BEFORE the structural passes inflate the

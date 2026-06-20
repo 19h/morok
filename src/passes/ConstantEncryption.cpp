@@ -179,7 +179,9 @@ Value *emitFeistelDecrypt(IRBuilder<NoFolder> &B, Value *V, unsigned bits,
 
 Value *reconstruct(Module &M, Instruction &user, Constant *c,
                    unsigned shareCount, ir::IRRandom &rng, bool feistel = false,
-                   bool subXor = false, std::uint32_t subProb = 100) {
+                   bool subXor = false, std::uint32_t subProb = 100,
+                   bool globalize = false,
+                   std::uint32_t globalizeProb = 100) {
     std::optional<EncodedConstant> Enc = encodeConstant(c);
     if (!Enc)
         return c;
@@ -227,6 +229,19 @@ Value *reconstruct(Module &M, Instruction &user, Constant *c,
     }
     if (useFeistel)
         acc = emitFeistelDecrypt(B, acc, bits, fkeys);
+    if (globalize && rng.chance(globalizeProb)) {
+        const Align align = M.getDataLayout().getABITypeAlign(ty);
+        auto *gv = new GlobalVariable(
+            M, ty, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+            ConstantInt::get(ty, 0), "morok.const.global");
+        gv->setAlignment(align);
+        auto *stored = B.CreateStore(acc, gv, /*isVolatile=*/true);
+        stored->setAlignment(align);
+        auto *loaded = B.CreateLoad(ty, gv, /*isVolatile=*/true,
+                                    "morok.const.global.load");
+        loaded->setAlignment(align);
+        acc = loaded;
+    }
     if (Enc->result_ty != Enc->carrier_ty)
         return B.CreateBitCast(acc, Enc->result_ty, "morok.share.fp");
     return acc;
@@ -388,6 +403,7 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
     }
     const bool useFeistel = params.feistel && !hasMusttail;
     const bool useSubstitute = params.substitute_xor && !hasMusttail;
+    const bool useGlobalize = params.globalize && !hasMusttail;
 
     // Compile the value filters once.  Use llvm::Regex (not std::regex): this
     // codebase builds with exceptions disabled, so a malformed std::regex would
@@ -533,7 +549,8 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
             Value *repl =
                 reconstruct(M, *InsertBefore, t.value, shareCount, rng,
                             useFeistel, useSubstitute,
-                            params.substitute_xor_prob);
+                            params.substitute_xor_prob, useGlobalize,
+                            params.globalize_prob);
             if (t.phi_incoming) {
                 auto *PN = cast<PHINode>(t.user);
                 BasicBlock *Incoming = t.incoming_block;
