@@ -673,7 +673,7 @@ foundation helpers instead of hardcoding duplicate offsets or import paths.
 | Kernel-debugger census | `morok-winkdbg` | `windows_kernel_debugger` | Reads `SharedUserData`, queries kernel-debugger state, samples module/parent/window-class signals. |
 | Direct/indirect syscalls | `morok-winsys` | `windows_syscalls` | Resolves syscall numbers from runtime stubs and compares direct vs recycled-gadget syscall paths. |
 | KnownDlls unhook | `morok-winunhook` | `windows_unhook` | Maps pristine `ntdll.dll`/`kernel32.dll` text from KnownDlls and locally refreshes hooked `.text`. |
-| VEH audit | `morok-winveh` | `windows_veh_audit` | Locates/decode-candidates the internal VEH list and removes foreign handlers outside loader-known modules. |
+| VEH audit | `morok-winveh` | `windows_veh_audit` | Locates/decode-candidates the internal VEH list and folds suspicious handler findings without mutating process-wide VEH state. |
 | Process mitigations | `morok-winmitigate` | `windows_process_mitigations` | Hash-resolves `SetProcessMitigationPolicy` and opts into ACG/CIG after Morok's startup text repair. |
 
 ## TOML Option Reference
