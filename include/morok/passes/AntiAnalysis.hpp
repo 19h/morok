@@ -119,8 +119,8 @@ bool windowsUnhookModule(llvm::Module &M, morok::ir::IRRandom &rng);
 /// Inject Windows x86_64 VEH-list auditing.  The emitted startup probe resolves
 /// ntdll's vectored-handler exports by hash, locates the internal
 /// LdrpVectorHandlerList through RIP-relative references in those routines,
-/// decodes encoded handler pointers with RtlDecodePointer, and removes entries
-/// whose decoded handler does not land inside the loader-known module set.
+/// decodes encoded handler pointers with RtlDecodePointer, and folds suspicious
+/// handler findings without removing entries from the process-wide VEH list.
 /// Returns true if code was added.
 bool windowsVehAuditModule(llvm::Module &M, morok::ir::IRRandom &rng);
 

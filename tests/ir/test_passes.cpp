@@ -15861,7 +15861,16 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Executable,
                                  "morok.win.veh.exec.ntqueryvm.status") >= 1u);
     CHECK(countNamedInstructions(*Executable,
+                                 "morok.win.veh.exec.mbi.type") >= 1u);
+    CHECK(countNamedInstructions(*Executable,
+                                 "morok.win.veh.exec.mbi.image") >= 1u);
+    CHECK(countNamedInstructions(*Executable,
                                  "morok.win.veh.exec.mbi.executable") >= 1u);
+    CHECK(countNamedInstructions(*Executable,
+                                 "morok.win.veh.exec.mbi.writable") >= 1u);
+    CHECK(countNamedInstructions(*Executable,
+                                 "morok.win.veh.exec.mbi.protect.safe") >=
+          1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.head.readable") >= 1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.decoded.20") >= 1u);
     CHECK(countNamedInstructions(*Audit,

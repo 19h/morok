@@ -1342,9 +1342,10 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   `NtQueryVirtualMemory` by hashed ntdll export lookup, scans the exported
   vectored-handler routines for RIP-relative references to the internal VEH list,
   validates candidate heads/nodes with `NtQueryVirtualMemory`, decodes plausible
-  encoded handler slots, and calls the remove routine for handlers outside the
-  loader-known module ranges while folding seen/foreign counts into
-  `morok.win.state`.
+  encoded handler slots, and folds seen/foreign counts into `morok.win.state`
+  without mutating the process-wide VEH list.  Decoded handlers are trusted only
+  when they land in loader-known module ranges or in committed, non-writable
+  executable `MEM_IMAGE` regions; private RWX/JIT pages remain suspicious.
   WindowsProcessMitigations resolves `SetProcessMitigationPolicy` through
   hashed `kernelbase.dll`/`kernel32.dll` export lookup, sets
   `ProcessDynamicCodePolicy` with `ProhibitDynamicCode` for ACG, then sets

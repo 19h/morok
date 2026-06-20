@@ -10360,23 +10360,36 @@ Function *windowsExecutableAddressHelper(Module &M) {
     Value *state = loadAt(QB, M, i32, mbi, 32, "morok.win.veh.exec.mbi.state");
     Value *protect =
         loadAt(QB, M, i32, mbi, 36, "morok.win.veh.exec.mbi.protect");
+    Value *type = loadAt(QB, M, i32, mbi, 40, "morok.win.veh.exec.mbi.type");
     Value *okStatus =
         QB.CreateICmpSGE(status, ConstantInt::get(i32, 0),
                          "morok.win.veh.exec.ntqueryvm.ok");
     Value *committed =
         QB.CreateICmpEQ(state, ConstantInt::get(i32, 0x1000),
                         "morok.win.veh.exec.mbi.committed");
+    Value *image =
+        QB.CreateICmpEQ(type, ConstantInt::get(i32, 0x1000000),
+                        "morok.win.veh.exec.mbi.image");
     Value *blocked = QB.CreateICmpNE(
         QB.CreateAnd(protect, ConstantInt::get(i32, 0x101)),
         ConstantInt::get(i32, 0), "morok.win.veh.exec.mbi.blocked");
     Value *executable = QB.CreateICmpNE(
         QB.CreateAnd(protect, ConstantInt::get(i32, 0xF0)),
         ConstantInt::get(i32, 0), "morok.win.veh.exec.mbi.executable");
-    Value *trusted =
+    Value *writableExecutable = QB.CreateICmpNE(
+        QB.CreateAnd(protect, ConstantInt::get(i32, 0xC0)),
+        ConstantInt::get(i32, 0), "morok.win.veh.exec.mbi.writable");
+    Value *validRegion =
         QB.CreateAnd(QB.CreateAnd(okStatus, committed,
-                                  "morok.win.veh.exec.mbi.valid"),
-                     QB.CreateAnd(executable, QB.CreateNot(blocked),
-                                  "morok.win.veh.exec.mbi.allowed"),
+                                  "morok.win.veh.exec.mbi.committed.valid"),
+                     image, "morok.win.veh.exec.mbi.valid");
+    Value *safeProtect = QB.CreateAnd(
+        QB.CreateNot(blocked), QB.CreateNot(writableExecutable),
+        "morok.win.veh.exec.mbi.protect.safe");
+    Value *allowedProtect = QB.CreateAnd(
+        executable, safeProtect, "morok.win.veh.exec.mbi.allowed");
+    Value *trusted =
+        QB.CreateAnd(validRegion, allowedProtect,
                      "morok.win.veh.executable.result");
     QB.CreateRet(QB.CreateZExt(trusted, i32));
 
