@@ -117,13 +117,16 @@ build*/                                          generated build trees
 - CMake 3.28 or newer.
 - Ninja.
 - A C11 and C++23 capable toolchain.
-- LLVM 18 or newer with the New-PM plugin API Morok targets.
+- LLVM 18 or newer with the New-PM plugin API Morok targets; current vanilla
+  LLVM 22/23-style builds are the expected path.
 
-This tree currently validates a forked/custom LLVM plugin API:
-`<llvm/Plugins/PassPlugin.h>` with `LLVM_PLUGIN_API_VERSION == 2`. Upstream LLVM
-normally exposes `<llvm/Passes/PassPlugin.h>` with API version 1. The CMake
-probe in [`cmake/MorokLLVM.cmake`](cmake/MorokLLVM.cmake) fails loudly if the
-host LLVM cannot load the plugin ABI that Morok was compiled against.
+Morok does not require a private LLVM fork. It does require the LLVM headers and
+the `clang`/`opt` binaries used at runtime to agree on the same New-PM pass
+plugin ABI. The build currently checks for `<llvm/Plugins/PassPlugin.h>` with
+`LLVM_PLUGIN_API_VERSION == 2`; older LLVM installs that only expose
+`<llvm/Passes/PassPlugin.h>` with API version 1 are a different plugin ABI and
+will be rejected by [`cmake/MorokLLVM.cmake`](cmake/MorokLLVM.cmake) instead of
+failing later with a cryptic plugin-load error.
 
 The test/build helper defaults to a local LLVM install under `/Users/int/local`.
 Override with `CC`, `CXX`, and `LLVM_DIR` when using another matching LLVM.
