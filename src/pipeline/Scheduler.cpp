@@ -109,6 +109,18 @@ constexpr std::uint64_t kModuleGrowthFunctionLimit = 1500;
 constexpr std::uint64_t kModuleCloneInstLimit = 20000;
 constexpr std::uint64_t kModuleCloneBlockLimit = 3000;
 constexpr std::uint64_t kModuleCloneFunctionLimit = 500;
+// Caller-keyed and returnless dispatch are bounded-cost passes: their work
+// scales with the number of call/return SITES (already capped by max_calls /
+// max_sites) and each site adds only a small fixed decode/branch sequence — they
+// do not grow the module in proportion to its size.  Gating them on the growth
+// budget (meant to bound passes that EXPLODE the module) wrongly skips them on a
+// heavily-grown module — e.g. a tiny program whose verdict function flattens to
+// tens of thousands of instructions — leaving the binary with no sealed dispatch
+// at all.  Give them a much larger dedicated host, mirroring the integrity
+// passes' dedicated per-function budget.
+constexpr std::uint64_t kDispatchModuleInstLimit = 600000;
+constexpr std::uint64_t kDispatchModuleBlockLimit = 80000;
+constexpr std::uint64_t kDispatchModuleFunctionLimit = 12000;
 constexpr std::uint64_t kModuleEligibleFunctionVisitLimit = 256;
 constexpr std::uint64_t kSensitiveHelperVisitLimit = 64;
 
@@ -210,6 +222,12 @@ bool moduleGrowthOk(const ModuleSize &Size) {
     return withinModuleBudget(Size, kModuleGrowthInstLimit,
                               kModuleGrowthBlockLimit,
                               kModuleGrowthFunctionLimit);
+}
+
+bool dispatchModuleOk(const ModuleSize &Size) {
+    return withinModuleBudget(Size, kDispatchModuleInstLimit,
+                              kDispatchModuleBlockLimit,
+                              kDispatchModuleFunctionLimit);
 }
 
 bool moduleCloneOk(const ModuleSize &Size) {
@@ -1195,13 +1213,32 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         changed |= passes::adversarialFunctionMergingModule(M, p, rng);
     }
 
+    // Returnless dispatch: rewrite tail-position returns (`%r = call g(args) ;
+    // ret %r`) into indirect tail branches so eligible functions leave through a
+    // computed `br x16` / `jmp *rax` read from a volatile slot instead of a
+    // `ret`.  Runs BEFORE caller-keyed dispatch so it claims the tail-position
+    // call edges first; CKD then skips them (they are now indirect/musttail) and
+    // mops up the remaining direct calls.  The musttail adjacency it needs stays
+    // intact afterwards: CKD/FunctionWrapper ignore indirect calls,
+    // PerBuildPolymorphism skips isMustTailReturn blocks, and MisleadingMetadata
+    // only rewrites debug-locations.
+    if (InitialModuleGrowthOk &&
+        config_.passes.returnless_dispatch.enabled.value_or(false) &&
+        dispatchModuleOk(measureUserModule(M))) {
+        passes::ReturnlessParams p;
+        p.probability =
+            config_.passes.returnless_dispatch.probability.value_or(100);
+        p.max_sites = config_.passes.returnless_dispatch.max_sites.value_or(64);
+        changed |= passes::returnlessDispatchModule(M, p, rng);
+    }
+
     // Collapse surviving direct user calls through one shared native dispatch
     // hub.  Keep this after merge/tuning and before FunctionWrapper; otherwise
     // wrappers would consume user edges first and leave only generated
     // `morok.wrap` callees for this pass to skip.
     if (InitialModuleGrowthOk &&
         config_.passes.caller_keyed_dispatch.enabled.value_or(false) &&
-        moduleGrowthOk(measureUserModule(M))) {
+        dispatchModuleOk(measureUserModule(M))) {
         passes::CallerKeyedDispatchParams p;
         p.probability =
             config_.passes.caller_keyed_dispatch.probability.value_or(100);
@@ -1209,6 +1246,7 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
             config_.passes.caller_keyed_dispatch.max_calls.value_or(4096);
         p.region_bytes =
             config_.passes.caller_keyed_dispatch.region_bytes.value_or(16);
+        p.carriers = config_.passes.caller_keyed_dispatch.carriers.value_or(1);
         // Fail-closed-on-unsealed (#106) subsumes CKD's seal_required: when an
         // unsealed binary must die, the dispatch target poison is exactly the
         // behaviour wanted, so enable the same poison path here too.
@@ -1249,22 +1287,6 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
 
     if (InitialModuleGrowthOk)
         changed |= passes::misleadingMetadataModule(M, rng);
-
-    // Returnless dispatch runs after every instruction-inserting transform so
-    // nothing can later break the musttail/tail-call adjacency it relies on.
-    // It rewrites tail-position returns (`%r = call g(args) ; ret %r`) into
-    // indirect tail branches: eligible functions leave through a computed
-    // `br x16` / `jmp *rax` instead of a `ret`, with the callee target read from
-    // a volatile slot.  Default-off; opt-in while validated per platform.
-    if (InitialModuleGrowthOk &&
-        config_.passes.returnless_dispatch.enabled.value_or(false) &&
-        moduleGrowthOk(measureUserModule(M))) {
-        passes::ReturnlessParams p;
-        p.probability =
-            config_.passes.returnless_dispatch.probability.value_or(100);
-        p.max_sites = config_.passes.returnless_dispatch.max_sites.value_or(64);
-        changed |= passes::returnlessDispatchModule(M, p, rng);
-    }
 
     // Final symbol hygiene: every generated `morok.*` helper still carries its
     // descriptive internal-linkage name (`morok.gf8mul`, `morok.strdec`, …),

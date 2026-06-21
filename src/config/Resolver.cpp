@@ -331,6 +331,8 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.caller_keyed_dispatch.region_bytes);
     mergeOpt(dst.caller_keyed_dispatch.seal_required,
              src.caller_keyed_dispatch.seal_required);
+    mergeOpt(dst.caller_keyed_dispatch.carriers,
+             src.caller_keyed_dispatch.carriers);
     mergeOpt(dst.returnless_dispatch.enabled,
              src.returnless_dispatch.enabled);
     mergeOpt(dst.returnless_dispatch.probability,

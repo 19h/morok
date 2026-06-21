@@ -322,6 +322,7 @@ struct CallerKeyedDispatchConfig {
     Opt<std::uint32_t> max_calls;
     Opt<std::uint32_t> region_bytes;
     Opt<bool> seal_required;
+    Opt<std::uint32_t> carriers; ///< distinct carrier registers to rotate
 };
 
 struct ReturnlessDispatchConfig {

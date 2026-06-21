@@ -24,6 +24,12 @@ struct CallerKeyedDispatchParams {
     std::uint32_t probability = 100; ///< per direct call-site chance, 0..100
     std::uint32_t max_calls = 4096;  ///< transformed direct call-site cap
     std::uint32_t region_bytes = 16; ///< live code bytes hashed per site
+    /// Number of distinct callee-saved carrier registers to rotate the indirect
+    /// dispatch through (1 = the single legacy `morok.ckd.dispatch` / `br x19`).
+    /// Higher values spread sites across per-register dispatchers
+    /// (`morok.ckd.dispatch.x21`, ...) so the final indirect branch differs per
+    /// site and the call ABI looks bespoke.  Clamped to the per-arch pool.
+    std::uint32_t carriers = 1;
     /// Sealed-release mode.  When true, the startup constructor never
     /// recomputes the encoded target from live code bytes: the post-link sealer
     /// is the sole source of truth, and an unsealed (or downgrade-reset) seal

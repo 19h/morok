@@ -21,6 +21,8 @@
 #include "morok/passes/CodeRegionKdf.hpp"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CallingConv.h"
@@ -42,6 +44,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 using namespace llvm;
@@ -58,18 +61,22 @@ constexpr std::uint64_t kPostlinkMagic = 0xC30D5B11A6E48F27ULL;
 constexpr std::uint32_t kPostlinkVersion = 2;
 
 struct ArchLayout {
-    StringRef dispatcher_asm;
-    StringRef dispatcher_constraints;
-    StringRef carrier_def_asm;
-    StringRef carrier_def_constraints;
-    StringRef carrier_anchor_constraints;
+    std::string dispatcher_asm;
+    std::string dispatcher_constraints;
+    std::string carrier_def_asm;
+    std::string carrier_def_constraints;
+    std::string carrier_anchor_constraints;
 };
+
+enum class Arch { AArch64, X86_64 };
 
 struct Site {
     CallInst *call = nullptr;
     Function *caller = nullptr;
     Function *callee = nullptr;
     BasicBlock *block = nullptr;
+    Function *dispatcher = nullptr; ///< per-site carrier dispatcher
+    std::string carrier;           ///< callee-saved carrier register name
     GlobalVariable *encoded = nullptr;
     GlobalVariable *cache = nullptr;
     GlobalVariable *code_size = nullptr;
@@ -82,20 +89,56 @@ struct Site {
     std::uint32_t rot = 0;
 };
 
-std::optional<ArchLayout> layoutFor(const Triple &TT) {
+std::optional<Arch> archOf(const Triple &TT) {
     switch (TT.getArch()) {
     case Triple::x86_64:
-        return ArchLayout{"jmpq *%r14", "~{memory},~{dirflag},~{fpsr},~{flags}",
-                          "movq $1, $0",
-                          "={r14},r,~{memory},~{dirflag},~{fpsr},~{flags}",
-                          "{r14},~{memory},~{dirflag},~{fpsr},~{flags}"};
+        return Arch::X86_64;
     case Triple::aarch64:
     case Triple::aarch64_be:
-        return ArchLayout{"br x19", "~{memory}", "mov $0, $1",
-                          "={x19},r,~{memory}", "{x19},~{memory}"};
+        return Arch::AArch64;
     default:
         return std::nullopt;
     }
+}
+
+// Callee-saved registers that the C convention never uses for argument passing,
+// so the carried jump target survives the dispatcher call's argument setup.  The
+// legacy register (x19 / r14) is first so `carriers == 1` reproduces the
+// original single-dispatcher behaviour exactly.
+std::vector<std::string> carrierPool(Arch A) {
+    if (A == Arch::AArch64)
+        return {"x19", "x20", "x21", "x22", "x23",
+                "x24", "x25", "x26", "x27", "x28"};
+    return {"r14", "r12", "r13", "r15"};
+}
+
+ArchLayout layoutForRegister(Arch A, StringRef Reg) {
+    ArchLayout L;
+    if (A == Arch::AArch64) {
+        L.dispatcher_asm = (Twine("br ") + Reg).str();
+        L.dispatcher_constraints = "~{memory}";
+        L.carrier_def_asm = "mov $0, $1";
+        L.carrier_def_constraints = (Twine("={") + Reg + "},r,~{memory}").str();
+        L.carrier_anchor_constraints = (Twine("{") + Reg + "},~{memory}").str();
+    } else {
+        L.dispatcher_asm = (Twine("jmpq *%") + Reg).str();
+        L.dispatcher_constraints = "~{memory},~{dirflag},~{fpsr},~{flags}";
+        L.carrier_def_asm = "movq $1, $0";
+        L.carrier_def_constraints =
+            (Twine("={") + Reg + "},r,~{memory},~{dirflag},~{fpsr},~{flags}")
+                .str();
+        L.carrier_anchor_constraints =
+            (Twine("{") + Reg + "},~{memory},~{dirflag},~{fpsr},~{flags}").str();
+    }
+    return L;
+}
+
+// Legacy bare name for the default carrier (keeps existing manifests/tests
+// unchanged); a per-register suffix for the rotated dispatchers.
+std::string dispatcherName(StringRef Reg, bool IsDefault) {
+    if (IsDefault)
+        return "morok.ckd.dispatch";
+    return (Twine("morok.ckd.dispatch.") + Reg).str();
 }
 
 bool eligible(CallInst &CI) {
@@ -110,15 +153,21 @@ bool eligible(CallInst &CI) {
         return false;
     if (Callee->getName().starts_with("morok."))
         return false;
-    // The carrier register (r14 / x19) is only a safe, callee-saved hidden slot
-    // under the standard C calling convention.  Non-C conventions
-    // (e.g. x86_regcallcc, vectorcall) may pass integer arguments in that very
-    // register, so the call's argument setup would overwrite the loaded jump
-    // target after the carrier asm — and the naked `jmp *%r14` would then jump
-    // to an argument value, turning attacker-influenced input into the
-    // instruction pointer.  Only rewrite plain C-convention calls.
-    if (CI.getCallingConv() != CallingConv::C ||
-        Callee->getCallingConv() != CallingConv::C)
+    // The carrier register pool (x19-x28 / r12-r15) must stay callee-saved and
+    // never used for argument passing under the call's convention, or the
+    // dispatcher call's argument setup would overwrite the loaded jump target
+    // and the naked `br`/`jmp` would land on an argument value.  C and fastcc
+    // both keep that pool callee-saved and pass integer arguments in the normal
+    // argument registers, so both are safe — and clang promotes static internal
+    // functions to fastcc at -O2/-O3, so restricting to C alone silently skips
+    // most internal call graphs (e.g. a `static`-heavy license verdict).  Other
+    // conventions (x86_regcallcc, vectorcall, preserve_*, numbered) may pass
+    // arguments in the carrier pool and are still excluded.
+    const auto carrierSafeCC = [](CallingConv::ID CC) {
+        return CC == CallingConv::C || CC == CallingConv::Fast;
+    };
+    if (!carrierSafeCC(CI.getCallingConv()) ||
+        !carrierSafeCC(Callee->getCallingConv()))
         return false;
     Function *Caller = CI.getFunction();
     if (!Caller || Caller->isDeclaration() || Caller->hasPersonalityFn())
@@ -135,14 +184,14 @@ void shuffleCalls(std::vector<CallInst *> &Calls, ir::IRRandom &Rng) {
     }
 }
 
-Function *ensureDispatcher(Module &M, const ArchLayout &Layout) {
-    if (Function *Existing = M.getFunction("morok.ckd.dispatch"))
+Function *ensureDispatcher(Module &M, StringRef Name,
+                          const ArchLayout &Layout) {
+    if (Function *Existing = M.getFunction(Name))
         return Existing;
 
     LLVMContext &Ctx = M.getContext();
     auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), false);
-    auto *Fn = Function::Create(FTy, GlobalValue::InternalLinkage,
-                                "morok.ckd.dispatch", &M);
+    auto *Fn = Function::Create(FTy, GlobalValue::InternalLinkage, Name, &M);
     Fn->setDSOLocal(true);
     Fn->addFnAttr(Attribute::Naked);
     Fn->addFnAttr(Attribute::NoInline);
@@ -325,7 +374,7 @@ GlobalVariable *makeSealStateSlot(Module &M, std::uint64_t Unsealed) {
     return GV;
 }
 
-void emitPostlinkManifest(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
+void emitPostlinkManifest(Module &M, ArrayRef<Site> Sites,
                           std::uint32_t RegionBytes) {
     if (Sites.empty())
         return;
@@ -342,7 +391,7 @@ void emitPostlinkManifest(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
     for (const Site &S : Sites) {
         Records.push_back(ConstantStruct::get(
             RecordTy,
-            {S.encoded, S.code_size, S.seal_state, Dispatcher,
+            {S.encoded, S.code_size, S.seal_state, S.dispatcher,
              BlockAddress::get(S.caller, S.block), S.callee,
              ConstantInt::get(I64, S.salt), ConstantInt::get(I64, S.mul),
              ConstantInt::get(I64, S.add), ConstantInt::get(I64, S.seal_salt),
@@ -383,8 +432,8 @@ void emitCarrierAnchor(IRBuilder<> &B, Value *Carrier,
     B.CreateCall(FTy, IA, {Carrier});
 }
 
-void emitInit(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
-              std::uint32_t RegionBytes, bool SealRequired) {
+void emitInit(Module &M, ArrayRef<Site> Sites, std::uint32_t RegionBytes,
+              bool SealRequired) {
     if (Sites.empty())
         return;
 
@@ -436,7 +485,7 @@ void emitInit(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
             B.CreateICmpEQ(SealState, ConstantInt::get(I64, S.seal_unsealed),
                            "morok.ckd.seal.unsealed");
         Value *ExpectedSeal =
-            emitSealState(B, Dispatcher, S, Existing, CodeSize, RegionBytes,
+            emitSealState(B, S.dispatcher, S, Existing, CodeSize, RegionBytes,
                           "morok.ckd.seal.expected");
         Value *SealOk =
             B.CreateICmpEQ(SealState, ExpectedSeal, "morok.ckd.seal.ok");
@@ -472,11 +521,11 @@ void emitInit(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
         B.CreateCondBr(UseFallback, FallbackBB, SealedBB);
 
         Builder FB(FallbackBB);
-        Value *Disp = ptrToI64(FB, Dispatcher);
+        Value *Disp = ptrToI64(FB, S.dispatcher);
         Value *Target = ptrToI64(FB, S.callee);
         Value *Delta = FB.CreateSub(Target, Disp, "morok.ckd.target.delta");
-        Value *H =
-            emitSiteHash(FB, M, Dispatcher, S.caller, S.block, S, RegionBytes);
+        Value *H = emitSiteHash(FB, M, S.dispatcher, S.caller, S.block, S,
+                                RegionBytes);
         Value *Computed = FB.CreateAdd(Delta, H, "morok.ckd.target.enc");
         FB.CreateBr(StoreBB);
 
@@ -506,8 +555,10 @@ void emitInit(Module &M, Function *Dispatcher, ArrayRef<Site> Sites,
     appendToCompilerUsed(M, {Init});
 }
 
-void rewriteSite(Module &M, Function *Dispatcher, const Site &S,
-                 const ArchLayout &Layout, std::uint32_t RegionBytes) {
+void rewriteSite(Module &M, const Site &S, Arch A,
+                 std::uint32_t RegionBytes) {
+    Function *Dispatcher = S.dispatcher;
+    const ArchLayout Layout = layoutForRegister(A, S.carrier);
     CallInst *Old = S.call;
     BasicBlock *EntryBB = Old->getParent();
     BasicBlock *JoinBB = SplitBlock(EntryBB, Old);
@@ -580,9 +631,15 @@ bool callerKeyedDispatchModule(Module &M,
         params.region_bytes == 0)
         return false;
 
-    auto Layout = layoutFor(Triple(M.getTargetTriple()));
-    if (!Layout)
+    auto A = archOf(Triple(M.getTargetTriple()));
+    if (!A)
         return false;
+
+    const std::vector<std::string> Pool = carrierPool(*A);
+    const std::uint32_t NCarriers =
+        params.carriers == 0
+            ? 1u
+            : std::min(params.carriers, static_cast<std::uint32_t>(Pool.size()));
 
     const std::uint32_t Limit = std::min(params.max_calls, kMaxCallsPerModule);
     std::vector<CallInst *> Calls;
@@ -609,7 +666,6 @@ bool callerKeyedDispatchModule(Module &M,
     if (Calls.size() > Limit)
         Calls.resize(Limit);
 
-    Function *Dispatcher = ensureDispatcher(M, *Layout);
     const std::uint32_t RegionBytes =
         std::min(params.region_bytes, kMaxRegionBytes);
 
@@ -639,15 +695,22 @@ bool callerKeyedDispatchModule(Module &M,
         S.cache = makeCacheSlot(M);
         S.code_size = makeCodeSizeSlot(M);
         S.seal_state = makeSealStateSlot(M, S.seal_unsealed);
+        // Rotate the carrier register per site.  `carriers == 1` consumes no RNG
+        // and resolves to the legacy `morok.ckd.dispatch` (x19 / r14), so the
+        // single-carrier path stays byte-identical to the original.
+        const std::uint32_t Ci = NCarriers <= 1 ? 0u : rng.range(NCarriers);
+        S.carrier = Pool[Ci];
+        S.dispatcher = ensureDispatcher(M, dispatcherName(Pool[Ci], Ci == 0),
+                                        layoutForRegister(*A, Pool[Ci]));
         Sites.push_back(S);
     }
     if (Sites.empty())
         return false;
 
-    emitPostlinkManifest(M, Dispatcher, Sites, RegionBytes);
-    emitInit(M, Dispatcher, Sites, RegionBytes, params.seal_required);
+    emitPostlinkManifest(M, Sites, RegionBytes);
+    emitInit(M, Sites, RegionBytes, params.seal_required);
     for (const Site &S : Sites)
-        rewriteSite(M, Dispatcher, S, *Layout, RegionBytes);
+        rewriteSite(M, S, *A, RegionBytes);
     return true;
 }
 

@@ -149,10 +149,16 @@ width = 512
 shuffle = true
 lift_comparisons = true
 
+# Virtualization deliberately does NOT claim every function: at probability=100
+# it lifts all user logic into morok.vm.* bytecode, which the seal-binding passes
+# (self_checksum_constants / mutual_guard_graph / caller_keyed_dispatch) skip —
+# leaving a binary with zero sealed manifests.  A partial reach virtualizes the
+# heaviest logic while leaving the rest for the seal layer, so both protections
+# are present.
 [passes.virtualization]
 enabled = true
-probability = 100
-max_functions = 64
+probability = 50
+max_functions = 16
 max_instructions = 1200
 max_registers = 255
 
@@ -293,6 +299,7 @@ probability = 100
 max_calls = 4096
 region_bytes = 32
 seal_required = true
+carriers = 10
 
 [passes.returnless_dispatch]
 enabled = true

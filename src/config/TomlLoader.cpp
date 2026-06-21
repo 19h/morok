@@ -371,6 +371,7 @@ void parseCallerKeyedDispatch(const toml::table &t,
     c.max_calls = readU32(t["max_calls"]);
     c.region_bytes = readU32(t["region_bytes"]);
     c.seal_required = readBool(t["seal_required"]);
+    c.carriers = readU32(t["carriers"]);
 }
 
 void parseReturnlessDispatch(const toml::table &t,
