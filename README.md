@@ -32,6 +32,7 @@ attestation, sandboxing, or server-side policy.
 - [TOML Option Reference](#toml-option-reference)
 - [Platform Notes](#platform-notes)
 - [Static-Recovery Resistance Notes](#static-recovery-resistance-notes)
+- [FAQ](#faq)
 - [Development Workflow](#development-workflow)
 - [Troubleshooting](#troubleshooting)
 - [Related Documents and Examples](#related-documents-and-examples)
@@ -862,6 +863,75 @@ The current string/import strategy is designed against simple static decoders:
   bait while real user strings remain hidden.
 - Generated `morok.*` helpers are demoted to private linkage at the end of the
   scheduler so descriptive helper names do not reach the object symbol table.
+
+## FAQ
+
+The detailed objection handling is in
+[`docs/objections.md`](docs/objections.md). This section keeps the public claim
+short.
+
+**What does Morok actually claim to buy?**
+
+Morok is meant to make cheap static recovery unattractive: `strings`, import
+walks, direct call graphs, ordinary switch/branch recovery, bulk IR lifting, and
+one-pass decompiler cleanup should stop giving a clean map of the protected
+program. The target is attacker cost, not permanent secrecy.
+
+**What does it not claim to beat?**
+
+A debugger, DBI trace, emulator, or hostile kernel that reaches the right runtime
+context can observe concrete state. If plaintext bytes, a decoded VM stream, a
+resolved function pointer, or a reconstructed secret exists in process memory,
+then a sufficiently placed dynamic trace can see it. Morok can shorten windows,
+bind values to runtime checks, and make the analyst work for the trigger
+condition; it cannot remove the basic man-at-the-end limit.
+
+**Will IDA, Ghidra, or Binary Ninja still produce something useful?**
+
+Yes. A decompiler will always produce something. The question is whether the
+output is good enough for fast triage: stable strings, obvious imports,
+recoverable caller/callee relationships, clean dispatchers, readable arithmetic,
+and obvious authorization gates. Morok tries to damage those landmarks. It does
+not make the original semantics mathematically unrecoverable.
+
+**Are MBA rewrites and opaque predicates the security boundary?**
+
+No. Treat them as noise and pressure, not load-bearing protection. MBA identities
+and many opaque predicates are known deobfuscator targets. Their job is to add
+surface area and force proof work around stronger mechanisms such as per-site
+string recovery, function-call obfuscation, indirect routing, VM transforms, and
+sealed runtime state.
+
+**Are strings and imports supposed to be invisible?**
+
+Real protected strings should not sit in the binary as plaintext or flow through
+one global decryptor. Supported call sites use per-site materialization, and
+function pointers are resolved and cached per call site. Fallback paths exist,
+platform support differs, and decoy strings are intentionally left readable. A
+release build should be checked with normal static tooling before it is trusted.
+
+**Does virtualization or self-decryption stop dynamic reversing?**
+
+No. It changes the job from "read the original function" to "recover the executed
+semantics or the decoded stream." That can be much more expensive, especially
+when runtime seals and trigger conditions are involved, but it is still a
+recoverable dynamic-analysis problem.
+
+**Does open source make the project pointless?**
+
+No, but it removes any excuse for relying on hidden transform templates. Assume
+the attacker has read every pass. The only secrets that matter are per-build
+seeded choices, runtime-gated values, and deployment-specific state. Source
+availability also tells a dynamic attacker where to look, so claims must be
+tested on binaries, not argued from source shape.
+
+**What is the release bar?**
+
+Run the full test gate, then inspect the binary as an attacker would: `strings`,
+`nm`/`otool`/`objdump`, decompiler output, import tables, runtime traces for
+gated paths, and post-link seal state when those features are enabled. If a
+protected build still exposes clear strings, direct sensitive imports, or a
+plain authorization path, treat that as a failed configuration or a bug.
 
 ## Development Workflow
 
