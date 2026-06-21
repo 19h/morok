@@ -339,6 +339,14 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.returnless_dispatch.probability);
     mergeOpt(dst.returnless_dispatch.max_sites,
              src.returnless_dispatch.max_sites);
+    mergeOpt(dst.function_fission.enabled, src.function_fission.enabled);
+    mergeOpt(dst.function_fission.probability,
+             src.function_fission.probability);
+    mergeOpt(dst.function_fission.max_splits, src.function_fission.max_splits);
+    mergeOpt(dst.function_fission.min_region_blocks,
+             src.function_fission.min_region_blocks);
+    mergeOpt(dst.function_fission.max_region_blocks,
+             src.function_fission.max_region_blocks);
     // Trap-mediated branch nanomites
     mergeOpt(dst.nanomites.enabled, src.nanomites.enabled);
     mergeOpt(dst.nanomites.probability, src.nanomites.probability);

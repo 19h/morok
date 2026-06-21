@@ -29,6 +29,7 @@
 #include "morok/passes/Flattening.hpp"
 #include "morok/passes/FaultPagedPayload.hpp"
 #include "morok/passes/FunctionCallObfuscate.hpp"
+#include "morok/passes/FunctionFission.hpp"
 #include "morok/passes/FunctionWrapper.hpp"
 #include "morok/passes/HashGatedSelfDecrypt.hpp"
 #include "morok/passes/IndirectBranch.hpp"
@@ -246,6 +247,7 @@ bool hasSensitiveGeneratedPrefix(StringRef Name) {
            Name.starts_with("morok.mg.node.") ||
            Name.starts_with("morok.mg.diff.") ||
            Name.starts_with("morok.fpp.") ||
+           Name.starts_with("morok.fission") ||
            Name.starts_with("morok.antidbg") ||
            Name.starts_with("morok.watchdog") ||
            Name.starts_with("morok.antihook") ||
@@ -608,6 +610,25 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
     if (InitialModuleGrowthOk &&
         config_.passes.vtable_integrity.enabled.value_or(false))
         changed |= passes::vtableIntegrityModule(M);
+
+    // Function fission: split user functions into smaller `morok.fission.*`
+    // callees BEFORE the per-function obfuscation wave.  The shrunken originals
+    // fall back under the per-function budgets (so the integrity/seal passes can
+    // reach logic an un-split monster function would have grown past every
+    // budget), and the source function boundaries no longer match the binary.
+    // Runs after the VM wave so virtualization claims whole kernels first.
+    if (InitialModuleGrowthOk &&
+        config_.passes.function_fission.enabled.value_or(false) &&
+        dispatchModuleOk(measureUserModule(M))) {
+        passes::FunctionFissionParams p;
+        p.probability = config_.passes.function_fission.probability.value_or(100);
+        p.max_splits = config_.passes.function_fission.max_splits.value_or(8);
+        p.min_region_blocks =
+            config_.passes.function_fission.min_region_blocks.value_or(2);
+        p.max_region_blocks =
+            config_.passes.function_fission.max_region_blocks.value_or(64);
+        changed |= passes::functionFissionModule(M, p, rng);
+    }
 
     if (InitialModuleGrowthOk) {
         std::uint64_t VisitedEligibleFunctions = 0;

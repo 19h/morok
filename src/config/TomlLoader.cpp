@@ -381,6 +381,14 @@ void parseReturnlessDispatch(const toml::table &t,
     c.max_sites = readU32(t["max_sites"]);
 }
 
+void parseFunctionFission(const toml::table &t, FunctionFissionConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.probability = readU32(t["probability"]);
+    c.max_splits = readU32(t["max_splits"]);
+    c.min_region_blocks = readU32(t["min_region_blocks"]);
+    c.max_region_blocks = readU32(t["max_region_blocks"]);
+}
+
 void parseNanomites(const toml::table &t, NanomiteConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.probability = readU32(t["probability"]);
@@ -528,6 +536,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseCallerKeyedDispatch(*t, pc.caller_keyed_dispatch);
     if (auto *t = p["returnless_dispatch"].as_table())
         parseReturnlessDispatch(*t, pc.returnless_dispatch);
+    if (auto *t = p["function_fission"].as_table())
+        parseFunctionFission(*t, pc.function_fission);
     if (auto *t = p["nanomites"].as_table())
         parseNanomites(*t, pc.nanomites);
     if (auto *t = p["string_encryption"].as_table())

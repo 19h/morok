@@ -45,6 +45,7 @@
 #include "morok/passes/PathExplosion.hpp"
 #include "morok/passes/PerBuildPolymorphism.hpp"
 #include "morok/passes/PhiTangling.hpp"
+#include "morok/passes/FunctionFission.hpp"
 #include "morok/passes/PointerLaundering.hpp"
 #include "morok/passes/ReturnlessDispatch.hpp"
 #include "morok/passes/RuntimeSeal.hpp"
@@ -597,6 +598,65 @@ std::size_t countInlineAsmBodies(Function &F, StringRef needle) {
                 if (Asm->getAsmString().contains(needle))
                     ++n;
     return n;
+}
+
+TEST_CASE("functionFission outlines regions into smaller noinline callees") {
+    LLVMContext ctx;
+    const char *ir = R"ir(
+define i32 @branchy(i32 %n) {
+entry:
+  %c = icmp sgt i32 %n, 0
+  br i1 %c, label %pos, label %neg
+pos:
+  %a = add i32 %n, 1
+  %c2 = icmp sgt i32 %a, 10
+  br i1 %c2, label %big, label %small
+big:
+  %b = mul i32 %a, 2
+  br label %join
+small:
+  %s = sub i32 %a, 1
+  br label %join
+join:
+  %p = phi i32 [ %b, %big ], [ %s, %small ]
+  br label %exit
+neg:
+  %d = sub i32 0, %n
+  br label %exit
+exit:
+  %r = phi i32 [ %p, %join ], [ %d, %neg ]
+  ret i32 %r
+}
+)ir";
+    auto M = parse(ctx, ir);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0xF1551011);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::FunctionFissionParams params;
+    params.min_region_blocks = 2;
+    const bool changed = morok::passes::functionFissionModule(*M, params, rng);
+
+    CHECK(changed);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+
+    // The original survives (smaller) and at least one fission part was created.
+    REQUIRE(M->getFunction("branchy") != nullptr);
+    std::size_t parts = 0;
+    for (Function &F : *M) {
+        if (!F.getName().starts_with("morok.fission"))
+            continue;
+        ++parts;
+        // Parts are kept separate from the caller and re-split is suppressed.
+        CHECK(F.hasFnAttribute(Attribute::NoInline));
+        CHECK(F.hasFnAttribute("morok-fission-part"));
+        CHECK(F.hasLocalLinkage());
+    }
+    CHECK(parts >= 1u);
+
+    // Re-running keeps the IR valid; the generated parts are never re-split
+    // (functionEligible skips anything carrying the part attribute).
+    morok::passes::functionFissionModule(*M, params, rng);
+    CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
 TEST_CASE("returnlessDispatch turns tail-position returns into indirect tails") {

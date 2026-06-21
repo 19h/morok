@@ -36,6 +36,7 @@ add_library(morok_passes STATIC
   ChaosStateMachine.cpp
   CallerKeyedDispatch.cpp
   ReturnlessDispatch.cpp
+  FunctionFission.cpp
   OptimizerAmplification.cpp
   PerBuildPolymorphism.cpp
   ArithmeticTables.cpp

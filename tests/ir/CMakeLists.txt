@@ -4,7 +4,7 @@
 # components to concrete libraries.
 #==============================================================================
 
-morok_llvm_map_components(_llvm_libs core support irreader asmparser transformutils)
+morok_llvm_map_components(_llvm_libs core support irreader asmparser transformutils analysis)
 
 morok_add_unit_test(morok_ir_tests
   SOURCES test_passes.cpp

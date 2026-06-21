@@ -331,6 +331,14 @@ struct ReturnlessDispatchConfig {
     Opt<std::uint32_t> max_sites;
 };
 
+struct FunctionFissionConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> max_splits;
+    Opt<std::uint32_t> min_region_blocks;
+    Opt<std::uint32_t> max_region_blocks;
+};
+
 struct NanomiteConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
@@ -437,6 +445,7 @@ struct PassConfig {
     MicrocodeStressConfig microcode_stress;
     CallerKeyedDispatchConfig caller_keyed_dispatch;
     ReturnlessDispatchConfig returnless_dispatch;
+    FunctionFissionConfig function_fission;
     NanomiteConfig nanomites;
     StrEncConfig str_enc;
     ConstEncConfig const_enc;

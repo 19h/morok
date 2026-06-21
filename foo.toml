@@ -306,6 +306,13 @@ enabled = true
 probability = 100
 max_sites = 4096
 
+[passes.function_fission]
+enabled = true
+probability = 100
+max_splits = 12
+min_region_blocks = 2
+max_region_blocks = 48
+
 [passes.nanomites]
 enabled = true
 probability = 100

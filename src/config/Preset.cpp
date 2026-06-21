@@ -274,6 +274,14 @@ PassConfig makeLow() {
     c.returnless_dispatch.probability = 100;
     c.returnless_dispatch.max_sites = 64;
 
+    // Off in every preset for now: opt-in via [passes.function_fission] while the
+    // CodeExtractor-based function splitting is validated per platform.
+    c.function_fission.enabled = false;
+    c.function_fission.probability = 100;
+    c.function_fission.max_splits = 8;
+    c.function_fission.min_region_blocks = 2;
+    c.function_fission.max_region_blocks = 64;
+
     c.vec.enabled = false;
     c.csm.enabled = false;
     c.csm.generator = CsmGenerator::Logistic;

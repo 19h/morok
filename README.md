@@ -564,6 +564,7 @@ and private-linkage cleanup for generated `morok.*` helpers, are scheduler-only.
 | Capability | `-passes` name | TOML section | Summary |
 |---|---|---|---|
 | Split basic blocks | `morok-split` | `split_blocks` | Splits blocks into more dispatch targets. |
+| Function fission | `morok-fission` | `function_fission` | Outlines single-entry/single-exit regions of a function into fresh internal `morok.fission.*` callees (via `CodeExtractor`), so the source function boundaries no longer match the binary and the call graph fans out. Shrinking the originals also brings oversized functions back under the per-function obfuscation/integrity budgets so the seal-binding passes can reach them. Parts are marked `noinline`; EH/`setjmp`/varargs/computed-goto functions are skipped. |
 | Bogus control flow | `morok-bcf` | `bcf` | Adds opaque-true guarded junk/decoy edges with optional entropy and inline-asm pressure. |
 | Flattening | `morok-flatten` | `flattening` | Classic switch-dispatcher control-flow flattening. |
 | Data-entangled flattening | `morok-entfla` | `data_entangled_flattening` | Stores successor state through live-data and previous-state tokens. |
@@ -776,6 +777,7 @@ that extra layer per rewritten literal.
 | `function_call_obfuscate` | `enabled` |
 | `caller_keyed_dispatch` | `enabled`, `probability`, `max_calls`, `region_bytes`, `seal_required`, `carriers` |
 | `returnless_dispatch` | `enabled`, `probability`, `max_sites` |
+| `function_fission` | `enabled`, `probability`, `max_splits`, `min_region_blocks`, `max_region_blocks` |
 | `function_wrapper` | `enabled`, `probability`, `times` |
 | `vtable_integrity` | `enabled` |
 | `decoy_strings` | `enabled` |
