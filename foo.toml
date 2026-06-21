@@ -10,17 +10,17 @@ fail_closed_on_unsealed = true
 [passes.bcf]
 enabled = true
 probability = 100
-iterations = 8
-complexity = 16
+iterations = 4
+complexity = 8
 entropy_chain = true
 junk_asm = true
-junk_asm_min = 8
-junk_asm_max = 16
+junk_asm_min = 4
+junk_asm_max = 8
 
 [passes.substitution]
 enabled = true
 probability = 100
-iterations = 8
+iterations = 6
 
 [passes.mba]
 enabled = true

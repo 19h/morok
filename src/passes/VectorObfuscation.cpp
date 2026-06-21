@@ -39,13 +39,24 @@ bool passGenerated(const Instruction *I) {
 }
 
 bool supportedScalar(Type *Ty) {
-    return Ty->isIntegerTy() || Ty->isHalfTy() || Ty->isBFloatTy() ||
-           Ty->isFloatTy() || Ty->isDoubleTy();
+    // Sub-byte integers (notably i1) vectorize into <N x i1> mask vectors that
+    // several backends mis-lower or crash on — e.g. the X86 Assembly Printer
+    // aborts on a junk-filled <32 x i1> vector trunc produced from `trunc i8 to
+    // i1`. Such lanes also carry no obfuscation value, so only vectorize integer
+    // lanes that are at least one byte wide.
+    if (auto *IT = dyn_cast<IntegerType>(Ty))
+        return IT->getBitWidth() >= 8;
+    return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
+           Ty->isDoubleTy();
 }
 
 bool liftable(BinaryOperator *bo) {
     Type *Ty = bo->getType();
-    if (Ty->isIntegerTy()) {
+    if (auto *IT = dyn_cast<IntegerType>(Ty)) {
+        // Skip sub-byte (i1) lanes: <N x i1> vectors are backend-fragile and
+        // pointless to obfuscate. See supportedScalar().
+        if (IT->getBitWidth() < 8)
+            return false;
         switch (bo->getOpcode()) {
         case Instruction::Add:
         case Instruction::Sub:
@@ -87,8 +98,11 @@ bool liftable(BinaryOperator *bo) {
 
 bool liftableCompare(CmpInst *cmp) {
     Type *Ty = cmp->getOperand(0)->getType();
-    if (auto *ICmp = dyn_cast<ICmpInst>(cmp))
-        return Ty->isIntegerTy() && ICmp->getOperand(1)->getType() == Ty;
+    if (auto *ICmp = dyn_cast<ICmpInst>(cmp)) {
+        auto *IT = dyn_cast<IntegerType>(Ty);
+        return IT && IT->getBitWidth() >= 8 &&
+               ICmp->getOperand(1)->getType() == Ty;
+    }
     if (auto *FCmp = dyn_cast<FCmpInst>(cmp)) {
         if (!(Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
               Ty->isDoubleTy()))
