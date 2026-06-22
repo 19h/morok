@@ -1,0 +1,6 @@
+[global]
+preset = "none"
+
+[passes.string_encryption]
+enabled = true
+probability = 100

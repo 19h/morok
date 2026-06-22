@@ -69,6 +69,10 @@ set(_boundary_trace_config
     "${CMAKE_CURRENT_SOURCE_DIR}/boundary_trace.toml")
 set(_boundary_trace_workload
     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/boundary_trace.c")
+set(_string_dynamic_escape_config
+    "${CMAKE_CURRENT_SOURCE_DIR}/string_dynamic_escape.toml")
+set(_string_dynamic_escape_workload
+    "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/string_dynamic_escape.c")
 set(_vtable_integrity_driver
     "${CMAKE_CURRENT_SOURCE_DIR}/vtable_integrity_dispatch.sh")
 set(_vtable_integrity_config
@@ -198,6 +202,20 @@ add_test(NAME "e2e/differential_maxtoml"
 set_tests_properties("e2e/differential_maxtoml" PROPERTIES
   LABELS "e2e;max"
   REQUIRED_FILES "$<TARGET_FILE:morok_plugin>;${_maxcfg_setting}")
+
+add_test(NAME "e2e/string_dynamic_escape"
+  COMMAND bash "${_driver}"
+          "${CMAKE_C_COMPILER}"
+          "$<TARGET_FILE:morok_plugin>"
+          "${_sysroot}"
+          "${_string_dynamic_escape_workload}"
+          "${_string_dynamic_escape_config}"
+          6114)
+set_tests_properties("e2e/string_dynamic_escape" PROPERTIES
+  LABELS "e2e;security"
+  REQUIRED_FILES
+    "$<TARGET_FILE:morok_plugin>;${_string_dynamic_escape_config};${_string_dynamic_escape_workload}"
+  TIMEOUT 120)
 
 # Virtualization-specific differential gate.  Asserts the bytecode VM actually
 # lifted at least one function (catches a silent "lifts nothing" regression, the

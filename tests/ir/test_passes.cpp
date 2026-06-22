@@ -13925,6 +13925,65 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+// Regression for #110: function-scoped re-encryption is only safe when the
+// string address cannot outlive the using frame.  Dynamic escapes such as
+// returns, stores, and capturing calls must keep the constructor fallback;
+// otherwise the release inserted before ret hands callers ciphertext.
+TEST_CASE("stringEncryptModule uses constructor fallback for dynamic escapes") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@ret.str = private constant [11 x i8] c"ret-secret\00"
+@store.str = private constant [13 x i8] c"store-secret\00"
+@capture.str = private constant [15 x i8] c"capture-secret\00"
+
+declare void @capture(ptr)
+
+define ptr @return_secret() {
+entry:
+  ret ptr @ret.str
+}
+
+define void @store_secret(ptr %out) {
+entry:
+  store ptr @store.str, ptr %out
+  ret void
+}
+
+define void @capture_secret() {
+entry:
+  call void @capture(ptr @capture.str)
+  ret void
+}
+)ir");
+    REQUIRE(M);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6114);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+
+    CHECK(countFunctions(*M, "morok.strdec") == 3u);
+    CHECK(countFunctions(*M, "morok.strrel") == 0u);
+    CHECK(countGlobals(*M, "morok.str.ref") == 0u);
+    std::vector<unsigned> Priorities = ctorPrioritiesFor(*M, "morok.strdec");
+    REQUIRE(Priorities.size() == 3u);
+    CHECK(std::all_of(Priorities.begin(), Priorities.end(),
+                      [](unsigned P) { return P == 0u; }));
+
+    for (StringRef Name : {"return_secret", "store_secret",
+                           "capture_secret"}) {
+        Function *F = M->getFunction(Name);
+        REQUIRE(F);
+        CHECK(countCallsTo(*F, "morok.strdec") == 0u);
+        CHECK(countCallsTo(*F, "morok.strrel") == 0u);
+    }
+
+    CHECK_FALSE(hasReadableByteString(*M, "ret-secret"));
+    CHECK_FALSE(hasReadableByteString(*M, "store-secret"));
+    CHECK_FALSE(hasReadableByteString(*M, "capture-secret"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 // Regression for #38: when a string address escapes through static data, the
 // pass cannot inject a first-use call before every read and must fall back to a
 // global constructor.  That decryptor must run before ordinary user ctors such

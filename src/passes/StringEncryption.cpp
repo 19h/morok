@@ -430,24 +430,66 @@ Value *emitStackString(Instruction *InsertBefore, const Cipher &C,
         "morok.str.stack.ptr");
 }
 
-// Collect the functions that (transitively, through constant exprs) reference
-// GV.  Sets Escapes if the address is baked into static data (another global's
-// initializer) or any non-instruction, non-constant user — contexts where no
-// function-entry hook can guarantee the string is decrypted before it is read.
+bool isPointerAliasInstruction(const Instruction *I) {
+    return isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
+           isa<AddrSpaceCastInst>(I);
+}
+
 void collectUsingFunctions(Value *V, SmallPtrSetImpl<Function *> &Funcs,
-                           bool &Escapes) {
-    for (User *U : V->users()) {
-        if (auto *I = dyn_cast<Instruction>(U)) {
+                           bool &Escapes, SmallPtrSetImpl<Value *> &Seen) {
+    if (!Seen.insert(V).second)
+        return;
+
+    for (Use &U : V->uses()) {
+        User *Usr = U.getUser();
+        if (auto *I = dyn_cast<Instruction>(Usr)) {
             if (Function *F = I->getFunction())
                 Funcs.insert(F);
-        } else if (isa<GlobalVariable>(U)) {
+
+            if (isPointerAliasInstruction(I)) {
+                collectUsingFunctions(I, Funcs, Escapes, Seen);
+                continue;
+            }
+
+            if (isa<ReturnInst>(I) || isa<StoreInst>(I)) {
+                Escapes = true;
+                continue;
+            }
+
+            if (auto *CB = dyn_cast<CallBase>(I)) {
+                if (!CB->isArgOperand(&U)) {
+                    Escapes = true;
+                    continue;
+                }
+                const unsigned ArgNo = CB->getArgOperandNo(&U);
+                if (!CB->doesNotCapture(ArgNo))
+                    Escapes = true;
+                continue;
+            }
+
+            if (I->getType()->isPointerTy()) {
+                Escapes = true;
+                continue;
+            }
+            continue;
+        }
+        if (isa<GlobalVariable>(Usr)) {
             Escapes = true;
-        } else if (isa<Constant>(U)) {
-            collectUsingFunctions(U, Funcs, Escapes);
+        } else if (isa<Constant>(Usr)) {
+            collectUsingFunctions(Usr, Funcs, Escapes, Seen);
         } else {
             Escapes = true;
         }
     }
+}
+
+// Collect the functions that (transitively, through constant exprs and pointer
+// aliases) reference GV.  Sets Escapes if the address can outlive those frames:
+// static data, returns, stores, capturing calls, or unsupported pointer flow.
+void collectUsingFunctions(Value *V, SmallPtrSetImpl<Function *> &Funcs,
+                           bool &Escapes) {
+    SmallPtrSet<Value *, 16> Seen;
+    collectUsingFunctions(V, Funcs, Escapes, Seen);
 }
 
 bool collectLoadUseSites(Value *V, SmallVectorImpl<LoadInst *> &Loads,
