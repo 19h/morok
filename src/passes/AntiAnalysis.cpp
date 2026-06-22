@@ -2030,6 +2030,370 @@ Function *linuxRtSigreturnRestorer(Module &M, const Triple &TT) {
     return fn;
 }
 
+bool linuxFaultFlowSyscalls(const Triple &TT, std::uint32_t &RtSigaction,
+                            std::uint32_t &Sigaltstack) {
+    if (!TT.isOSLinux())
+        return false;
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        RtSigaction = 13;
+        Sigaltstack = 131;
+        return true;
+    case Triple::aarch64:
+        RtSigaction = 134;
+        Sigaltstack = 132;
+        return true;
+    default:
+        return false;
+    }
+}
+
+struct LinuxFaultFlowLayout {
+    std::uint64_t pcSlotOffset = 0;
+    std::uint64_t siginfoAddrOffset = 16;
+    std::uint32_t instructionBytes = 0;
+    std::int32_t sigIll = 4;
+};
+
+bool linuxFaultFlowLayout(const Triple &TT, LinuxFaultFlowLayout &L) {
+    if (!TT.isOSLinux())
+        return false;
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        L.pcSlotOffset = 168; // ucontext_t.uc_mcontext.gregs[REG_RIP]
+        L.instructionBytes = 2;
+        return true;
+    case Triple::aarch64:
+        // glibc aarch64 ucontext_t: uc_mcontext starts after flags/link/stack
+        // and sigmask; mcontext_t.pc follows fault_address, regs[31], and sp.
+        L.pcSlotOffset = 432;
+        L.instructionBytes = 4;
+        return true;
+    default:
+        return false;
+    }
+}
+
+GlobalVariable *linuxFaultFlowSentinel(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.antidbg.faultcf.sentinel",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, 0), "morok.antidbg.faultcf.sentinel");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(8));
+    return gv;
+}
+
+GlobalVariable *linuxFaultFlowToken(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.antidbg.faultcf.token",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i64, 0), "morok.antidbg.faultcf.token");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(8));
+    return gv;
+}
+
+GlobalVariable *linuxFaultFlowExpectedSig(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.antidbg.faultcf.sig",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i32, 0),
+                                  "morok.antidbg.faultcf.sig");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(4));
+    return gv;
+}
+
+Function *linuxFaultFlowHandler(Module &M, GlobalVariable *State,
+                                const LinuxFaultFlowLayout &Layout) {
+    if (Function *existing = M.getFunction("morok.antidbg.faultcf.handler"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(
+        FunctionType::get(Type::getVoidTy(ctx), {i32, ptr, ptr}, false),
+        GlobalValue::PrivateLinkage, "morok.antidbg.faultcf.handler", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *sig = fn->getArg(0);
+    sig->setName("sig");
+    Argument *info = fn->getArg(1);
+    info->setName("info");
+    Argument *uctx = fn->getArg(2);
+    uctx->setName("uctx");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *handledBB = BasicBlock::Create(ctx, "handled", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    Value *expectedSig =
+        B.CreateLoad(i32, linuxFaultFlowExpectedSig(M),
+                     "morok.antidbg.faultcf.sig.expected");
+    cast<LoadInst>(expectedSig)->setVolatile(true);
+    Value *sigOk = B.CreateICmpEQ(sig, expectedSig,
+                                  "morok.antidbg.faultcf.sig.match");
+    Value *ctxOk = B.CreateICmpNE(uctx, ConstantPointerNull::get(ptr),
+                                  "morok.antidbg.faultcf.ctx");
+    Value *infoOk = B.CreateICmpNE(info, ConstantPointerNull::get(ptr),
+                                   "morok.antidbg.faultcf.info");
+    B.CreateCondBr(B.CreateAnd(sigOk, B.CreateAnd(ctxOk, infoOk),
+                               "morok.antidbg.faultcf.ready"),
+                   handledBB, retBB);
+
+    IRBuilder<> HB(handledBB);
+    Value *pc = loadAt(HB, M, ip, uctx, Layout.pcSlotOffset,
+                       "morok.antidbg.faultcf.pc");
+    Value *nextPc =
+        HB.CreateAdd(pc, ConstantInt::get(ip, Layout.instructionBytes),
+                     "morok.antidbg.faultcf.pc.next");
+    storeAt(HB, M, uctx, Layout.pcSlotOffset, nextPc,
+            "morok.antidbg.faultcf.advance.pc");
+    Value *token =
+        HB.CreateLoad(i64, linuxFaultFlowToken(M),
+                      "morok.antidbg.faultcf.token.v");
+    cast<LoadInst>(token)->setVolatile(true);
+    auto *sentinel = HB.CreateStore(token, linuxFaultFlowSentinel(M));
+    sentinel->setVolatile(true);
+    sentinel->setAlignment(Align(8));
+    Value *fault = loadAt(HB, M, ip, info, Layout.siginfoAddrOffset,
+                          "morok.antidbg.faultcf.si.addr");
+    foldState(HB, State, fault, 0xB647D1E93A205C8FULL,
+              "morok.antidbg.faultcf.addr.mix");
+    foldState(HB, State, pc, 0x64A91C0BE73D528FULL,
+              "morok.antidbg.faultcf.pc.mix");
+    foldState(HB, State, token, 0xD38F24A10B6C95E7ULL,
+              "morok.antidbg.faultcf.token.mix");
+    HB.CreateBr(retBB);
+
+    IRBuilder<> RB(retBB);
+    RB.CreateRetVoid();
+    return fn;
+}
+
+void zeroRawSigaction(IRBuilder<> &B, Module &M, AllocaInst *Action,
+                      const LinuxRawSigactionLayout &Layout,
+                      const Twine &Name) {
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    for (std::uint64_t i = 0; i < Layout.actionSize; ++i)
+        B.CreateStore(ConstantInt::get(i8, 0),
+                      gepI8(B, M, Action, constIp(M, i), Name + ".zero"));
+}
+
+void storeRawSiginfoAction(IRBuilder<> &B, Module &M, AllocaInst *Action,
+                           Function *Handler,
+                           const LinuxRawSigactionLayout &Layout,
+                           std::uint64_t ExtraFlags, const Twine &Name) {
+    auto *i64 = Type::getInt64Ty(M.getContext());
+    zeroRawSigaction(B, M, Action, Layout, Name);
+    B.CreateStore(Handler, gepI8(B, M, Action, constIp(M, 0),
+                                 Name + ".handler"));
+    B.CreateStore(ConstantInt::get(i64, Layout.flags | ExtraFlags),
+                  gepI8(B, M, Action, constIp(M, Layout.flagsOffset),
+                        Name + ".flags"));
+}
+
+void emitLinuxFaultFlowStimulus(IRBuilder<> &B, const Triple &TT) {
+    auto *asmTy = FunctionType::get(Type::getVoidTy(B.getContext()), false);
+    StringRef asmText = TT.getArch() == Triple::aarch64 ? ".inst 0x00000000"
+                                                        : ".byte 0x0f,0x0b";
+    InlineAsm *IA = InlineAsm::get(asmTy, asmText, "~{memory}",
+                                   /*hasSideEffects=*/true);
+    B.CreateCall(asmTy, IA);
+}
+
+Function *linuxIntentionalFaultFlowProbe(Module &M, GlobalVariable *State,
+                                         ir::IRRandom &rng, const Triple &TT) {
+    if (!TT.isOSLinux() || intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    LinuxRawSigactionLayout rawLayout;
+    LinuxFaultFlowLayout faultLayout;
+    if (!linuxRawSigactionLayout(TT, rawLayout) ||
+        !linuxFaultFlowLayout(TT, faultLayout))
+        return nullptr;
+    std::uint32_t rtSigactionNr = 0;
+    std::uint32_t sigaltstackNr = 0;
+    if (!linuxFaultFlowSyscalls(TT, rtSigactionNr, sigaltstackNr))
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antidbg.faultcf"))
+        return existing;
+
+    runtime_seal::getChannel(M, runtime_seal::kAntiDebugChannel, rng);
+    runtime_seal::getChannel(M, runtime_seal::kTracerChannel, rng);
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), {i64},
+                                                  false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antidbg.faultcf", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *tag = fn->getArg(0);
+    tag->setName("tag");
+
+    Function *handler = linuxFaultFlowHandler(M, State, faultLayout);
+    Function *restorer = rawLayout.needsRestorer
+                             ? linuxRtSigreturnRestorer(M, TT)
+                             : nullptr;
+    if (rawLayout.needsRestorer && !restorer)
+        return nullptr;
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *armedBB = BasicBlock::Create(ctx, "armed", fn);
+    auto *notInstalledBB = BasicBlock::Create(ctx, "not.installed", fn);
+    auto *restoreBB = BasicBlock::Create(ctx, "restore", fn);
+    auto *restoreAltBB = BasicBlock::Create(ctx, "restore.alt", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    constexpr std::uint64_t kAltStackBytes = 8192;
+    constexpr std::uint64_t kStackTBytes = 24;
+    constexpr std::uint64_t kSaOnStack = 0x08000000ULL;
+    auto *actionTy = ArrayType::get(i8, rawLayout.actionSize);
+    auto *stackTy = ArrayType::get(i8, kStackTBytes);
+    auto *altTy = ArrayType::get(i8, kAltStackBytes);
+    AllocaInst *action =
+        B.CreateAlloca(actionTy, nullptr, "morok.antidbg.faultcf.sa");
+    AllocaInst *oldAction =
+        B.CreateAlloca(actionTy, nullptr, "morok.antidbg.faultcf.old.sa");
+    AllocaInst *altStack =
+        B.CreateAlloca(altTy, nullptr, "morok.antidbg.faultcf.alt.bytes");
+    AllocaInst *newStack =
+        B.CreateAlloca(stackTy, nullptr, "morok.antidbg.faultcf.alt");
+    AllocaInst *oldStack =
+        B.CreateAlloca(stackTy, nullptr, "morok.antidbg.faultcf.old.alt");
+    action->setAlignment(Align(8));
+    oldAction->setAlignment(Align(8));
+    altStack->setAlignment(Align(16));
+    newStack->setAlignment(Align(8));
+    oldStack->setAlignment(Align(8));
+    zeroRawSigaction(B, M, oldAction, rawLayout, "morok.antidbg.faultcf.old.sa");
+    for (std::uint64_t i = 0; i < kStackTBytes; ++i) {
+        B.CreateStore(ConstantInt::get(i8, 0),
+                      gepI8(B, M, newStack, constIp(M, i),
+                            "morok.antidbg.faultcf.alt.zero"));
+        B.CreateStore(ConstantInt::get(i8, 0),
+                      gepI8(B, M, oldStack, constIp(M, i),
+                            "morok.antidbg.faultcf.old.alt.zero"));
+    }
+    Value *altPtr = B.CreateInBoundsGEP(
+        altTy, altStack, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antidbg.faultcf.alt.ptr");
+    storeAt(B, M, newStack, 0, altPtr, "morok.antidbg.faultcf.alt.sp");
+    storeAt(B, M, newStack, 8, ConstantInt::get(i32, 0),
+            "morok.antidbg.faultcf.alt.flags");
+    storeAt(B, M, newStack, 16, ConstantInt::get(ip, kAltStackBytes),
+            "morok.antidbg.faultcf.alt.size");
+    Value *altRc = emitLinuxSyscall(B, M, TT, sigaltstackNr,
+                                    {newStack, oldStack});
+    altRc->setName("morok.antidbg.faultcf.sigaltstack");
+    Value *altOk = B.CreateICmpEQ(altRc, ConstantInt::get(ip, 0),
+                                  "morok.antidbg.faultcf.sigaltstack.ok");
+    foldFlag(B, State, B.CreateNot(altOk), 0x3C51DA8F206B974EULL,
+             "morok.antidbg.faultcf.alt.unavailable");
+
+    storeRawSiginfoAction(B, M, action, handler, rawLayout, kSaOnStack,
+                          "morok.antidbg.faultcf.sa");
+    if (rawLayout.needsRestorer)
+        B.CreateStore(restorer,
+                      gepI8(B, M, action, constIp(M, rawLayout.restorerOffset),
+                            "morok.antidbg.faultcf.sa.restorer"));
+    Value *sigactionRc = emitLinuxSyscall(
+        B, M, TT, rtSigactionNr,
+        {ConstantInt::getSigned(ip, faultLayout.sigIll), action, oldAction,
+         ConstantInt::get(ip, rawLayout.sigsetSize)});
+    sigactionRc->setName("morok.antidbg.faultcf.rt_sigaction");
+    Value *installed =
+        B.CreateICmpEQ(sigactionRc, ConstantInt::get(ip, 0),
+                       "morok.antidbg.faultcf.rt_sigaction.ok");
+    foldFlag(B, State, B.CreateNot(installed), 0x7E0D42B6A195C83FULL,
+             "morok.antidbg.faultcf.install.unavailable");
+    B.CreateCondBr(installed, armedBB, notInstalledBB);
+
+    IRBuilder<> AB(armedBB);
+    const std::uint64_t tokenMul = rng.next() | 1ULL;
+    const std::uint64_t tokenSalt = rng.next() | 1ULL;
+    Value *tokenBase =
+        AB.CreateAdd(AB.CreateMul(tag, ConstantInt::get(i64, tokenMul),
+                                  "morok.antidbg.faultcf.token.mul"),
+                     ConstantInt::get(i64, tokenSalt),
+                     "morok.antidbg.faultcf.token.mix");
+    Value *token =
+        AB.CreateOr(tokenBase, ConstantInt::get(i64, 1),
+                    "morok.antidbg.faultcf.token.expected");
+    AB.CreateStore(ConstantInt::get(i64, 0), linuxFaultFlowSentinel(M))
+        ->setVolatile(true);
+    AB.CreateStore(token, linuxFaultFlowToken(M))->setVolatile(true);
+    AB.CreateStore(ConstantInt::getSigned(i32, faultLayout.sigIll),
+                   linuxFaultFlowExpectedSig(M))
+        ->setVolatile(true);
+    emitLinuxFaultFlowStimulus(AB, TT);
+    Value *sentinel =
+        AB.CreateLoad(i64, linuxFaultFlowSentinel(M),
+                      "morok.antidbg.faultcf.sentinel.v");
+    cast<LoadInst>(sentinel)->setVolatile(true);
+    Value *delta =
+        AB.CreateXor(sentinel, token, "morok.antidbg.faultcf.sentinel.delta");
+    Value *missing =
+        AB.CreateICmpNE(delta, ConstantInt::get(i64, 0),
+                        "morok.antidbg.faultcf.sentinel.missing");
+    foldState(AB, State, delta, 0xA91E4D63B70C528FULL,
+              "morok.antidbg.faultcf.sentinel");
+    foldEnforcedFlag(AB, State, missing, 0x51B7EC204D9A683FULL,
+                     "morok.antidbg.faultcf.missing");
+    runtime_seal::foldWord(AB, runtime_seal::kAntiDebugChannel, delta,
+                           0xF46A917C2D5E03B8ULL,
+                           "morok.antidbg.faultcf.anti_debug");
+    runtime_seal::foldWord(AB, runtime_seal::kTracerChannel, delta,
+                           0x83D52E10A9C476BFULL,
+                           "morok.antidbg.faultcf.tracer");
+    AB.CreateBr(restoreBB);
+
+    IRBuilder<> NB(notInstalledBB);
+    NB.CreateCondBr(altOk, restoreAltBB, retBB);
+
+    IRBuilder<> RB(restoreBB);
+    Value *restoreRc = emitLinuxSyscall(
+        RB, M, TT, rtSigactionNr,
+        {ConstantInt::getSigned(ip, faultLayout.sigIll), oldAction,
+         ConstantPointerNull::get(ptr),
+         ConstantInt::get(ip, rawLayout.sigsetSize)});
+    restoreRc->setName("morok.antidbg.faultcf.rt_sigaction.restore");
+    RB.CreateCondBr(altOk, restoreAltBB, retBB);
+
+    IRBuilder<> SAB(restoreAltBB);
+    Value *restoreAlt = emitLinuxSyscall(
+        SAB, M, TT, sigaltstackNr, {oldStack, ConstantPointerNull::get(ptr)});
+    restoreAlt->setName("morok.antidbg.faultcf.sigaltstack.restore");
+    SAB.CreateBr(retBB);
+
+    IRBuilder<> RetB(retBB);
+    RetB.CreateRetVoid();
+    return fn;
+}
+
 bool linuxLandlockSyscalls(const Triple &TT, std::uint32_t &CreateRuleset,
                            std::uint32_t &RestrictSelf) {
     switch (TT.getArch()) {
@@ -2734,6 +3098,9 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
     foldFlag(B, State, B.CreateICmpNE(status, ConstantInt::get(i32, 0)),
              0xA4756E49F2D31219ULL, "morok.antidbg.status");
     foldState(B, State, stat4, 0xDA942042E4DD58B5ULL, "morok.antidbg.stat4");
+    if (Function *faultCf = linuxIntentionalFaultFlowProbe(M, State, rng, TT))
+        B.CreateCall(faultCf->getFunctionType(), faultCf,
+                     {ConstantInt::get(B.getInt64Ty(), rng.next())});
     emitLinuxLandlockSandbox(B, M, State, TT);
     emitLinuxSeccompTracerOracle(B, M, State, rng, TT);
     emitLinuxSeccompFilter(B, M, TT, AllowSelfTrace);
@@ -9802,6 +10169,9 @@ Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
                  0x3FEC9A6245A7DB13ULL, "morok.antidbg.probe.status");
         foldState(B, State, stat4, 0x84379D6FA21708C9ULL,
                   "morok.antidbg.probe.stat4");
+        if (Function *faultCf =
+                linuxIntentionalFaultFlowProbe(M, State, rng, TT))
+            B.CreateCall(faultCf->getFunctionType(), faultCf, {tag});
     } else if (TT.isOSDarwin()) {
         emitDarwinSysctlCheck(B, M, State, TT);
         emitDarwinCsopsCheck(B, M, State, TT);

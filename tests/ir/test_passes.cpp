@@ -17125,6 +17125,10 @@ entry:
     Function *Sigreturn = M->getFunction("morok.antidbg.seccomp.sigreturn");
     Function *ProbeWatch = M->getFunction("morok.antidbg.probe.watch");
     Function *HeartbeatWatch = M->getFunction("morok.watchdog.heartbeat.watch");
+    Function *FaultCf = M->getFunction("morok.antidbg.faultcf");
+    Function *FaultCfHandler =
+        M->getFunction("morok.antidbg.faultcf.handler");
+    Function *HotProbe = M->getFunction("morok.antidbg.probe");
     REQUIRE(Memfd != nullptr);
     CHECK(Watch != nullptr);
     CHECK(Sentinel != nullptr);
@@ -17133,13 +17137,18 @@ entry:
     CHECK(Sigreturn != nullptr);
     CHECK(ProbeWatch != nullptr);
     CHECK(HeartbeatWatch != nullptr);
+    CHECK(FaultCf != nullptr);
+    CHECK(FaultCfHandler != nullptr);
+    CHECK(HotProbe != nullptr);
     CHECK(Memfd->arg_size() == 3);
     CHECK(M->getFunction("morok.watchdog") != nullptr);
-    CHECK(M->getFunction("morok.antidbg.probe") != nullptr);
     Function *AntiDbg = M->getFunction("morok.antidbg");
     REQUIRE(AntiDbg != nullptr);
     CHECK(M->getGlobalVariable("morok.antidbg.seccomp.sigsys.slot", true) !=
           nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.faultcf.sentinel", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.faultcf.token", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.seal.root.tracer", true) != nullptr);
     CHECK(countUserCallsTo(*M, "morok.antidbg.probe") >= 1u);
     CHECK(M->getFunction("ptrace") == nullptr);
@@ -17151,6 +17160,7 @@ entry:
     CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.status")));
     CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.stat4")));
     CHECK(hasInlineAsmCall(*Watch));
+    CHECK(hasInlineAsmCall(*FaultCf));
     CHECK(countNamedInstructions(*Memfd, "morok.antidbg.memfd.readlink") >= 1u);
     CHECK(hasNamedIcmpWithConstant(*Memfd, "morok.antidbg.memfd.prefix.enough",
                                    7u));
@@ -17287,6 +17297,35 @@ entry:
               *AntiDbg, "morok.antidbg.seccomp.trace.anti_debug.next") >= 1u);
     CHECK(countNamedInstructions(
               *AntiDbg, "morok.antidbg.seccomp.trace.tracer.next") >= 1u);
+    CHECK(countNamedInstructions(*FaultCf,
+                                 "morok.antidbg.faultcf.sigaltstack") >= 1u);
+    CHECK(countNamedInstructions(*FaultCf,
+                                 "morok.antidbg.faultcf.rt_sigaction") >= 1u);
+    CHECK(countNamedInstructions(
+              *FaultCf, "morok.antidbg.faultcf.rt_sigaction.restore") >= 1u);
+    CHECK(countNamedInstructions(
+              *FaultCf, "morok.antidbg.faultcf.sigaltstack.restore") >= 1u);
+    CHECK(countNamedInstructions(*FaultCf,
+                                 "morok.antidbg.faultcf.sentinel.delta") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *FaultCf, "morok.antidbg.faultcf.sentinel.missing") >= 1u);
+    CHECK(countNamedInstructions(
+              *FaultCf, "morok.antidbg.faultcf.anti_debug.next") >= 1u);
+    CHECK(countNamedInstructions(*FaultCf,
+                                 "morok.antidbg.faultcf.tracer.next") >= 1u);
+    CHECK(countCallsTo(*AntiDbg, "morok.antidbg.faultcf") == 1u);
+    CHECK(countCallsTo(*HotProbe, "morok.antidbg.faultcf") == 1u);
+    CHECK(countNamedInstructions(
+              *FaultCfHandler, "morok.antidbg.faultcf.sig.match") >= 1u);
+    CHECK(countNamedInstructions(*FaultCfHandler,
+                                 "morok.antidbg.faultcf.pc.next") >= 1u);
+    CHECK(countNamedInstructions(
+              *FaultCfHandler, "morok.antidbg.faultcf.advance.pc") >= 1u);
+    CHECK(countNamedInstructions(
+              *FaultCfHandler, "morok.antidbg.faultcf.si.addr") >= 1u);
+    CHECK(countNamedInstructions(*HotProbe,
+                                 "morok.antidbg.probe.status") >= 1u);
     CHECK(functionHasConstantInt(*AntiDbg, 13u));       // rt_sigaction syscall
     CHECK(functionHasConstantInt(*AntiDbg, 31u));       // SIGSYS
     CHECK(functionHasConstantInt(*AntiDbg, 0x00030000)); // SECCOMP_RET_TRAP
@@ -17342,6 +17381,11 @@ define i32 @main() { ret i32 0 }
 
     Function *Ctor = M->getFunction("morok.antidbg");
     REQUIRE(Ctor != nullptr);
+    Function *FaultCf = M->getFunction("morok.antidbg.faultcf");
+    REQUIRE(FaultCf != nullptr);
+    Function *FaultCfHandler =
+        M->getFunction("morok.antidbg.faultcf.handler");
+    REQUIRE(FaultCfHandler != nullptr);
     CHECK(maxStaticAllocaArrayElements(*Ctor,
                                        "morok.antidbg.seccomp.filters") == 17u);
     CHECK(maxStaticAllocaArrayElements(
@@ -17353,11 +17397,22 @@ define i32 @main() { ret i32 0 }
               *Ctor, "morok.antidbg.seccomp.sigsys.anti_debug.next") >= 1u);
     CHECK(countNamedInstructions(
               *Ctor, "morok.antidbg.seccomp.sigsys.tracer.next") >= 1u);
+    CHECK(countNamedInstructions(*FaultCf,
+                                 "morok.antidbg.faultcf.sigaltstack") >= 1u);
+    CHECK(countNamedInstructions(*FaultCf,
+                                 "morok.antidbg.faultcf.rt_sigaction") >= 1u);
+    CHECK(countNamedInstructions(
+              *FaultCf, "morok.antidbg.faultcf.sentinel.delta") >= 1u);
+    CHECK(countNamedInstructions(
+              *FaultCf, "morok.antidbg.faultcf.anti_debug.next") >= 1u);
+    CHECK(countNamedInstructions(
+              *FaultCfHandler, "morok.antidbg.faultcf.pc.next") >= 1u);
     CHECK(M->getFunction("morok.antidbg.seccomp.sigsys") != nullptr);
     CHECK(M->getFunction("morok.antidbg.seccomp.sigreturn") == nullptr);
     CHECK(M->getGlobalVariable("morok.seal.root.tracer", true) != nullptr);
     CHECK(functionHasConstantInt(*Ctor, 134u));       // rt_sigaction syscall
     CHECK(functionHasConstantInt(*Ctor, 277u));       // seccomp syscall
+    CHECK(functionHasConstantInt(*FaultCf, 132u));    // sigaltstack syscall
     CHECK(functionHasConstantInt(*Ctor, 0xC00000B7)); // AUDIT_ARCH_AARCH64
     CHECK(functionHasConstantInt(*Ctor, 0x00030000)); // SECCOMP_RET_TRAP
     CHECK(functionHasConstantInt(*Ctor, 0x7ff00000)); // SECCOMP_RET_TRACE
