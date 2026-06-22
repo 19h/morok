@@ -17905,6 +17905,9 @@ define i32 @main() { ret i32 0 }
                                  "morok.win.pebheap.api.raw.diverged") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.nt.global.flag") >=
           1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.pebheap.nt.global.flag.hit") >=
+          1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.process.heap") >=
           1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.pebheap.heap.flags") >= 1u);
@@ -17934,6 +17937,11 @@ define i32 @main() { ret i32 0 }
     REQUIRE(ApiDiverged != nullptr);
     CHECK(valueFeedsNamedInstruction(ApiDiverged,
                                      "morok.seal.fold.anti_debug"));
+    Instruction *NtGlobalFlagHit =
+        findNamedInstruction(*Probe, "morok.win.pebheap.nt.global.flag.hit");
+    REQUIRE(NtGlobalFlagHit != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(NtGlobalFlagHit,
+                                           "morok.seal.fold.anti_debug"));
     Instruction *HeapCoherence = findNamedInstruction(
         *Probe, "morok.win.pebheap.nt.heap.coherence.mismatch");
     REQUIRE(HeapCoherence != nullptr);

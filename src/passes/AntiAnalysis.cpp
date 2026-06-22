@@ -15456,12 +15456,11 @@ Function *windowsPebHeapDebugProbe(Module &M, GlobalVariable *State,
     Value *ntDebugBits =
         PB.CreateAnd(ntGlobalFlag, ConstantInt::get(i32, 0x70),
                      "morok.win.pebheap.nt.global.flag.bits");
-    foldEnforcedFlag(PB, State,
-                     PB.CreateICmpNE(
-                         ntDebugBits, ConstantInt::get(i32, 0),
-                         "morok.win.pebheap.nt.global.flag.hit"),
-                     0xE43BC91F672A580DULL,
-                     "morok.win.pebheap.nt.global.flag");
+    foldFlag(PB, State,
+             PB.CreateICmpNE(ntDebugBits, ConstantInt::get(i32, 0),
+                             "morok.win.pebheap.nt.global.flag.hit"),
+             0xE43BC91F672A580DULL,
+             "morok.win.pebheap.nt.global.flag");
     PB.CreateCondBr(PB.CreateICmpNE(processHeap, ConstantInt::get(ip, 0),
                                     "morok.win.pebheap.heap.present"),
                     readHeapBB, retBB);
