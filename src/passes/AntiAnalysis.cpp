@@ -10640,12 +10640,17 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
     Value *mapLibPin = bufferHasLiteral(
         MB, M, maps.buf, maps.n, {0x6c, 0x69, 0x62, 0x70, 0x69, 0x6e}, 8192,
         "morok.antihook.dbi.maps.libpin");
-    // "hluda" — a Frida fork that renames the "frida"/"gum" artifacts to
-    // "hluda" specifically to evade the "frida" substring match above; its
-    // renamed agent/server still maps a uniquely-named module, absent on a
-    // clean run (zero-on-clean), so it is safe to enforce (#163).
+    // "hluda-" — a Frida fork that renames the "frida"/"gum" artifacts to
+    // "hluda" specifically to evade the "frida" substring match above. Anchored
+    // to the trailing '-' of its module convention (hluda-agent / hluda-gadget
+    // / hluda-server / libhluda-gum, mirroring frida-agent / frida-gadget) so
+    // the enforced match cannot false-positive on a benign path that merely
+    // contains the bare 5-byte token "hluda" — a free-floating substring is not
+    // zero-on-clean for the consumed seal (#236). The dash anchor is as
+    // boundary-safe as the existing "qemu-" literal while still catching every
+    // hluda artifact form.
     Value *mapHluda = bufferHasLiteral(
-        MB, M, maps.buf, maps.n, {0x68, 0x6c, 0x75, 0x64, 0x61}, 8192,
+        MB, M, maps.buf, maps.n, {0x68, 0x6c, 0x75, 0x64, 0x61, 0x2d}, 8192,
         "morok.antihook.dbi.maps.hluda");
     Value *mapSig = MB.CreateOr(
         MB.CreateOr(MB.CreateOr(mapSig0, mapSig1), mapSig2),

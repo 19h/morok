@@ -16700,6 +16700,19 @@ entry:
     // #163: the hluda Frida-fork signature must be scanned and OR-folded into
     // the enforced maps verdict alongside the other instrumentation tools.
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.maps.hluda") >= 1u);
+    // #236: the hluda literal must be anchored to "hluda-" (6 bytes incl. the
+    // trailing '-'), not the bare 5-byte "hluda" substring that false-positived
+    // on benign paths in the enforced seal. bufferHasLiteral emits a `.end` add
+    // of `idx + literal_length`, so the constant operand must be 6, not 5.
+    Instruction *HludaEnd =
+        findNamedInstruction(*Dbi, "morok.antihook.dbi.maps.hluda.end");
+    REQUIRE(HludaEnd != nullptr);
+    bool hludaAnchoredSixBytes = false;
+    for (Use &U : HludaEnd->operands())
+        if (auto *CI = dyn_cast<ConstantInt>(U.get()))
+            if (CI->getZExtValue() == 6u)
+                hludaAnchoredSixBytes = true;
+    CHECK(hludaAnchoredSixBytes);
     CHECK(countNamedInstructions(*Dbi,
                                  "morok.antihook.dbi.jit.maps.jitcache") >=
           1u);
