@@ -1131,6 +1131,54 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
                 passes::IndirParams p;
                 changed |= passes::indirectBranchFunction(F, p, rng);
             }
+
+            // Record that the per-function wave reached this function, so the
+            // guaranteed integrity wave below only revisits the functions the
+            // loop never got to (it breaks once the growing module exceeds the
+            // growth budget).
+            F.addFnAttr("morok.reached");
+        }
+    }
+
+    // Guaranteed integrity coverage.  The per-function loop above breaks once the
+    // growing module exceeds the growth budget, so a single ballooning function
+    // (e.g. a date routine that flattens to 100k+ instructions) can starve every
+    // function after it in module order of self-check / mutual-guard coverage —
+    // and which functions those are shifts per target, so the same source can
+    // ship sealed on one arch and unsealed (0 self-check manifests) on another.
+    // Re-run only the bounded integrity passes on the not-yet-reached eligible
+    // functions, gated on their own per-function budget and a dispatch-style
+    // module budget rather than the growth break, so every build carries at
+    // least the configured seal coverage.
+    if (InitialModuleGrowthOk && dispatchModuleOk(measureUserModule(M))) {
+        for (Function &F : M) {
+            if (F.isDeclaration() || F.getName().starts_with("morok.") ||
+                F.hasFnAttribute("morok.reached") || !integrityFunctionOk(F))
+                continue;
+            const config::PassConfig eff =
+                config::resolve(config_, moduleName, F.getName(), demangle);
+            if (ir::shouldObfuscate(F, "selfcheck",
+                                    eff.self_checksum.enabled.value_or(false))) {
+                passes::SelfChecksumParams p;
+                p.probability = eff.self_checksum.probability.value_or(35);
+                p.max_constants = eff.self_checksum.max_constants.value_or(8);
+                p.region_bytes = eff.self_checksum.region_bytes.value_or(32);
+                p.fail_closed_on_unsealed =
+                    eff.fail_closed_on_unsealed.value_or(false);
+                changed |= passes::selfChecksumConstantsFunction(F, p, rng);
+            }
+            if (ir::shouldObfuscate(F, "mutualguard",
+                                    eff.mutual_guard.enabled.value_or(false))) {
+                passes::MutualGuardGraphParams p;
+                p.probability = eff.mutual_guard.probability.value_or(35);
+                p.nodes = eff.mutual_guard.nodes.value_or(3);
+                p.region_bytes = eff.mutual_guard.region_bytes.value_or(32);
+                p.max_returns = eff.mutual_guard.max_returns.value_or(2);
+                p.fail_closed_on_unsealed =
+                    eff.fail_closed_on_unsealed.value_or(false);
+                changed |= passes::mutualGuardGraphFunction(F, p, rng);
+            }
+            F.addFnAttr("morok.reached");
         }
     }
 

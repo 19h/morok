@@ -27,6 +27,16 @@ CONFIG=""
 SEED="${SEED:-0}"
 OPT_LEVEL="${OPT_LEVEL:--O3}"
 
+# Extra flexibility for multi-file projects (e.g. crackmes/zorya).
+# EXTRA_SOURCES: additional source files compiled alongside SRC.
+# EXTRA_CFLAGS:  extra compiler flags (e.g. -no-pie -ffast-math).
+# LIBS:          extra link libraries (e.g. -lpthread).
+# C_STD:         override the C/C++ standard (default: c11 / c++23).
+EXTRA_SOURCES="${EXTRA_SOURCES:-}"
+EXTRA_CFLAGS="${EXTRA_CFLAGS:-}"
+LIBS="${LIBS:-}"
+C_STD=""
+
 # Post-link self-check sealing.  The self_checksum/DFI passes emit a runtime
 # native-code hash gated on a patchable window length that is only filled in
 # after the final layout is known.  Without this step the window length stays at
@@ -78,6 +88,12 @@ Options:
   --no-macos             Skip macOS
   --no-strip             Do not strip produced binaries
   --no-audit             Skip the final morok-audit release gate
+  --dynamic              Linux dynamic link (default: static)
+  --extra-cflags FLAGS   Extra compiler flags (e.g. "-no-pie -ffast-math")
+  --extra-sources PATHS  Extra source files compiled alongside the main source
+                         (space-separated, e.g. "tweetnacl.c")
+  --libs FLAGS           Extra link libraries (e.g. "-lpthread")
+  --c-std STD            Override C/C++ standard (e.g. c23, c17, c++20)
   -h, --help             Show this help
 
 Environment overrides mirror the option names in uppercase, for example:
@@ -85,6 +101,16 @@ Environment overrides mirror the option names in uppercase, for example:
   LINUX_TARGET=i686-linux-musl LINUX_CC=i686-linux-musl-gcc ./cross_build.sh
   AUDIT_TOOL=tools/morok-audit.py AUDIT_PROVENANCE=build/cross/audit.json ./cross_build.sh
   AUDIT_ALLOWLIST=release-audit-allow.json ./cross_build.sh
+
+Multi-file Linux-only project (e.g. crackmes/zorya):
+  ./cross_build.sh --linux-only --no-macos \
+    --source crackmes/zorya/zorya.c \
+    --extra-sources "crackmes/zorya/tweetnacl.c" \
+    --libs "-lpthread" \
+    --extra-cflags "-no-pie -ffast-math -Wno-implicit-function-declaration" \
+    --c-std c23 \
+    --config crackmes/zorya/morok-linux-static.toml \
+    --seed 1234
 USAGE
 }
 
@@ -150,6 +176,11 @@ while [ "$#" -gt 0 ]; do
     --no-macos) BUILD_MACOS=0; shift ;;
     --no-strip) STRIP_BINARIES=0; shift ;;
     --no-audit) AUDIT_BINARIES=0; shift ;;
+    --dynamic) LINUX_STATIC=0; shift ;;
+    --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
+    --extra-sources) EXTRA_SOURCES="$2"; shift 2 ;;
+    --libs) LIBS="$2"; shift 2 ;;
+    --c-std) C_STD="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     # Test hook: emit the derived static config and exit (see
     # tests/e2e/static_config_layering.sh).  Args: <src|""> <preset> <out>.
@@ -191,11 +222,20 @@ case "$SRC" in
     STD=(-std=c11)
     ;;
 esac
+if [ -n "$C_STD" ]; then
+  STD=(-std="$C_STD")
+fi
 need_tool "$COMPILER"
 
 mkdir -p "$OUT_DIR"
 BASE="$(basename "$SRC")"
 STEM="${BASE%.*}"
+
+# Resolve extra source files relative to ROOT
+EXTRA_SRC_ARRAY=()
+for f in $EXTRA_SOURCES; do
+  EXTRA_SRC_ARRAY+=("$(root_path "$f")")
+done
 
 MOROK_CONFIG=()
 if [ -n "$CONFIG" ]; then
@@ -206,15 +246,34 @@ else
   MOROK_CONFIG=(-mllvm "-morok-preset=$PRESET")
 fi
 
+# Extra compiler flags (e.g. -no-pie -ffast-math) parsed into an array
+EXTRA_CFLAG_ARRAY=()
+for f in $EXTRA_CFLAGS; do
+  EXTRA_CFLAG_ARRAY+=("$f")
+done
+
+# Extra link libraries parsed into an array
+LIB_ARRAY=()
+for l in $LIBS; do
+  LIB_ARRAY+=("$l")
+done
+
 # Obfuscation flags shared by every target, MINUS the preset/config selection
 # (which a target may need to override — see build_linux for static links).
+# Source files and link libs are kept separate so build_linux/build_macos can
+# place them correctly relative to --static and other target-specific flags.
 COMMON=(
   "$OPT_LEVEL" "${STD[@]}"
+  "${EXTRA_CFLAG_ARRAY[@]}"
   -fpass-plugin="$PLUGIN"
   -mllvm -morok
   -mllvm "-morok-seed=$SEED"
   "$SRC"
 )
+# Append extra sources after the main source
+COMMON+=("${EXTRA_SRC_ARRAY[@]}")
+# Append extra link libs at the very end
+COMMON+=("${LIB_ARRAY[@]}")
 
 OUTPUTS=()
 
@@ -233,6 +292,24 @@ strip_macos() {
   local out="$1"
   [ "$STRIP_BINARIES" -eq 1 ] || return 0
   xcrun strip -ur "$out"
+  # The misleading-metadata pass emits decoy DWARF.  On ELF, `llvm-strip -s`
+  # removes it (strip_linux); on Mach-O, `strip` leaves a __TEXT,__debug_* section
+  # in place, so the decoy build-path strings and the debug section itself survive
+  # into the artifact and trip the release audit (embedded-dev-path /
+  # debug-symbols).  Remove every __debug* section explicitly — `strip`/
+  # `--strip-debug` miss it because the section lives in __TEXT, not __DWARF.
+  local objcopy="${MACOS_OBJCOPY:-llvm-objcopy}"
+  if command -v "$objcopy" >/dev/null 2>&1; then
+    local secs
+    secs="$(xcrun otool -l "$out" 2>/dev/null | awk '
+      /segname/ { seg = $2 }
+      /sectname/ { if ($2 ~ /debug/) print "--remove-section " seg "," $2 }' \
+      | sort -u)"
+    if [ -n "$secs" ]; then
+      # shellcheck disable=SC2086
+      "$objcopy" $secs "$out" 2>/dev/null || true
+    fi
+  fi
 }
 
 # Post-link seal MUST run last (after strip), so the sealed code-window hash is
