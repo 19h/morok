@@ -18312,9 +18312,14 @@ define i32 @main() { ret i32 0 }
     Function *Probe = M->getFunction("morok.win.veh.probe");
     Function *Scan = M->getFunction("morok.win.veh.scan.list");
     Function *Audit = M->getFunction("morok.win.veh.audit.list");
+    Function *LdrAudit = M->getFunction("morok.win.ldr.audit.list");
+    Function *NameScan = M->getFunction("morok.win.ldr.name.scan");
+    Function *VadAudit = M->getFunction("morok.win.ldr.vad.audit");
     Function *Readable = M->getFunction("morok.win.veh.readable");
     Function *Executable = M->getFunction("morok.win.veh.executable");
     Function *Contains = M->getFunction("morok.win.ldr.contains");
+    Function *ContainsList = M->getFunction("morok.win.ldr.contains.list");
+    Function *ContainsAny = M->getFunction("morok.win.ldr.contains.any");
     Function *ImageSize = M->getFunction("morok.win.pe.image.size");
     Function *Peb = M->getFunction("morok.win.peb");
     Function *Resolve = M->getFunction("morok.win.pe.resolve");
@@ -18323,9 +18328,14 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Probe != nullptr);
     REQUIRE(Scan != nullptr);
     REQUIRE(Audit != nullptr);
+    REQUIRE(LdrAudit != nullptr);
+    REQUIRE(NameScan != nullptr);
+    REQUIRE(VadAudit != nullptr);
     REQUIRE(Readable != nullptr);
     REQUIRE(Executable != nullptr);
     REQUIRE(Contains != nullptr);
+    REQUIRE(ContainsList != nullptr);
+    REQUIRE(ContainsAny != nullptr);
     REQUIRE(ImageSize != nullptr);
     REQUIRE(Peb != nullptr);
     REQUIRE(Resolve != nullptr);
@@ -18333,7 +18343,7 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.seal.root.anti_debug", true) !=
           nullptr);
-    checkNoSealEnforcement(*Probe);
+    checkSealEnforcement(*M, *Probe);
     CHECK(M->getFunction("RtlAddVectoredExceptionHandler") == nullptr);
     CHECK(M->getFunction("RtlRemoveVectoredExceptionHandler") == nullptr);
     CHECK(M->getFunction("RtlDecodePointer") == nullptr);
@@ -18346,6 +18356,15 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Probe, "morok.win.veh.list.from.add") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.veh.audit.primary") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.veh.audit.shifted") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.ldr.audit.load") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.ldr.audit.memory") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.ldr.audit.init") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.ldr.audit.bad.total") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.ldr.audit.bad.any") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.ldr.vad.audit.result") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.ldr.vad.bad.total") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.ldr.vad.bad.any") >= 1u);
     CHECK(countNamedInstructions(*Scan, "morok.win.veh.scan.riprel") >= 1u);
     CHECK(countNamedInstructions(*Scan, "morok.win.veh.scan.candidate.ok") >=
           1u);
@@ -18376,11 +18395,69 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.bad.next") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.veh.bad.any") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.veh.foreign") >= 1u);
+    Instruction *VehBad = findNamedInstruction(*Probe, "morok.win.veh.bad.any");
+    REQUIRE(VehBad != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(VehBad,
+                                           "morok.seal.fold.anti_debug"));
+    Instruction *LdrBad =
+        findNamedInstruction(*Probe, "morok.win.ldr.audit.bad.any");
+    REQUIRE(LdrBad != nullptr);
+    CHECK(valueFeedsNamedInstruction(LdrBad, "morok.seal.fold.anti_debug"));
+    Instruction *VadBad =
+        findNamedInstruction(*Probe, "morok.win.ldr.vad.bad.any");
+    REQUIRE(VadBad != nullptr);
+    CHECK(valueFeedsNamedInstruction(VadBad, "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.remove.status") == 0u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.remove.ready") == 0u);
     CHECK(countNamedInstructions(*Contains, "morok.win.ldr.contains.match") >=
           1u);
     CHECK(functionHasConstantInt(*Contains, 256));
+    CHECK(countNamedInstructions(*ContainsList,
+                                 "morok.win.ldr.contains.list.match") >= 1u);
+    CHECK(countNamedInstructions(*ContainsAny,
+                                 "morok.win.ldr.contains.any.load") >= 1u);
+    CHECK(countNamedInstructions(*ContainsAny,
+                                 "morok.win.ldr.contains.any.memory") >= 1u);
+    CHECK(countNamedInstructions(*ContainsAny,
+                                 "morok.win.ldr.contains.any.init") >= 1u);
+    CHECK(countNamedInstructions(*LdrAudit, "morok.win.ldr.audit.link.ok") >=
+          1u);
+    CHECK(countNamedInstructions(*LdrAudit,
+                                 "morok.win.ldr.audit.ntqueryvm.status") >= 1u);
+    CHECK(countNamedInstructions(*LdrAudit, "morok.win.ldr.audit.mbi.image") >=
+          1u);
+    CHECK(countNamedInstructions(*LdrAudit,
+                                 "morok.win.ldr.audit.vad.missing") >= 1u);
+    CHECK(countNamedInstructions(*LdrAudit,
+                                 "morok.win.ldr.audit.union.missing") >= 1u);
+    CHECK(countNamedInstructions(*LdrAudit, "morok.win.ldr.audit.name.hit") >=
+          1u);
+    CHECK(countNamedInstructions(*LdrAudit, "morok.win.ldr.audit.bad.name") >=
+          1u);
+    CHECK(countNamedInstructions(*NameScan, "morok.win.ldr.name.qbdi") >= 1u);
+    CHECK(countNamedInstructions(*NameScan, "morok.win.ldr.name.frida") >= 1u);
+    CHECK(countNamedInstructions(*NameScan, "morok.win.ldr.name.pinvm") >= 1u);
+    CHECK(countNamedInstructions(*NameScan, "morok.win.ldr.name.dynamo") >= 1u);
+    CHECK(countNamedInstructions(*NameScan, "morok.win.ldr.name.pinexe") >= 1u);
+    CHECK(countNamedInstructions(*NameScan, "morok.win.ldr.name.pindll") >= 1u);
+    CHECK(functionHasConstantInt(*NameScan, 260));
+    CHECK(countNamedInstructions(*VadAudit,
+                                 "morok.win.ldr.vad.ntqueryvm.status") >= 1u);
+    CHECK(countNamedInstructions(*VadAudit, "morok.win.ldr.vad.mbi.image") >=
+          1u);
+    CHECK(countNamedInstructions(*VadAudit, "morok.win.ldr.vad.contains") >= 1u);
+    CHECK(countNamedInstructions(*VadAudit,
+                                 "morok.win.ldr.vad.image.phantom") >= 1u);
+    CHECK(countNamedInstructions(*VadAudit,
+                                 "morok.win.ldr.vad.private.exec") >= 1u);
+    CHECK(countNamedInstructions(*VadAudit, "morok.win.ldr.vad.image.next") >=
+          1u);
+    CHECK(countNamedInstructions(*VadAudit, "morok.win.ldr.vad.private.next") >=
+          1u);
+    CHECK_FALSE(hasReadableByteString(*M, "frida"));
+    CHECK_FALSE(hasReadableByteString(*M, "dynamorio"));
+    CHECK_FALSE(hasReadableByteString(*M, "qbdi"));
+    CHECK_FALSE(hasReadableByteString(*M, "pin.exe"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

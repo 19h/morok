@@ -13460,6 +13460,176 @@ Function *windowsAddressInLdrModule(Module &M) {
     return fn;
 }
 
+Function *windowsAddressInLdrList(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.ldr.contains.list"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(
+        FunctionType::get(i32, {ip, ip, i32, i32}, false),
+        GlobalValue::PrivateLinkage, "morok.win.ldr.contains.list", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *peb = fn->getArg(0);
+    peb->setName("peb");
+    Argument *address = fn->getArg(1);
+    address->setName("address");
+    Argument *headOffArg = fn->getArg(2);
+    headOffArg->setName("head_off");
+    Argument *linkOffArg = fn->getArg(3);
+    linkOffArg->setName("link_off");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *readBB = BasicBlock::Create(ctx, "read", fn);
+    auto *headBB = BasicBlock::Create(ctx, "head", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
+    auto *matchBB = BasicBlock::Create(ctx, "match", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
+
+    IRBuilder<> B(entry);
+    Value *argsReady = B.CreateAnd(
+        B.CreateICmpNE(peb, ConstantInt::get(ip, 0)),
+        B.CreateICmpNE(address, ConstantInt::get(ip, 0)),
+        "morok.win.ldr.contains.list.args");
+    B.CreateCondBr(argsReady, readBB, ret0BB);
+
+    IRBuilder<> RB(readBB);
+    Value *pebPtr =
+        RB.CreateIntToPtr(peb, ptr, "morok.win.ldr.contains.list.peb.ptr");
+    Value *ldr =
+        loadAt(RB, M, ip, pebPtr, 0x18, "morok.win.ldr.contains.list.ldr");
+    RB.CreateCondBr(RB.CreateICmpNE(ldr, ConstantInt::get(ip, 0),
+                                    "morok.win.ldr.contains.list.ldr.ready"),
+                    headBB, ret0BB);
+
+    IRBuilder<> HB(headBB);
+    Value *head = HB.CreateAdd(
+        ldr, HB.CreateZExt(headOffArg, ip,
+                           "morok.win.ldr.contains.list.head.off.ip"),
+        "morok.win.ldr.contains.list.head");
+    Value *headPtr =
+        HB.CreateIntToPtr(head, ptr, "morok.win.ldr.contains.list.head.ptr");
+    Value *first =
+        loadAt(HB, M, ip, headPtr, 0ULL, "morok.win.ldr.contains.list.first");
+    Value *ready = HB.CreateAnd(
+        HB.CreateICmpNE(first, ConstantInt::get(ip, 0)),
+        HB.CreateICmpNE(first, head),
+        "morok.win.ldr.contains.list.ready");
+    HB.CreateCondBr(ready, loopBB, ret0BB);
+
+    IRBuilder<> LB(loopBB);
+    auto *cursor = LB.CreatePHI(ip, 2, "morok.win.ldr.contains.list.cursor");
+    auto *idx = LB.CreatePHI(i32, 2, "morok.win.ldr.contains.list.idx");
+    cursor->addIncoming(first, headBB);
+    idx->addIncoming(ConstantInt::get(i32, 0), headBB);
+    Value *keepWalking = LB.CreateAnd(
+        LB.CreateAnd(LB.CreateICmpULT(idx, ConstantInt::get(i32, 256),
+                                      "morok.win.ldr.contains.list.limit"),
+                     LB.CreateICmpNE(cursor, ConstantInt::get(ip, 0)),
+                     "morok.win.ldr.contains.list.cursor.present"),
+        LB.CreateICmpNE(cursor, head, "morok.win.ldr.contains.list.not.head"),
+        "morok.win.ldr.contains.list.keep.walking");
+    LB.CreateCondBr(keepWalking, bodyBB, ret0BB);
+
+    IRBuilder<> BB(bodyBB);
+    Value *entryBase =
+        BB.CreateSub(cursor, BB.CreateZExt(linkOffArg, ip),
+                     "morok.win.ldr.contains.list.entry.base");
+    Value *entryPtr =
+        BB.CreateIntToPtr(entryBase, ptr,
+                          "morok.win.ldr.contains.list.entry.ptr");
+    Value *dllBase = loadAt(BB, M, ip, entryPtr, 0x30,
+                            "morok.win.ldr.contains.list.dll.base");
+    Value *imageSize32 =
+        loadAt(BB, M, i32, entryPtr, 0x40,
+               "morok.win.ldr.contains.list.image.size");
+    Value *imageSize =
+        BB.CreateZExt(imageSize32, ip,
+                      "morok.win.ldr.contains.list.image.size.ip");
+    Value *imageEnd =
+        BB.CreateAdd(dllBase, imageSize,
+                     "morok.win.ldr.contains.list.image.end");
+    Value *inside = BB.CreateAnd(
+        BB.CreateAnd(BB.CreateICmpNE(dllBase, ConstantInt::get(ip, 0)),
+                     BB.CreateICmpNE(imageSize, ConstantInt::get(ip, 0)),
+                     "morok.win.ldr.contains.list.image.valid"),
+        BB.CreateAnd(BB.CreateICmpUGE(address, dllBase),
+                     BB.CreateICmpULT(address, imageEnd),
+                     "morok.win.ldr.contains.list.range"),
+        "morok.win.ldr.contains.list.match");
+    BB.CreateCondBr(inside, matchBB, nextBB);
+
+    IRBuilder<> MB(matchBB);
+    MB.CreateRet(ConstantInt::get(i32, 1));
+
+    IRBuilder<> NB(nextBB);
+    Value *cursorPtr =
+        NB.CreateIntToPtr(cursor, ptr,
+                          "morok.win.ldr.contains.list.cursor.ptr");
+    Value *nextCursor =
+        loadAt(NB, M, ip, cursorPtr, 0ULL,
+               "morok.win.ldr.contains.list.next.cursor");
+    Value *nextIdx =
+        NB.CreateAdd(idx, ConstantInt::get(i32, 1),
+                     "morok.win.ldr.contains.list.next.idx");
+    NB.CreateBr(loopBB);
+    cursor->addIncoming(nextCursor, nextBB);
+    idx->addIncoming(nextIdx, nextBB);
+
+    IRBuilder<> RetB(ret0BB);
+    RetB.CreateRet(ConstantInt::get(i32, 0));
+    return fn;
+}
+
+Function *windowsAddressInAnyLdrModule(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.ldr.contains.any"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *fn = Function::Create(FunctionType::get(i32, {ip, ip}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.ldr.contains.any", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *peb = fn->getArg(0);
+    peb->setName("peb");
+    Argument *address = fn->getArg(1);
+    address->setName("address");
+
+    Function *containsList = windowsAddressInLdrList(M);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    auto *containsTy = containsList->getFunctionType();
+    Value *loadHit = B.CreateCall(
+        containsTy, containsList,
+        {peb, address, ConstantInt::get(i32, 0x10), ConstantInt::get(i32, 0)},
+        "morok.win.ldr.contains.any.load");
+    Value *memoryHit = B.CreateCall(
+        containsTy, containsList,
+        {peb, address, ConstantInt::get(i32, 0x20), ConstantInt::get(i32, 0x10)},
+        "morok.win.ldr.contains.any.memory");
+    Value *initHit = B.CreateCall(
+        containsTy, containsList,
+        {peb, address, ConstantInt::get(i32, 0x30), ConstantInt::get(i32, 0x20)},
+        "morok.win.ldr.contains.any.init");
+    Value *any = B.CreateOr(
+        B.CreateOr(B.CreateICmpNE(loadHit, ConstantInt::get(i32, 0)),
+                   B.CreateICmpNE(memoryHit, ConstantInt::get(i32, 0)),
+                   "morok.win.ldr.contains.any.load.memory"),
+        B.CreateICmpNE(initHit, ConstantInt::get(i32, 0)),
+        "morok.win.ldr.contains.any.result");
+    B.CreateRet(B.CreateZExt(any, i32));
+    return fn;
+}
+
 Function *windowsReadableAddressHelper(Module &M) {
     if (Function *existing = M.getFunction("morok.win.veh.readable"))
         return existing;
@@ -13888,6 +14058,494 @@ Function *windowsVehAuditListHelper(Module &M) {
         DB.CreateZExt(seenFinal, i64),
         DB.CreateShl(DB.CreateZExt(badFinal, i64), ConstantInt::get(i64, 32)),
         "morok.win.veh.audit.result"));
+    return fn;
+}
+
+Function *windowsSuspiciousWideModuleName(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.ldr.name.scan"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i32, {ip, i16}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.ldr.name.scan", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *name = fn->getArg(0);
+    name->setName("name");
+    Argument *bytes = fn->getArg(1);
+    bytes->setName("bytes");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    Value *chars = B.CreateLShr(B.CreateZExt(bytes, i32),
+                                ConstantInt::get(i32, 1),
+                                "morok.win.ldr.name.chars");
+    Value *limit = B.CreateSelect(
+        B.CreateICmpULT(chars, ConstantInt::get(i32, 260)),
+        chars, ConstantInt::get(i32, 260), "morok.win.ldr.name.limit");
+    B.CreateCondBr(B.CreateAnd(B.CreateICmpNE(name, ConstantInt::get(ip, 0)),
+                               B.CreateICmpNE(limit, ConstantInt::get(i32, 0)),
+                               "morok.win.ldr.name.ready"),
+                   loopBB, retBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *idx = LB.CreatePHI(i32, 2, "morok.win.ldr.name.idx");
+    auto *win = LB.CreatePHI(i64, 2, "morok.win.ldr.name.window");
+    auto *hit = LB.CreatePHI(i32, 2, "morok.win.ldr.name.hit");
+    idx->addIncoming(ConstantInt::get(i32, 0), entry);
+    win->addIncoming(ConstantInt::get(i64, 0), entry);
+    hit->addIncoming(ConstantInt::get(i32, 0), entry);
+    LB.CreateCondBr(LB.CreateICmpULT(idx, limit,
+                                     "morok.win.ldr.name.idx.in.range"),
+                    bodyBB, retBB);
+
+    IRBuilder<> BB(bodyBB);
+    Value *idxIp = BB.CreateZExt(idx, ip, "morok.win.ldr.name.idx.ip");
+    Value *wide = loadAt(BB, M, i16, BB.CreateIntToPtr(name, ptr),
+                         BB.CreateMul(idxIp, ConstantInt::get(ip, 2),
+                                      "morok.win.ldr.name.byte.off"),
+                         "morok.win.ldr.name.wchar");
+    Value *low =
+        BB.CreateAnd(BB.CreateZExt(wide, i32), ConstantInt::get(i32, 0xff),
+                     "morok.win.ldr.name.low");
+    Value *isUpper = BB.CreateAnd(
+        BB.CreateICmpUGE(low, ConstantInt::get(i32, 'A')),
+        BB.CreateICmpULE(low, ConstantInt::get(i32, 'Z')),
+        "morok.win.ldr.name.upper");
+    Value *lower = BB.CreateSelect(
+        isUpper, BB.CreateAdd(low, ConstantInt::get(i32, 'a' - 'A')), low,
+        "morok.win.ldr.name.lower");
+    Value *nextWin = BB.CreateOr(
+        BB.CreateShl(win, ConstantInt::get(i64, 8),
+                     "morok.win.ldr.name.window.shift"),
+        BB.CreateZExt(lower, i64), "morok.win.ldr.name.window.next");
+    Value *win4 = BB.CreateAnd(nextWin, ConstantInt::get(i64, 0xffffffffULL),
+                               "morok.win.ldr.name.win4");
+    Value *win5 = BB.CreateAnd(nextWin, ConstantInt::get(i64, 0xffffffffffULL),
+                               "morok.win.ldr.name.win5");
+    Value *win6 =
+        BB.CreateAnd(nextWin, ConstantInt::get(i64, 0xffffffffffffULL),
+                     "morok.win.ldr.name.win6");
+    Value *win7 =
+        BB.CreateAnd(nextWin, ConstantInt::get(i64, 0xffffffffffffffULL),
+                     "morok.win.ldr.name.win7");
+    Value *hitQbdi =
+        BB.CreateICmpEQ(win4, ConstantInt::get(i64, 0x71626469ULL),
+                        "morok.win.ldr.name.qbdi");
+    Value *hitFrida =
+        BB.CreateICmpEQ(win5, ConstantInt::get(i64, 0x6672696461ULL),
+                        "morok.win.ldr.name.frida");
+    Value *hitPinVm =
+        BB.CreateICmpEQ(win5, ConstantInt::get(i64, 0x70696e766dULL),
+                        "morok.win.ldr.name.pinvm");
+    Value *hitDynamo =
+        BB.CreateICmpEQ(win6, ConstantInt::get(i64, 0x64796e616d6fULL),
+                        "morok.win.ldr.name.dynamo");
+    Value *hitPinExe =
+        BB.CreateICmpEQ(win7, ConstantInt::get(i64, 0x70696e2e657865ULL),
+                        "morok.win.ldr.name.pinexe");
+    Value *hitPinDll =
+        BB.CreateICmpEQ(win7, ConstantInt::get(i64, 0x70696e2e646c6cULL),
+                        "morok.win.ldr.name.pindll");
+    Value *any = BB.CreateOr(
+        BB.CreateOr(hitQbdi, hitFrida, "morok.win.ldr.name.qbdi.frida"),
+        BB.CreateOr(BB.CreateOr(hitPinVm, hitDynamo,
+                                "morok.win.ldr.name.pinvm.dynamo"),
+                    BB.CreateOr(hitPinExe, hitPinDll,
+                                "morok.win.ldr.name.pin.file"),
+                    "morok.win.ldr.name.pin.any"),
+        "morok.win.ldr.name.suspicious");
+    BB.CreateBr(nextBB);
+
+    IRBuilder<> NB(nextBB);
+    Value *nextIdx =
+        NB.CreateAdd(idx, ConstantInt::get(i32, 1),
+                     "morok.win.ldr.name.next");
+    Value *nextHit =
+        NB.CreateOr(hit, NB.CreateZExt(any, i32),
+                    "morok.win.ldr.name.hit.next");
+    NB.CreateBr(loopBB);
+    idx->addIncoming(nextIdx, nextBB);
+    win->addIncoming(nextWin, nextBB);
+    hit->addIncoming(nextHit, nextBB);
+
+    IRBuilder<> RB(retBB);
+    auto *result = RB.CreatePHI(i32, 2, "morok.win.ldr.name.result");
+    result->addIncoming(ConstantInt::get(i32, 0), entry);
+    result->addIncoming(hit, loopBB);
+    RB.CreateRet(result);
+    return fn;
+}
+
+Function *windowsLdrSingleListAuditHelper(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.ldr.audit.list"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(
+        FunctionType::get(i64, {ip, i32, i32, ip}, false),
+        GlobalValue::PrivateLinkage, "morok.win.ldr.audit.list", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *peb = fn->getArg(0);
+    peb->setName("peb");
+    Argument *headOffArg = fn->getArg(1);
+    headOffArg->setName("head_off");
+    Argument *linkOffArg = fn->getArg(2);
+    linkOffArg->setName("link_off");
+    Argument *queryVm = fn->getArg(3);
+    queryVm->setName("query_vm");
+
+    Function *contains = windowsAddressInLdrModule(M);
+    Function *nameScan = windowsSuspiciousWideModuleName(M);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *readBB = BasicBlock::Create(ctx, "read", fn);
+    auto *startBB = BasicBlock::Create(ctx, "start", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
+    auto *linkBadBB = BasicBlock::Create(ctx, "link.bad", fn);
+    auto *evalBB = BasicBlock::Create(ctx, "eval", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "done", fn);
+
+    IRBuilder<> B(entry);
+    auto *mbiTy = ArrayType::get(i8, 48);
+    AllocaInst *mbi = B.CreateAlloca(mbiTy, nullptr,
+                                     "morok.win.ldr.audit.mbi");
+    AllocaInst *retLen = B.CreateAlloca(ip, nullptr,
+                                        "morok.win.ldr.audit.retlen");
+    AllocaInst *seen = B.CreateAlloca(i32, nullptr,
+                                      "morok.win.ldr.audit.seen");
+    AllocaInst *bad = B.CreateAlloca(i32, nullptr, "morok.win.ldr.audit.bad");
+    B.CreateStore(ConstantInt::get(ip, 0), retLen)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), seen)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), bad)->setVolatile(true);
+    Value *argsReady = B.CreateAnd(
+        B.CreateICmpNE(peb, ConstantInt::get(ip, 0)),
+        B.CreateICmpNE(queryVm, ConstantInt::get(ip, 0)),
+        "morok.win.ldr.audit.args.ready");
+    B.CreateCondBr(argsReady, readBB, doneBB);
+
+    IRBuilder<> PB(readBB);
+    Value *pebPtr = PB.CreateIntToPtr(peb, ptr, "morok.win.ldr.audit.peb.ptr");
+    Value *ldr = loadAt(PB, M, ip, pebPtr, 0x18, "morok.win.ldr.audit.ldr");
+    Value *headOff =
+        PB.CreateZExt(headOffArg, ip, "morok.win.ldr.audit.head.off.ip");
+    Value *head = PB.CreateAdd(ldr, headOff, "morok.win.ldr.audit.head");
+    Value *ready = PB.CreateAnd(
+        PB.CreateICmpNE(ldr, ConstantInt::get(ip, 0)),
+        PB.CreateICmpNE(head, ConstantInt::get(ip, 0)),
+        "morok.win.ldr.audit.ready");
+    PB.CreateCondBr(ready, startBB, doneBB);
+
+    IRBuilder<> SB(startBB);
+    Value *first =
+        loadAt(SB, M, ip, SB.CreateIntToPtr(head, ptr),
+               0ULL, "morok.win.ldr.audit.first");
+    SB.CreateBr(loopBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *cursor = LB.CreatePHI(ip, 2, "morok.win.ldr.audit.cursor");
+    auto *prev = LB.CreatePHI(ip, 2, "morok.win.ldr.audit.prev");
+    auto *idx = LB.CreatePHI(i32, 2, "morok.win.ldr.audit.idx");
+    cursor->addIncoming(first, startBB);
+    prev->addIncoming(head, startBB);
+    idx->addIncoming(ConstantInt::get(i32, 0), startBB);
+    Value *keepWalking = LB.CreateAnd(
+        LB.CreateAnd(LB.CreateICmpULT(idx, ConstantInt::get(i32, 128),
+                                      "morok.win.ldr.audit.limit"),
+                     LB.CreateICmpNE(cursor, ConstantInt::get(ip, 0)),
+                     "morok.win.ldr.audit.cursor.present"),
+        LB.CreateICmpNE(cursor, head, "morok.win.ldr.audit.not.head"),
+        "morok.win.ldr.audit.keep.walking");
+    LB.CreateCondBr(keepWalking, bodyBB, doneBB);
+
+    IRBuilder<> BB(bodyBB);
+    Value *cursorPtr =
+        BB.CreateIntToPtr(cursor, ptr, "morok.win.ldr.audit.cursor.ptr");
+    Value *next =
+        loadAt(BB, M, ip, cursorPtr, 0ULL, "morok.win.ldr.audit.next");
+    Value *back =
+        loadAt(BB, M, ip, cursorPtr, 8, "morok.win.ldr.audit.back");
+    BB.CreateCondBr(BB.CreateICmpEQ(back, prev,
+                                    "morok.win.ldr.audit.link.ok"),
+                    evalBB, linkBadBB);
+
+    IRBuilder<> LBB(linkBadBB);
+    Value *oldBadLink =
+        LBB.CreateLoad(i32, bad, "morok.win.ldr.audit.link.bad.old");
+    cast<LoadInst>(oldBadLink)->setVolatile(true);
+    LBB.CreateStore(LBB.CreateAdd(oldBadLink, ConstantInt::get(i32, 1),
+                                  "morok.win.ldr.audit.link.bad.next"),
+                    bad)
+        ->setVolatile(true);
+    LBB.CreateBr(doneBB);
+
+    IRBuilder<> EB(evalBB);
+    Value *oldSeen =
+        EB.CreateLoad(i32, seen, "morok.win.ldr.audit.seen.old");
+    cast<LoadInst>(oldSeen)->setVolatile(true);
+    EB.CreateStore(EB.CreateAdd(oldSeen, ConstantInt::get(i32, 1),
+                                "morok.win.ldr.audit.seen.next"),
+                   seen)
+        ->setVolatile(true);
+    Value *entryBase =
+        EB.CreateSub(cursor, EB.CreateZExt(linkOffArg, ip),
+                     "morok.win.ldr.audit.entry.base");
+    Value *entryPtr =
+        EB.CreateIntToPtr(entryBase, ptr, "morok.win.ldr.audit.entry.ptr");
+    Value *dllBase =
+        loadAt(EB, M, ip, entryPtr, 0x30, "morok.win.ldr.audit.dll.base");
+    Value *fullBytes =
+        loadAt(EB, M, Type::getInt16Ty(ctx), entryPtr, 0x48,
+               "morok.win.ldr.audit.full.bytes");
+    Value *fullBuffer =
+        loadAt(EB, M, ip, entryPtr, 0x50,
+               "morok.win.ldr.audit.full.buffer");
+    auto *queryTy = FunctionType::get(i32, {ptr, ptr, i32, ptr, ip, ptr}, false);
+    Value *status = EB.CreateCall(
+        queryTy,
+        EB.CreateIntToPtr(queryVm, ptr, "morok.win.ldr.audit.ntqueryvm.ptr"),
+        {EB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr),
+         EB.CreateIntToPtr(dllBase, ptr, "morok.win.ldr.audit.query.base"),
+         ConstantInt::get(i32, 0), mbi, ConstantInt::get(ip, 48), retLen},
+        "morok.win.ldr.audit.ntqueryvm.status");
+    Value *state = loadAt(EB, M, i32, mbi, 32,
+                          "morok.win.ldr.audit.mbi.state");
+    Value *type =
+        loadAt(EB, M, i32, mbi, 40, "morok.win.ldr.audit.mbi.type");
+    Value *queryOk =
+        EB.CreateICmpSGE(status, ConstantInt::get(i32, 0),
+                         "morok.win.ldr.audit.ntqueryvm.ok");
+    Value *committed =
+        EB.CreateICmpEQ(state, ConstantInt::get(i32, 0x1000),
+                        "morok.win.ldr.audit.mbi.committed");
+    Value *image =
+        EB.CreateICmpEQ(type, ConstantInt::get(i32, 0x1000000),
+                        "morok.win.ldr.audit.mbi.image");
+    Value *imageOk =
+        EB.CreateAnd(EB.CreateAnd(queryOk, committed,
+                                  "morok.win.ldr.audit.vad.committed"),
+                     image, "morok.win.ldr.audit.vad.image");
+    Value *containsBase = EB.CreateCall(contains, {peb, dllBase},
+                                        "morok.win.ldr.audit.contains");
+    Value *nameHit = EB.CreateCall(nameScan, {fullBuffer, fullBytes},
+                                   "morok.win.ldr.audit.name.hit");
+    Value *hasBase =
+        EB.CreateICmpNE(dllBase, ConstantInt::get(ip, 0),
+                        "morok.win.ldr.audit.dll.present");
+    Value *badVad =
+        EB.CreateAnd(hasBase, EB.CreateNot(imageOk),
+                     "morok.win.ldr.audit.vad.missing");
+    Value *badUnion =
+        EB.CreateAnd(hasBase,
+                     EB.CreateICmpEQ(containsBase, ConstantInt::get(i32, 0)),
+                     "morok.win.ldr.audit.union.missing");
+    Value *badName =
+        EB.CreateICmpNE(nameHit, ConstantInt::get(i32, 0),
+                        "morok.win.ldr.audit.bad.name");
+    Value *badAny = EB.CreateOr(EB.CreateOr(badVad, badUnion,
+                                            "morok.win.ldr.audit.bad.mapping"),
+                                badName, "morok.win.ldr.audit.bad.any");
+    Value *oldBad = EB.CreateLoad(i32, bad, "morok.win.ldr.audit.bad.old");
+    cast<LoadInst>(oldBad)->setVolatile(true);
+    EB.CreateStore(EB.CreateAdd(oldBad, EB.CreateZExt(badAny, i32),
+                                "morok.win.ldr.audit.bad.next"),
+                   bad)
+        ->setVolatile(true);
+    EB.CreateBr(nextBB);
+
+    IRBuilder<> NB(nextBB);
+    Value *nextIdx =
+        NB.CreateAdd(idx, ConstantInt::get(i32, 1),
+                     "morok.win.ldr.audit.next.idx");
+    NB.CreateBr(loopBB);
+    cursor->addIncoming(next, nextBB);
+    prev->addIncoming(cursor, nextBB);
+    idx->addIncoming(nextIdx, nextBB);
+
+    IRBuilder<> DB(doneBB);
+    Value *seenFinal =
+        DB.CreateLoad(i32, seen, "morok.win.ldr.audit.seen.final");
+    cast<LoadInst>(seenFinal)->setVolatile(true);
+    Value *badFinal = DB.CreateLoad(i32, bad, "morok.win.ldr.audit.bad.final");
+    cast<LoadInst>(badFinal)->setVolatile(true);
+    DB.CreateRet(DB.CreateOr(
+        DB.CreateZExt(seenFinal, i64),
+        DB.CreateShl(DB.CreateZExt(badFinal, i64), ConstantInt::get(i64, 32)),
+        "morok.win.ldr.audit.result"));
+    return fn;
+}
+
+Function *windowsLdrVadCensusHelper(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.ldr.vad.audit"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, {ip, ip}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.ldr.vad.audit", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *peb = fn->getArg(0);
+    peb->setName("peb");
+    Argument *queryVm = fn->getArg(1);
+    queryVm->setName("query_vm");
+
+    Function *containsAny = windowsAddressInAnyLdrModule(M);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *queryBB = BasicBlock::Create(ctx, "query", fn);
+    auto *evalBB = BasicBlock::Create(ctx, "eval", fn);
+    auto *imageBB = BasicBlock::Create(ctx, "image", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "done", fn);
+
+    IRBuilder<> B(entry);
+    auto *mbiTy = ArrayType::get(i8, 48);
+    AllocaInst *mbi = B.CreateAlloca(mbiTy, nullptr,
+                                     "morok.win.ldr.vad.mbi");
+    AllocaInst *retLen =
+        B.CreateAlloca(ip, nullptr, "morok.win.ldr.vad.retlen");
+    AllocaInst *imageBad =
+        B.CreateAlloca(i32, nullptr, "morok.win.ldr.vad.image.bad");
+    AllocaInst *privateBad =
+        B.CreateAlloca(i32, nullptr, "morok.win.ldr.vad.private.bad");
+    B.CreateStore(ConstantInt::get(ip, 0), retLen)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), imageBad)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), privateBad)->setVolatile(true);
+    Value *argsReady = B.CreateAnd(
+        B.CreateICmpNE(peb, ConstantInt::get(ip, 0)),
+        B.CreateICmpNE(queryVm, ConstantInt::get(ip, 0)),
+        "morok.win.ldr.vad.ready");
+    B.CreateCondBr(argsReady, loopBB, doneBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *idx = LB.CreatePHI(i32, 2, "morok.win.ldr.vad.idx");
+    auto *addr = LB.CreatePHI(ip, 2, "morok.win.ldr.vad.addr");
+    idx->addIncoming(ConstantInt::get(i32, 0), entry);
+    addr->addIncoming(ConstantInt::get(ip, 0), entry);
+    LB.CreateCondBr(LB.CreateICmpULT(idx, ConstantInt::get(i32, 512),
+                                     "morok.win.ldr.vad.limit"),
+                    queryBB, doneBB);
+
+    IRBuilder<> QB(queryBB);
+    auto *queryTy = FunctionType::get(i32, {ptr, ptr, i32, ptr, ip, ptr}, false);
+    Value *status = QB.CreateCall(
+        queryTy,
+        QB.CreateIntToPtr(queryVm, ptr, "morok.win.ldr.vad.ntqueryvm.ptr"),
+        {QB.CreateIntToPtr(ConstantInt::getSigned(ip, -1), ptr),
+         QB.CreateIntToPtr(addr, ptr, "morok.win.ldr.vad.query.addr"),
+         ConstantInt::get(i32, 0), mbi, ConstantInt::get(ip, 48), retLen},
+        "morok.win.ldr.vad.ntqueryvm.status");
+    QB.CreateCondBr(QB.CreateICmpSGE(status, ConstantInt::get(i32, 0),
+                                     "morok.win.ldr.vad.ntqueryvm.ok"),
+                    evalBB, doneBB);
+
+    IRBuilder<> EB(evalBB);
+    Value *base = loadAt(EB, M, ip, mbi, 0ULL, "morok.win.ldr.vad.base");
+    Value *regionSize =
+        loadAt(EB, M, ip, mbi, 24, "morok.win.ldr.vad.region.size");
+    Value *state = loadAt(EB, M, i32, mbi, 32,
+                          "morok.win.ldr.vad.mbi.state");
+    Value *protect =
+        loadAt(EB, M, i32, mbi, 36, "morok.win.ldr.vad.mbi.protect");
+    Value *type = loadAt(EB, M, i32, mbi, 40, "morok.win.ldr.vad.mbi.type");
+    Value *committed =
+        EB.CreateICmpEQ(state, ConstantInt::get(i32, 0x1000),
+                        "morok.win.ldr.vad.mbi.committed");
+    Value *image =
+        EB.CreateICmpEQ(type, ConstantInt::get(i32, 0x1000000),
+                        "morok.win.ldr.vad.mbi.image");
+    Value *isPrivate =
+        EB.CreateICmpEQ(type, ConstantInt::get(i32, 0x20000),
+                        "morok.win.ldr.vad.mbi.private");
+    Value *blocked = EB.CreateICmpNE(
+        EB.CreateAnd(protect, ConstantInt::get(i32, 0x101)),
+        ConstantInt::get(i32, 0), "morok.win.ldr.vad.mbi.blocked");
+    Value *executable = EB.CreateICmpNE(
+        EB.CreateAnd(protect, ConstantInt::get(i32, 0xF0)),
+        ConstantInt::get(i32, 0), "morok.win.ldr.vad.mbi.executable");
+    Value *imageCandidate =
+        EB.CreateAnd(committed, image, "morok.win.ldr.vad.image.committed");
+    EB.CreateCondBr(imageCandidate, imageBB, nextBB);
+
+    IRBuilder<> IB(imageBB);
+    auto *containsTy = containsAny->getFunctionType();
+    Value *contains = IB.CreateCall(containsTy, containsAny, {peb, base},
+                                    "morok.win.ldr.vad.contains");
+    Value *phantomImage =
+        IB.CreateICmpEQ(contains, ConstantInt::get(i32, 0),
+                        "morok.win.ldr.vad.image.phantom");
+    Value *oldImage =
+        IB.CreateLoad(i32, imageBad, "morok.win.ldr.vad.image.old");
+    cast<LoadInst>(oldImage)->setVolatile(true);
+    IB.CreateStore(IB.CreateAdd(oldImage, IB.CreateZExt(phantomImage, i32),
+                                "morok.win.ldr.vad.image.next"),
+                   imageBad)
+        ->setVolatile(true);
+    IB.CreateBr(nextBB);
+
+    IRBuilder<> NB(nextBB);
+    Value *privateExec = NB.CreateAnd(
+        NB.CreateAnd(NB.CreateAnd(committed, isPrivate,
+                                  "morok.win.ldr.vad.private.committed"),
+                     executable, "morok.win.ldr.vad.private.executable"),
+        NB.CreateNot(blocked), "morok.win.ldr.vad.private.exec");
+    Value *oldPrivate =
+        NB.CreateLoad(i32, privateBad, "morok.win.ldr.vad.private.old");
+    cast<LoadInst>(oldPrivate)->setVolatile(true);
+    NB.CreateStore(NB.CreateAdd(oldPrivate, NB.CreateZExt(privateExec, i32),
+                                "morok.win.ldr.vad.private.next"),
+                   privateBad)
+        ->setVolatile(true);
+    Value *step = NB.CreateSelect(
+        NB.CreateICmpUGT(regionSize, ConstantInt::get(ip, 0)),
+        regionSize, ConstantInt::get(ip, 0x1000), "morok.win.ldr.vad.step");
+    Value *nextAddr = NB.CreateAdd(addr, step, "morok.win.ldr.vad.next.addr");
+    Value *nextIdx =
+        NB.CreateAdd(idx, ConstantInt::get(i32, 1),
+                     "morok.win.ldr.vad.next.idx");
+    NB.CreateCondBr(NB.CreateICmpUGT(nextAddr, addr,
+                                     "morok.win.ldr.vad.advance"),
+                    loopBB, doneBB);
+    idx->addIncoming(nextIdx, nextBB);
+    addr->addIncoming(nextAddr, nextBB);
+
+    IRBuilder<> DB(doneBB);
+    Value *imageFinal =
+        DB.CreateLoad(i32, imageBad, "morok.win.ldr.vad.image.final");
+    cast<LoadInst>(imageFinal)->setVolatile(true);
+    Value *privateFinal =
+        DB.CreateLoad(i32, privateBad, "morok.win.ldr.vad.private.final");
+    cast<LoadInst>(privateFinal)->setVolatile(true);
+    DB.CreateRet(DB.CreateOr(
+        DB.CreateZExt(imageFinal, i64),
+        DB.CreateShl(DB.CreateZExt(privateFinal, i64), ConstantInt::get(i64, 32)),
+        "morok.win.ldr.vad.result"));
     return fn;
 }
 
@@ -17393,8 +18051,10 @@ Function *windowsVehAuditProbe(Module &M, GlobalVariable *State,
     Function *imageSizeFn = windowsPeImageSize(M);
     Function *scanner = windowsVehListReferenceScanner(M);
     Function *auditList = windowsVehAuditListHelper(M);
+    Function *ldrAudit = windowsLdrSingleListAuditHelper(M);
+    Function *vadAudit = windowsLdrVadCensusHelper(M);
     if (!pebReader || !moduleByHash || !resolver || !imageSizeFn || !scanner ||
-        !auditList)
+        !auditList || !ldrAudit || !vadAudit)
         return nullptr;
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
@@ -17486,6 +18146,60 @@ Function *windowsVehAuditProbe(Module &M, GlobalVariable *State,
         AB.CreateAdd(bad0, bad1, "morok.win.veh.bad.total");
     Value *seenTotal =
         AB.CreateAdd(seen0, seen1, "morok.win.veh.seen.total");
+    auto *ldrAuditTy = ldrAudit->getFunctionType();
+    Value *loadAudit = AB.CreateCall(
+        ldrAuditTy, ldrAudit,
+        {peb, ConstantInt::get(i32, 0x10), ConstantInt::get(i32, 0), ntQueryVm},
+        "morok.win.ldr.audit.load");
+    Value *memoryAudit = AB.CreateCall(
+        ldrAuditTy, ldrAudit,
+        {peb, ConstantInt::get(i32, 0x20), ConstantInt::get(i32, 0x10),
+         ntQueryVm},
+        "morok.win.ldr.audit.memory");
+    Value *initAudit = AB.CreateCall(
+        ldrAuditTy, ldrAudit,
+        {peb, ConstantInt::get(i32, 0x30), ConstantInt::get(i32, 0x20),
+         ntQueryVm},
+        "morok.win.ldr.audit.init");
+    Value *loadBad =
+        AB.CreateTrunc(AB.CreateLShr(loadAudit, ConstantInt::get(i64, 32)),
+                       i32, "morok.win.ldr.audit.load.bad");
+    Value *memoryBad =
+        AB.CreateTrunc(AB.CreateLShr(memoryAudit, ConstantInt::get(i64, 32)),
+                       i32, "morok.win.ldr.audit.memory.bad");
+    Value *initBad =
+        AB.CreateTrunc(AB.CreateLShr(initAudit, ConstantInt::get(i64, 32)),
+                       i32, "morok.win.ldr.audit.init.bad");
+    Value *loadSeen =
+        AB.CreateTrunc(loadAudit, i32, "morok.win.ldr.audit.load.seen");
+    Value *memorySeen =
+        AB.CreateTrunc(memoryAudit, i32, "morok.win.ldr.audit.memory.seen");
+    Value *initSeen =
+        AB.CreateTrunc(initAudit, i32, "morok.win.ldr.audit.init.seen");
+    Value *ldrBadTotal = AB.CreateAdd(
+        AB.CreateAdd(loadBad, memoryBad, "morok.win.ldr.audit.bad.pair"),
+        initBad, "morok.win.ldr.audit.bad.total");
+    Value *ldrSeenTotal = AB.CreateAdd(
+        AB.CreateAdd(loadSeen, memorySeen, "morok.win.ldr.audit.seen.pair"),
+        initSeen, "morok.win.ldr.audit.seen.total");
+    auto *vadAuditTy = vadAudit->getFunctionType();
+    Value *vadAuditResult =
+        AB.CreateCall(vadAuditTy, vadAudit, {peb, ntQueryVm},
+                      "morok.win.ldr.vad.audit.result");
+    Value *vadImageTotal =
+        AB.CreateTrunc(vadAuditResult, i32, "morok.win.ldr.vad.image.total");
+    Value *vadPrivateTotal =
+        AB.CreateTrunc(AB.CreateLShr(vadAuditResult, ConstantInt::get(i64, 32)),
+                       i32, "morok.win.ldr.vad.private.total");
+    Value *vadBadTotal =
+        AB.CreateAdd(vadImageTotal, vadPrivateTotal,
+                     "morok.win.ldr.vad.bad.total");
+    Value *ldrBadAny =
+        AB.CreateICmpNE(ldrBadTotal, ConstantInt::get(i32, 0),
+                        "morok.win.ldr.audit.bad.any");
+    Value *vadBadAny =
+        AB.CreateICmpNE(vadBadTotal, ConstantInt::get(i32, 0),
+                        "morok.win.ldr.vad.bad.any");
     foldState(AB, State, addCandidate, rng.next(),
               "morok.win.veh.list.from.add.mix");
     foldState(AB, State, removeCandidate, rng.next(),
@@ -17496,6 +18210,24 @@ Function *windowsVehAuditProbe(Module &M, GlobalVariable *State,
               "morok.win.veh.audit.shifted.mix");
     foldState(AB, State, seenTotal, rng.next(),
               "morok.win.veh.seen.total.mix");
+    foldState(AB, State, loadAudit, rng.next(),
+              "morok.win.ldr.audit.load.mix");
+    foldState(AB, State, memoryAudit, rng.next(),
+              "morok.win.ldr.audit.memory.mix");
+    foldState(AB, State, initAudit, rng.next(),
+              "morok.win.ldr.audit.init.mix");
+    foldState(AB, State, ldrSeenTotal, rng.next(),
+              "morok.win.ldr.audit.seen.total.mix");
+    foldState(AB, State, ldrBadTotal, rng.next(),
+              "morok.win.ldr.audit.bad.total.mix");
+    foldState(AB, State, vadAuditResult, rng.next(),
+              "morok.win.ldr.vad.audit.mix");
+    foldState(AB, State, vadBadTotal, rng.next(),
+              "morok.win.ldr.vad.bad.total.mix");
+    foldEnforcedFlag(AB, State, ldrBadAny, 0x5CE10A64BF923D71ULL,
+                     "morok.win.ldr.audit.changed");
+    foldEnforcedFlag(AB, State, vadBadAny, 0xC9E2305AF41B876DULL,
+                     "morok.win.ldr.vad.changed");
     // Foreign VEH classification is not zero-on-clean: legitimate runtimes can
     // register non-image/JIT handlers, so keep it out of the enforced seal.
     foldFlag(AB, State,
