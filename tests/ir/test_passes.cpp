@@ -13702,11 +13702,14 @@ TEST_CASE("stringEncryptModule falls back to per-string decryptors") {
     // The small string's stored size is padded past its true length (6).
     CHECK(cast<ArrayType>(Small->getValueType())->getNumElements() > 6u);
 
-    // The plaintext is gone, and the encryption is driven by the runtime-opaque
-    // module seed plus dedicated decryptors (no shared gf8mul / key globals).
+    // The plaintext is gone, and the encryption is driven by a runtime KDF seed
+    // provider plus dedicated decryptors (no shared gf8mul / key globals, and
+    // no reusable cloak seed word for static pool recovery).
     if (auto *CDA = dyn_cast<ConstantDataArray>(Small->getInitializer()))
         CHECK(CDA->getRawDataValues().find("small") == StringRef::npos);
-    CHECK(countGlobals(*M, "morok.cloak.seed") == 1u);
+    CHECK(countGlobals(*M, "morok.cloak.seed") == 0u);
+    CHECK(countGlobals(*M, "morok.str.kdf.blob") == 1u);
+    CHECK(M->getFunction("morok.str.seed") != nullptr);
     CHECK(countGlobals(*M, "morok.k1") == 0u);
     CHECK(M->getFunction("morok.gf8mul") == nullptr);
     CHECK(countFunctions(*M, "morok.strdec") == 2u);
@@ -14447,7 +14450,7 @@ entry:
     CHECK(hasInlineAsmCall(*AntiDump));
     CHECK(M->getFunction("dlsym") != nullptr);
     CHECK(M->getFunction("dlopen") != nullptr);
-    CHECK(M->getFunction("getenv") != nullptr);
+    CHECK(M->getFunction("getenv") == nullptr);
     CHECK(M->getFunction("readlink") == nullptr);
     CHECK(M->getFunction("open") == nullptr);
     CHECK(M->getFunction("lseek") == nullptr);
@@ -14594,12 +14597,15 @@ entry:
     CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.rwx") >= 1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.anonymous.exec") >=
           1u);
-    CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.preload") >= 1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.preload") >= 1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.audit") >= 1u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
                                  "morok.antihook.prologue.x86.hit") >= 1u);
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/exe"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/maps"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/self/environ"));
     CHECK_FALSE(hasReadableByteString(*M, "LD_PRELOAD"));
+    CHECK_FALSE(hasReadableByteString(*M, "LD_AUDIT"));
     CHECK_FALSE(hasReadableByteString(*M, "MSHookFunction"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
