@@ -18118,6 +18118,7 @@ entry:
     Function *SigtrapHandler =
         M->getFunction("morok.antidbg.sigtrap.handler");
     Function *HotProbe = M->getFunction("morok.antidbg.probe");
+    Function *Parent = M->getFunction("morok.antidbg.parent");
     Function *Rr = M->getFunction("morok.antidbg.rr");
     REQUIRE(Memfd != nullptr);
     REQUIRE(Sigmask != nullptr);
@@ -18134,6 +18135,7 @@ entry:
     CHECK(Sigtrap != nullptr);
     CHECK(SigtrapHandler != nullptr);
     CHECK(HotProbe != nullptr);
+    CHECK(Parent != nullptr);
     CHECK(Rr != nullptr);
     CHECK(Memfd->arg_size() == 3);
     CHECK(M->getFunction("morok.watchdog") != nullptr);
@@ -18168,7 +18170,9 @@ entry:
     CHECK(hasInlineAsmCall(*Watch));
     CHECK(hasInlineAsmCall(*FaultCf));
     CHECK(hasInlineAsmCall(*Sigtrap));
+    CHECK(hasInlineAsmCall(*Parent));
     CHECK(hasInlineAsmCall(*Rr));
+    checkNoSealEnforcement(*Parent);
     checkNoSealEnforcement(*Rr);
     CHECK(countNamedInstructions(*Memfd, "morok.antidbg.memfd.readlink") >= 1u);
     CHECK(hasNamedIcmpWithConstant(*Memfd, "morok.antidbg.memfd.prefix.enough",
@@ -18318,6 +18322,20 @@ entry:
           1u);
     CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.dr.ptracer.scope1") >=
           1u);
+    CHECK(countCallsTo(*AntiDbg, "morok.antidbg.parent") == 1u);
+    CHECK(countNamedInstructions(*Parent, "morok.antidbg.parent.getppid") >=
+          1u);
+    CHECK(countNamedInstructions(*Parent, "morok.antidbg.parent.comm.hit") >=
+          1u);
+    CHECK(countNamedInstructions(*Parent, "morok.antidbg.parent.exe.readlink") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Parent, "morok.antidbg.parent.status.ppid.value") >= 1u);
+    CHECK(countNamedInstructions(*Parent,
+                                 "morok.antidbg.parent.ancestry.hit") >= 1u);
+    CHECK(functionHasConstantInt(*Parent, 110u)); // getppid
+    CHECK(functionHasConstantInt(*Parent, 257u)); // openat
+    CHECK(functionHasConstantInt(*Parent, 267u)); // readlinkat
     CHECK(countCallsTo(*AntiDbg, "morok.antidbg.rr") == 1u);
     CHECK(countNamedInstructions(*Rr,
                                  "morok.antidbg.rr.perf.paranoid.value") >= 1u);
@@ -18568,7 +18586,13 @@ entry:
     CHECK_FALSE(
         hasReadableByteString(*M, "/proc/sys/kernel/perf_event_paranoid"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/comm"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/exe"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/status"));
     CHECK_FALSE(hasReadableByteString(*M, "rr-detach"));
+    CHECK_FALSE(hasReadableByteString(*M, "valgrind"));
+    CHECK_FALSE(hasReadableByteString(*M, "strace"));
+    CHECK_FALSE(hasReadableByteString(*M, "ltrace"));
+    CHECK_FALSE(hasReadableByteString(*M, "gcore"));
     CHECK_FALSE(hasReadableByteString(*M, "TracerPid"));
     CHECK_FALSE(hasReadableByteString(*M, "ptrace_stop"));
     CHECK_FALSE(hasReadableByteString(*M, "SigBlk"));
@@ -18653,6 +18677,9 @@ define i32 @main() { ret i32 0 }
     REQUIRE(FaultCfHandler != nullptr);
     CHECK(M->getFunction("morok.antidbg.sigtrap") == nullptr);
     CHECK(M->getFunction("morok.antidbg.sigtrap.handler") == nullptr);
+    Function *Parent = M->getFunction("morok.antidbg.parent");
+    REQUIRE(Parent != nullptr);
+    checkNoSealEnforcement(*Parent);
     Function *Rr = M->getFunction("morok.antidbg.rr");
     REQUIRE(Rr != nullptr);
     checkNoSealEnforcement(*Rr);
@@ -18667,6 +18694,16 @@ define i32 @main() { ret i32 0 }
               *Sigmask, "morok.antidbg.sigmask.rt_sigprocmask") >= 1u);
     CHECK(countNamedInstructions(
               *PtraceStop, "morok.antidbg.ptrace_stop.kernel.uname") >= 1u);
+    CHECK(countCallsTo(*Ctor, "morok.antidbg.parent") == 1u);
+    CHECK(countNamedInstructions(*Parent, "morok.antidbg.parent.comm.hit") >=
+          1u);
+    CHECK(countNamedInstructions(*Parent, "morok.antidbg.parent.exe.readlink") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Parent, "morok.antidbg.parent.status.ppid.value") >= 1u);
+    CHECK(functionHasConstantInt(*Parent, 173u)); // getppid
+    CHECK(functionHasConstantInt(*Parent, 56u));  // openat
+    CHECK(functionHasConstantInt(*Parent, 78u));  // readlinkat
     CHECK(countNamedInstructions(*Rr,
                                  "morok.antidbg.rr.perf.hw.denied.lowpolicy") >=
           1u);
@@ -18780,6 +18817,43 @@ define i32 @main() { ret i32 0 }
     REQUIRE(PtraceChain != nullptr);
     CHECK(valueFeedsNamedInstruction(PtraceChain,
                                      "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("antiDebuggingModule emits arm Linux parent ancestry probe") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "armv7-unknown-linux-gnueabihf"
+define i32 @main() { ret i32 0 }
+)ir");
+    M->setDataLayout("e-m:e-p:32:32-i64:64-v128:64:128-a:0:32-n32-S64");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8824);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::antiDebuggingModule(*M, rng));
+
+    Function *Ctor = M->getFunction("morok.antidbg");
+    REQUIRE(Ctor != nullptr);
+    Function *Parent = M->getFunction("morok.antidbg.parent");
+    REQUIRE(Parent != nullptr);
+    CHECK(M->getFunction("morok.antidbg.rr") == nullptr);
+    CHECK(countCallsTo(*Ctor, "morok.antidbg.parent") == 1u);
+    CHECK(countNamedInstructions(*Parent, "morok.antidbg.parent.getppid") >=
+          1u);
+    CHECK(countNamedInstructions(*Parent, "morok.antidbg.parent.comm.hit") >=
+          1u);
+    CHECK(countNamedInstructions(*Parent, "morok.antidbg.parent.exe.readlink") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Parent, "morok.antidbg.parent.status.ppid.value") >= 1u);
+    CHECK(functionHasConstantInt(*Parent, 64u));  // getppid
+    CHECK(functionHasConstantInt(*Parent, 322u)); // openat
+    CHECK(functionHasConstantInt(*Parent, 332u)); // readlinkat
+    CHECK(M->getFunction("syscall") != nullptr);
+    checkNoSealEnforcement(*Parent);
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/comm"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/exe"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/status"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

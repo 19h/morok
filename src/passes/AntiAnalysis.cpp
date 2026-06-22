@@ -1347,6 +1347,8 @@ Value *emitDarwinSysctl(IRBuilder<> &B, Module &M, const Triple &TT, Value *Mib,
 Value *emitClockGettimeNanos(IRBuilder<> &B, Module &M, std::int32_t ClockId,
                              const Twine &Name);
 Value *emitRdtscp(IRBuilder<> &B, Module &M);
+Function *linuxParentAncestryProbe(Module &M, GlobalVariable *State,
+                                   ir::IRRandom &rng, const Triple &TT);
 Function *linuxRrReplayProbe(Module &M, GlobalVariable *State,
                              ir::IRRandom &rng, const Triple &TT);
 
@@ -2003,6 +2005,142 @@ struct StatusHexFieldIR {
     Value *found = nullptr;
     Value *value = nullptr;
 };
+
+struct StatusDecimalFieldIR {
+    Value *found = nullptr;
+    Value *value = nullptr;
+};
+
+StatusDecimalFieldIR parseProcStatusDecimalField(
+    IRBuilder<> &B, Module &M, AllocaInst *Buf, Value *N,
+    std::initializer_list<unsigned char> Prefix, std::uint64_t MaxBytes,
+    const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    Function *fn = B.GetInsertBlock()->getParent();
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    std::vector<unsigned char> prefix(Prefix.begin(), Prefix.end());
+
+    auto *foundSlot = B.CreateAlloca(i1, nullptr, Name + ".found.slot");
+    auto *valueSlot = B.CreateAlloca(i64, nullptr, Name + ".value.slot");
+    auto *idxSlot = B.CreateAlloca(ip, nullptr, Name + ".idx.slot");
+    B.CreateStore(ConstantInt::getFalse(ctx), foundSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), valueSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), idxSlot)->setVolatile(true);
+
+    auto *scanBB = BasicBlock::Create(ctx, (Name + ".scan").str(), fn);
+    auto *matchBB = BasicBlock::Create(ctx, (Name + ".match").str(), fn);
+    auto *parseBB = BasicBlock::Create(ctx, (Name + ".parse").str(), fn);
+    auto *charBB = BasicBlock::Create(ctx, (Name + ".char").str(), fn);
+    auto *digitBB = BasicBlock::Create(ctx, (Name + ".digit").str(), fn);
+    auto *skipBB = BasicBlock::Create(ctx, (Name + ".skip").str(), fn);
+    auto *stopBB = BasicBlock::Create(ctx, (Name + ".stop").str(), fn);
+    auto *hitBB = BasicBlock::Create(ctx, (Name + ".hit").str(), fn);
+    auto *nextBB = BasicBlock::Create(ctx, (Name + ".next").str(), fn);
+    auto *doneBB = BasicBlock::Create(ctx, (Name + ".done").str(), fn);
+    B.CreateBr(scanBB);
+
+    IRBuilder<> SB(scanBB);
+    auto *found = SB.CreateLoad(i1, foundSlot, Name + ".found.v");
+    found->setVolatile(true);
+    auto *idx = SB.CreateLoad(ip, idxSlot, Name + ".idx");
+    idx->setVolatile(true);
+    Value *end = SB.CreateAdd(idx, ConstantInt::get(ip, prefix.size()),
+                              Name + ".end");
+    Value *withinRead = SB.CreateICmpSLE(end, N, Name + ".within.read");
+    Value *withinBuf = SB.CreateICmpULE(end, ConstantInt::get(ip, MaxBytes),
+                                        Name + ".within.buf");
+    SB.CreateCondBr(SB.CreateAnd(SB.CreateAnd(withinRead, withinBuf),
+                                 SB.CreateNot(found)),
+                    matchBB, doneBB);
+
+    IRBuilder<> MB(matchBB);
+    Value *match = ConstantInt::getTrue(ctx);
+    for (std::uint64_t j = 0; j < prefix.size(); ++j) {
+        Value *ch = loadAt(MB, M, i8, Buf,
+                           MB.CreateAdd(idx, ConstantInt::get(ip, j)),
+                           Name + ".prefix.ch");
+        match = MB.CreateAnd(
+            match, MB.CreateICmpEQ(ch, ConstantInt::get(i8, prefix[j])),
+            Name + ".prefix.match");
+    }
+    MB.CreateCondBr(match, parseBB, nextBB);
+
+    IRBuilder<> PB(parseBB);
+    Value *start = PB.CreateAdd(idx, ConstantInt::get(ip, prefix.size()),
+                                Name + ".value.start");
+    PB.CreateBr(charBB);
+
+    IRBuilder<> CB(charBB);
+    auto *pos = CB.CreatePHI(ip, 3, Name + ".pos");
+    auto *acc = CB.CreatePHI(i64, 3, Name + ".acc");
+    auto *seen = CB.CreatePHI(i1, 3, Name + ".seen");
+    pos->addIncoming(start, parseBB);
+    acc->addIncoming(ConstantInt::get(i64, 0), parseBB);
+    seen->addIncoming(ConstantInt::getFalse(ctx), parseBB);
+    Value *posInRead = CB.CreateICmpSLT(pos, N, Name + ".pos.in.read");
+    Value *posInBuf =
+        CB.CreateICmpULT(pos, ConstantInt::get(ip, MaxBytes), Name + ".pos.in.buf");
+    CB.CreateCondBr(CB.CreateAnd(posInRead, posInBuf), digitBB, stopBB);
+
+    IRBuilder<> DB(digitBB);
+    Value *ch = loadAt(DB, M, i8, Buf, pos, Name + ".ch");
+    Value *dec = DB.CreateAnd(
+        DB.CreateICmpUGE(ch, ConstantInt::get(i8, '0'), Name + ".dec.lo"),
+        DB.CreateICmpULE(ch, ConstantInt::get(i8, '9'), Name + ".dec.hi"),
+        Name + ".dec");
+    Value *digit =
+        DB.CreateSub(DB.CreateZExt(ch, i64, Name + ".zext"),
+                     ConstantInt::get(i64, '0'), Name + ".digit.value");
+    Value *nextAcc =
+        DB.CreateAdd(DB.CreateMul(acc, ConstantInt::get(i64, 10),
+                                  Name + ".acc.scale"),
+                     digit, Name + ".next.acc");
+    Value *nextPos = DB.CreateAdd(pos, ConstantInt::get(ip, 1),
+                                  Name + ".next.pos");
+    DB.CreateCondBr(dec, charBB, skipBB);
+    pos->addIncoming(nextPos, digitBB);
+    acc->addIncoming(nextAcc, digitBB);
+    seen->addIncoming(ConstantInt::getTrue(ctx), digitBB);
+
+    IRBuilder<> SKB(skipBB);
+    Value *ws = SKB.CreateOr(
+        SKB.CreateICmpEQ(ch, ConstantInt::get(i8, ' '), Name + ".space"),
+        SKB.CreateICmpEQ(ch, ConstantInt::get(i8, '\t'), Name + ".tab"),
+        Name + ".ws");
+    Value *skip = SKB.CreateAnd(SKB.CreateNot(seen), ws, Name + ".skip.ws");
+    Value *skipPos = SKB.CreateAdd(pos, ConstantInt::get(ip, 1),
+                                   Name + ".skip.pos");
+    SKB.CreateCondBr(skip, charBB, stopBB);
+    pos->addIncoming(skipPos, skipBB);
+    acc->addIncoming(acc, skipBB);
+    seen->addIncoming(seen, skipBB);
+
+    IRBuilder<> STB(stopBB);
+    STB.CreateCondBr(seen, hitBB, doneBB);
+
+    IRBuilder<> HTB(hitBB);
+    HTB.CreateStore(ConstantInt::getTrue(ctx), foundSlot)->setVolatile(true);
+    HTB.CreateStore(acc, valueSlot)->setVolatile(true);
+    HTB.CreateBr(doneBB);
+
+    IRBuilder<> NB(nextBB);
+    NB.CreateStore(NB.CreateAdd(idx, ConstantInt::get(ip, 1),
+                                Name + ".idx.next"),
+                   idxSlot)
+        ->setVolatile(true);
+    NB.CreateBr(scanBB);
+
+    B.SetInsertPoint(doneBB);
+    StatusDecimalFieldIR out;
+    out.found = B.CreateLoad(i1, foundSlot, Name + ".found");
+    cast<LoadInst>(out.found)->setVolatile(true);
+    out.value = B.CreateLoad(i64, valueSlot, Name + ".value");
+    cast<LoadInst>(out.value)->setVolatile(true);
+    return out;
+}
 
 StatusHexFieldIR parseProcStatusHexField(IRBuilder<> &B, Module &M,
                                          AllocaInst *Buf, Value *N,
@@ -4853,6 +4991,8 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
             drActive = nullptr;
         }
     }
+    if (Function *parent = linuxParentAncestryProbe(M, State, rng, TT))
+        B.CreateCall(parent);
     if (Function *rr = linuxRrReplayProbe(M, State, rng, TT))
         B.CreateCall(rr);
     emitLinuxHardening(B, M, State, rng, TT, drSentinel);
@@ -12071,6 +12211,150 @@ Value *bufferHasLiteral(IRBuilder<> &B, Module &M, AllocaInst *Buf, Value *N,
     return out;
 }
 
+Value *bufferEqualsLiteral(IRBuilder<> &B, Module &M, AllocaInst *Buf, Value *N,
+                           std::initializer_list<unsigned char> Literal,
+                           std::uint64_t MaxBytes, const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    Function *fn = B.GetInsertBlock()->getParent();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *ip = intPtrTy(M);
+    if (Literal.size() == 0 || MaxBytes < Literal.size())
+        return ConstantInt::getFalse(ctx);
+
+    std::vector<unsigned char> bytes(Literal.begin(), Literal.end());
+    auto *bodyBB = BasicBlock::Create(ctx, (Name + ".body").str(), fn);
+    auto *doneBB = BasicBlock::Create(ctx, (Name + ".done").str(), fn);
+    BasicBlock *guardBB = B.GetInsertBlock();
+    Value *sameSize =
+        B.CreateICmpEQ(N, ConstantInt::get(ip, bytes.size()), Name + ".size");
+    B.CreateCondBr(sameSize, bodyBB, doneBB);
+
+    IRBuilder<> MB(bodyBB);
+    Value *match = ConstantInt::getTrue(ctx);
+    for (std::uint64_t j = 0; j < bytes.size(); ++j) {
+        Value *ch = loadAt(MB, M, i8, Buf, ConstantInt::get(ip, j),
+                           Name + ".ch");
+        match = MB.CreateAnd(
+            match, MB.CreateICmpEQ(ch, ConstantInt::get(i8, bytes[j])),
+            Name + ".match");
+    }
+    MB.CreateBr(doneBB);
+
+    B.SetInsertPoint(doneBB);
+    auto *out = B.CreatePHI(Type::getInt1Ty(ctx), 2, Name + ".out");
+    out->addIncoming(ConstantInt::getFalse(ctx), guardBB);
+    out->addIncoming(match, bodyBB);
+    return out;
+}
+
+Value *bufferBasenameEqualsLiteral(IRBuilder<> &B, Module &M, AllocaInst *Buf,
+                                   Value *N,
+                                   std::initializer_list<unsigned char> Literal,
+                                   std::uint64_t MaxBytes,
+                                   const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    Function *fn = B.GetInsertBlock()->getParent();
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *ip = intPtrTy(M);
+    if (Literal.size() == 0 || MaxBytes < Literal.size())
+        return ConstantInt::getFalse(ctx);
+
+    std::vector<unsigned char> bytes(Literal.begin(), Literal.end());
+    auto *prefixBB = BasicBlock::Create(ctx, (Name + ".prefix").str(), fn);
+    auto *prevBB = BasicBlock::Create(ctx, (Name + ".prev").str(), fn);
+    auto *matchBB = BasicBlock::Create(ctx, (Name + ".match").str(), fn);
+    auto *doneBB = BasicBlock::Create(ctx, (Name + ".done").str(), fn);
+    BasicBlock *guardBB = B.GetInsertBlock();
+    Value *longEnough =
+        B.CreateICmpSGE(N, ConstantInt::get(ip, bytes.size()), Name + ".len");
+    Value *withinBuf = B.CreateICmpSLE(N, ConstantInt::get(ip, MaxBytes),
+                                       Name + ".within.buf");
+    B.CreateCondBr(B.CreateAnd(longEnough, withinBuf, Name + ".ready"),
+                   prefixBB, doneBB);
+
+    IRBuilder<> PB(prefixBB);
+    Value *start = PB.CreateSub(N, ConstantInt::get(ip, bytes.size()),
+                                Name + ".start");
+    Value *atStart = PB.CreateICmpEQ(start, ConstantInt::get(ip, 0),
+                                     Name + ".at.start");
+    PB.CreateCondBr(atStart, matchBB, prevBB);
+
+    IRBuilder<> PRB(prevBB);
+    Value *prevIdx = PRB.CreateSub(start, ConstantInt::get(ip, 1),
+                                   Name + ".prev.idx");
+    Value *prev = loadAt(PRB, M, i8, Buf, prevIdx, Name + ".prev.ch");
+    Value *afterSlash =
+        PRB.CreateICmpEQ(prev, ConstantInt::get(i8, '/'), Name + ".after.slash");
+    PRB.CreateCondBr(afterSlash, matchBB, doneBB);
+
+    IRBuilder<> MB(matchBB);
+    Value *matchStart = MB.CreateSub(N, ConstantInt::get(ip, bytes.size()),
+                                     Name + ".match.start");
+    Value *match = ConstantInt::getTrue(ctx);
+    for (std::uint64_t j = 0; j < bytes.size(); ++j) {
+        Value *ch = loadAt(MB, M, i8, Buf,
+                           MB.CreateAdd(matchStart, ConstantInt::get(ip, j)),
+                           Name + ".ch");
+        match = MB.CreateAnd(
+            match, MB.CreateICmpEQ(ch, ConstantInt::get(i8, bytes[j])),
+            Name + ".match");
+    }
+    MB.CreateBr(doneBB);
+
+    B.SetInsertPoint(doneBB);
+    auto *out = B.CreatePHI(i1, 3, Name + ".out");
+    out->addIncoming(ConstantInt::getFalse(ctx), guardBB);
+    out->addIncoming(ConstantInt::getFalse(ctx), prevBB);
+    out->addIncoming(match, matchBB);
+    return out;
+}
+
+Value *bufferHasLinuxParentToolComm(IRBuilder<> &B, Module &M, AllocaInst *Buf,
+                                    Value *N, std::uint64_t MaxBytes,
+                                    const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    Value *hit = ConstantInt::getFalse(ctx);
+    unsigned idx = 0;
+    auto add = [&](std::initializer_list<unsigned char> bytes) {
+        Value *one = bufferEqualsLiteral(B, M, Buf, N, bytes, MaxBytes,
+                                         Name + ".n" + Twine(idx++));
+        hit = B.CreateOr(hit, one, Name + ".any");
+    };
+    add({0x67, 0x64, 0x62, 0x0a});
+    add({0x6c, 0x6c, 0x64, 0x62, 0x0a});
+    add({0x73, 0x74, 0x72, 0x61, 0x63, 0x65, 0x0a});
+    add({0x6c, 0x74, 0x72, 0x61, 0x63, 0x65, 0x0a});
+    add({0x72, 0x72, 0x0a});
+    add({0x70, 0x65, 0x72, 0x66, 0x0a});
+    add({0x76, 0x61, 0x6c, 0x67, 0x72, 0x69, 0x6e, 0x64, 0x0a});
+    add({0x67, 0x63, 0x6f, 0x72, 0x65, 0x0a});
+    return hit;
+}
+
+Value *bufferHasLinuxParentToolBasename(IRBuilder<> &B, Module &M,
+                                        AllocaInst *Buf, Value *N,
+                                        std::uint64_t MaxBytes,
+                                        const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    Value *hit = ConstantInt::getFalse(ctx);
+    unsigned idx = 0;
+    auto add = [&](std::initializer_list<unsigned char> bytes) {
+        Value *one = bufferBasenameEqualsLiteral(B, M, Buf, N, bytes, MaxBytes,
+                                                 Name + ".n" + Twine(idx++));
+        hit = B.CreateOr(hit, one, Name + ".any");
+    };
+    add({0x67, 0x64, 0x62});
+    add({0x6c, 0x6c, 0x64, 0x62});
+    add({0x73, 0x74, 0x72, 0x61, 0x63, 0x65});
+    add({0x6c, 0x74, 0x72, 0x61, 0x63, 0x65});
+    add({0x72, 0x72});
+    add({0x70, 0x65, 0x72, 0x66});
+    add({0x76, 0x61, 0x6c, 0x67, 0x72, 0x69, 0x6e, 0x64});
+    add({0x67, 0x63, 0x6f, 0x72, 0x65});
+    return hit;
+}
+
 Value *bufferHasLinuxAnonymousExecMap(IRBuilder<> &B, Module &M,
                                       AllocaInst *Buf, Value *N,
                                       std::uint64_t MaxBytes,
@@ -12226,6 +12510,10 @@ bool linuxDbiParentSyscalls(const Triple &TT, std::uint32_t &Getppid,
     case Triple::aarch64:
         Getppid = 173;
         Readlinkat = 78;
+        return true;
+    case Triple::arm:
+        Getppid = 64;
+        Readlinkat = 332;
         return true;
     default:
         return false;
@@ -13990,6 +14278,179 @@ LinuxClockSample emitLinuxRawClockGettimeNanos(IRBuilder<> &B, Module &M,
     return {B.CreateSelect(ready, nanos, ConstantInt::get(i64, 0),
                            Name + ".nanos"),
             ready};
+}
+
+Function *linuxParentAncestryProbe(Module &M, GlobalVariable *State,
+                                   ir::IRRandom &rng, const Triple &TT) {
+    if (!TT.isOSLinux())
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antidbg.parent"))
+        return existing;
+
+    std::uint32_t ptraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    std::uint32_t getppidNr = 0;
+    std::uint32_t readlinkatNr = 0;
+    if (!linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr) ||
+        !linuxDbiParentSyscalls(TT, getppidNr, readlinkatNr))
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+
+    auto *fn = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antidbg.parent", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "morok.antidbg.parent.loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "morok.antidbg.parent.body", fn);
+    auto *doneBB = BasicBlock::Create(ctx, "morok.antidbg.parent.done", fn);
+
+    IRBuilder<> B(entry);
+    auto *pathTy = ArrayType::get(i8, 96);
+    auto *exeTy = ArrayType::get(i8, 256);
+    auto *commPath =
+        B.CreateAlloca(pathTy, nullptr, "morok.antidbg.parent.comm.path");
+    auto *exePath =
+        B.CreateAlloca(pathTy, nullptr, "morok.antidbg.parent.exe.path");
+    auto *statusPath =
+        B.CreateAlloca(pathTy, nullptr, "morok.antidbg.parent.status.path");
+    auto *exeBuf = B.CreateAlloca(exeTy, nullptr,
+                                  "morok.antidbg.parent.exe.buf");
+    auto *hits = B.CreateAlloca(i64, nullptr, "morok.antidbg.parent.hits");
+    auto *pidSlot = B.CreateAlloca(ip, nullptr, "morok.antidbg.parent.pid.slot");
+    auto *depthSlot =
+        B.CreateAlloca(i32, nullptr, "morok.antidbg.parent.depth.slot");
+    B.CreateStore(ConstantInt::get(i64, 0), hits)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), depthSlot)->setVolatile(true);
+    Value *initialPid = emitLinuxSyscall(B, M, TT, getppidNr, {});
+    initialPid->setName("morok.antidbg.parent.getppid");
+    B.CreateStore(initialPid, pidSlot)->setVolatile(true);
+    B.CreateBr(loopBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *depth = LB.CreateLoad(i32, depthSlot, "morok.antidbg.parent.depth");
+    depth->setVolatile(true);
+    auto *pid = LB.CreateLoad(ip, pidSlot, "morok.antidbg.parent.pid");
+    pid->setVolatile(true);
+    Value *depthOk = LB.CreateICmpULT(depth, ConstantInt::get(i32, 5),
+                                      "morok.antidbg.parent.depth.ok");
+    Value *pidLive = LB.CreateICmpSGT(pid, ConstantInt::get(ip, 1),
+                                      "morok.antidbg.parent.pid.live");
+    LB.CreateCondBr(LB.CreateAnd(depthOk, pidLive,
+                                 "morok.antidbg.parent.keep"),
+                    bodyBB, doneBB);
+
+    IRBuilder<> BB(bodyBB);
+    FunctionCallee snprintfFn = M.getOrInsertFunction(
+        "snprintf", FunctionType::get(i32, {ptr, ip, ptr}, true));
+    Value *commPathPtr = BB.CreateInBoundsGEP(
+        pathTy, commPath, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antidbg.parent.comm.path.ptr");
+    BB.CreateCall(snprintfFn,
+                  {commPathPtr, ConstantInt::get(ip, 96),
+                   ir::emitCloakedSymbol(BB, M, "/proc/%ld/comm", rng), pid},
+                  "morok.antidbg.parent.comm.path.n");
+    ReadFileIR comm = emitReadPathValue(
+        BB, M, fn, commPathPtr, 64, TT, "morok.antidbg.parent.comm");
+    auto *afterCommBB =
+        BasicBlock::Create(ctx, "morok.antidbg.parent.after.comm", fn);
+
+    IRBuilder<> CMB(comm.ret0);
+    CMB.CreateBr(afterCommBB);
+
+    IRBuilder<> CB(comm.afterRead);
+    Value *commHit = bufferHasLinuxParentToolComm(
+        CB, M, comm.buf, comm.n, 64, "morok.antidbg.parent.comm.tool");
+    incrementDiff(CB, hits, commHit, "morok.antidbg.parent.comm.hit");
+    CB.CreateBr(afterCommBB);
+
+    IRBuilder<> EB(afterCommBB);
+    Value *exePathPtr = EB.CreateInBoundsGEP(
+        pathTy, exePath, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antidbg.parent.exe.path.ptr");
+    Value *exeBufPtr = EB.CreateInBoundsGEP(
+        exeTy, exeBuf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antidbg.parent.exe.ptr");
+    EB.CreateCall(snprintfFn,
+                  {exePathPtr, ConstantInt::get(ip, 96),
+                   ir::emitCloakedSymbol(EB, M, "/proc/%ld/exe", rng), pid},
+                  "morok.antidbg.parent.exe.path.n");
+    Value *exeN = emitLinuxSyscall(
+        EB, M, TT, readlinkatNr,
+        {ConstantInt::getSigned(ip, -100), exePathPtr, exeBufPtr,
+         ConstantInt::get(ip, 255)});
+    exeN->setName("morok.antidbg.parent.exe.readlink");
+    Value *exeHit = bufferHasLinuxParentToolBasename(
+        EB, M, exeBuf, exeN, 256, "morok.antidbg.parent.exe.tool");
+    incrementDiff(EB, hits, exeHit, "morok.antidbg.parent.exe.hit");
+
+    Value *statusPathPtr = EB.CreateInBoundsGEP(
+        pathTy, statusPath, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        "morok.antidbg.parent.status.path.ptr");
+    EB.CreateCall(
+        snprintfFn,
+        {statusPathPtr, ConstantInt::get(ip, 96),
+         ir::emitCloakedSymbol(EB, M, "/proc/%ld/status", rng), pid},
+        "morok.antidbg.parent.status.path.n");
+    ReadFileIR status = emitReadPathValue(
+        EB, M, fn, statusPathPtr, 768, TT, "morok.antidbg.parent.status");
+    auto *afterStatusBB =
+        BasicBlock::Create(ctx, "morok.antidbg.parent.after.status", fn);
+
+    IRBuilder<> SMB(status.ret0);
+    SMB.CreateStore(ConstantInt::get(ip, 1), pidSlot)->setVolatile(true);
+    SMB.CreateBr(afterStatusBB);
+
+    IRBuilder<> SB(status.afterRead);
+    StatusDecimalFieldIR nextPid = parseProcStatusDecimalField(
+        SB, M, status.buf, status.n, {0x50, 0x50, 0x69, 0x64, 0x3a}, 768,
+        "morok.antidbg.parent.status.ppid");
+    Value *nextPidLive =
+        SB.CreateAnd(nextPid.found,
+                     SB.CreateICmpUGT(nextPid.value, ConstantInt::get(i64, 1),
+                                      "morok.antidbg.parent.status.ppid.live"),
+                     "morok.antidbg.parent.status.ppid.ready");
+    Value *nextPidWord = SB.CreateSelect(
+        nextPidLive, nextPid.value, ConstantInt::get(i64, 1),
+        "morok.antidbg.parent.status.ppid.next");
+    SB.CreateStore(SB.CreateZExtOrTrunc(nextPidWord, ip), pidSlot)
+        ->setVolatile(true);
+    SB.CreateBr(afterStatusBB);
+
+    IRBuilder<> ASB(afterStatusBB);
+    auto *oldDepth =
+        ASB.CreateLoad(i32, depthSlot, "morok.antidbg.parent.depth.old");
+    oldDepth->setVolatile(true);
+    ASB.CreateStore(ASB.CreateAdd(oldDepth, ConstantInt::get(i32, 1),
+                                  "morok.antidbg.parent.depth.next"),
+                    depthSlot)
+        ->setVolatile(true);
+    ASB.CreateBr(loopBB);
+
+    IRBuilder<> DB(doneBB);
+    auto *hitCount =
+        DB.CreateLoad(i64, hits, "morok.antidbg.parent.ancestry.hits");
+    hitCount->setVolatile(true);
+    Value *hitAny =
+        DB.CreateICmpNE(hitCount, ConstantInt::get(i64, 0),
+                        "morok.antidbg.parent.ancestry.hit");
+    foldState(DB, State, hitCount, 0xF0D4B9A6218C73E5ULL,
+              "morok.antidbg.parent.ancestry.count");
+    foldFlag(DB, State, hitAny, 0x6C58A1E9D4B7302FULL,
+             "morok.antidbg.parent.ancestry");
+    DB.CreateRetVoid();
+    return fn;
 }
 
 Function *linuxRrReplayProbe(Module &M, GlobalVariable *State,

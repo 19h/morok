@@ -165,6 +165,13 @@ bool lookupLinuxCoreSyscalls(const Triple &TT, LinuxCoreSyscalls &Out) {
         Out.read = 63;
         Out.close = 57;
         return true;
+    case Triple::arm:
+        Out.ptrace = 26;
+        Out.prctl = 172;
+        Out.openat = 322;
+        Out.read = 3;
+        Out.close = 6;
+        return true;
     default:
         return false;
     }
