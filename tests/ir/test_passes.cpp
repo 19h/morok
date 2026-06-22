@@ -684,6 +684,36 @@ std::size_t countInlineAsmBodies(Function &F, StringRef needle) {
     return n;
 }
 
+void checkFpuSimdProbe(Function &Fpu, Function &Ctor) {
+    CHECK(hasInlineAsmCall(Fpu));
+    CHECK(countNamedInstructions(Fpu, "morok.antihook.fpu.bits.raw") >= 1u);
+    CHECK(countNamedInstructions(Fpu,
+                                 "morok.antihook.fpu.daz.flush.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(
+              Fpu, "morok.antihook.fpu.denormal.flag.mismatch") >= 1u);
+    CHECK(countNamedInstructions(
+              Fpu, "morok.antihook.fpu.snan.invalid.mismatch") >= 1u);
+    CHECK(countNamedInstructions(Fpu,
+                                 "morok.antihook.fpu.mxcsr.round.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(Fpu,
+                                 "morok.antihook.fpu.fcw.round.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(Fpu,
+                                 "morok.antihook.fpu.fnstenv.ip.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(Fpu, "morok.antihook.fpu.cpuid.aes") >= 1u);
+    CHECK(countNamedInstructions(Fpu, "morok.antihook.fpu.aes.raw") >= 1u);
+    CHECK(countNamedInstructions(Fpu,
+                                 "morok.antihook.fpu.aes.roundtrip") >= 1u);
+    Instruction *FpuChanged =
+        findNamedInstruction(Ctor, "morok.corroborate.fpu.changed");
+    REQUIRE(FpuChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(FpuChanged,
+                                     "morok.seal.fold.anti_debug"));
+}
+
 TEST_CASE("RuntimeSeal gates weighted detector score with corroboration") {
     LLVMContext ctx;
     Module M("seal-score", ctx);
@@ -15912,6 +15942,8 @@ entry:
     Function *EmuSignalHandler =
         M->getFunction("morok.antihook.emu.sig.handler");
     REQUIRE(EmuSignalHandler != nullptr);
+    Function *Fpu = M->getFunction("morok.antihook.fpu.x86");
+    REQUIRE(Fpu != nullptr);
     Function *Sandbox = M->getFunction("morok.antihook.sandbox");
     REQUIRE(Sandbox != nullptr);
     Function *Dbi = M->getFunction("morok.antihook.dbi.linux");
@@ -16050,6 +16082,7 @@ entry:
     CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.rx") >= 1u);
     CHECK(hasInlineAsmCall(*Diverge));
     CHECK(hasInlineAsmCall(*Emu));
+    CHECK(hasInlineAsmCall(*Fpu));
     CHECK(hasInlineAsmCall(*Sandbox));
     CHECK(countNamedInstructions(*Diverge,
                                  "morok.antihook.diverge.getpid.direct") >= 1u);
@@ -16100,6 +16133,7 @@ entry:
     REQUIRE(EmuChanged != nullptr);
     CHECK(valueFeedsNamedInstruction(EmuChanged,
                                      "morok.seal.fold.anti_debug"));
+    checkFpuSimdProbe(*Fpu, *Ctor);
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
@@ -16339,6 +16373,8 @@ entry:
     REQUIRE(Diverge != nullptr);
     Function *Emu = M->getFunction("morok.antihook.emu.x86");
     REQUIRE(Emu != nullptr);
+    Function *Fpu = M->getFunction("morok.antihook.fpu.x86");
+    REQUIRE(Fpu != nullptr);
     Function *Sandbox = M->getFunction("morok.antihook.sandbox");
     REQUIRE(Sandbox != nullptr);
     Function *Smc = M->getFunction("morok.antihook.dbi.smc");
@@ -16422,6 +16458,7 @@ entry:
     CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.text") >= 1u);
     CHECK(hasInlineAsmCall(*Diverge));
     CHECK(hasInlineAsmCall(*Emu));
+    CHECK(hasInlineAsmCall(*Fpu));
     CHECK(countNamedInstructions(*Diverge,
                                  "morok.antihook.diverge.getpid.direct") >= 1u);
     CHECK(countNamedInstructions(
@@ -16440,6 +16477,7 @@ entry:
     REQUIRE(EmuChanged != nullptr);
     CHECK(valueFeedsNamedInstruction(EmuChanged,
                                      "morok.seal.fold.anti_debug"));
+    checkFpuSimdProbe(*Fpu, *Ctor);
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
@@ -16540,6 +16578,8 @@ entry:
     REQUIRE(Sandbox != nullptr);
     Function *Emu = M->getFunction("morok.antihook.emu.x86");
     REQUIRE(Emu != nullptr);
+    Function *Fpu = M->getFunction("morok.antihook.fpu.x86");
+    REQUIRE(Fpu != nullptr);
     Function *Smc = M->getFunction("morok.antihook.dbi.smc");
     REQUIRE(Smc != nullptr);
     Function *NegativeTiming = M->getFunction("morok.negative.timing");
@@ -16557,6 +16597,7 @@ entry:
     CHECK(M->getFunction("exit") == nullptr);
     CHECK(hasInlineAsmCall(*Sandbox));
     CHECK(hasInlineAsmCall(*Emu));
+    CHECK(hasInlineAsmCall(*Fpu));
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
@@ -16575,6 +16616,7 @@ entry:
     REQUIRE(EmuChanged != nullptr);
     CHECK(valueFeedsNamedInstruction(EmuChanged,
                                      "morok.seal.fold.anti_debug"));
+    checkFpuSimdProbe(*Fpu, *Ctor);
     Instruction *SandboxChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.sandbox.changed");
     REQUIRE(SandboxChanged != nullptr);
@@ -16628,6 +16670,7 @@ entry:
     Function *Ctor = M->getFunction("morok.antihook");
     REQUIRE(Ctor != nullptr);
     CHECK(M->getFunction("morok.antihook.emu.x86") == nullptr);
+    CHECK(M->getFunction("morok.antihook.fpu.x86") == nullptr);
     Function *Schro = M->getFunction("morok.antihook.schro");
     REQUIRE(Schro != nullptr);
     Function *SchroHandler = M->getFunction("morok.antihook.schro.handler");

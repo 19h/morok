@@ -7900,6 +7900,272 @@ Function *emulationDivergenceProbe(Module &M, const Triple &TT) {
     return fn;
 }
 
+Function *fpuSimdDivergenceProbe(Module &M, const Triple &TT) {
+    const bool IsX64 = TT.getArch() == Triple::x86_64;
+    const bool IsX86 = TT.getArch() == Triple::x86;
+    if (!IsX64 && !IsX86)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.fpu.x86"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.fpu.x86", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    AllocaInst *diff = B.CreateAlloca(i64, nullptr, "morok.antihook.fpu.diff");
+    B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
+
+    Value *leaf1 = emitCpuid(B, M, ConstantInt::get(i32, 1),
+                             ConstantInt::get(i32, 0));
+    Value *edx = cpuidReg(B, leaf1, 3, "morok.antihook.fpu.cpuid.edx");
+    Value *sseFlag = B.CreateAnd(edx, ConstantInt::get(i32, 1u << 25),
+                                 "morok.antihook.fpu.cpuid.sse");
+    Value *hasSse =
+        B.CreateICmpNE(sseFlag, ConstantInt::get(i32, 0),
+                       "morok.antihook.fpu.sse.supported");
+    BasicBlock *probeBB =
+        BasicBlock::Create(ctx, "morok.antihook.fpu.probe", fn);
+    BasicBlock *doneBB = BasicBlock::Create(ctx, "morok.antihook.fpu.done", fn);
+    B.CreateCondBr(hasSse, probeBB, doneBB);
+    B.SetInsertPoint(probeBB);
+
+    auto *asmTy = FunctionType::get(i32, false);
+    const char *Asm =
+        IsX64
+            ? "xorl %eax, %eax\n\t"
+              "subq $128, %rsp\n\t"
+              "stmxcsr 0(%rsp)\n\t"
+              "fnstcw 4(%rsp)\n\t"
+              "movl $0x00001fc0, 8(%rsp)\n\t"
+              "ldmxcsr 8(%rsp)\n\t"
+              "movl $0x00000001, 16(%rsp)\n\t"
+              "movl $0x00000000, 20(%rsp)\n\t"
+              "movss 16(%rsp), %xmm0\n\t"
+              "addss 20(%rsp), %xmm0\n\t"
+              "stmxcsr 24(%rsp)\n\t"
+              "movl 24(%rsp), %esi\n\t"
+              "andl $0x2, %esi\n\t"
+              "setne %cl\n\t"
+              "movzbl %cl, %ecx\n\t"
+              "orl %ecx, %eax\n\t"
+              "movl $0x00001f80, 8(%rsp)\n\t"
+              "ldmxcsr 8(%rsp)\n\t"
+              "movss 16(%rsp), %xmm0\n\t"
+              "addss 20(%rsp), %xmm0\n\t"
+              "stmxcsr 24(%rsp)\n\t"
+              "movl 24(%rsp), %esi\n\t"
+              "andl $0x2, %esi\n\t"
+              "sete %cl\n\t"
+              "movzbl %cl, %ecx\n\t"
+              "shll $1, %ecx\n\t"
+              "orl %ecx, %eax\n\t"
+              "movl $0x00001f80, 8(%rsp)\n\t"
+              "ldmxcsr 8(%rsp)\n\t"
+              "movl $0x7f800001, 32(%rsp)\n\t"
+              "movss 32(%rsp), %xmm0\n\t"
+              "addss 20(%rsp), %xmm0\n\t"
+              "stmxcsr 24(%rsp)\n\t"
+              "movl 24(%rsp), %esi\n\t"
+              "andl $0x1, %esi\n\t"
+              "sete %cl\n\t"
+              "movzbl %cl, %ecx\n\t"
+              "shll $2, %ecx\n\t"
+              "orl %ecx, %eax\n\t"
+              "movl $0x00007f80, 8(%rsp)\n\t"
+              "ldmxcsr 8(%rsp)\n\t"
+              "stmxcsr 24(%rsp)\n\t"
+              "movl 24(%rsp), %esi\n\t"
+              "andl $0x6000, %esi\n\t"
+              "cmpl $0x6000, %esi\n\t"
+              "setne %cl\n\t"
+              "movzbl %cl, %ecx\n\t"
+              "shll $3, %ecx\n\t"
+              "orl %ecx, %eax\n\t"
+              "movw $0x0f7f, 36(%rsp)\n\t"
+              "fldcw 36(%rsp)\n\t"
+              "fnstcw 40(%rsp)\n\t"
+              "movzwl 40(%rsp), %esi\n\t"
+              "andl $0x0c00, %esi\n\t"
+              "cmpl $0x0c00, %esi\n\t"
+              "setne %cl\n\t"
+              "movzbl %cl, %ecx\n\t"
+              "shll $4, %ecx\n\t"
+              "orl %ecx, %eax\n\t"
+              "fnclex\n\t"
+              "fldz\n\t"
+              "fnstenv 48(%rsp)\n\t"
+              "fstp %st(0)\n\t"
+              "movl 60(%rsp), %esi\n\t"
+              "testl %esi, %esi\n\t"
+              "sete %cl\n\t"
+              "movzbl %cl, %ecx\n\t"
+              "shll $5, %ecx\n\t"
+              "orl %ecx, %eax\n\t"
+              "ldmxcsr 0(%rsp)\n\t"
+              "fldcw 4(%rsp)\n\t"
+              "addq $128, %rsp"
+            : "xorl %eax, %eax\n\t"
+              "subl $128, %esp\n\t"
+              "stmxcsr 0(%esp)\n\t"
+              "fnstcw 4(%esp)\n\t"
+              "movl $0x00001fc0, 8(%esp)\n\t"
+              "ldmxcsr 8(%esp)\n\t"
+              "movl $0x00000001, 16(%esp)\n\t"
+              "movl $0x00000000, 20(%esp)\n\t"
+              "movss 16(%esp), %xmm0\n\t"
+              "addss 20(%esp), %xmm0\n\t"
+              "stmxcsr 24(%esp)\n\t"
+              "movl 24(%esp), %esi\n\t"
+              "andl $0x2, %esi\n\t"
+              "setne %cl\n\t"
+              "movzbl %cl, %ecx\n\t"
+              "orl %ecx, %eax\n\t"
+              "movl $0x00001f80, 8(%esp)\n\t"
+              "ldmxcsr 8(%esp)\n\t"
+              "movss 16(%esp), %xmm0\n\t"
+              "addss 20(%esp), %xmm0\n\t"
+              "stmxcsr 24(%esp)\n\t"
+              "movl 24(%esp), %esi\n\t"
+              "andl $0x2, %esi\n\t"
+              "sete %cl\n\t"
+              "movzbl %cl, %ecx\n\t"
+              "shll $1, %ecx\n\t"
+              "orl %ecx, %eax\n\t"
+              "movl $0x00001f80, 8(%esp)\n\t"
+              "ldmxcsr 8(%esp)\n\t"
+              "movl $0x7f800001, 32(%esp)\n\t"
+              "movss 32(%esp), %xmm0\n\t"
+              "addss 20(%esp), %xmm0\n\t"
+              "stmxcsr 24(%esp)\n\t"
+              "movl 24(%esp), %esi\n\t"
+              "andl $0x1, %esi\n\t"
+              "sete %cl\n\t"
+              "movzbl %cl, %ecx\n\t"
+              "shll $2, %ecx\n\t"
+              "orl %ecx, %eax\n\t"
+              "movl $0x00007f80, 8(%esp)\n\t"
+              "ldmxcsr 8(%esp)\n\t"
+              "stmxcsr 24(%esp)\n\t"
+              "movl 24(%esp), %esi\n\t"
+              "andl $0x6000, %esi\n\t"
+              "cmpl $0x6000, %esi\n\t"
+              "setne %cl\n\t"
+              "movzbl %cl, %ecx\n\t"
+              "shll $3, %ecx\n\t"
+              "orl %ecx, %eax\n\t"
+              "movw $0x0f7f, 36(%esp)\n\t"
+              "fldcw 36(%esp)\n\t"
+              "fnstcw 40(%esp)\n\t"
+              "movzwl 40(%esp), %esi\n\t"
+              "andl $0x0c00, %esi\n\t"
+              "cmpl $0x0c00, %esi\n\t"
+              "setne %cl\n\t"
+              "movzbl %cl, %ecx\n\t"
+              "shll $4, %ecx\n\t"
+              "orl %ecx, %eax\n\t"
+              "fnclex\n\t"
+              "fldz\n\t"
+              "fnstenv 48(%esp)\n\t"
+              "fstp %st(0)\n\t"
+              "movl 60(%esp), %esi\n\t"
+              "testl %esi, %esi\n\t"
+              "sete %cl\n\t"
+              "movzbl %cl, %ecx\n\t"
+              "shll $5, %ecx\n\t"
+              "orl %ecx, %eax\n\t"
+              "ldmxcsr 0(%esp)\n\t"
+              "fldcw 4(%esp)\n\t"
+              "addl $128, %esp";
+    InlineAsm *ProbeAsm = InlineAsm::get(
+        asmTy, Asm,
+        "={eax},~{ecx},~{esi},~{xmm0},~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    Value *bits =
+        B.CreateCall(asmTy, ProbeAsm, {}, "morok.antihook.fpu.bits.raw");
+    auto mixProbe = [&](IRBuilder<> &Builder, Value *Flag, const Twine &Name,
+                        std::uint64_t Salt) {
+        auto *old = Builder.CreateLoad(i64, diff, Name + ".old");
+        old->setVolatile(true);
+        Value *wide = Builder.CreateZExtOrTrunc(Flag, i64, Name + ".wide");
+        Value *mask =
+            Builder.CreateSub(ConstantInt::get(i64, 0), wide, Name + ".mask");
+        Value *selected = Builder.CreateAnd(mask, ConstantInt::get(i64, Salt),
+                                            Name + ".salt");
+        Value *mixed = Builder.CreateMul(
+            Builder.CreateXor(old, selected, Name + ".xor"),
+            ConstantInt::get(i64, Salt ^ 0x9E3779B97F4A7C15ULL),
+            Name + ".mul");
+        Value *next = Builder.CreateXor(
+            mixed, Builder.CreateLShr(mixed, ConstantInt::get(i64, 29)),
+            Name + ".next");
+        auto *st = Builder.CreateStore(next, diff);
+        st->setVolatile(true);
+    };
+    auto subProbe = [&](std::uint32_t Mask, const Twine &Name,
+                        std::uint64_t Salt) {
+        Value *Flag = B.CreateICmpNE(
+            B.CreateAnd(bits, ConstantInt::get(i32, Mask), Name + ".masked"),
+            ConstantInt::get(i32, 0), Name + ".mismatch");
+        mixProbe(B, Flag, Name, Salt);
+    };
+    subProbe(1u << 0, "morok.antihook.fpu.daz.flush",
+             0xA16B4F927C35D8E1ULL);
+    subProbe(1u << 1, "morok.antihook.fpu.denormal.flag",
+             0x5C8E21D3A7946F0BULL);
+    subProbe(1u << 2, "morok.antihook.fpu.snan.invalid",
+             0xD3B64109E85A27C4ULL);
+    subProbe(1u << 3, "morok.antihook.fpu.mxcsr.round",
+             0x7E492CA1B603D5F8ULL);
+    subProbe(1u << 4, "morok.antihook.fpu.fcw.round",
+             0x2B8F70D4C15A9E36ULL);
+    subProbe(1u << 5, "morok.antihook.fpu.fnstenv.ip",
+             0xE0953C6AB27D184FULL);
+
+    Value *ecx = cpuidReg(B, leaf1, 2, "morok.antihook.fpu.cpuid.ecx");
+    Value *aesFlag = B.CreateAnd(ecx, ConstantInt::get(i32, 1u << 25),
+                                 "morok.antihook.fpu.cpuid.aes");
+    Value *hasAes =
+        B.CreateICmpNE(aesFlag, ConstantInt::get(i32, 0),
+                       "morok.antihook.fpu.aes.supported");
+    BasicBlock *aesBB = BasicBlock::Create(ctx, "morok.antihook.fpu.aes", fn);
+    B.CreateCondBr(hasAes, aesBB, doneBB);
+
+    IRBuilder<> AB(aesBB);
+    InlineAsm *AesAsm = InlineAsm::get(
+        asmTy,
+        "xorl %eax, %eax\n\t"
+        "pxor %xmm1, %xmm1\n\t"
+        "pcmpeqd %xmm0, %xmm0\n\t"
+        "movdqa %xmm0, %xmm2\n\t"
+        ".byte 0x66,0x0f,0x38,0xdd,0xc1\n\t"
+        ".byte 0x66,0x0f,0x38,0xdf,0xc1\n\t"
+        "pcmpeqd %xmm2, %xmm0\n\t"
+        "pmovmskb %xmm0, %ecx\n\t"
+        "cmpl $0xffff, %ecx\n\t"
+        "setne %al",
+        "={eax},~{ecx},~{xmm0},~{xmm1},~{xmm2},~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    Value *aes =
+        AB.CreateCall(asmTy, AesAsm, {}, "morok.antihook.fpu.aes.raw");
+    Value *aesMismatch =
+        AB.CreateICmpNE(aes, ConstantInt::get(i32, 0),
+                        "morok.antihook.fpu.aes.roundtrip");
+    mixProbe(AB, aesMismatch, "morok.antihook.fpu.aes",
+             0x91D62B4F0CA758E3ULL);
+    AB.CreateBr(doneBB);
+
+    B.SetInsertPoint(doneBB);
+    emitRetDiff(B, diff);
+    return fn;
+}
+
 Value *bufferHasLiteral(IRBuilder<> &B, Module &M, AllocaInst *Buf, Value *N,
                         std::initializer_list<unsigned char> Literal,
                         std::uint64_t MaxBytes, const Twine &Name) {
@@ -15329,6 +15595,16 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
         foldState(B, state, diff, 0x7642CDB91E30A58FULL, "morok.antihook.emu");
         foldEnforcedFlag(B, state, changed, 0x1F0E3D2C4B5A6978ULL,
                          "morok.antihook.emu.changed");
+    }
+    if (Function *fpu = fpuSimdDivergenceProbe(M, tt)) {
+        Value *diff = B.CreateCall(fpu, {}, "morok.antihook.fpu.diff");
+        Value *changed =
+            B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0),
+                           "morok.corroborate.fpu.changed");
+        incrementDiff(B, corroboration, changed, "morok.corroborate.fpu");
+        foldState(B, state, diff, 0xA38F51D76B20C4E9ULL, "morok.antihook.fpu");
+        foldEnforcedFlag(B, state, changed, 0x62D9B40E8F1C357AULL,
+                         "morok.antihook.fpu.changed");
     }
     if (Function *sandbox = sandboxHeuristicProbe(M, tt)) {
         Value *score =
