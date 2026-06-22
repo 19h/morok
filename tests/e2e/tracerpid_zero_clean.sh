@@ -26,7 +26,7 @@ SYSROOT=()
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-CFLAGS=(-O0 -std=c11 -D_GNU_SOURCE -fno-builtin)
+CFLAGS=(-O2 -std=c11 -D_GNU_SOURCE -fno-builtin)
 
 "$CLANG" "${SYSROOT[@]}" "${CFLAGS[@]}" "$SRC" -o "$TMP/clean"
 
