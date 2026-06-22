@@ -83,6 +83,10 @@ morok::config     Presets, TOML loading, policy resolution, pass options.
 morok::ir         LLVM helper layer: annotations, symbol cloaking, IR random
                   adapters, shared emit utilities.
 
+morok::runtime    Shared runtime IR emitters for platform primitives such as
+                  direct-syscall policy, page protection, file access, and
+                  Windows runtime mode selection.
+
 morok::passes     New-PM pass implementations plus testable free functions.
 
 morok_plugin      Loadable New-PM pass plugin, emitted as libMorok.
@@ -91,17 +95,19 @@ morok_plugin      Loadable New-PM pass plugin, emitted as libMorok.
 Tracked top-level paths:
 
 ```text
-include/morok/{core,config,ir,passes,pipeline}/   public headers
-src/{core,config,ir,passes,pipeline}/             implementations
+include/morok/{core,config,ir,runtime,passes,pipeline}/ public headers
+src/{core,config,ir,runtime,passes,pipeline}/           implementations
 tests/{unit,ir,e2e}/                              unit, IR, and e2e gates
 third_party/{doctest,tomlplusplus}/               vendored header-only deps
 cmake/Morok{LLVM,Test,Warnings}.cmake             build policy modules
 docs/algorithms.md                                pass and scheduler reference
 docs/hardness.md                                  primitive hardness notes
+docs/objections.md                                public claim/objection notes
 docs/insurance-tasks.md                           implementable protection checklist
 docs/roadmap.md                                   design backlog and reality notes
 cross_build.sh                                    Linux/macOS cross-build helper
 run_tests.sh                                      authoritative local test entrypoint
+tools/morok-audit.py                              release binary audit gate
 ```
 
 Optional local paths may exist in a developer tree:
@@ -252,6 +258,7 @@ MOROK_PRESET=high                      preset fallback when no config file is lo
 MOROK_SEED=1234                        seed fallback when -morok-seed is absent or zero
 MOROK_CKD_SEAL_REQUIRED=1              require a post-link CKD seal instead of startup self-seal fallback
 MOROK_FAIL_CLOSED_ON_UNSEALED=1        poison seal-dependent paths if retained manifests are still unsealed
+MOROK_DISTRIBUTION_SIGNED=1            treat macOS get-task-allow findings as release-signing failures
 ```
 
 When `-morok-config` or `MOROK_CONFIG` loads successfully, that file supplies
@@ -261,9 +268,11 @@ for reproducible builds.
 
 The command-line equivalents for the strict release switches are
 `-mllvm -morok-ckd-seal-required` and
-`-mllvm -morok-fail-closed-on-unsealed`. Only enable them for builds where the
-binary will be post-link sealed before first run; an unsealed strict build is
-supposed to fail closed rather than silently self-recover.
+`-mllvm -morok-fail-closed-on-unsealed`; the macOS distribution-signing
+assertion is `-mllvm -morok-distribution-signed`. Only enable strict sealing
+switches for builds where the binary will be post-link sealed before first run;
+an unsealed strict build is supposed to fail closed rather than silently
+self-recover.
 
 For `clang -fpass-plugin`, Morok also registers extension-point callbacks:
 
@@ -554,17 +563,19 @@ The precise maintained order is documented in
 
 ## Pass Inventory
 
-Each pass can be run standalone with `-passes=morok-*` where registered, or
-through the scheduler with a TOML section. Some final hygiene transforms, such
-as misleading metadata, leaf-helper seal binding, protection-helper hardening,
-and private-linkage cleanup for generated `morok.*` helpers, are scheduler-only.
+Each pass can be run standalone with `-passes=morok-*` where the plugin registers
+that name, or through the scheduler with a TOML section. Rows marked
+`scheduler-only` have config support but no current plugin parsing callback.
+Some final hygiene transforms, such as misleading metadata, leaf-helper seal
+binding, protection-helper hardening, and private-linkage cleanup for generated
+`morok.*` helpers, are scheduler-only.
 
 ### Structural, Control-Flow, and Decompiler Stress
 
 | Capability | `-passes` name | TOML section | Summary |
 |---|---|---|---|
 | Split basic blocks | `morok-split` | `split_blocks` | Splits blocks into more dispatch targets. |
-| Function fission | `morok-fission` | `function_fission` | Outlines single-entry/single-exit regions of a function into fresh internal `morok.fission.*` callees (via `CodeExtractor`), so the source function boundaries no longer match the binary and the call graph fans out. Shrinking the originals also brings oversized functions back under the per-function obfuscation/integrity budgets so the seal-binding passes can reach them. Parts are marked `noinline`; EH/`setjmp`/varargs/computed-goto functions are skipped. |
+| Function fission | scheduler-only | `function_fission` | Outlines single-entry/single-exit regions of a function into fresh internal `morok.fission.*` callees (via `CodeExtractor`), so the source function boundaries no longer match the binary and the call graph fans out. Shrinking the originals also brings oversized functions back under the per-function obfuscation/integrity budgets so the seal-binding passes can reach them. Parts are marked `noinline`; EH/`setjmp`/varargs/computed-goto functions are skipped. |
 | Bogus control flow | `morok-bcf` | `bcf` | Adds opaque-true guarded junk/decoy edges with optional entropy and inline-asm pressure. |
 | Flattening | `morok-flatten` | `flattening` | Classic switch-dispatcher control-flow flattening. |
 | Data-entangled flattening | `morok-entfla` | `data_entangled_flattening` | Stores successor state through live-data and previous-state tokens. |
@@ -613,7 +624,7 @@ and private-linkage cleanup for generated `morok.*` helpers, are scheduler-only.
 | Sealed blobs | `morok-sealedblob` | `sealed_blob` | Encrypts explicit `.morok.sealed` byte-array globals and rewrites supported reads through per-blob lazy accessors keyed by RuntimeSeal/external-proof material, with optional runtime-keyed magic-prefix diagnostics. |
 | Function-call obfuscation | `morok-fco` | `function_call_obfuscate` | Hides external calls behind per-site import indirection. Linux/macOS 64-bit paths use manual export-by-hash resolvers where supported; unsupported targets use per-site cloaked dynamic lookup. |
 | Caller-keyed dispatch | `morok-ckd` | `caller_keyed_dispatch` | Collapses surviving direct user calls through native dispatch hubs keyed by caller context and post-link sealed integrity bytes. With `carriers > 1` the indirect jump rotates across distinct callee-saved carrier registers (per-register dispatchers `br x19`/`br x21`/…), so the control transfer at each site looks bespoke. |
-| Returnless dispatch | `morok-returnless` | `returnless_dispatch` | Rewrites tail-position returns (`return f(...)`) into indirect tail branches: the function leaves through a computed `br x16` / `jmp *rax` read from a hidden slot instead of a `ret`, and the callee target is no longer a direct edge. Perfect-forwarding sites use `musttail` (guaranteed no `ret`); others use a `tail` hint. Only genuine tail-position returns qualify — returns of computed values keep a normal ABI return, and escaping/EH/`setjmp`/varargs/`sret`/`byval` sites are skipped. Off by default; opt-in while validated per platform. |
+| Returnless dispatch | scheduler-only | `returnless_dispatch` | Rewrites tail-position returns (`return f(...)`) into indirect tail branches: the function leaves through a computed `br x16` / `jmp *rax` read from a hidden slot instead of a `ret`, and the callee target is no longer a direct edge. Perfect-forwarding sites use `musttail` (guaranteed no `ret`); others use a `tail` hint. Only genuine tail-position returns qualify — returns of computed values keep a normal ABI return, and escaping/EH/`setjmp`/varargs/`sret`/`byval` sites are skipped. Off by default; opt-in while validated per platform. |
 | Function wrapper | `morok-funcwrap` | `function_wrapper` | Wraps calls after per-function transforms so callers see proxy edges. |
 | VTable integrity | `morok-vtable` | `vtable_integrity` | Guards Itanium C++ virtual dispatches by expected vptr, slot, target, and cookie hash. |
 | Decoy strings | `morok-decoystr` | `decoy_strings` | Distributes retained plaintext honeypot diagnostics and fake logging infrastructure. |
@@ -639,6 +650,7 @@ does not require a plaintext sentinel to survive in `.rodata`.
 | Fault-paged payload delivery | `morok-fpp` | `fault_paged_payload` | Encrypts VM bytecode per page and replaces direct bytecode loads with a lazy accessor that decrypts one page-local cache at a time, re-clears page state on switches, and binds anomalous access to the `fault_paged_payload` runtime seal channel. |
 | Hash-gated self-decrypt | `morok-selfdecrypt` | `hash_gated_self_decrypt` | Lazily decrypts VM bytecode from runtime hashes/context and re-encrypts on helper exit. |
 | External proof binding | `morok-proofbind` | `external_secret_binding` | Materializes a proof feed/finish API and folds the proof digest difference into the `external_proof` runtime seal channel, so only the expected proof keeps the clean key state. |
+| Environment binding KDF | `morok-envbind` | `env_binding_kdf` | Collects enrolled host identity material, folds mismatches into the `env_binding` runtime seal channel, and feeds string, sealed-blob, and VM key schedules. |
 | Tracer attestation | `morok-tracer` | `tracer_attestation` | Uses a Linux/x86_64 buddy tracer to inject runtime-only share words into the parent and folds only delivery mismatch deltas into the `tracer` and anti-debug runtime seal channels. |
 | Self-checksum constants | `morok-selfcheck` | `self_checksum_constants` | Fuses constants with runtime checksum diffs so tamper corrupts data instead of branching. |
 | Mutual guard graph | `morok-mutualguard` | `mutual_guard_graph` | Emits overlapping checksum nodes whose aggregate diff poisons scalar returns. |
@@ -698,6 +710,7 @@ foundation helpers instead of hardcoding duplicate offsets or import paths.
 | Anti-attach | `morok-winattach` | `windows_anti_attach` | Patches debugger attach helpers, probes invalid-handle behavior, and avoids plaintext API names. |
 | Kernel-debugger census | `morok-winkdbg` | `windows_kernel_debugger` | Reads `SharedUserData`, queries kernel-debugger state, samples module/parent/window-class signals. |
 | Direct/indirect syscalls | `morok-winsys` | `windows_syscalls` | Resolves syscall numbers from runtime stubs and compares direct vs recycled-gadget syscall paths. |
+| Process/module census | `morok-winprocmod` | `windows_process_modules` | Scans bounded process and module snapshots for debugger-tool and injected-module telemetry. |
 | KnownDlls unhook | `morok-winunhook` | `windows_unhook` | Maps pristine `ntdll.dll`/`kernel32.dll` text from KnownDlls and locally refreshes hooked `.text`. |
 | VEH audit | `morok-winveh` | `windows_veh_audit` | Locates/decode-candidates the internal VEH list and folds suspicious handler findings without mutating process-wide VEH state. |
 | Process mitigations | `morok-winmitigate` | `windows_process_mitigations` | Hash-resolves `SetProcessMitigationPolicy` and opts into ACG/CIG after Morok's startup text repair. |
@@ -785,6 +798,7 @@ that extra layer per rewritten literal.
 | `fault_paged_payload` | `enabled`, `probability`, `max_payloads`, `max_payload_bytes`, `page_size`, `delivery`, `backend`, `per_page_keys`, `reseal_after_use`, `decoy_pages`, `fallback`, `bind_to_runtime_seal`, `virtualize_helpers` |
 | `hash_gated_self_decrypt` | `enabled`, `probability`, `max_payloads`, `max_payload_bytes`, `context_keying` |
 | `external_secret_binding` | `enabled`, `mode`, `public_key`, `expected_digest`, `identity_policy`, `bind_to_runtime_seal`, `virtualize_helpers` |
+| `env_binding_kdf` | `enabled`, `mode`, `expected_digest`, `identity_policy`, `min_factors`, `bind_to_runtime_seal`, `virtualize_helpers` |
 | `tracer_attestation` | `enabled`, `mode`, `shares`, `renewal`, `bind_to_runtime_seal`, `virtualize_helpers` |
 | `sealed_blob` | `enabled`, `max_blobs`, `max_blob_bytes`, `key_sources`, `delivery`, `zeroize_after_use`, `runtime_keyed_magic`, `magic_bytes` |
 | `self_checksum_constants` | `enabled`, `probability`, `max_constants`, `region_bytes` |
@@ -795,6 +809,7 @@ that extra layer per rewritten literal.
 | `adversarial_self_tuning` | `enabled`, `max_candidates`, `max_candidate_passes`, `score_floor`, `emit_marker` |
 | `per_build_polymorphism` | `enabled`, `function_order`, `block_order`, `anchor_probability`, `max_anchors` |
 
+`environment_binding_kdf` is accepted as an alias for `env_binding_kdf`.
 `skip_content`, `force_content`, `skip_value`, and `force_value` are string
 arrays.
 
@@ -803,7 +818,6 @@ arrays.
 These sections currently accept only `enabled`:
 
 ```text
-anti_debugging
 anti_hooking
 anti_class_dump
 windows_pe_foundation
@@ -813,6 +827,7 @@ windows_thread_hide
 windows_anti_attach
 windows_kernel_debugger
 windows_syscalls
+windows_process_modules
 windows_unhook
 windows_veh_audit
 windows_process_mitigations
@@ -823,6 +838,10 @@ page_fault_oracles
 cache_timing_oracles
 microarchitectural_canaries
 ```
+
+`anti_debugging` accepts `enabled` and `distribution_signed`. The
+`distribution_signed` key is also forced by `-mllvm -morok-distribution-signed`
+or `MOROK_DISTRIBUTION_SIGNED=1`.
 
 `platform_runtime` accepts `enabled`, `direct_syscalls` (`auto`, `always`,
 `never`), `windows_mode` (`documented_api`, `hashed_import`, `direct_syscall`),
@@ -995,8 +1014,10 @@ self-check data region.
 - [`docs/hardness.md`](docs/hardness.md): hardness-backed primitive specs.
 - [`docs/insurance.md`](docs/insurance.md): broader binary self-protection catalog.
 - [`docs/insurance-tasks.md`](docs/insurance-tasks.md): implementable task list.
+- [`docs/objections.md`](docs/objections.md): limitations and objection handling.
 - [`docs/roadmap.md`](docs/roadmap.md): design backlog and known limits.
 - [`tests/e2e/*.toml`](tests/e2e): tested pipeline configurations.
+- [`tools/morok-audit.py`](tools/morok-audit.py): release binary audit gate.
 - [`crackmes/siloterminal/README.md`](crackmes/siloterminal/README.md):
   freestanding/static crackme example.
 - [`crackmes/zorya/AUTHORS_NOTE.md`](crackmes/zorya/AUTHORS_NOTE.md):
