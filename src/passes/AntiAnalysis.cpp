@@ -1818,6 +1818,100 @@ Value *emitLinuxPtraceRaw(IRBuilder<> &B, Module &M, const Triple &TT,
     return rc;
 }
 
+struct LinuxYamaScopeSample {
+    Value *value;
+    Value *ready;
+    Value *unreadable;
+    Value *mode0;
+    Value *mode1;
+    Value *mode2;
+    Value *mode3;
+};
+
+LinuxYamaScopeSample emitLinuxYamaPtraceScopeRead(IRBuilder<> &B, Module &M,
+                                                  ir::IRRandom &rng,
+                                                  const Triple &TT,
+                                                  const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    constexpr std::uint64_t kBufBytes = 4;
+
+    std::uint32_t ptraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+    if (!linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr)) {
+        Value *zero = ConstantInt::get(i32, 0);
+        Value *falseV = ConstantInt::getFalse(ctx);
+        Value *trueV = ConstantInt::getTrue(ctx);
+        return {zero, falseV, trueV, falseV, falseV, falseV, falseV};
+    }
+
+    auto *bufTy = ArrayType::get(i8, kBufBytes);
+    AllocaInst *buf = B.CreateAlloca(bufTy, nullptr, Name + ".buf");
+    B.CreateMemSet(buf, ConstantInt::get(i8, 0),
+                   ConstantInt::get(ip, kBufBytes), MaybeAlign(1));
+    Value *path =
+        ir::emitCloakedSymbol(B, M, "/proc/sys/kernel/yama/ptrace_scope", rng);
+    Value *fd = emitLinuxSyscall(B, M, TT, openatNr,
+                                 {ConstantInt::getSigned(ip, -100), path,
+                                  ConstantInt::get(ip, 0),
+                                  ConstantInt::get(ip, 0)});
+    fd->setName(Name + ".fd");
+    Value *bufPtr = B.CreateInBoundsGEP(
+        bufTy, buf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        Name + ".ptr");
+    Value *nread = emitLinuxSyscall(
+        B, M, TT, readNr, {fd, bufPtr, ConstantInt::get(ip, kBufBytes - 1)});
+    nread->setName(Name + ".read.n");
+    emitLinuxSyscall(B, M, TT, closeNr, {fd});
+
+    Value *ch = loadAt(B, M, i8, buf, 0ULL, Name + ".ch");
+    Value *digit = B.CreateAnd(
+        B.CreateICmpUGE(ch, ConstantInt::get(i8, '0'), Name + ".ge0"),
+        B.CreateICmpULE(ch, ConstantInt::get(i8, '9'), Name + ".le9"),
+        Name + ".digit");
+    Value *fdOk =
+        B.CreateICmpSGE(fd, ConstantInt::get(ip, 0), Name + ".fd.ok");
+    Value *readOk =
+        B.CreateICmpSGT(nread, ConstantInt::get(ip, 0), Name + ".read.ok");
+    Value *ready = B.CreateAnd(fdOk, B.CreateAnd(readOk, digit),
+                               Name + ".ready");
+    Value *raw = B.CreateZExt(
+        B.CreateSub(ch, ConstantInt::get(i8, '0'), Name + ".raw"), i32,
+        Name + ".raw.i32");
+    Value *value = B.CreateSelect(ready, raw, ConstantInt::get(i32, 0),
+                                  Name + ".value");
+    Value *unreadable = B.CreateNot(ready, Name + ".unreadable");
+    Value *mode0 = B.CreateAnd(
+        ready, B.CreateICmpEQ(value, ConstantInt::get(i32, 0), Name + ".is0"),
+        Name + ".mode0");
+    Value *mode1 = B.CreateAnd(
+        ready, B.CreateICmpEQ(value, ConstantInt::get(i32, 1), Name + ".is1"),
+        Name + ".mode1");
+    Value *mode2 = B.CreateAnd(
+        ready, B.CreateICmpEQ(value, ConstantInt::get(i32, 2), Name + ".is2"),
+        Name + ".mode2");
+    Value *mode3 = B.CreateAnd(
+        ready, B.CreateICmpEQ(value, ConstantInt::get(i32, 3), Name + ".is3"),
+        Name + ".mode3");
+    return {value, ready, unreadable, mode0, mode1, mode2, mode3};
+}
+
+void foldLinuxYamaPtraceScope(IRBuilder<> &B, GlobalVariable *State,
+                              const LinuxYamaScopeSample &Scope,
+                              const Twine &Name) {
+    foldState(B, State, Scope.value, 0x48A6C1D93E0572B4ULL, Name + ".value");
+    foldFlag(B, State, Scope.unreadable, 0x75D2B849A13E6C0FULL,
+             Name + ".unreadable");
+    foldFlag(B, State, Scope.mode0, 0xD6438A1BE59C207FULL, Name + ".mode0");
+    foldFlag(B, State, Scope.mode2, 0x2F9B51C84A60D37EULL, Name + ".mode2");
+    foldFlag(B, State, Scope.mode3, 0xA91E2D7046B8C35FULL, Name + ".mode3");
+}
+
 Function *linuxDrScrubThread(Module &M, const Triple &TT) {
     if (Function *existing = M.getFunction("morok.antidbg.linux.dr.scrub"))
         return existing;
@@ -2141,6 +2235,9 @@ bool emitLinuxDrSentinelStart(IRBuilder<> &B, Module &M, GlobalVariable *State,
     LLVMContext &ctx = M.getContext();
     auto *ip = intPtrTy(M);
     Function *ctor = B.GetInsertBlock()->getParent();
+    LinuxYamaScopeSample yama =
+        emitLinuxYamaPtraceScopeRead(B, M, rng, TT, "morok.antidbg.yama.dr");
+    foldLinuxYamaPtraceScope(B, State, yama, "morok.antidbg.yama.dr");
     Value *pid = emitLinuxSyscall(B, M, TT, forkNr, {});
     pid->setName("morok.antidbg.dr.fork");
     foldState(B, State, pid, 0xD8A18F4C2E7B6A95ULL, "morok.antidbg.dr.fork");
@@ -2169,12 +2266,21 @@ bool emitLinuxDrSentinelStart(IRBuilder<> &B, Module &M, GlobalVariable *State,
     auto *buddyStore = ParentB.CreateStore(pid, BuddyPid);
     buddyStore->setVolatile(true);
     auto *inactive =
-        ParentB.CreateStore(ConstantInt::getFalse(ctx), SentinelActive);
+        ParentB.CreateStore(
+            ParentB.CreateAnd(
+                ParentB.CreateICmpSGT(pid, ConstantInt::get(ip, 0),
+                                      "morok.antidbg.dr.pid.valid"),
+                ParentB.CreateOr(yama.mode0, yama.unreadable,
+                                 "morok.antidbg.dr.ptracer.scope.open"),
+                "morok.antidbg.dr.ptracer.open.active"),
+            SentinelActive);
     inactive->setVolatile(true);
     inactive->setAlignment(Align(1));
     ParentB.CreateCondBr(
-        ParentB.CreateICmpSGT(pid, ConstantInt::get(ip, 0),
-                              "morok.antidbg.dr.pid.valid"),
+        ParentB.CreateAnd(
+            ParentB.CreateICmpSGT(pid, ConstantInt::get(ip, 0),
+                                  "morok.antidbg.dr.pid.valid.ptracer"),
+            yama.mode1, "morok.antidbg.dr.ptracer.scope1"),
         setPtracerBB, contBB);
 
     IRBuilder<> PB(setPtracerBB);
@@ -2206,11 +2312,29 @@ bool emitLinuxDrSentinelStart(IRBuilder<> &B, Module &M, GlobalVariable *State,
     return true;
 }
 
-void emitLinuxHardening(IRBuilder<> &B, Module &M, const Triple &TT,
+void emitLinuxHardening(IRBuilder<> &B, Module &M, GlobalVariable *State,
+                        ir::IRRandom &rng, const Triple &TT,
                         bool PreservePtracer = false) {
     emitLinuxPrctl(B, M, TT, 4, 0, 0, 0, 0);          // PR_SET_DUMPABLE
-    if (!PreservePtracer)
-        emitLinuxPrctl(B, M, TT, 0x59616D61, 0, 0, 0, 0); // PR_SET_PTRACER
+    if (!PreservePtracer) {
+        LinuxYamaScopeSample yama = emitLinuxYamaPtraceScopeRead(
+            B, M, rng, TT, "morok.antidbg.yama.harden");
+        foldLinuxYamaPtraceScope(B, State, yama, "morok.antidbg.yama.harden");
+
+        Function *fn = B.GetInsertBlock()->getParent();
+        auto *setPtracerBB =
+            BasicBlock::Create(M.getContext(), "morok.antidbg.yama.ptracer", fn);
+        auto *contBB =
+            BasicBlock::Create(M.getContext(), "morok.antidbg.yama.cont", fn);
+        B.CreateCondBr(yama.mode1, setPtracerBB, contBB);
+
+        IRBuilder<> PB(setPtracerBB);
+        Value *ptracerRc =
+            emitLinuxPrctl(PB, M, TT, 0x59616D61, 0, 0, 0, 0);
+        ptracerRc->setName("morok.antidbg.yama.ptracer.rc");
+        PB.CreateBr(contBB);
+        B.SetInsertPoint(contBB);
+    }
     emitLinuxPrctl(B, M, TT, 38, 1, 0, 0, 0);         // PR_SET_NO_NEW_PRIVS
 }
 
@@ -3432,7 +3556,7 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
             drActive = nullptr;
         }
     }
-    emitLinuxHardening(B, M, TT, drSentinel);
+    emitLinuxHardening(B, M, State, rng, TT, drSentinel);
 
     Function *statusFn = linuxStatusTracerCheck(M, rng, TT);
     Function *statFn = linuxStatField4Check(M, rng, TT);

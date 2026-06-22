@@ -18075,6 +18075,19 @@ entry:
                                  "morok.antidbg.dr.ptracer.restricted") >= 1u);
     CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.dr.ptracer.ok") >=
           1u);
+    CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.yama.dr.value") >=
+          1u);
+    CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.yama.dr.mode0") >=
+          1u);
+    CHECK(countNamedInstructions(*AntiDbg,
+                                 "morok.antidbg.yama.dr.unreadable") >= 1u);
+    CHECK(countNamedInstructions(*AntiDbg,
+                                 "morok.antidbg.dr.ptracer.scope.open") >= 1u);
+    CHECK(countNamedInstructions(*AntiDbg,
+                                 "morok.antidbg.dr.ptracer.open.active") >=
+          1u);
+    CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.dr.ptracer.scope1") >=
+          1u);
     CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.dr.ptracer.old") ==
           0u);
     CHECK(storesNamedValueToGlobalPrefix(*AntiDbg, "morok.antidbg.dr.active",
@@ -18237,6 +18250,8 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/status"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/stat"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/task"));
+    CHECK_FALSE(
+        hasReadableByteString(*M, "/proc/sys/kernel/yama/ptrace_scope"));
     CHECK_FALSE(hasReadableByteString(*M, "TracerPid"));
     CHECK_FALSE(hasReadableByteString(*M, ".nscd-cache"));
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -18344,6 +18359,11 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("ptrace") != nullptr);
     CHECK(M->getFunction("__errno_location") != nullptr);
     CHECK(M->getFunction("syscall") != nullptr);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.yama.harden.value") >=
+          1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.yama.ptracer.rc") >= 1u);
+    CHECK_FALSE(
+        hasReadableByteString(*M, "/proc/sys/kernel/yama/ptrace_scope"));
     Instruction *PtraceFirstEperm = findNamedInstruction(
         *Ctor, "morok.antidbg.ptrace.init.chain.raw.first.eperm");
     REQUIRE(PtraceFirstEperm != nullptr);
@@ -18887,6 +18907,13 @@ entry:
     CHECK(M->getFunction("morok.antidbg.linux.watch") == nullptr);
     CHECK(M->getFunction("morok.watchdog") == nullptr);
     CHECK(M->getFunction("morok.antidbg.probe.watch") == nullptr);
+    Function *Ctor = M->getFunction("morok.antidbg");
+    REQUIRE(Ctor != nullptr);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.yama.harden.value") >=
+          1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.yama.ptracer.rc") >= 1u);
+    CHECK_FALSE(
+        hasReadableByteString(*M, "/proc/sys/kernel/yama/ptrace_scope"));
     CHECK(M->getFunction("morok.watchdog.heartbeat.watch") == nullptr);
     CHECK(M->getFunction("pthread_create") == nullptr);
     CHECK(M->getFunction("pthread_detach") == nullptr);
