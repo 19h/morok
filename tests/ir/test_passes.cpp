@@ -18410,6 +18410,26 @@ entry:
     REQUIRE(ProbeSigtrapCoherence != nullptr);
     CHECK(valueFeedsNamedInstruction(ProbeSigtrapCoherence,
                                      "morok.seal.fold.anti_debug"));
+    CHECK(countNamedInstructions(*AntiDbg,
+                                 "morok.antidbg.personality.raw") >= 1u);
+    CHECK(countNamedInstructions(
+              *AntiDbg, "morok.antidbg.personality.addr_no_randomize") >= 1u);
+    CHECK(countNamedInstructions(*AntiDbg,
+                                 "morok.antidbg.aslr.load.page") >= 1u);
+    CHECK(countNamedInstructions(*AntiDbg,
+                                 "morok.antidbg.aslr.start.delta") >= 1u);
+    CHECK(functionHasConstantInt(*AntiDbg, 135u));       // personality syscall
+    CHECK(functionHasConstantInt(*AntiDbg, 0x00040000)); // ADDR_NO_RANDOMIZE
+    Instruction *AslrOff = findNamedInstruction(
+        *AntiDbg, "morok.antidbg.personality.aslr.off");
+    REQUIRE(AslrOff != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(AslrOff,
+                                           "morok.seal.fold.anti_debug"));
+    Instruction *LoadBad =
+        findNamedInstruction(*AntiDbg, "morok.antidbg.aslr.load.bad");
+    REQUIRE(LoadBad != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(LoadBad,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(maxStaticAllocaArrayElements(*AntiDbg,
                                        "morok.antidbg.seccomp.filters") == 17u);
     CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.seccomp.tsync") >=
@@ -18533,6 +18553,7 @@ entry:
     CHECK(M->getFunction("read") == nullptr);
     CHECK(M->getFunction("readlink") == nullptr);
     CHECK(M->getFunction("close") == nullptr);
+    CHECK(M->getFunction("personality") == nullptr);
     CHECK(M->getFunction("sleep") != nullptr);
 
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/exe"));
@@ -18688,6 +18709,8 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Ctor, "morok.antidbg.ptrace.init.chain") ==
           0u);
     CHECK(functionHasConstantInt(*Ctor, 134u));       // rt_sigaction syscall
+    CHECK(functionHasConstantInt(*Ctor, 92u));        // personality syscall
+    CHECK(functionHasConstantInt(*Ctor, 0x00040000)); // ADDR_NO_RANDOMIZE
     CHECK(functionHasConstantInt(*Sigmask, 135u));    // rt_sigprocmask syscall
     CHECK(functionHasConstantInt(*PtraceStop, 160u)); // aarch64 uname syscall
     CHECK(functionHasConstantInt(*Ctor, 277u));       // seccomp syscall
@@ -18699,7 +18722,18 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("__errno_location") == nullptr);
     CHECK(M->getFunction("sigaction") == nullptr);
     CHECK(M->getFunction("prctl") == nullptr);
+    CHECK(M->getFunction("personality") == nullptr);
     CHECK(M->getFunction("syscall") != nullptr);
+    Instruction *Aarch64AslrOff = findNamedInstruction(
+        *Ctor, "morok.antidbg.personality.aslr.off");
+    REQUIRE(Aarch64AslrOff != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(Aarch64AslrOff,
+                                           "morok.seal.fold.anti_debug"));
+    Instruction *Aarch64LoadBad =
+        findNamedInstruction(*Ctor, "morok.antidbg.aslr.load.bad");
+    REQUIRE(Aarch64LoadBad != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(Aarch64LoadBad,
+                                           "morok.seal.fold.anti_debug"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

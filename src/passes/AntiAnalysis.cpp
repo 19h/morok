@@ -763,6 +763,11 @@ Value *emitLinuxSyscall(IRBuilder<> &B, Module &M, const Triple &TT,
     return runtime::emitLinuxSyscall(B, M, TT, Number, Args);
 }
 
+Value *emitLinuxStaticRawSyscall(IRBuilder<> &B, Module &M, const Triple &TT,
+                                 std::uint32_t Number,
+                                 std::initializer_list<Value *> Args,
+                                 const Twine &Name);
+
 bool linuxCoreSyscalls(const Triple &TT, std::uint32_t &Ptrace,
                        std::uint32_t &Prctl, std::uint32_t &OpenAt,
                        std::uint32_t &Read, std::uint32_t &Close) {
@@ -775,6 +780,21 @@ bool linuxCoreSyscalls(const Triple &TT, std::uint32_t &Ptrace,
     Read = sys.read;
     Close = sys.close;
     return true;
+}
+
+bool linuxPersonalitySyscall(const Triple &TT, std::uint32_t &Personality) {
+    if (!TT.isOSLinux())
+        return false;
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        Personality = 135;
+        return true;
+    case Triple::aarch64:
+        Personality = 92;
+        return true;
+    default:
+        return false;
+    }
 }
 
 Value *emitLinuxPtrace(IRBuilder<> &B, Module &M, const Triple &TT,
@@ -971,6 +991,26 @@ GlobalVariable *elfDynamicWeakSymbol(Module &M) {
                               "_DYNAMIC");
 }
 
+GlobalVariable *elfHeaderWeakSymbol(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("__ehdr_start", /*AllowInternal=*/true))
+        return existing;
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    return new GlobalVariable(M, i8, /*isConstant=*/false,
+                              GlobalValue::ExternalWeakLinkage, nullptr,
+                              "__ehdr_start");
+}
+
+GlobalValue *elfStartWeakSymbol(Module &M) {
+    if (auto *existing =
+            dyn_cast_or_null<GlobalValue>(M.getNamedValue("_start")))
+        return existing;
+    auto *fn = Function::Create(
+        FunctionType::get(Type::getVoidTy(M.getContext()), false),
+        GlobalValue::ExternalWeakLinkage, "_start", &M);
+    return fn;
+}
+
 Value *emitElfDynamicPresent(IRBuilder<> &B, Module &M, const Triple &TT) {
     if (!TT.isOSLinux())
         return ConstantInt::getTrue(M.getContext());
@@ -978,6 +1018,304 @@ Value *emitElfDynamicPresent(IRBuilder<> &B, Module &M, const Triple &TT) {
     return B.CreateICmpNE(elfDynamicWeakSymbol(M),
                           ConstantPointerNull::get(ptr),
                           "morok.antihook.dynamic.present");
+}
+
+void emitLinuxPersonalityAslrTelemetry(IRBuilder<> &B, Module &M,
+                                       GlobalVariable *State,
+                                       const Triple &TT) {
+    std::uint32_t personalityNr = 0;
+    if (!linuxPersonalitySyscall(TT, personalityNr))
+        return;
+
+    constexpr std::uint32_t kPersonalityQuery = 0xffffffffU;
+    constexpr std::uint32_t kAddrNoRandomize = 0x00040000U;
+    auto *ip = intPtrTy(M);
+    Value *raw = emitLinuxStaticRawSyscall(
+        B, M, TT, personalityNr, {ConstantInt::get(ip, kPersonalityQuery)},
+        "morok.antidbg.personality.raw");
+    Value *queryOk =
+        B.CreateICmpSGE(raw, ConstantInt::getSigned(ip, 0),
+                        "morok.antidbg.personality.ok");
+    Value *addrNoRandomizeBits =
+        B.CreateAnd(raw, ConstantInt::get(ip, kAddrNoRandomize),
+                    "morok.antidbg.personality.addr_no_randomize.bits");
+    Value *addrNoRandomize =
+        B.CreateICmpNE(addrNoRandomizeBits, ConstantInt::get(ip, 0),
+                       "morok.antidbg.personality.addr_no_randomize");
+    Value *aslrOff =
+        B.CreateAnd(queryOk, addrNoRandomize,
+                    "morok.antidbg.personality.aslr.off");
+    foldState(B, State, raw, 0x49B62D8A1F57C3E5ULL,
+              "morok.antidbg.personality.raw");
+    foldFlag(B, State, aslrOff, 0xD6A1437C8B9E205FULL,
+             "morok.antidbg.personality.aslr");
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+    GlobalVariable *header = elfHeaderWeakSymbol(M);
+    GlobalValue *start = elfStartWeakSymbol(M);
+    Value *headerPresent =
+        B.CreateICmpNE(header, ConstantPointerNull::get(ptr),
+                       "morok.antidbg.aslr.ehdr.present");
+    Value *startPresent =
+        B.CreateICmpNE(start, ConstantPointerNull::get(ptr),
+                       "morok.antidbg.aslr.start.present");
+    Value *dynamicPresent =
+        B.CreateICmpNE(elfDynamicWeakSymbol(M), ConstantPointerNull::get(ptr),
+                       "morok.antidbg.aslr.dynamic.present");
+    Value *known = B.CreateAnd(
+        B.CreateAnd(headerPresent, startPresent, "morok.antidbg.aslr.symbols"),
+        dynamicPresent, "morok.antidbg.aslr.load.known");
+    Value *headerAddr =
+        B.CreatePtrToInt(header, ip, "morok.antidbg.aslr.ehdr.addr");
+    Value *startAddr =
+        B.CreatePtrToInt(start, ip, "morok.antidbg.aslr.start.addr");
+    Value *pageBits =
+        B.CreateAnd(headerAddr, ConstantInt::get(ip, 0xfff),
+                    "morok.antidbg.aslr.ehdr.page.bits");
+    Value *headerMisaligned =
+        B.CreateICmpNE(pageBits, ConstantInt::get(ip, 0),
+                       "morok.antidbg.aslr.ehdr.misaligned");
+
+    Function *fn = B.GetInsertBlock()->getParent();
+    BasicBlock *knownBB =
+        BasicBlock::Create(ctx, "morok.antidbg.aslr.elf", fn);
+    BasicBlock *loopBB =
+        BasicBlock::Create(ctx, "morok.antidbg.aslr.phdr.loop", fn);
+    BasicBlock *bodyBB =
+        BasicBlock::Create(ctx, "morok.antidbg.aslr.phdr.body", fn);
+    BasicBlock *doneBB =
+        BasicBlock::Create(ctx, "morok.antidbg.aslr.done", fn);
+    BasicBlock *entryBB = B.GetInsertBlock();
+    B.CreateCondBr(known, knownBB, doneBB);
+
+    auto loadAt = [&](IRBuilder<> &IB, Value *base, std::uint64_t offset,
+                      Type *ty, const Twine &name) {
+        Value *slot = gepI8(IB, M, base, ConstantInt::get(ip, offset),
+                            name + ".ptr");
+        auto *load = IB.CreateLoad(ty, slot, name);
+        load->setAlignment(Align(1));
+        return load;
+    };
+
+    IRBuilder<> EB(knownBB);
+    Value *elfMagic =
+        loadAt(EB, header, 0, i32, "morok.antidbg.aslr.elf.magic");
+    Value *elfClass =
+        loadAt(EB, header, 4, i8, "morok.antidbg.aslr.elf.class");
+    Value *phoff64 =
+        loadAt(EB, header, 32, Type::getInt64Ty(ctx),
+               "morok.antidbg.aslr.elf.phoff");
+    Value *phentsize =
+        loadAt(EB, header, 54, i16, "morok.antidbg.aslr.elf.phentsize");
+    Value *phnum = loadAt(EB, header, 56, i16,
+                          "morok.antidbg.aslr.elf.phnum");
+    Value *phoff = EB.CreateZExtOrTrunc(phoff64, ip,
+                                        "morok.antidbg.aslr.elf.phoff.ip");
+    Value *phentsizeIp = EB.CreateZExt(phentsize, ip,
+                                       "morok.antidbg.aslr.elf.phentsize.ip");
+    Value *phnumIp = EB.CreateZExt(phnum, ip,
+                                   "morok.antidbg.aslr.elf.phnum.ip");
+    Value *scanLimit = EB.CreateSelect(
+        EB.CreateICmpULT(phnumIp, ConstantInt::get(ip, 64),
+                         "morok.antidbg.aslr.elf.phnum.small"),
+        phnumIp, ConstantInt::get(ip, 64), "morok.antidbg.aslr.phdr.limit");
+    Value *elfReady = EB.CreateAnd(
+        EB.CreateICmpEQ(elfMagic, ConstantInt::get(i32, 0x464C457F),
+                        "morok.antidbg.aslr.elf.magic.ok"),
+        EB.CreateICmpEQ(elfClass, ConstantInt::get(i8, 2),
+                        "morok.antidbg.aslr.elf.class64"),
+        "morok.antidbg.aslr.elf.ident.ok");
+    elfReady = EB.CreateAnd(
+        elfReady,
+        EB.CreateICmpUGE(phentsize, ConstantInt::get(i16, 56),
+                         "morok.antidbg.aslr.elf.phentsize.ok"),
+        "morok.antidbg.aslr.elf.phdr.size.ok");
+    elfReady = EB.CreateAnd(
+        elfReady,
+        EB.CreateICmpULT(phoff, ConstantInt::get(ip, 4096),
+                         "morok.antidbg.aslr.elf.phoff.ok"),
+        "morok.antidbg.aslr.elf.phoff.ready");
+    elfReady = EB.CreateAnd(
+        elfReady,
+        EB.CreateICmpNE(scanLimit, ConstantInt::get(ip, 0),
+                        "morok.antidbg.aslr.elf.phnum.ready"),
+        "morok.antidbg.aslr.elf.ready");
+    Value *phdrBase =
+        gepI8(EB, M, header, phoff, "morok.antidbg.aslr.phdr.base");
+    EB.CreateCondBr(elfReady, loopBB, doneBB);
+
+    IRBuilder<> LB(loopBB);
+    PHINode *idx = LB.CreatePHI(ip, 2, "morok.antidbg.aslr.phdr.idx");
+    PHINode *baseFound =
+        LB.CreatePHI(Type::getInt1Ty(ctx), 2,
+                     "morok.antidbg.aslr.load.base.found");
+    PHINode *baseVaddr =
+        LB.CreatePHI(ip, 2, "morok.antidbg.aslr.load.base.vaddr");
+    PHINode *execFound =
+        LB.CreatePHI(Type::getInt1Ty(ctx), 2,
+                     "morok.antidbg.aslr.load.exec.found");
+    PHINode *execVaddr =
+        LB.CreatePHI(ip, 2, "morok.antidbg.aslr.load.exec.vaddr");
+    PHINode *execMemsz =
+        LB.CreatePHI(ip, 2, "morok.antidbg.aslr.load.exec.memsz");
+    idx->addIncoming(ConstantInt::get(ip, 0), knownBB);
+    baseFound->addIncoming(ConstantInt::getFalse(ctx), knownBB);
+    baseVaddr->addIncoming(ConstantInt::get(ip, 0), knownBB);
+    execFound->addIncoming(ConstantInt::getFalse(ctx), knownBB);
+    execVaddr->addIncoming(ConstantInt::get(ip, 0), knownBB);
+    execMemsz->addIncoming(ConstantInt::get(ip, 0), knownBB);
+    Value *scanMore =
+        LB.CreateICmpULT(idx, scanLimit, "morok.antidbg.aslr.phdr.more");
+    LB.CreateCondBr(scanMore, bodyBB, doneBB);
+
+    IRBuilder<> PB(bodyBB);
+    Value *entryOffset =
+        PB.CreateMul(idx, phentsizeIp, "morok.antidbg.aslr.phdr.offset");
+    Value *entry =
+        gepI8(PB, M, phdrBase, entryOffset, "morok.antidbg.aslr.phdr.entry");
+    Value *pType =
+        loadAt(PB, entry, 0, i32, "morok.antidbg.aslr.phdr.type");
+    Value *pFlags =
+        loadAt(PB, entry, 4, i32, "morok.antidbg.aslr.phdr.flags");
+    Value *pOffset64 =
+        loadAt(PB, entry, 8, Type::getInt64Ty(ctx),
+               "morok.antidbg.aslr.phdr.offset.file");
+    Value *pVaddr64 =
+        loadAt(PB, entry, 16, Type::getInt64Ty(ctx),
+               "morok.antidbg.aslr.phdr.vaddr");
+    Value *pMemsz64 =
+        loadAt(PB, entry, 40, Type::getInt64Ty(ctx),
+               "morok.antidbg.aslr.phdr.memsz");
+    Value *pOffset = PB.CreateZExtOrTrunc(pOffset64, ip,
+                                          "morok.antidbg.aslr.phdr.offset.ip");
+    Value *pVaddr = PB.CreateZExtOrTrunc(pVaddr64, ip,
+                                         "morok.antidbg.aslr.phdr.vaddr.ip");
+    Value *pMemsz = PB.CreateZExtOrTrunc(pMemsz64, ip,
+                                         "morok.antidbg.aslr.phdr.memsz.ip");
+    Value *isLoad =
+        PB.CreateICmpEQ(pType, ConstantInt::get(i32, 1),
+                        "morok.antidbg.aslr.phdr.load");
+    Value *isBaseLoad = PB.CreateAnd(
+        isLoad, PB.CreateICmpEQ(pOffset, ConstantInt::get(ip, 0),
+                                "morok.antidbg.aslr.phdr.base.offset"),
+        "morok.antidbg.aslr.phdr.base.load");
+    isBaseLoad =
+        PB.CreateAnd(isBaseLoad,
+                     PB.CreateNot(baseFound,
+                                  "morok.antidbg.aslr.phdr.base.not.found"),
+                     "morok.antidbg.aslr.phdr.base.take");
+    Value *execFlag =
+        PB.CreateICmpNE(PB.CreateAnd(pFlags, ConstantInt::get(i32, 1),
+                                     "morok.antidbg.aslr.phdr.exec.bits"),
+                        ConstantInt::get(i32, 0),
+                        "morok.antidbg.aslr.phdr.exec.flag");
+    Value *isExecLoad =
+        PB.CreateAnd(isLoad, execFlag, "morok.antidbg.aslr.phdr.exec.load");
+    isExecLoad =
+        PB.CreateAnd(isExecLoad,
+                     PB.CreateNot(execFound,
+                                  "morok.antidbg.aslr.phdr.exec.not.found"),
+                     "morok.antidbg.aslr.phdr.exec.take");
+    Value *nextBaseFound =
+        PB.CreateOr(baseFound, isBaseLoad,
+                    "morok.antidbg.aslr.load.base.found.next");
+    Value *nextBaseVaddr =
+        PB.CreateSelect(isBaseLoad, pVaddr, baseVaddr,
+                        "morok.antidbg.aslr.load.base.vaddr.next");
+    Value *nextExecFound =
+        PB.CreateOr(execFound, isExecLoad,
+                    "morok.antidbg.aslr.load.exec.found.next");
+    Value *nextExecVaddr =
+        PB.CreateSelect(isExecLoad, pVaddr, execVaddr,
+                        "morok.antidbg.aslr.load.exec.vaddr.next");
+    Value *nextExecMemsz =
+        PB.CreateSelect(isExecLoad, pMemsz, execMemsz,
+                        "morok.antidbg.aslr.load.exec.memsz.next");
+    Value *nextIdx =
+        PB.CreateAdd(idx, ConstantInt::get(ip, 1),
+                     "morok.antidbg.aslr.phdr.next");
+    PB.CreateBr(loopBB);
+    idx->addIncoming(nextIdx, bodyBB);
+    baseFound->addIncoming(nextBaseFound, bodyBB);
+    baseVaddr->addIncoming(nextBaseVaddr, bodyBB);
+    execFound->addIncoming(nextExecFound, bodyBB);
+    execVaddr->addIncoming(nextExecVaddr, bodyBB);
+    execMemsz->addIncoming(nextExecMemsz, bodyBB);
+
+    B.SetInsertPoint(doneBB);
+    auto *baseFoundOut =
+        B.CreatePHI(Type::getInt1Ty(ctx), 3,
+                    "morok.antidbg.aslr.load.base.found.out");
+    auto *baseVaddrOut =
+        B.CreatePHI(ip, 3, "morok.antidbg.aslr.load.base.vaddr.out");
+    auto *execFoundOut =
+        B.CreatePHI(Type::getInt1Ty(ctx), 3,
+                    "morok.antidbg.aslr.load.exec.found.out");
+    auto *execVaddrOut =
+        B.CreatePHI(ip, 3, "morok.antidbg.aslr.load.exec.vaddr.out");
+    auto *execMemszOut =
+        B.CreatePHI(ip, 3, "morok.antidbg.aslr.load.exec.memsz.out");
+    baseFoundOut->addIncoming(ConstantInt::getFalse(ctx), entryBB);
+    baseVaddrOut->addIncoming(ConstantInt::get(ip, 0), entryBB);
+    execFoundOut->addIncoming(ConstantInt::getFalse(ctx), entryBB);
+    execVaddrOut->addIncoming(ConstantInt::get(ip, 0), entryBB);
+    execMemszOut->addIncoming(ConstantInt::get(ip, 0), entryBB);
+    baseFoundOut->addIncoming(ConstantInt::getFalse(ctx), knownBB);
+    baseVaddrOut->addIncoming(ConstantInt::get(ip, 0), knownBB);
+    execFoundOut->addIncoming(ConstantInt::getFalse(ctx), knownBB);
+    execVaddrOut->addIncoming(ConstantInt::get(ip, 0), knownBB);
+    execMemszOut->addIncoming(ConstantInt::get(ip, 0), knownBB);
+    baseFoundOut->addIncoming(baseFound, loopBB);
+    baseVaddrOut->addIncoming(baseVaddr, loopBB);
+    execFoundOut->addIncoming(execFound, loopBB);
+    execVaddrOut->addIncoming(execVaddr, loopBB);
+    execMemszOut->addIncoming(execMemsz, loopBB);
+
+    Value *loadBias =
+        B.CreateSub(headerAddr, baseVaddrOut, "morok.antidbg.aslr.load.bias");
+    Value *startLink =
+        B.CreateSub(startAddr, loadBias, "morok.antidbg.aslr.start.link");
+    Value *execEnd =
+        B.CreateAdd(execVaddrOut, execMemszOut, "morok.antidbg.aslr.exec.end");
+    Value *startInExec = B.CreateAnd(
+        B.CreateICmpUGE(startLink, execVaddrOut,
+                        "morok.antidbg.aslr.start.ge.exec"),
+        B.CreateICmpULT(startLink, execEnd,
+                        "morok.antidbg.aslr.start.lt.exec"),
+        "morok.antidbg.aslr.start.in.exec");
+    Value *loadCoherent = B.CreateAnd(
+        baseFoundOut, B.CreateAnd(execFoundOut, startInExec,
+                                  "morok.antidbg.aslr.load.ranges"),
+        "morok.antidbg.aslr.load.coherent");
+    loadCoherent = B.CreateAnd(
+        loadCoherent,
+        B.CreateNot(headerMisaligned, "morok.antidbg.aslr.ehdr.aligned"),
+        "morok.antidbg.aslr.load.aligned");
+    Value *loadBad = B.CreateAnd(
+        known, B.CreateNot(loadCoherent, "morok.antidbg.aslr.load.not.coherent"),
+        "morok.antidbg.aslr.load.bad");
+    Value *loadPage =
+        B.CreateSelect(baseFoundOut,
+                       B.CreateLShr(loadBias, ConstantInt::get(ip, 12),
+                                    "morok.antidbg.aslr.load.page.raw"),
+                       ConstantInt::get(ip, 0),
+                       "morok.antidbg.aslr.load.page");
+    Value *startDelta =
+        B.CreateSelect(baseFoundOut,
+                       B.CreateSub(startLink, baseVaddrOut,
+                                   "morok.antidbg.aslr.start.delta.raw"),
+                       ConstantInt::get(ip, 0),
+                       "morok.antidbg.aslr.start.delta");
+    foldState(B, State, loadPage, 0x8C71E4B296D03AF5ULL,
+              "morok.antidbg.aslr.load.page");
+    foldState(B, State, startDelta, 0x31E8A9D57C046B2FULL,
+              "morok.antidbg.aslr.start.delta");
+    foldFlag(B, State, loadBad, 0xB4D7058E2C93A16FULL,
+             "morok.antidbg.aslr.load");
 }
 
 bool useDirectDarwinSyscalls(const Module &M, const Triple &TT) {
@@ -4536,6 +4874,7 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
     foldFlag(B, State, statusTraced, 0xA4756E49F2D31219ULL,
              "morok.antidbg.status");
     foldState(B, State, stat4, 0xDA942042E4DD58B5ULL, "morok.antidbg.stat4");
+    emitLinuxPersonalityAslrTelemetry(B, M, State, TT);
     emitLinuxSigtrapCoherence(
         B, M, State, statusTraced, ConstantInt::get(B.getInt64Ty(), rng.next()),
         rng, TT, "morok.antidbg.sigtrap");
