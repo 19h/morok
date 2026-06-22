@@ -30,6 +30,7 @@
 #include "morok/passes/FaultPagedPayload.hpp"
 #include "morok/passes/Flattening.hpp"
 #include "morok/passes/FunctionCallObfuscate.hpp"
+#include "morok/passes/FunctionFission.hpp"
 #include "morok/passes/FunctionWrapper.hpp"
 #include "morok/passes/HashGatedSelfDecrypt.hpp"
 #include "morok/passes/IndirectBranch.hpp"
@@ -45,7 +46,6 @@
 #include "morok/passes/PathExplosion.hpp"
 #include "morok/passes/PerBuildPolymorphism.hpp"
 #include "morok/passes/PhiTangling.hpp"
-#include "morok/passes/FunctionFission.hpp"
 #include "morok/passes/PointerLaundering.hpp"
 #include "morok/passes/ReturnlessDispatch.hpp"
 #include "morok/passes/RuntimeSeal.hpp"
@@ -460,6 +460,21 @@ std::size_t countFunctions(Module &M, StringRef prefix) {
     return n;
 }
 
+Function *firstFunctionByPrefix(Module &M, StringRef prefix) {
+    for (Function &F : M)
+        if (F.getName().starts_with(prefix))
+            return &F;
+    return nullptr;
+}
+
+Function *firstFunctionByPrefixAndArity(Module &M, StringRef prefix,
+                                        unsigned arity) {
+    for (Function &F : M)
+        if (F.getName().starts_with(prefix) && F.arg_size() == arity)
+            return &F;
+    return nullptr;
+}
+
 std::vector<unsigned> ctorPrioritiesFor(Module &M, StringRef functionPrefix) {
     std::vector<Function *> matches;
     for (Function &F : M)
@@ -501,6 +516,16 @@ std::size_t countCallsTo(Function &F, StringRef name) {
         if (auto *CB = dyn_cast<CallBase>(&I))
             if (Function *Callee = CB->getCalledFunction())
                 if (Callee->getName() == name)
+                    ++n;
+    return n;
+}
+
+std::size_t countCallsToPrefix(Function &F, StringRef prefix) {
+    std::size_t n = 0;
+    for (Instruction &I : instructions(F))
+        if (auto *CB = dyn_cast<CallBase>(&I))
+            if (Function *Callee = CB->getCalledFunction())
+                if (Callee->getName().starts_with(prefix))
                     ++n;
     return n;
 }
@@ -669,7 +694,8 @@ exit:
     CHECK(changed);
     CHECK_FALSE(verifyModule(*M, &errs()));
 
-    // The original survives (smaller) and at least one fission part was created.
+    // The original survives (smaller) and at least one fission part was
+    // created.
     REQUIRE(M->getFunction("branchy") != nullptr);
     std::size_t parts = 0;
     for (Function &F : *M) {
@@ -739,7 +765,8 @@ attributes #0 = { returns_twice }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE("returnlessDispatch turns tail-position returns into indirect tails") {
+TEST_CASE(
+    "returnlessDispatch turns tail-position returns into indirect tails") {
     LLVMContext ctx;
     const char *ir = R"ir(
 define internal i32 @callee(i32 %x) {
@@ -820,7 +847,8 @@ entry:
         return nullptr;
     };
 
-    // Perfect-forwarding return becomes a guaranteed-no-`ret` indirect musttail.
+    // Perfect-forwarding return becomes a guaranteed-no-`ret` indirect
+    // musttail.
     CallInst *fwd = firstCall(M->getFunction("fwd"));
     REQUIRE(fwd != nullptr);
     CHECK(fwd->getCalledFunction() == nullptr);
@@ -919,10 +947,11 @@ TEST_CASE("PlatformRuntime direct_syscalls=auto keeps the direct path") {
     CHECK_FALSE(verifyModule(M, &errs()));
 }
 
-// Regression for the #102 reopen: applying the policy more than once (a repeated
-// Morok run, or input IR that already carries the flag) must REPLACE the flag,
-// not append a duplicate.  Duplicate llvm.module.flags entries are verifier-
-// invalid (a build DoS) and let a stale first value shadow the operator policy.
+// Regression for the #102 reopen: applying the policy more than once (a
+// repeated Morok run, or input IR that already carries the flag) must REPLACE
+// the flag, not append a duplicate.  Duplicate llvm.module.flags entries are
+// verifier- invalid (a build DoS) and let a stale first value shadow the
+// operator policy.
 TEST_CASE("PlatformRuntime direct_syscalls policy flag is idempotent") {
     LLVMContext ctx;
     Module M("platform-runtime-policy-idem", ctx);
@@ -940,8 +969,8 @@ TEST_CASE("PlatformRuntime direct_syscalls policy flag is idempotent") {
         B, M, Triple(M.getTargetTriple()), 39, {}, "morok.platform.getpid");
     B.CreateRet(B.CreateTruncOrBitCast(Rc, I32));
 
-    // No duplicate module flags -> module verifies, and the last value ("never")
-    // wins, so the syscall is routed through the libc import.
+    // No duplicate module flags -> module verifies, and the last value
+    // ("never") wins, so the syscall is routed through the libc import.
     CHECK_FALSE(verifyModule(M, &errs()));
     CHECK_FALSE(hasInlineAsmCall(*F));
     REQUIRE(M.getFunction("syscall") != nullptr);
@@ -8808,14 +8837,15 @@ entry:
     CHECK(Loaded->isThreadLocal());
     CHECK(Active->isThreadLocal());
     CHECK(Faults->isThreadLocal());
-    // Regression for the #99 reopen: marking the cache/state thread-local is not
-    // enough — a thread-local global's symbol is only its per-thread template,
-    // so a direct load/store/GEP through it writes the (shared/read-only)
-    // template and the binary faults at runtime (EXC_BAD_ACCESS).  The accessor
-    // must resolve each thread-local global to the current thread's instance via
-    // llvm.threadlocal.address before using it, so assert the intrinsic is
-    // present once per thread-local access (and that no thread-local global is
-    // used directly as a load/store/GEP pointer operand).
+    // Regression for the #99 reopen: marking the cache/state thread-local is
+    // not enough — a thread-local global's symbol is only its per-thread
+    // template, so a direct load/store/GEP through it writes the
+    // (shared/read-only) template and the binary faults at runtime
+    // (EXC_BAD_ACCESS).  The accessor must resolve each thread-local global to
+    // the current thread's instance via llvm.threadlocal.address before using
+    // it, so assert the intrinsic is present once per thread-local access (and
+    // that no thread-local global is used directly as a load/store/GEP pointer
+    // operand).
     std::size_t tlaCalls = 0;
     for (Instruction &I : instructions(*Accessor))
         if (auto *CB = dyn_cast<CallInst>(&I))
@@ -9235,9 +9265,8 @@ entry:
                      (BI->getSuccessor(0)->getName() == "fail.poison" &&
                       BI->getSuccessor(1)->getName() == "fail.publish"));
             if (BB.getName() == "fail.publish")
-                failPoisonPublishes =
-                    BI->isUnconditional() &&
-                    BI->getSuccessor(0)->getName() == "exit";
+                failPoisonPublishes = BI->isUnconditional() &&
+                                      BI->getSuccessor(0)->getName() == "exit";
         }
     }
     for (Instruction &I : instructions(*Seal)) {
@@ -9583,7 +9612,8 @@ entry:
     // Regression for reopened #95: seeing any non-empty proof is not enough to
     // keep the seal clean. The seen path must be digest-bound and becomes zero
     // only when the runtime accumulator equals the build-time expected digest;
-    // missing or forged proof material still poisons the external_proof channel.
+    // missing or forged proof material still poisons the external_proof
+    // channel.
     bool missingProofPoisonsSeal = false;
     bool seenProofIsDigestBound = false;
     bool seenProofUsesExpectedDigest = false;
@@ -14113,8 +14143,7 @@ entry:
     CHECK(std::all_of(Priorities.begin(), Priorities.end(),
                       [](unsigned P) { return P == 0u; }));
 
-    for (StringRef Name : {"return_secret", "store_secret",
-                           "capture_secret"}) {
+    for (StringRef Name : {"return_secret", "store_secret", "capture_secret"}) {
         Function *F = M->getFunction(Name);
         REQUIRE(F);
         CHECK(countCallsTo(*F, "morok.strdec") == 0u);
@@ -14642,8 +14671,8 @@ entry:
 
     auto engine = morok::core::Xoshiro256pp::fromSeed(308);
     morok::ir::IRRandom rng(engine);
-    CHECK(morok::passes::stringEncryptModule(
-        *M, morok::passes::StrEncParams{}, rng));
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
 
     CHECK_FALSE(hasReadableByteString(*M, "RD-CNWDI"));
     CHECK_FALSE(hasReadableByteString(*M, "UF6"));
@@ -14729,8 +14758,13 @@ define i32 @caller() {
     CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
     CHECK(M->getFunction("dlopen") == nullptr);
     CHECK(M->getFunction("dlsym") == nullptr);
-    CHECK(M->getFunction("morok.fco.resolve.elf") != nullptr);
-    Function *Scan = M->getFunction("morok.fco.resolve.elf.module");
+    CHECK(M->getFunction("morok.fco.resolve.elf") == nullptr);
+    CHECK(countFunctions(*M, "morok.fco.resolve.elf.") >= 1u);
+    Function *Resolve =
+        firstFunctionByPrefixAndArity(*M, "morok.fco.resolve.elf.", 2);
+    REQUIRE(Resolve);
+    CHECK(Resolve->arg_size() == 2);
+    Function *Scan = firstFunctionByPrefix(*M, "morok.fco.resolve.elf.module.");
     REQUIRE(Scan);
     bool hasIfuncReturn = false;
     bool hasIfuncCall = false;
@@ -14805,16 +14839,21 @@ entry:
     morok::ir::IRRandom rng(engine);
     CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
 
-    Function *Resolve = M->getFunction("morok.win.pe.resolve");
+    CHECK(M->getFunction("morok.win.pe.resolve") == nullptr);
+    Function *Resolve = firstFunctionByPrefix(*M, "morok.win.pe.resolve.");
     REQUIRE(Resolve != nullptr);
+    CHECK(Resolve->arg_size() == 3);
     CHECK(countNamedInstructions(*Resolve, "morok.win.pe.export.size") >= 1u);
     CHECK(countNamedInstructions(*Resolve, "morok.win.pe.export.nonempty") >=
           1u);
     CHECK(countNamedInstructions(*Resolve, "morok.win.pe.forwarder") >= 1u);
     CHECK(countNamedInstructions(*Resolve, "morok.win.pe.func.safe") >= 1u);
 
-    Function *WinResolve = M->getFunction("morok.fco.resolve.windows");
+    CHECK(M->getFunction("morok.fco.resolve.windows") == nullptr);
+    Function *WinResolve =
+        firstFunctionByPrefix(*M, "morok.fco.resolve.windows.");
     REQUIRE(WinResolve != nullptr);
+    CHECK(WinResolve->arg_size() == 2);
     CHECK(countNamedInstructions(*WinResolve, "morok.fco.win.resolved.phi") >=
           1u);
     CHECK(countNamedInstructions(*WinResolve, "morok.fco.win.candidate.next") >=
@@ -14981,6 +15020,7 @@ define i32 @caller() {
     bool hasFaultAsm = false;
     bool hasResolveBlock = false;
     bool indirectUsesCachedPointer = false;
+    bool resolverCallHasSiteSalt = false;
     auto requirePendingTls = [&](StringRef Name) {
         GlobalVariable *GV = M->getGlobalVariable(Name, true);
         REQUIRE(GV);
@@ -15001,7 +15041,8 @@ define i32 @caller() {
                 SI->getPointerOperand()->stripPointerCasts() == PendingHash;
         if (auto *CI = dyn_cast<CallInst>(&I)) {
             if (Function *Cee = CI->getCalledFunction()) {
-                (void)Cee;
+                if (Cee->getName().starts_with("morok.fco.resolve.elf."))
+                    resolverCallHasSiteSalt |= CI->arg_size() == 2;
             } else if (auto *Asm =
                            dyn_cast<InlineAsm>(CI->getCalledOperand())) {
                 hasFaultAsm |=
@@ -15016,16 +15057,18 @@ define i32 @caller() {
     Function *Handler = M->getFunction("morok.fco.ex.handler");
     REQUIRE(Handler);
     CHECK(M->getFunction("dlsym") == nullptr);
-    CHECK(countCallsTo(*Handler, "morok.fco.resolve.elf") == 0u);
-    CHECK(countCallsTo(*Caller, "morok.fco.resolve.elf") == 1u);
+    CHECK(M->getFunction("morok.fco.resolve.elf") == nullptr);
+    CHECK(countCallsToPrefix(*Handler, "morok.fco.resolve.elf.") == 0u);
+    CHECK(countCallsToPrefix(*Caller, "morok.fco.resolve.elf.") == 1u);
     Function *Install = M->getFunction("morok.fco.ex.install");
     REQUIRE(Install);
-    CHECK(countCallsTo(*Install, "morok.fco.resolve.elf") == 0u);
+    CHECK(countCallsToPrefix(*Install, "morok.fco.resolve.elf.") == 0u);
     CHECK(countGlobals(*M, "morok.fco.cache") == 1u);
     CHECK(storesPendingHash);
     CHECK(hasFaultAsm);
     CHECK(hasResolveBlock);
     CHECK(indirectUsesCachedPointer);
+    CHECK(resolverCallHasSiteSalt);
     CHECK(countInlineAsmCalls(*Caller) >= 1u);
     CHECK(countNamedAllocas(*Caller, "morok.cloak.mix") == 0u);
     CHECK(countNamedAllocas(*Caller, "morok.fco.ex.slot") == 1u);
@@ -15055,10 +15098,11 @@ define i64 @caller(ptr %f) {
 
     CHECK(countGlobals(*M, "morok.cloak.c") == 0u);
     CHECK(M->getFunction("dlsym") == nullptr);
-    CHECK(M->getFunction("morok.fco.resolve.macho") != nullptr);
+    CHECK(M->getFunction("morok.fco.resolve.macho") == nullptr);
+    CHECK(countFunctions(*M, "morok.fco.resolve.macho.") >= 1u);
     Function *Caller = M->getFunction("caller");
     REQUIRE(Caller);
-    CHECK(countCallsTo(*Caller, "morok.fco.resolve.macho") == 1u);
+    CHECK(countCallsToPrefix(*Caller, "morok.fco.resolve.macho.") == 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -15079,8 +15123,9 @@ define ptr @caller(ptr %dst, ptr %src) {
     Function *Caller = M->getFunction("caller");
     REQUIRE(Caller);
     CHECK(countCallsTo(*Caller, "strncpy") == 0u);
-    CHECK(M->getFunction("morok.fco.resolve.macho") != nullptr);
-    CHECK(countCallsTo(*Caller, "morok.fco.resolve.macho") == 2u);
+    CHECK(M->getFunction("morok.fco.resolve.macho") == nullptr);
+    CHECK(countFunctions(*M, "morok.fco.resolve.macho.") >= 1u);
+    CHECK(countCallsToPrefix(*Caller, "morok.fco.resolve.macho.") == 2u);
     CHECK(countNamedInstructions(*Caller, "morok.fco.hash.alias.resolved") >=
           1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -15250,8 +15295,7 @@ entry:
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.lazy.ok") == 0u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.lazy.pending") >=
           1u);
-    CHECK(countNamedInstructions(*Got, "morok.antihook.got.lazy.notnow") >=
-          1u);
+    CHECK(countNamedInstructions(*Got, "morok.antihook.got.lazy.notnow") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.lazy.bound") == 0u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.lazy.bind.fail") ==
           0u);
@@ -15365,15 +15409,16 @@ entry:
     CHECK(countNamedAllocas(*Maps, "morok.antihook.env.read.count") == 1u);
     CHECK(countNamedAllocas(*Maps, "morok.antihook.env.preload.state") == 1u);
     CHECK(countNamedAllocas(*Maps, "morok.antihook.env.audit.state") == 1u);
-    CHECK(hasNamedIcmpWithConstant(*Maps, "morok.antihook.env.read.limit", 16u));
+    CHECK(
+        hasNamedIcmpWithConstant(*Maps, "morok.antihook.env.read.limit", 16u));
     CHECK(countNamedInstructions(*Maps, "morok.antihook.env.read.next") >= 1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.env.idx.live") >= 1u);
+    CHECK(countNamedInstructions(
+              *Maps, "morok.antihook.env.preload.state.next") >= 1u);
     CHECK(countNamedInstructions(*Maps,
-                                 "morok.antihook.env.preload.state.next") >=
+                                 "morok.antihook.env.audit.state.next") >= 1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.preload.hit") >=
           1u);
-    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.audit.state.next") >=
-          1u);
-    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.preload.hit") >= 1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.env.audit.hit") >= 1u);
     CHECK_FALSE(functionHasConstantInt(*Maps, 8181u));
     CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
@@ -15432,7 +15477,8 @@ define i32 @main() { ret i32 0 }
     }
 }
 
-TEST_CASE("antiHookingModule emits Darwin clean-copy checker with bound fixups") {
+TEST_CASE(
+    "antiHookingModule emits Darwin clean-copy checker with bound fixups") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 target triple = "x86_64-apple-macosx13.0.0"
@@ -15460,7 +15506,8 @@ entry:
     REQUIRE(Text != nullptr);
     Function *ImageText = M->getFunction("morok.antihook.macho.image.text");
     REQUIRE(ImageText != nullptr);
-    Function *DylibOrdinal = M->getFunction("morok.antihook.macho.dylib.ordinal");
+    Function *DylibOrdinal =
+        M->getFunction("morok.antihook.macho.dylib.ordinal");
     REQUIRE(DylibOrdinal != nullptr);
     Function *Expected = M->getFunction("morok.antihook.macho.expected.symbol");
     REQUIRE(Expected != nullptr);
@@ -15520,40 +15567,36 @@ entry:
                                  "morok.antihook.fixup.indirect.index") >= 1u);
     CHECK(countNamedInstructions(*Fixups,
                                  "morok.antihook.fixup.indirect.raw") >= 1u);
-    CHECK(countNamedInstructions(*Fixups,
-                                 "morok.antihook.fixup.sym.ordinal") >= 1u);
+    CHECK(countNamedInstructions(*Fixups, "morok.antihook.fixup.sym.ordinal") >=
+          1u);
     CHECK(countNamedInstructions(*Fixups,
                                  "morok.antihook.fixup.expected.dylib") >= 1u);
     CHECK(countNamedInstructions(*Fixups,
                                  "morok.antihook.fixup.expected.symbol") >= 1u);
-    CHECK(countNamedInstructions(*Fixups,
-                                 "morok.antihook.fixup.expected.eq") == 0u);
-    CHECK(countNamedInstructions(*Fixups,
-                                 "morok.antihook.fixup.sym.strx") >= 1u);
-    CHECK(countNamedInstructions(*Fixups,
-                                 "morok.antihook.fixup.sym.name") >= 1u);
-    CHECK(countNamedInstructions(*Fixups,
-                                 "morok.antihook.fixup.target.ok") >= 1u);
-    CHECK(countNamedInstructions(*Fixups,
-                                 "morok.antihook.fixup.lazy.main") >= 1u);
-    CHECK(countNamedInstructions(*Fixups,
-                                 "morok.antihook.fixup.local.main") >= 1u);
-    CHECK(countNamedInstructions(*DylibOrdinal,
-                                 "morok.antihook.macho.dylib.ordinal.match") >=
+    CHECK(countNamedInstructions(*Fixups, "morok.antihook.fixup.expected.eq") ==
+          0u);
+    CHECK(countNamedInstructions(*Fixups, "morok.antihook.fixup.sym.strx") >=
           1u);
+    CHECK(countNamedInstructions(*Fixups, "morok.antihook.fixup.sym.name") >=
+          1u);
+    CHECK(countNamedInstructions(*Fixups, "morok.antihook.fixup.target.ok") >=
+          1u);
+    CHECK(countNamedInstructions(*Fixups, "morok.antihook.fixup.lazy.main") >=
+          1u);
+    CHECK(countNamedInstructions(*Fixups, "morok.antihook.fixup.local.main") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *DylibOrdinal, "morok.antihook.macho.dylib.ordinal.match") >= 1u);
+    CHECK(countNamedInstructions(
+              *Expected, "morok.antihook.macho.expected.image.name.eq") >= 1u);
+    CHECK(countNamedInstructions(
+              *Expected, "morok.antihook.macho.expected.sym.name.eq") >= 1u);
     CHECK(countNamedInstructions(*Expected,
-                                 "morok.antihook.macho.expected.image.name.eq") >=
+                                 "morok.antihook.macho.expected.sym.eq") >= 1u);
+    CHECK(countNamedInstructions(
+              *Expected, "morok.antihook.macho.expected.symbol.hit") >= 1u);
+    CHECK(countNamedInstructions(*StringEq, "morok.antihook.str.eq.byte") >=
           1u);
-    CHECK(countNamedInstructions(*Expected,
-                                 "morok.antihook.macho.expected.sym.name.eq") >=
-          1u);
-    CHECK(countNamedInstructions(*Expected,
-                                 "morok.antihook.macho.expected.sym.eq") >=
-          1u);
-    CHECK(countNamedInstructions(*Expected,
-                                 "morok.antihook.macho.expected.symbol.hit") >=
-          1u);
-    CHECK(countNamedInstructions(*StringEq, "morok.antihook.str.eq.byte") >= 1u);
     CHECK(countNamedInstructions(*Text, "morok.antihook.macho.text.hit") >= 1u);
     CHECK(countNamedInstructions(*ImageText,
                                  "morok.antihook.macho.image.text.hit") >= 1u);
@@ -16817,25 +16860,24 @@ define i32 @main() { ret i32 0 }
           1u);
     CHECK(countNamedInstructions(*Executable,
                                  "morok.win.veh.exec.ntqueryvm.status") >= 1u);
-    CHECK(countNamedInstructions(*Executable,
-                                 "morok.win.veh.exec.mbi.type") >= 1u);
-    CHECK(countNamedInstructions(*Executable,
-                                 "morok.win.veh.exec.mbi.image") >= 1u);
+    CHECK(countNamedInstructions(*Executable, "morok.win.veh.exec.mbi.type") >=
+          1u);
+    CHECK(countNamedInstructions(*Executable, "morok.win.veh.exec.mbi.image") >=
+          1u);
     CHECK(countNamedInstructions(*Executable,
                                  "morok.win.veh.exec.mbi.executable") >= 1u);
     CHECK(countNamedInstructions(*Executable,
                                  "morok.win.veh.exec.mbi.writable") >= 1u);
     CHECK(countNamedInstructions(*Executable,
-                                 "morok.win.veh.exec.mbi.protect.safe") >=
-          1u);
+                                 "morok.win.veh.exec.mbi.protect.safe") >= 1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.head.readable") >= 1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.decoded.20") >= 1u);
     CHECK(countNamedInstructions(*Audit,
                                  "morok.win.veh.handler.20.executable") >= 1u);
     CHECK(countNamedInstructions(*Audit,
                                  "morok.win.veh.handler.18.executable") >= 1u);
-    CHECK(countNamedInstructions(*Audit,
-                                 "morok.win.veh.handler.trusted.any") >= 1u);
+    CHECK(countNamedInstructions(*Audit, "morok.win.veh.handler.trusted.any") >=
+          1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.handler.foreign") >=
           1u);
     CHECK(countNamedInstructions(*Audit, "morok.win.veh.bad.next") >= 1u);

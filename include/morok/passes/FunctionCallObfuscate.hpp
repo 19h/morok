@@ -2,12 +2,13 @@
 //
 // Morok — modular LLVM IR obfuscator.
 //
-// morok/passes/FunctionCallObfuscate.hpp — resolve external calls via dlsym.
+// morok/passes/FunctionCallObfuscate.hpp — obscure external call resolution.
 //
-// Direct calls and invokes to external (library) functions are rewritten to look
-// the symbol up at run time with dlsym and call/invoke the resolved pointer.
-// The import no longer appears as a static call edge, hiding which library
-// functions are used.
+// Direct calls and invokes to external (library) functions are rewritten to
+// look the symbol up at run time and call/invoke the resolved pointer.
+// Supported 64-bit targets use private hash-resolver families; other targets
+// use cloaked dlsym names.  The import no longer appears as a static call edge,
+// hiding which library functions are used.
 
 #ifndef MOROK_PASSES_FUNCTION_CALL_OBFUSCATE_HPP
 #define MOROK_PASSES_FUNCTION_CALL_OBFUSCATE_HPP
@@ -30,8 +31,8 @@ struct FcoParams {
     std::uint32_t max_calls = 256;   ///< total redirected call/invoke-site cap
 };
 
-/// Redirect eligible external calls/invokes in `M` through dlsym.  Returns true
-/// if any site was rewritten.
+/// Redirect eligible external calls/invokes in `M`.  Returns true if any site
+/// was rewritten.
 bool functionCallObfuscateModule(llvm::Module &M, const FcoParams &params,
                                  morok::ir::IRRandom &rng);
 

@@ -1192,7 +1192,10 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
 - FunctionWrapper: polymorphic proxies including concrete variadic call/invoke sites; prob/times/max_wrappers/hard cap 256.
 - FunctionCallObfuscate: per-site import indirection; hard cap 256 call/invoke
   sites. On 64-bit Linux and macOS the target symbol name is not emitted at all:
-  each site carries only `FNV-1a(symbol)` and calls a private manual resolver.
+  each site carries only a per-family keyed symbol hash that is perturbed by a
+  per-callsite salt, then calls one of several private manual resolver families.
+  Reversing one resolver family or one `(hash, salt)` pair no longer rebuilds a
+  module-wide import table.
   Linux walks the loaded ELF program headers and `.dynamic` data, scans
   `DT_HASH`/`DT_SYMTAB`/`DT_STRTAB`, handles direct-loader musl images without
   `PT_PHDR`, then falls back through `DT_DEBUG`, `AT_BASE`, and
@@ -1213,7 +1216,7 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   immediately before the indirect call/invoke.  There is no reusable plaintext
   function-pointer slot for static IAT-style recovery.
   On Linux x86_64 direct call sites also take the exception-mediated path: the
-  site stores a pending request `(FNV-1a(symbol), null-name, out-slot,
+  site stores a pending request `(salted-hash(symbol), null-name, out-slot,
   continuation blockaddress)` and deliberately faults through inline asm. A
   `SIGSEGV` `SA_SIGINFO` handler validates the pending hash request, clears it,
   and rewrites the saved RIP to the continuation block. The continuation runs
