@@ -19065,6 +19065,18 @@ entry:
                                  "morok.antidbg.watch.status.enforced") == 0u);
     CHECK(countNamedInstructions(*HotProbe,
                                  "morok.antidbg.probe.status.enforced") == 0u);
+    CHECK(M->getGlobalVariable("morok.seal.score.anti_debug.weight", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.seal.score.anti_debug.evidence", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.seal.score.anti_debug.committed", true) !=
+          nullptr);
+    CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.status.score") >=
+          1u);
+    CHECK(countNamedInstructions(*Watch, "morok.antidbg.watch.status.score") >=
+          1u);
+    CHECK(countNamedInstructions(*HotProbe,
+                                 "morok.antidbg.probe.status.score") >= 1u);
     CHECK(countCallsTo(*AntiDbg, "morok.antidbg.sigtrap") == 1u);
     CHECK(countCallsTo(*HotProbe, "morok.antidbg.sigtrap") == 1u);
     CHECK(functionHasConstantInt(*AntiDbg, 13u));       // rt_sigaction syscall

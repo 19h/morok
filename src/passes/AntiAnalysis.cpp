@@ -447,6 +447,15 @@ void foldSoftScore(IRBuilderBase &B, Value *Flag, std::uint64_t Salt,
         Salt ^ 0xC6A4A7935BD1E995ULL, Name + ".score");
 }
 
+void foldSharedEvidenceScore(IRBuilderBase &B, Value *Flag,
+                             std::uint64_t EvidenceMask, std::uint64_t Salt,
+                             const Twine &Name) {
+    runtime_seal::foldWeightedFlag(
+        B, runtime_seal::kAntiDebugChannel, Flag, kSoftScoreWeight,
+        EvidenceMask ? EvidenceMask : 1ULL, kSoftScoreThreshold,
+        Salt ^ 0xD6E8FEB86659FD93ULL, Name + ".score");
+}
+
 void foldFlag(IRBuilderBase &B, GlobalVariable *State, Value *Flag,
               std::uint64_t Salt, const Twine &Name,
               bool ScoreSoftSignal = false) {
@@ -518,7 +527,10 @@ void foldLinuxTracerPidVerdict(IRBuilderBase &B, GlobalVariable *State,
                                std::uint64_t EnforcedSalt,
                                const Twine &Name) {
     foldFlag(B, State, Traced, TelemetrySalt, Name);
-    if (!AllowSelfTrace)
+    if (AllowSelfTrace)
+        foldSharedEvidenceScore(B, Traced, 1ULL << 7,
+                                TelemetrySalt ^ 0x8A5CD7896351B20FULL, Name);
+    else
         foldEnforcedFlag(B, State, Traced, EnforcedSalt, Name + ".enforced");
 }
 
