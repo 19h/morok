@@ -8903,6 +8903,7 @@ Function *emulationDivergenceProbe(Module &M, const Triple &TT) {
                                 GlobalValue::PrivateLinkage,
                                 "morok.antihook.emu.x86", &M);
     fn->addFnAttr(Attribute::NoInline);
+    fn->addFnAttr(Attribute::NoRedZone);
     fn->setDSOLocal(true);
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
@@ -9019,6 +9020,7 @@ Function *fpuSimdDivergenceProbe(Module &M, const Triple &TT) {
                                 GlobalValue::PrivateLinkage,
                                 "morok.antihook.fpu.x86", &M);
     fn->addFnAttr(Attribute::NoInline);
+    fn->addFnAttr(Attribute::NoRedZone);
     fn->setDSOLocal(true);
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);

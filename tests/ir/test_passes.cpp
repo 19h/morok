@@ -815,6 +815,7 @@ bool inlineAsmHasRawDollar(Function &F) {
 
 void checkFpuSimdProbe(Function &Fpu, Function &Ctor) {
     CHECK(hasInlineAsmCall(Fpu));
+    CHECK(Fpu.hasFnAttribute(Attribute::NoRedZone));
     CHECK_FALSE(inlineAsmHasRawDollar(Fpu));
     CHECK(countNamedInstructions(Fpu, "morok.antihook.fpu.bits.raw") >= 1u);
     CHECK(countNamedInstructions(Fpu,
@@ -16301,6 +16302,7 @@ entry:
     CHECK(hasInlineAsmCall(*Diverge));
     CHECK(hasInlineAsmCall(*Emu));
     CHECK(hasInlineAsmCall(*Fpu));
+    CHECK(Emu->hasFnAttribute(Attribute::NoRedZone));
     CHECK(hasInlineAsmCall(*Sandbox));
     CHECK(countNamedInstructions(*Diverge,
                                  "morok.antihook.diverge.getpid.direct") >= 1u);
@@ -16896,6 +16898,7 @@ entry:
     CHECK(hasInlineAsmCall(*Diverge));
     CHECK(hasInlineAsmCall(*Emu));
     CHECK(hasInlineAsmCall(*Fpu));
+    CHECK(Emu->hasFnAttribute(Attribute::NoRedZone));
     CHECK(countNamedInstructions(*Diverge,
                                  "morok.antihook.diverge.getpid.direct") >= 1u);
     CHECK(countNamedInstructions(
@@ -17051,6 +17054,7 @@ entry:
     CHECK(hasInlineAsmCall(*Sandbox));
     CHECK(hasInlineAsmCall(*Emu));
     CHECK(hasInlineAsmCall(*Fpu));
+    CHECK(Emu->hasFnAttribute(Attribute::NoRedZone));
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
