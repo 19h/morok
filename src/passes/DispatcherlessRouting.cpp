@@ -23,6 +23,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -54,6 +55,14 @@ constexpr std::uint32_t kMaxSuccessorsPerSite = 32;
 
 bool isGeneratedBlock(const BasicBlock &BB) {
     return BB.getName().starts_with("morok.");
+}
+
+bool isLinuxX86_64Target(const Function &F) {
+    const Module *M = F.getParent();
+    if (!M)
+        return false;
+    const Triple TT(M->getTargetTriple());
+    return TT.getArch() == Triple::x86_64 && TT.isOSLinux();
 }
 
 void addUnique(std::vector<BasicBlock *> &Blocks, BasicBlock *BB) {
@@ -340,6 +349,7 @@ bool dispatcherlessRoutingFunction(Function &F,
 
     const std::uint32_t RouteLimit =
         std::min(params.max_routes, kMaxRoutesPerInvocation);
+    const bool SkipSwitchRouting = isLinuxX86_64Target(F);
     BasicBlock *Entry = &F.getEntryBlock();
     std::vector<RouteSite> Selected;
     Selected.reserve(RouteLimit);
@@ -348,6 +358,12 @@ bool dispatcherlessRoutingFunction(Function &F,
             break;
         Instruction *Term = BB.getTerminator();
         if (!Term || !eligibleTerminator(*Term, Entry))
+            continue;
+        // LLVM 23's Linux x86_64 backend aborts while printing some optimized
+        // switch-heavy functions after this pass replaces switch terminators
+        // with token-mixed indirectbr routing. Branch routing remains enabled
+        // on the target; only switch lowering is held back.
+        if (SkipSwitchRouting && isa<SwitchInst>(Term))
             continue;
         if (rng.chance(params.probability))
             Selected.push_back({Term, terminatorSuccessors(*Term)});

@@ -11929,6 +11929,63 @@ alt:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("dispatcherlessRoutingFunction keeps Linux x86 switches direct") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+
+define i32 @mixed_density(i32 %x, i1 %flag) {
+entry:
+  br i1 %flag, label %prep, label %alt
+prep:
+  %y = add i32 %x, 1
+  br label %dispatch
+alt:
+  %z = sub i32 %x, 1
+  br label %dispatch
+dispatch:
+  %v = phi i32 [ %y, %prep ], [ %z, %alt ]
+  switch i32 %v, label %default [
+    i32 0, label %c0
+    i32 1, label %c1
+    i32 7, label %c7
+    i32 100, label %c100
+    i32 1000, label %c1000
+  ]
+c0:
+  ret i32 1000
+c1:
+  ret i32 1001
+c7:
+  ret i32 1007
+c100:
+  ret i32 2000
+c1000:
+  ret i32 3000
+default:
+  ret i32 0
+}
+)ir");
+    Function *F = M->getFunction("mixed_density");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(4242);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::dispatcherlessRoutingFunction(
+        *F, {/*probability=*/100, /*max_routes=*/8, /*max_terms=*/4}, rng));
+
+    std::size_t indirects = 0;
+    std::size_t switches = 0;
+    for (Instruction &I : instructions(*F)) {
+        indirects += isa<IndirectBrInst>(&I) ? 1u : 0u;
+        switches += isa<SwitchInst>(&I) ? 1u : 0u;
+    }
+    CHECK(indirects >= 1u);
+    CHECK(switches == 1u);
+    CHECK(M->getGlobalVariable("morok.dlf.table", true) != nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("dispatcherlessRoutingFunction honors zero probability") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
