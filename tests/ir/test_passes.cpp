@@ -17176,6 +17176,8 @@ entry:
     CHECK(M->getGlobalVariable("morok.antidbg.faultcf.sentinel", true) !=
           nullptr);
     CHECK(M->getGlobalVariable("morok.antidbg.faultcf.token", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.faultcf.enabled", true) !=
+          nullptr);
     CHECK(M->getGlobalVariable("morok.seal.root.tracer", true) != nullptr);
     CHECK(countUserCallsTo(*M, "morok.antidbg.probe") >= 1u);
     CHECK(M->getFunction("ptrace") != nullptr);
@@ -17283,6 +17285,12 @@ entry:
                                  "morok.antidbg.dr.child.no_new_privs") >= 1u);
     CHECK(countNamedInstructions(
               *AntiDbg, "morok.antidbg.ptrace.init.active.load") >= 1u);
+    CHECK(storesNamedValueToGlobalPrefix(
+        *AntiDbg, "morok.antidbg.faultcf.enabled",
+        "morok.antidbg.ptrace.init.faultcf.disabled"));
+    CHECK(namedInstructionPrecedes(
+        *AntiDbg, "morok.antidbg.ptrace.init.faultcf.disabled",
+        "morok.antidbg.ptrace.init.chain.raw.first"));
     CHECK(countNamedInstructions(*AntiDbg, "morok.antidbg.ptrace.init") >= 1u);
     CHECK(countNamedInstructions(
               *AntiDbg, "morok.antidbg.ptrace.init.chain.raw.first") >= 1u);
@@ -17351,6 +17359,8 @@ entry:
               *AntiDbg, "morok.antidbg.seccomp.trace.anti_debug.next") >= 1u);
     CHECK(countNamedInstructions(
               *AntiDbg, "morok.antidbg.seccomp.trace.tracer.next") >= 1u);
+    CHECK(countNamedInstructions(*FaultCf,
+                                 "morok.antidbg.faultcf.enabled.load") >= 1u);
     CHECK(countNamedInstructions(*FaultCf,
                                  "morok.antidbg.faultcf.sigaltstack") >= 1u);
     CHECK(countNamedInstructions(*FaultCf,

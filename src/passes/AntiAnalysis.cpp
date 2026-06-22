@@ -725,12 +725,41 @@ void emitLinuxPtraceTraceMeChain(IRBuilder<> &B, Module &M,
                      base + ".chain");
 }
 
+GlobalVariable *linuxFaultFlowEnabled(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.antidbg.faultcf.enabled",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i1 = Type::getInt1Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i1, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::getTrue(M.getContext()), "morok.antidbg.faultcf.enabled");
+    gv->setAlignment(Align(1));
+    return gv;
+}
+
+void disableLinuxFaultFlowAfterSelfTrace(IRBuilder<> &B, Module &M,
+                                         const Twine &Name) {
+    GlobalVariable *enabled = linuxFaultFlowEnabled(M);
+    auto *i1 = Type::getInt1Ty(M.getContext());
+    Value *previous =
+        B.CreateLoad(i1, enabled, Name + ".faultcf.enabled.prev");
+    cast<LoadInst>(previous)->setVolatile(true);
+    cast<LoadInst>(previous)->setAlignment(Align(1));
+    Value *disabled = B.CreateAnd(previous, ConstantInt::getFalse(M.getContext()),
+                                  Name + ".faultcf.disabled");
+    auto *store = B.CreateStore(disabled, enabled);
+    store->setVolatile(true);
+    store->setAlignment(Align(1));
+}
+
 void emitLinuxSelfTraceFallback(IRBuilder<> &B, Module &M,
                                 GlobalVariable *State,
                                 GlobalVariable *SentinelActive,
                                 const Triple &TT, const Twine &Name,
                                 std::uint64_t Salt) {
     auto trace = [&]() {
+        disableLinuxFaultFlowAfterSelfTrace(B, M, Name);
         emitLinuxPtraceTraceMeChain(B, M, State, TT, Name, Salt);
     };
     if (!SentinelActive) {
@@ -2369,6 +2398,7 @@ Function *linuxIntentionalFaultFlowProbe(Module &M, GlobalVariable *State,
         return nullptr;
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *setupBB = BasicBlock::Create(ctx, "setup", fn);
     auto *armedBB = BasicBlock::Create(ctx, "armed", fn);
     auto *notInstalledBB = BasicBlock::Create(ctx, "not.installed", fn);
     auto *restoreBB = BasicBlock::Create(ctx, "restore", fn);
@@ -2376,6 +2406,14 @@ Function *linuxIntentionalFaultFlowProbe(Module &M, GlobalVariable *State,
     auto *retBB = BasicBlock::Create(ctx, "ret", fn);
 
     IRBuilder<> B(entry);
+    Value *enabled =
+        B.CreateLoad(Type::getInt1Ty(ctx), linuxFaultFlowEnabled(M),
+                     "morok.antidbg.faultcf.enabled.load");
+    cast<LoadInst>(enabled)->setVolatile(true);
+    cast<LoadInst>(enabled)->setAlignment(Align(1));
+    B.CreateCondBr(enabled, setupBB, retBB);
+
+    B.SetInsertPoint(setupBB);
     constexpr std::uint64_t kAltStackBytes = 8192;
     constexpr std::uint64_t kStackTBytes = 24;
     constexpr std::uint64_t kSaOnStack = 0x08000000ULL;
