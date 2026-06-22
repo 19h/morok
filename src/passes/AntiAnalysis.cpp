@@ -6724,6 +6724,14 @@ Function *sandboxHeuristicProbe(Module &M, const Triple &TT) {
             "morok.antihook.sandbox.vmware.vendor");
         incrementDiff(B, score, vmwareVendor,
                       "morok.antihook.sandbox.vmware.vendor");
+        Value *tcgVendor = B.CreateAnd(
+            B.CreateAnd(B.CreateICmpEQ(hvEbx, ConstantInt::get(i32, 0x54474354u)),
+                        B.CreateICmpEQ(hvEcx,
+                                       ConstantInt::get(i32, 0x43544743u))),
+            B.CreateICmpEQ(hvEdx, ConstantInt::get(i32, 0x47435447u)),
+            "morok.antihook.sandbox.tcg.vendor");
+        incrementDiff(B, score, tcgVendor,
+                      "morok.antihook.sandbox.tcg.vendor");
 
         auto *backdoorBB =
             BasicBlock::Create(ctx, "morok.antihook.sandbox.vmware", fn);
@@ -6851,6 +6859,116 @@ Function *sandboxHeuristicProbe(Module &M, const Triple &TT) {
     auto *out = B.CreateLoad(i64, score, "morok.antihook.sandbox.score.ret");
     out->setVolatile(true);
     B.CreateRet(out);
+    return fn;
+}
+
+Function *emulationDivergenceProbe(Module &M, const Triple &TT) {
+    if (TT.getArch() != Triple::x86_64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.emu.x86"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.emu.x86", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    AllocaInst *diff = B.CreateAlloca(i64, nullptr, "morok.antihook.emu.diff");
+    B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
+
+    auto *flagsTy = FunctionType::get(i64, false);
+    auto *i32 = Type::getInt32Ty(ctx);
+    InlineAsm *flagsAsm = InlineAsm::get(
+        flagsTy, "xorq %rax, %rax\n\tpushfq\n\tpopq $0",
+        "=r,~{rax},~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    Value *flags =
+        B.CreateCall(flagsTy, flagsAsm, {}, "morok.antihook.emu.flags.raw");
+    constexpr std::uint64_t kStableXorFlagMask =
+        (1ull << 0) | (1ull << 2) | (1ull << 6) | (1ull << 7) | (1ull << 11);
+    constexpr std::uint64_t kExpectedXorFlags = (1ull << 2) | (1ull << 6);
+    Value *masked = B.CreateAnd(
+        flags, ConstantInt::get(i64, kStableXorFlagMask),
+        "morok.antihook.emu.flags.masked");
+    Value *mismatch =
+        B.CreateICmpNE(masked, ConstantInt::get(i64, kExpectedXorFlags),
+                       "morok.antihook.emu.flags.mismatch");
+    incrementDiff(B, diff, mismatch, "morok.antihook.emu.flags");
+
+    InlineAsm *cmpFlagsAsm = InlineAsm::get(
+        flagsTy,
+        "xorq %rax, %rax\n\tmovq %rax, %rcx\n\tincq %rcx\n\tcmpq %rcx, "
+        "%rax\n\tpushfq\n\tpopq $0",
+        "=r,~{rax},~{rcx},~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    Value *cmpFlags = B.CreateCall(flagsTy, cmpFlagsAsm, {},
+                                   "morok.antihook.emu.cmp.flags.raw");
+    constexpr std::uint64_t kExpectedCmpFlags =
+        (1ull << 0) | (1ull << 2) | (1ull << 7);
+    Value *cmpMasked = B.CreateAnd(
+        cmpFlags, ConstantInt::get(i64, kStableXorFlagMask),
+        "morok.antihook.emu.cmp.flags.masked");
+    Value *cmpMismatch =
+        B.CreateICmpNE(cmpMasked, ConstantInt::get(i64, kExpectedCmpFlags),
+                       "morok.antihook.emu.cmp.flags.mismatch");
+    incrementDiff(B, diff, cmpMismatch, "morok.antihook.emu.cmp.flags");
+
+    auto *setccTy = StructType::get(ctx, {i32, i32, i32, i32});
+    auto *setccFnTy = FunctionType::get(setccTy, false);
+    InlineAsm *setccAsm = InlineAsm::get(
+        setccFnTy,
+        "xorq %rax, %rax\n\tmovq %rax, %rcx\n\tincq %rcx\n\tcmpq %rcx, "
+        "%rax\n\tsetb %al\n\tsetz %cl\n\tsetl %dl\n\tsetg %bl\n\tmovzbl "
+        "%al, %eax\n\tmovzbl %cl, %ecx\n\tmovzbl %dl, %edx\n\tmovzbl %bl, "
+        "%ebx",
+        "={eax},={ecx},={edx},={ebx},~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    Value *setcc =
+        B.CreateCall(setccFnTy, setccAsm, {}, "morok.antihook.emu.setcc.raw");
+    Value *setb = B.CreateExtractValue(setcc, {0}, "morok.antihook.emu.setb");
+    Value *setz = B.CreateExtractValue(setcc, {1}, "morok.antihook.emu.setz");
+    Value *setl = B.CreateExtractValue(setcc, {2}, "morok.antihook.emu.setl");
+    Value *setg = B.CreateExtractValue(setcc, {3}, "morok.antihook.emu.setg");
+    Value *setccMismatch = B.CreateOr(
+        B.CreateOr(B.CreateICmpNE(setb, ConstantInt::get(i32, 1)),
+                   B.CreateICmpNE(setz, ConstantInt::get(i32, 0))),
+        B.CreateOr(B.CreateICmpNE(setl, ConstantInt::get(i32, 1)),
+                   B.CreateICmpNE(setg, ConstantInt::get(i32, 0))),
+        "morok.antihook.emu.setcc.mismatch");
+    incrementDiff(B, diff, setccMismatch, "morok.antihook.emu.setcc");
+
+    Value *leaf0 = emitCpuid(B, M, ConstantInt::get(i32, 0),
+                             ConstantInt::get(i32, 0));
+    Value *maxBasic = cpuidReg(B, leaf0, 0, "morok.antihook.emu.cpuid.max");
+    Value *vendorBits = B.CreateOr(
+        cpuidReg(B, leaf0, 1, "morok.antihook.emu.cpuid.ebx"),
+        B.CreateOr(cpuidReg(B, leaf0, 2, "morok.antihook.emu.cpuid.ecx"),
+                   cpuidReg(B, leaf0, 3, "morok.antihook.emu.cpuid.edx")),
+        "morok.antihook.emu.cpuid.vendor.bits");
+    Value *leaf0Bad = B.CreateOr(
+        B.CreateICmpEQ(maxBasic, ConstantInt::get(i32, 0)),
+        B.CreateICmpEQ(vendorBits, ConstantInt::get(i32, 0)),
+        "morok.antihook.emu.cpuid.leaf0.bad");
+    Value *leaf1 = emitCpuid(B, M, ConstantInt::get(i32, 1),
+                             ConstantInt::get(i32, 0));
+    Value *edx = cpuidReg(B, leaf1, 3, "morok.antihook.emu.cpuid.edx1");
+    constexpr std::uint32_t kX86_64BaselineFeatures =
+        (1u << 0) | (1u << 15) | (1u << 26); // FPU, CMOV, SSE2.
+    Value *baseline =
+        B.CreateAnd(edx, ConstantInt::get(i32, kX86_64BaselineFeatures),
+                    "morok.antihook.emu.cpuid.baseline");
+    Value *baselineBad = B.CreateICmpNE(
+        baseline, ConstantInt::get(i32, kX86_64BaselineFeatures),
+        "morok.antihook.emu.cpuid.baseline.bad");
+    Value *cpuidMismatch = B.CreateOr(leaf0Bad, baselineBad,
+                                      "morok.antihook.emu.cpuid.mismatch");
+    incrementDiff(B, diff, cpuidMismatch, "morok.antihook.emu.cpuid");
+    emitRetDiff(B, diff);
     return fn;
 }
 
@@ -13825,6 +13943,16 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
         foldEnforcedFlag(B, state, changed, 0xC58E90A37B42D16FULL,
                          "morok.antihook.diverge.changed");
     }
+    if (Function *emu = emulationDivergenceProbe(M, tt)) {
+        Value *diff = B.CreateCall(emu, {}, "morok.antihook.emu.diff");
+        Value *changed =
+            B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0),
+                           "morok.corroborate.emu.changed");
+        incrementDiff(B, corroboration, changed, "morok.corroborate.emu");
+        foldState(B, state, diff, 0x7642CDB91E30A58FULL, "morok.antihook.emu");
+        foldEnforcedFlag(B, state, changed, 0x1F0E3D2C4B5A6978ULL,
+                         "morok.antihook.emu.changed");
+    }
     if (Function *sandbox = sandboxHeuristicProbe(M, tt)) {
         Value *score =
             B.CreateCall(sandbox, {}, "morok.antihook.sandbox.score");
@@ -13834,8 +13962,11 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
         incrementDiff(B, corroboration, changed, "morok.corroborate.sandbox");
         foldState(B, state, score, 0x9A01C7E52D63B48FULL,
                   "morok.antihook.sandbox");
-        foldEnforcedFlag(B, state, changed, 0x4E87A61D39C205B3ULL,
-                         "morok.antihook.sandbox.changed");
+        // VM/cloud identity and sandbox-shape signals are useful telemetry, but
+        // legitimate customers run under hypervisors.  Never let these
+        // identity-only scores perturb the consumed anti_debug seal (#128).
+        foldFlag(B, state, changed, 0x4E87A61D39C205B3ULL,
+                 "morok.antihook.sandbox.changed");
     }
     if (Function *smc = dbiSmcTripwireProbe(M, tt)) {
         Value *diff = B.CreateCall(smc, {}, "morok.antihook.dbi.smc.diff");

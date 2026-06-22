@@ -199,6 +199,33 @@ std::size_t countNamedInstructions(Function &F, StringRef prefix) {
     return n;
 }
 
+Instruction *findNamedInstruction(Function &F, StringRef name) {
+    for (Instruction &I : instructions(F))
+        if (I.getName() == name)
+            return &I;
+    return nullptr;
+}
+
+bool valueFeedsNamedInstruction(Value *Root, StringRef prefix) {
+    SmallVector<Value *, 16> worklist;
+    SmallPtrSet<Value *, 32> seen;
+    worklist.push_back(Root);
+    seen.insert(Root);
+    while (!worklist.empty()) {
+        Value *cur = worklist.pop_back_val();
+        for (User *U : cur->users()) {
+            if (auto *I = dyn_cast<Instruction>(U)) {
+                if (I->getName().starts_with(prefix))
+                    return true;
+            }
+            Value *V = U;
+            if (seen.insert(V).second)
+                worklist.push_back(V);
+        }
+    }
+    return false;
+}
+
 void checkSealEnforcement(Module &M, Function &F) {
     CHECK(M.getGlobalVariable("morok.seal.root.anti_debug", true) != nullptr);
     CHECK(countNamedInstructions(F, "morok.seal.fold.anti_debug.trip") >= 1u);
@@ -15685,6 +15712,8 @@ entry:
     REQUIRE(Stack != nullptr);
     Function *Diverge = M->getFunction("morok.antihook.diverge.posix");
     REQUIRE(Diverge != nullptr);
+    Function *Emu = M->getFunction("morok.antihook.emu.x86");
+    REQUIRE(Emu != nullptr);
     Function *Sandbox = M->getFunction("morok.antihook.sandbox");
     REQUIRE(Sandbox != nullptr);
     Function *Dbi = M->getFunction("morok.antihook.dbi.linux");
@@ -15818,17 +15847,36 @@ entry:
     CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.rx") >= 1u);
     CHECK(hasInlineAsmCall(*Diverge));
+    CHECK(hasInlineAsmCall(*Emu));
     CHECK(hasInlineAsmCall(*Sandbox));
     CHECK(countNamedInstructions(*Diverge,
                                  "morok.antihook.diverge.getpid.direct") >= 1u);
     CHECK(countNamedInstructions(
               *Diverge, "morok.antihook.diverge.getppid.wrapper") >= 1u);
+    CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.flags.raw") >= 1u);
+    CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.flags.masked") >= 1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.flags.mismatch") >= 1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.cmp.flags.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.setcc.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.cpuid.baseline") >= 1u);
+    Instruction *EmuChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.emu.changed");
+    REQUIRE(EmuChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(EmuChanged,
+                                     "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.cpuid.vendor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.vmware.vendor") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.tcg.vendor") >= 1u);
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.vmware.backdoor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
@@ -15889,6 +15937,11 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Ctor, "morok.corroborate.antidump.changed") >=
           1u);
+    Instruction *SandboxChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.sandbox.changed");
+    REQUIRE(SandboxChanged != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(SandboxChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Ctor, "morok.negative.modules.extra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
@@ -16013,6 +16066,8 @@ entry:
     REQUIRE(Stack != nullptr);
     Function *Diverge = M->getFunction("morok.antihook.diverge.posix");
     REQUIRE(Diverge != nullptr);
+    Function *Emu = M->getFunction("morok.antihook.emu.x86");
+    REQUIRE(Emu != nullptr);
     Function *Sandbox = M->getFunction("morok.antihook.sandbox");
     REQUIRE(Sandbox != nullptr);
     Function *Smc = M->getFunction("morok.antihook.dbi.smc");
@@ -16095,12 +16150,29 @@ entry:
     CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.text") >= 1u);
     CHECK(hasInlineAsmCall(*Diverge));
+    CHECK(hasInlineAsmCall(*Emu));
     CHECK(countNamedInstructions(*Diverge,
                                  "morok.antihook.diverge.getpid.direct") >= 1u);
     CHECK(countNamedInstructions(
               *Diverge, "morok.antihook.diverge.getppid.wrapper") >= 1u);
+    CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.flags.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.cmp.flags.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.setcc.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.cpuid.baseline") >= 1u);
+    Instruction *EmuChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.emu.changed");
+    REQUIRE(EmuChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(EmuChanged,
+                                     "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.tcg.vendor") >= 1u);
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.vmware.backdoor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
@@ -16142,6 +16214,11 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Ctor, "morok.corroborate.antidump.changed") >=
           1u);
+    Instruction *SandboxChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.sandbox.changed");
+    REQUIRE(SandboxChanged != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(SandboxChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
     checkSealEnforcement(*M, *Work);
@@ -16190,6 +16267,8 @@ entry:
     REQUIRE(Stack != nullptr);
     Function *Sandbox = M->getFunction("morok.antihook.sandbox");
     REQUIRE(Sandbox != nullptr);
+    Function *Emu = M->getFunction("morok.antihook.emu.x86");
+    REQUIRE(Emu != nullptr);
     Function *Smc = M->getFunction("morok.antihook.dbi.smc");
     REQUIRE(Smc != nullptr);
     Function *NegativeTiming = M->getFunction("morok.negative.timing");
@@ -16206,8 +16285,30 @@ entry:
     CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(M->getFunction("exit") == nullptr);
     CHECK(hasInlineAsmCall(*Sandbox));
+    CHECK(hasInlineAsmCall(*Emu));
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.tcg.vendor") >= 1u);
+    CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.flags.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.cmp.flags.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.setcc.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.cpuid.baseline") >= 1u);
+    Instruction *EmuChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.emu.changed");
+    REQUIRE(EmuChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(EmuChanged,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *SandboxChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.sandbox.changed");
+    REQUIRE(SandboxChanged != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(SandboxChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.vmware.backdoor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
@@ -16255,6 +16356,7 @@ entry:
 
     Function *Ctor = M->getFunction("morok.antihook");
     REQUIRE(Ctor != nullptr);
+    CHECK(M->getFunction("morok.antihook.emu.x86") == nullptr);
     Function *Schro = M->getFunction("morok.antihook.schro");
     REQUIRE(Schro != nullptr);
     Function *SchroHandler = M->getFunction("morok.antihook.schro.handler");
