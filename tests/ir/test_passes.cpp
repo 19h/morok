@@ -200,6 +200,18 @@ std::size_t countNamedInstructions(Function &F, StringRef prefix) {
     return n;
 }
 
+bool namedInstructionPrecedes(Function &F, StringRef firstPrefix,
+                              StringRef secondPrefix) {
+    bool sawFirst = false;
+    for (Instruction &I : instructions(F)) {
+        if (I.getName().starts_with(firstPrefix))
+            sawFirst = true;
+        if (I.getName().starts_with(secondPrefix))
+            return sawFirst;
+    }
+    return false;
+}
+
 bool hasNamedInstructionContaining(Function &F, StringRef needle) {
     for (Instruction &I : instructions(F))
         if (I.getName().contains(needle))
@@ -712,8 +724,31 @@ std::size_t countInlineAsmBodies(Function &F, StringRef needle) {
     return n;
 }
 
+bool inlineAsmHasRawDollar(Function &F) {
+    for (Instruction &I : instructions(F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || !CB->isInlineAsm())
+            continue;
+        auto *Asm = dyn_cast<InlineAsm>(CB->getCalledOperand());
+        if (!Asm)
+            continue;
+        StringRef Text = Asm->getAsmString();
+        for (std::size_t Offset = 0, E = Text.size(); Offset != E; ++Offset) {
+            if (Text[Offset] != '$')
+                continue;
+            if (Offset + 1 != E && Text[Offset + 1] == '$') {
+                ++Offset;
+                continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 void checkFpuSimdProbe(Function &Fpu, Function &Ctor) {
     CHECK(hasInlineAsmCall(Fpu));
+    CHECK_FALSE(inlineAsmHasRawDollar(Fpu));
     CHECK(countNamedInstructions(Fpu, "morok.antihook.fpu.bits.raw") >= 1u);
     CHECK(countNamedInstructions(Fpu,
                                  "morok.antihook.fpu.daz.flush.mismatch") >=
@@ -17095,6 +17130,9 @@ entry:
                                  "morok.antidbg.seccomp.trace.raise") >= 1u);
     CHECK(countNamedInstructions(*AntiDbg,
                                  "morok.antidbg.seccomp.traced") >= 1u);
+    CHECK(namedInstructionPrecedes(*AntiDbg,
+                                   "morok.antidbg.seccomp.trace.raise",
+                                   "morok.antidbg.ptrace.init"));
     CHECK(countNamedInstructions(
               *AntiDbg, "morok.antidbg.seccomp.sigsys.anti_debug.next") >= 1u);
     CHECK(countNamedInstructions(
