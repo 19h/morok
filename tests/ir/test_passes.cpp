@@ -13734,6 +13734,76 @@ TEST_CASE("stringEncryptModule falls back to per-string decryptors") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("stringEncryptModule re-encrypts scoped fallback globals on exit") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@raw = private constant [8 x i8] c"scoped!\00"
+
+define i8 @use_raw(i64 %i) {
+entry:
+  %p = getelementptr inbounds [8 x i8], ptr @raw, i64 0, i64 %i
+  %c = load i8, ptr %p
+  ret i8 %c
+}
+)ir");
+    REQUIRE(M);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6101);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+
+    Function *Use = M->getFunction("use_raw");
+    REQUIRE(Use);
+    CHECK(countFunctions(*M, "morok.strdec") == 1u);
+    CHECK(countFunctions(*M, "morok.strrel") == 1u);
+    CHECK(countGlobals(*M, "morok.str.ref") == 1u);
+    CHECK(countCallsTo(*Use, "morok.strdec") == 1u);
+    CHECK(countCallsTo(*Use, "morok.strrel") == 1u);
+    CHECK(ctorPrioritiesFor(*M, "morok.strdec").empty());
+
+    Function *Release = M->getFunction("morok.strrel");
+    REQUIRE(Release);
+    CHECK(countNamedInstructions(*Release, "morok.str.ref.release.old") >= 1u);
+    CHECK(countNamedInstructions(*Release, "morok.str.release.won") >= 1u);
+    CHECK_FALSE(hasReadableByteString(*M, "scoped!"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("stringEncryptModule preserves musttail returns in fallback users") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@raw = private constant [9 x i8] c"tailgate\00"
+
+declare i8 @tail_sink(i64)
+
+define i8 @use_tail(i64 %i) {
+entry:
+  %p = getelementptr inbounds [9 x i8], ptr @raw, i64 0, i64 %i
+  %c = load i8, ptr %p
+  %cz = zext i8 %c to i64
+  %mix = xor i64 %i, %cz
+  %r = musttail call i8 @tail_sink(i64 %mix)
+  ret i8 %r
+}
+)ir");
+    REQUIRE(M);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6106);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+
+    Function *Use = M->getFunction("use_tail");
+    REQUIRE(Use);
+    CHECK(countFunctions(*M, "morok.strdec") == 1u);
+    CHECK(countFunctions(*M, "morok.strrel") == 0u);
+    CHECK(countCallsTo(*Use, "morok.strdec") == 1u);
+    CHECK(ctorPrioritiesFor(*M, "morok.strdec").empty());
+    CHECK_FALSE(hasReadableByteString(*M, "tailgate"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 // Regression for #38: when a string address escapes through static data, the
 // pass cannot inject a first-use call before every read and must fall back to a
 // global constructor.  That decryptor must run before ordinary user ctors such
@@ -13779,6 +13849,186 @@ entry:
     CHECK(userPriorities[0] == 150u);
     CHECK(decryptorPriorities[0] < userPriorities[0]);
 
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("format boundary lowering removes recovered all-string snprintf") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@fmt = private constant [12 x i8] c"%s@%s$%s&%s\00"
+
+declare i32 @snprintf(ptr, i64, ptr, ...)
+
+define i32 @canon(ptr %buf, ptr %a, ptr %b, ptr %c, ptr %d) {
+entry:
+  %n = call i32 (ptr, i64, ptr, ...) @snprintf(ptr %buf, i64 64, ptr @fmt, ptr %a, ptr %b, ptr %c, ptr %d)
+  ret i32 %n
+}
+)ir");
+    REQUIRE(M);
+    CHECK(morok::passes::inlineConstantFormatCalls(*M));
+
+    Function *Canon = M->getFunction("canon");
+    REQUIRE(Canon);
+    CHECK(countCallsTo(*Canon, "snprintf") == 0u);
+    CHECK(countFunctions(*M, "morok.fmt.") == 1u);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6102);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+    CHECK_FALSE(hasReadableByteString(*M, "%s@%s$%s&%s"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("format boundary lowering handles numeric sprintf") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@fmt = private constant [13 x i8] c"%s:%ld:%u:%x\00"
+
+declare i32 @sprintf(ptr, ptr, ...)
+
+define i32 @canon(ptr %buf, ptr %name, i64 %serial, i32 %slot) {
+entry:
+  %n = call i32 (ptr, ptr, ...) @sprintf(ptr %buf, ptr @fmt, ptr %name, i64 %serial, i32 %slot, i32 48879)
+  ret i32 %n
+}
+)ir");
+    REQUIRE(M);
+    CHECK(morok::passes::inlineConstantFormatCalls(*M));
+
+    Function *Canon = M->getFunction("canon");
+    REQUIRE(Canon);
+    CHECK(countCallsTo(*Canon, "sprintf") == 0u);
+    CHECK(countFunctions(*M, "morok.fmt.") == 1u);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6103);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+    CHECK_FALSE(hasReadableByteString(*M, "%s:%ld:%u:%x"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("format boundary lowering removes constant printf and fprintf") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@pfmt = private constant [12 x i8] c"[%s:%d:%X]\0A\00"
+@efmt = private constant [8 x i8] c"err:%c\0A\00"
+
+declare i32 @printf(ptr, ...)
+declare i32 @fprintf(ptr, ptr, ...)
+
+define i32 @emit(ptr %stream, ptr %name, i32 %code) {
+entry:
+  %a = call i32 (ptr, ...) @printf(ptr @pfmt, ptr %name, i32 %code, i32 48879)
+  %b = call i32 (ptr, ptr, ...) @fprintf(ptr %stream, ptr @efmt, i32 33)
+  %r = add i32 %a, %b
+  ret i32 %r
+}
+)ir");
+    REQUIRE(M);
+    CHECK(morok::passes::inlineConstantFormatCalls(*M));
+
+    Function *Emit = M->getFunction("emit");
+    REQUIRE(Emit);
+    CHECK(countCallsTo(*Emit, "printf") == 0u);
+    CHECK(countCallsTo(*Emit, "fprintf") == 0u);
+    CHECK(countFunctions(*M, "morok.print.") == 2u);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6104);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+    CHECK_FALSE(hasReadableByteString(*M, "[%s:%d:%X]\n"));
+    CHECK_FALSE(hasReadableByteString(*M, "err:%c\n"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("format boundary lowering leaves unsupported printf formats alone") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@fmt = private constant [6 x i8] c"%08x\0A\00"
+
+declare i32 @printf(ptr, ...)
+
+define i32 @emit(i32 %x) {
+entry:
+  %n = call i32 (ptr, ...) @printf(ptr @fmt, i32 %x)
+  ret i32 %n
+}
+)ir");
+    REQUIRE(M);
+    CHECK_FALSE(morok::passes::inlineConstantFormatCalls(*M));
+
+    Function *Emit = M->getFunction("emit");
+    REQUIRE(Emit);
+    CHECK(countCallsTo(*Emit, "printf") == 1u);
+    CHECK(countFunctions(*M, "morok.print.") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("format boundary lowering removes simple sscanf integer parsing") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@fmt = private constant [3 x i8] c"%d\00"
+
+declare i32 @sscanf(ptr, ptr, ...)
+
+define i32 @parse_pid(ptr %line, ptr %out) {
+entry:
+  %n = call i32 (ptr, ptr, ...) @sscanf(ptr %line, ptr @fmt, ptr %out)
+  ret i32 %n
+}
+)ir");
+    REQUIRE(M);
+    CHECK(morok::passes::inlineConstantFormatCalls(*M));
+
+    Function *Parse = M->getFunction("parse_pid");
+    REQUIRE(Parse);
+    CHECK(countCallsTo(*Parse, "sscanf") == 0u);
+    CHECK(countFunctions(*M, "morok.scan.") == 1u);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6105);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+    CHECK_FALSE(hasReadableByteString(*M, "%d"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("format boundary lowering removes assembler sscanf parsing") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@fmt = private constant [14 x i8] c"%31s %255[^\0A]\00"
+
+declare i32 @sscanf(ptr, ptr, ...)
+
+define i32 @parse_line(ptr %line, ptr %mnemonic, ptr %operand) {
+entry:
+  %n = call i32 (ptr, ptr, ...) @sscanf(ptr %line, ptr @fmt, ptr %mnemonic, ptr %operand)
+  ret i32 %n
+}
+)ir");
+    REQUIRE(M);
+    CHECK(morok::passes::inlineConstantFormatCalls(*M));
+
+    Function *Parse = M->getFunction("parse_line");
+    REQUIRE(Parse);
+    CHECK(countCallsTo(*Parse, "sscanf") == 0u);
+    CHECK(countFunctions(*M, "morok.scan.") == 1u);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6107);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+    CHECK_FALSE(hasReadableByteString(*M, "%31s %255[^\n]"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -14320,6 +14570,30 @@ define i64 @caller(ptr %f) {
     Function *Caller = M->getFunction("caller");
     REQUIRE(Caller);
     CHECK(countCallsTo(*Caller, "morok.fco.resolve.macho") == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("functionCallObfuscateModule probes Darwin strncpy platform alias") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "arm64-apple-macosx14.0.0"
+declare ptr @strncpy(ptr, ptr, i64)
+define ptr @caller(ptr %dst, ptr %src) {
+  %r = call ptr @strncpy(ptr %dst, ptr %src, i64 63)
+  ret ptr %r
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6110);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
+
+    Function *Caller = M->getFunction("caller");
+    REQUIRE(Caller);
+    CHECK(countCallsTo(*Caller, "strncpy") == 0u);
+    CHECK(M->getFunction("morok.fco.resolve.macho") != nullptr);
+    CHECK(countCallsTo(*Caller, "morok.fco.resolve.macho") == 2u);
+    CHECK(countNamedInstructions(*Caller, "morok.fco.hash.alias.resolved") >=
+          1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

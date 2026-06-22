@@ -194,6 +194,21 @@ Value *emitDecodedByte(IRBuilderBase &B, Value *CipherByte, Value *KsByte,
     return B.CreateTrunc(Plain32, CipherByte->getType(), Twine(Prefix) + ".p");
 }
 
+Value *emitEncodedByte(IRBuilderBase &B, Value *PlainByte, Value *KsByte,
+                       Value *ByteZero, bool AddCombined,
+                       StringRef Prefix) {
+    Value *MaskedKs = B.CreateXor(KsByte, ByteZero, Twine(Prefix) + ".km");
+    if (!AddCombined)
+        return B.CreateXor(PlainByte, MaskedKs, Twine(Prefix) + ".x");
+
+    auto *I32 = B.getInt32Ty();
+    Value *Plain32 = B.CreateZExt(PlainByte, I32, Twine(Prefix) + ".p32");
+    Value *Ks32 = B.CreateZExt(MaskedKs, I32, Twine(Prefix) + ".k32");
+    Value *Cipher32 = B.CreateAdd(Plain32, Ks32, Twine(Prefix) + ".c32");
+    return B.CreateTrunc(Cipher32, PlainByte->getType(),
+                         Twine(Prefix) + ".c");
+}
+
 struct UseSite {
     Instruction *inst = nullptr;
     unsigned operand = 0;
@@ -287,6 +302,37 @@ void emitDecryptUnrolled(IRBuilder<> &B, const Cipher &c, Function *seedFn,
         Value *plain =
             emitDecodedByte(B, cipher, ksByte, byteZero, c.add, "morok.str");
         B.CreateStore(plain, dp);
+    }
+}
+
+void emitEncodeUnrolled(IRBuilder<> &B, const Cipher &c, Function *seedFn,
+                        Value *src, Value *dst, ArrayType *arrTy,
+                        std::uint64_t n) {
+    auto *i8 = Type::getInt8Ty(B.getContext());
+    auto *i64 = Type::getInt64Ty(B.getContext());
+    Value *seedLoad = B.CreateCall(seedFn, {}, "morok.str.reseed.v");
+    emitStaticAnalysisBarrier(B, *seedFn->getParent());
+    Value *seedMix =
+        B.CreateAdd(seedLoad,
+                    emitVolatileStableZero(B, c.key ^ c.mul,
+                                           "morok.str.reenc.mix"),
+                    "morok.str.reenc.k.mix");
+    Value *rtKey = B.CreateXor(seedMix, ConstantInt::get(i64, c.key));
+    Value *byteZero = B.CreateTrunc(
+        emitVolatileStableZero(B, c.key + c.mul, "morok.str.reenc.byte.mix"),
+        i8, "morok.str.reenc.byte.zero");
+    for (std::uint64_t i = 0; i < n; ++i) {
+        Value *ks = ir::emitKeystream(B, c.recipe, rtKey,
+                                      static_cast<std::uint32_t>(i), c.mul);
+        Value *ksByte = B.CreateTrunc(ks, i8);
+        Value *sp = B.CreateInBoundsGEP(
+            arrTy, src, {ConstantInt::get(i64, 0), ConstantInt::get(i64, i)});
+        Value *dp = B.CreateInBoundsGEP(
+            arrTy, dst, {ConstantInt::get(i64, 0), ConstantInt::get(i64, i)});
+        Value *plain = B.CreateLoad(i8, sp);
+        Value *cipher = emitEncodedByte(B, plain, ksByte, byteZero, c.add,
+                                        "morok.str.reenc");
+        B.CreateStore(cipher, dp);
     }
 }
 
@@ -404,6 +450,22 @@ void collectUsingFunctions(Value *V, SmallPtrSetImpl<Function *> &Funcs,
     }
 }
 
+bool hasMustTailReturn(const SmallPtrSetImpl<Function *> &Funcs) {
+    for (Function *F : Funcs) {
+        if (!F || F->isDeclaration())
+            continue;
+        for (const BasicBlock &BB : *F) {
+            auto *Ret = dyn_cast<ReturnInst>(BB.getTerminator());
+            if (!Ret)
+                continue;
+            auto *Prev = dyn_cast_or_null<CallInst>(Ret->getPrevNode());
+            if (Prev && Prev->isMustTailCall())
+                return true;
+        }
+    }
+    return false;
+}
+
 // A private i8 once-state guard (0 = untouched, 1 = decrypting, 2 = done).
 GlobalVariable *createGuard(Module &M) {
     auto *I8 = Type::getInt8Ty(M.getContext());
@@ -411,6 +473,15 @@ GlobalVariable *createGuard(Module &M) {
                                   GlobalValue::PrivateLinkage,
                                   ConstantInt::get(I8, 0), "morok.strg");
     GV->setAlignment(Align(1));
+    return GV;
+}
+
+GlobalVariable *createRefCount(Module &M) {
+    auto *I32 = Type::getInt32Ty(M.getContext());
+    auto *GV = new GlobalVariable(M, I32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(I32, 0), "morok.str.ref");
+    GV->setAlignment(Align(4));
     return GV;
 }
 
@@ -546,6 +617,7 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
                          ir::IRRandom &rng) {
     LLVMContext &ctx = M.getContext();
     auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
     auto *i64 = Type::getInt64Ty(ctx);
     auto *voidTy = Type::getVoidTy(ctx);
 
@@ -693,15 +765,23 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
             continue;
         }
 
-        // Lazily decrypt in place the first time a using function runs, NOT
-        // eagerly in a global constructor.  Eager init-time decryption leaves
-        // plaintext sitting in writable .data for a "run the ctors, dump memory"
-        // attack; a lazy first-use decryptor leaves only ciphertext until the
-        // code path that needs the string actually executes.  A thread-safe
-        // once-guard (cmpxchg 0->1, publish 2 with release; late threads spin on
-        // an acquire load) makes it correct under concurrency — a plain flag
-        // would let a second thread observe a half-decrypted (or, for XOR,
-        // double-decrypted) buffer.
+        SmallPtrSet<Function *, 8> users;
+        bool escapes = false;
+        collectUsingFunctions(target, users, escapes);
+
+        // Lazily decrypt in place only when there is no safe stack rewrite.
+        // For originally-constant strings whose address does not escape through
+        // static data, bound the plaintext lifetime to active user frames: the
+        // first frame decrypts, nested/recursive frames share the plaintext, and
+        // the last returning frame re-encrypts it.  Escaped/static-address
+        // strings retain the constructor fallback because no function-scope
+        // release point can prove all observers are done with the address.
+        // musttail users cannot take an inserted release before ret; releasing
+        // before the tail call is not generally safe because the callee may
+        // receive the string pointer.
+        const bool scopedPlaintext =
+            stackCandidate && !escapes && !users.empty() &&
+            !hasMustTailReturn(users);
         target->setConstant(false); // mutated in place by its decryptor
         auto *decFn =
             Function::Create(FunctionType::get(voidTy, false),
@@ -710,12 +790,53 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
         decFn->addFnAttr(Attribute::OptimizeNone);
 
         GlobalVariable *guard = createGuard(M);
+        GlobalVariable *refCount =
+            scopedPlaintext ? createRefCount(M) : nullptr;
         auto *entryBB = BasicBlock::Create(ctx, "entry", decFn);
         auto *waitBB = BasicBlock::Create(ctx, "morok.str.wait", decFn);
         auto *decBB = BasicBlock::Create(ctx, "morok.str.dec", decFn);
         auto *doneBB = BasicBlock::Create(ctx, "morok.str.done", decFn);
 
-        {
+        if (scopedPlaintext) {
+            auto *claimBB =
+                BasicBlock::Create(ctx, "morok.str.claim", decFn, decBB);
+            auto *waitCipherBB =
+                BasicBlock::Create(ctx, "morok.str.wait.cipher", decFn, decBB);
+            IRBuilder<> B(entryBB);
+            auto *old = B.CreateAtomicRMW(AtomicRMWInst::Add, refCount,
+                                          ConstantInt::get(i32, 1), Align(4),
+                                          AtomicOrdering::AcquireRelease);
+            old->setVolatile(true);
+            old->setName("morok.str.ref.old");
+            B.CreateCondBr(B.CreateICmpEQ(old, ConstantInt::get(i32, 0),
+                                          "morok.str.ref.first"),
+                           claimBB, waitBB);
+
+            B.SetInsertPoint(waitBB);
+            auto *st = B.CreateLoad(i8, guard, "morok.str.state");
+            st->setAtomic(AtomicOrdering::Acquire);
+            st->setAlignment(Align(1));
+            B.CreateCondBr(
+                B.CreateICmpEQ(st, ConstantInt::get(i8, 2), "morok.str.ready"),
+                doneBB, waitBB);
+
+            B.SetInsertPoint(claimBB);
+            auto *won = B.CreateAtomicCmpXchg(
+                guard, ConstantInt::get(i8, 0), ConstantInt::get(i8, 1),
+                MaybeAlign(1), AtomicOrdering::AcquireRelease,
+                AtomicOrdering::Monotonic);
+            B.CreateCondBr(B.CreateExtractValue(won, 1, "morok.str.won"), decBB,
+                           waitCipherBB);
+
+            B.SetInsertPoint(waitCipherBB);
+            auto *cipherState =
+                B.CreateLoad(i8, guard, "morok.str.cipher.state");
+            cipherState->setAtomic(AtomicOrdering::Acquire);
+            cipherState->setAlignment(Align(1));
+            B.CreateCondBr(B.CreateICmpEQ(cipherState, ConstantInt::get(i8, 0),
+                                          "morok.str.cipher.ready"),
+                           claimBB, waitCipherBB);
+        } else {
             IRBuilder<> B(entryBB);
             auto *won = B.CreateAtomicCmpXchg(
                 guard, ConstantInt::get(i8, 0), ConstantInt::get(i8, 1),
@@ -723,9 +844,8 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
                 AtomicOrdering::Monotonic);
             B.CreateCondBr(B.CreateExtractValue(won, 1, "morok.str.won"), decBB,
                            waitBB);
-        }
-        {
-            IRBuilder<> B(waitBB);
+
+            B.SetInsertPoint(waitBB);
             auto *st = B.CreateLoad(i8, guard, "morok.str.state");
             st->setAtomic(AtomicOrdering::Acquire);
             st->setAlignment(Align(1));
@@ -780,14 +900,97 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
         B.CreateBr(doneBB);
         IRBuilder<>(doneBB).CreateRetVoid();
 
+        Function *releaseFn = nullptr;
+        if (scopedPlaintext) {
+            releaseFn = Function::Create(FunctionType::get(voidTy, false),
+                                         GlobalValue::InternalLinkage,
+                                         "morok.strrel", &M);
+            releaseFn->addFnAttr(Attribute::NoInline);
+            releaseFn->addFnAttr(Attribute::OptimizeNone);
+            auto *relEntry = BasicBlock::Create(ctx, "entry", releaseFn);
+            auto *relClaim =
+                BasicBlock::Create(ctx, "morok.str.release.claim", releaseFn);
+            auto *relEnc =
+                BasicBlock::Create(ctx, "morok.str.release.enc", releaseFn);
+            auto *relDone =
+                BasicBlock::Create(ctx, "morok.str.release.done", releaseFn);
+
+            IRBuilder<> RB(relEntry);
+            auto *old = RB.CreateAtomicRMW(AtomicRMWInst::Sub, refCount,
+                                           ConstantInt::get(i32, 1), Align(4),
+                                           AtomicOrdering::AcquireRelease);
+            old->setVolatile(true);
+            old->setName("morok.str.ref.release.old");
+            RB.CreateCondBr(RB.CreateICmpEQ(old, ConstantInt::get(i32, 1),
+                                            "morok.str.ref.last"),
+                            relClaim, relDone);
+
+            RB.SetInsertPoint(relClaim);
+            auto *won = RB.CreateAtomicCmpXchg(
+                guard, ConstantInt::get(i8, 2), ConstantInt::get(i8, 3),
+                MaybeAlign(1), AtomicOrdering::AcquireRelease,
+                AtomicOrdering::Monotonic);
+            RB.CreateCondBr(
+                RB.CreateExtractValue(won, 1, "morok.str.release.won"), relEnc,
+                relDone);
+
+            RB.SetInsertPoint(relEnc);
+            if (storedLen <= kUnrollThreshold) {
+                emitEncodeUnrolled(RB, c, seedFn, target, target, arrTy,
+                                   storedLen);
+            } else {
+                auto *loop =
+                    BasicBlock::Create(ctx, "morok.str.reloop", releaseFn);
+                auto *loopExit = BasicBlock::Create(
+                    ctx, "morok.str.reloopexit", releaseFn);
+                Value *seedLoad =
+                    RB.CreateCall(seedFn, {}, "morok.str.reloop.seed");
+                emitStaticAnalysisBarrier(RB, M);
+                Value *seedMix = RB.CreateAdd(
+                    seedLoad,
+                    emitVolatileStableZero(RB, c.key ^ c.mul,
+                                           "morok.str.reloop.mix"),
+                    "morok.str.reloop.k.mix");
+                Value *rtKey =
+                    RB.CreateXor(seedMix, ConstantInt::get(i64, c.key));
+                Value *byteZero = RB.CreateTrunc(
+                    emitVolatileStableZero(RB, c.key + c.mul,
+                                           "morok.str.reloop.byte.mix"),
+                    i8, "morok.str.reloop.byte.zero");
+                RB.CreateBr(loop);
+
+                RB.SetInsertPoint(loop);
+                PHINode *iv = RB.CreatePHI(i64, 2, "morok.str.reloop.i");
+                iv->addIncoming(ConstantInt::get(i64, 0), relEnc);
+                Value *ks =
+                    ir::emitKeystreamDynamic(RB, c.recipe, rtKey, iv, c.mul);
+                Value *ptr = RB.CreateInBoundsGEP(
+                    arrTy, target, {ConstantInt::get(i64, 0), iv});
+                Value *plainByte = RB.CreateLoad(i8, ptr);
+                Value *ksByte = RB.CreateTrunc(ks, i8);
+                Value *enc = emitEncodedByte(RB, plainByte, ksByte, byteZero,
+                                             c.add, "morok.str.reloop");
+                RB.CreateStore(enc, ptr);
+                Value *next =
+                    RB.CreateAdd(iv, ConstantInt::get(i64, 1),
+                                 "morok.str.reloop.next");
+                iv->addIncoming(next, loop);
+                RB.CreateCondBr(
+                    RB.CreateICmpULT(next, ConstantInt::get(i64, storedLen)),
+                    loop, loopExit);
+                RB.SetInsertPoint(loopExit);
+            }
+            auto *clear = RB.CreateStore(ConstantInt::get(i8, 0), guard);
+            clear->setAtomic(AtomicOrdering::Release);
+            clear->setAlignment(Align(1));
+            RB.CreateBr(relDone);
+            IRBuilder<>(relDone).CreateRetVoid();
+        }
+
         // Trigger the decryptor lazily at the entry of every function that
         // references the string.  If the address is baked into static data
         // (no function-entry hook can run first), fall back to an init-time
         // constructor for that one string.
-        SmallPtrSet<Function *, 8> users;
-        bool escapes = false;
-        collectUsingFunctions(target, users, escapes);
-        users.erase(decFn);
         if (escapes || users.empty()) {
             // Fallback constructor decryption must complete before any user
             // constructor can observe ciphertext through escaped static data.
@@ -798,6 +1001,19 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
                     continue;
                 IRBuilder<> EB(&*UF->getEntryBlock().getFirstInsertionPt());
                 EB.CreateCall(decFn->getFunctionType(), decFn, {});
+                if (releaseFn) {
+                    SmallVector<Instruction *, 8> Exits;
+                    for (BasicBlock &BB : *UF)
+                        if (Instruction *Term = BB.getTerminator())
+                            if (isa<ReturnInst>(Term) || isa<ResumeInst>(Term) ||
+                                isa<CleanupReturnInst>(Term))
+                                Exits.push_back(Term);
+                    for (Instruction *Exit : Exits) {
+                        IRBuilder<> XB(Exit);
+                        XB.CreateCall(releaseFn->getFunctionType(), releaseFn,
+                                      {});
+                    }
+                }
             }
         }
         changed = true;
@@ -837,7 +1053,23 @@ bool bindStringSeedToSeal(Module &M, ir::IRRandom &rng) {
 
 bool inlineConstantFormatCalls(Module &M) {
     Function *Snprintf = M.getFunction("snprintf");
-    if (!Snprintf || !Snprintf->isDeclaration())
+    Function *Sprintf = M.getFunction("sprintf");
+    Function *Printf = M.getFunction("printf");
+    Function *Fprintf = M.getFunction("fprintf");
+    Function *Sscanf = M.getFunction("sscanf");
+    if (Snprintf && !Snprintf->isDeclaration())
+        Snprintf = nullptr;
+    if (Sprintf && !Sprintf->isDeclaration())
+        Sprintf = nullptr;
+    if (Printf && !Printf->isDeclaration())
+        Printf = nullptr;
+    if (Fprintf && !Fprintf->isDeclaration())
+        Fprintf = nullptr;
+    if (Sscanf && !Sscanf->isDeclaration())
+        Sscanf = nullptr;
+    if ((!Snprintf || !Snprintf->isDeclaration()) &&
+        (!Sprintf || !Sprintf->isDeclaration()) && !Printf && !Fprintf &&
+        !Sscanf)
         return false;
 
     LLVMContext &Ctx = M.getContext();
@@ -846,17 +1078,28 @@ bool inlineConstantFormatCalls(Module &M) {
     auto *I64 = Type::getInt64Ty(Ctx);
     auto *Ptr = PointerType::getUnqual(Ctx);
 
-    // A format segment: either a run of literal bytes or one %s argument.
+    enum class SegKind { Literal, String, UnsignedDec, SignedDec, Hex, HexUpper, Char };
     struct Seg {
-        bool isArg;
+        SegKind kind;
         std::string lit;
     };
 
-    // Parse an all-%s format.  Bails (returns false) on any other conversion so
-    // %d/%u/width/precision formats are left untouched.
+    auto isArg = [](SegKind K) { return K != SegKind::Literal; };
+
+    // Parse deliberately small, hook-sensitive format strings.  Full printf
+    // compatibility would require locale, width, precision, floating-point,
+    // and undefined-overflow behavior.  Keep this helper exact for literals,
+    // %%, %s, %c, simple signed/unsigned decimal, and simple hex, including
+    // integer length modifiers that are normalized to i64 helper arguments.
     auto parse = [](StringRef Fmt, std::vector<Seg> &Segs,
                     unsigned &ArgCount) -> bool {
         std::string lit;
+        auto flushLit = [&]() {
+            if (!lit.empty()) {
+                Segs.push_back({SegKind::Literal, lit});
+                lit.clear();
+            }
+        };
         ArgCount = 0;
         for (std::size_t i = 0; i < Fmt.size(); ++i) {
             char c = Fmt[i];
@@ -869,22 +1112,53 @@ bool inlineConstantFormatCalls(Module &M) {
                     ++i;
                     continue;
                 }
-                if (n == 's') {
-                    if (!lit.empty()) {
-                        Segs.push_back({false, lit});
-                        lit.clear();
+
+                std::size_t spec = i + 1;
+                while (spec < Fmt.size()) {
+                    char m = Fmt[spec];
+                    if (m == 'h' || m == 'l' || m == 'j' || m == 'z' ||
+                        m == 't') {
+                        ++spec;
+                        continue;
                     }
-                    Segs.push_back({true, {}});
-                    ++ArgCount;
-                    ++i;
-                    continue;
+                    break;
                 }
-                return false; // %d/%u/%f/width/… unsupported
+                if (spec >= Fmt.size())
+                    return false;
+
+                SegKind Kind = SegKind::Literal;
+                switch (Fmt[spec]) {
+                case 's':
+                    Kind = SegKind::String;
+                    break;
+                case 'c':
+                    Kind = SegKind::Char;
+                    break;
+                case 'd':
+                case 'i':
+                    Kind = SegKind::SignedDec;
+                    break;
+                case 'u':
+                    Kind = SegKind::UnsignedDec;
+                    break;
+                case 'x':
+                    Kind = SegKind::Hex;
+                    break;
+                case 'X':
+                    Kind = SegKind::HexUpper;
+                    break;
+                default:
+                    return false;
+                }
+                flushLit();
+                Segs.push_back({Kind, {}});
+                ++ArgCount;
+                i = spec;
+                continue;
             }
             lit.push_back(c);
         }
-        if (!lit.empty())
-            Segs.push_back({false, lit});
+        flushLit();
         return true;
     };
 
@@ -900,18 +1174,28 @@ bool inlineConstantFormatCalls(Module &M) {
         return true;
     };
 
+    enum class BoundaryKind { Snprintf, Sprintf, Printf, Fprintf, Sscanf };
+
     StringMap<Function *> HelperCache;
+    StringMap<Function *> PrintHelperCache;
+    StringMap<Function *> ScanHelperCache;
     unsigned Counter = 0;
 
-    auto getHelper = [&](const std::string &Fmt, const std::vector<Seg> &Segs,
-                         unsigned ArgCount) -> Function * {
+    auto getBufferHelper = [&](const std::string &Fmt,
+                               const std::vector<Seg> &Segs) -> Function * {
         auto It = HelperCache.find(Fmt);
         if (It != HelperCache.end())
             return It->second;
 
         SmallVector<Type *, 8> Params{Ptr, I64};
-        for (unsigned k = 0; k < ArgCount; ++k)
-            Params.push_back(Ptr);
+        for (const Seg &S : Segs) {
+            if (!isArg(S.kind))
+                continue;
+            if (S.kind == SegKind::String)
+                Params.push_back(Ptr);
+            else
+                Params.push_back(I64);
+        }
         auto *Fn = Function::Create(FunctionType::get(I32, Params, false),
                                     GlobalValue::InternalLinkage,
                                     "morok.fmt." + Twine(Counter++), &M);
@@ -929,10 +1213,10 @@ bool inlineConstantFormatCalls(Module &M) {
         B.CreateStore(ConstantInt::get(I64, 0), Pos);
         B.CreateStore(ConstantInt::get(I64, 0), Cnt);
 
-        // Append one byte with exact, branchless snprintf semantics: the store
-        // always executes but lands in a 1-byte scratch slot when the output is
-        // full (pos+1 >= size), so the destination buffer is never written out
-        // of bounds; pos advances only on a real write while count always grows.
+        // Append one byte with exact snprintf-style bounds: the store always
+        // executes but lands in a scratch slot when the output is full.  sprintf
+        // calls pass size_t(-1), so this degenerates to unbounded sprintf
+        // semantics while sharing one helper body.
         auto appendByte = [&](Value *ByteVal) {
             Value *P = B.CreateLoad(I64, Pos);
             Value *C = B.CreateLoad(I64, Cnt);
@@ -945,32 +1229,143 @@ bool inlineConstantFormatCalls(Module &M) {
             B.CreateStore(B.CreateAdd(C, ConstantInt::get(I64, 1)), Cnt);
         };
 
+        auto appendUnsigned = [&](Value *Num, unsigned Base, bool Upper,
+                                  StringRef Prefix) {
+            auto *TmpTy = ArrayType::get(I8, 65);
+            AllocaInst *Tmp =
+                B.CreateAlloca(TmpTy, nullptr, Twine(Prefix) + ".tmp");
+            BasicBlock *Pre = B.GetInsertBlock();
+            auto *ZeroBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".zero", Fn);
+            auto *LoopBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".loop", Fn);
+            auto *RevBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".rev", Fn);
+            auto *RevBodyBB =
+                BasicBlock::Create(Ctx, Twine(Prefix) + ".rev.body", Fn);
+            auto *DoneBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".done", Fn);
+
+            B.CreateCondBr(B.CreateICmpEQ(Num, ConstantInt::get(I64, 0)),
+                           ZeroBB, LoopBB);
+
+            B.SetInsertPoint(ZeroBB);
+            appendByte(ConstantInt::get(I8, '0'));
+            B.CreateBr(DoneBB);
+
+            B.SetInsertPoint(LoopBB);
+            PHINode *V = B.CreatePHI(I64, 2, Twine(Prefix) + ".v");
+            PHINode *J = B.CreatePHI(I64, 2, Twine(Prefix) + ".j");
+            V->addIncoming(Num, Pre);
+            J->addIncoming(ConstantInt::get(I64, 0), Pre);
+            Value *Rem = B.CreateURem(V, ConstantInt::get(I64, Base),
+                                      Twine(Prefix) + ".rem");
+            Value *Digit = B.CreateTrunc(Rem, I8, Twine(Prefix) + ".digit");
+            Value *DecCh = B.CreateAdd(Digit, ConstantInt::get(I8, '0'),
+                                       Twine(Prefix) + ".dec");
+            Value *HexCh = B.CreateAdd(
+                Digit, ConstantInt::get(I8, (Upper ? 'A' : 'a') - 10),
+                Twine(Prefix) + ".hex");
+            Value *Ch = B.CreateSelect(
+                B.CreateICmpULT(Rem, ConstantInt::get(I64, 10)),
+                DecCh, HexCh, Twine(Prefix) + ".ch");
+            Value *PtrTmp = B.CreateInBoundsGEP(
+                TmpTy, Tmp, {ConstantInt::get(I64, 0), J},
+                Twine(Prefix) + ".tmp.ptr");
+            B.CreateStore(Ch, PtrTmp);
+            Value *NextV = B.CreateUDiv(V, ConstantInt::get(I64, Base),
+                                        Twine(Prefix) + ".next.v");
+            Value *NextJ = B.CreateAdd(J, ConstantInt::get(I64, 1),
+                                       Twine(Prefix) + ".next.j");
+            V->addIncoming(NextV, LoopBB);
+            J->addIncoming(NextJ, LoopBB);
+            B.CreateCondBr(B.CreateICmpNE(NextV, ConstantInt::get(I64, 0)),
+                           LoopBB, RevBB);
+
+            B.SetInsertPoint(RevBB);
+            PHINode *R = B.CreatePHI(I64, 2, Twine(Prefix) + ".rev.i");
+            R->addIncoming(NextJ, LoopBB);
+            B.CreateCondBr(B.CreateICmpNE(R, ConstantInt::get(I64, 0)),
+                           RevBodyBB, DoneBB);
+
+            B.SetInsertPoint(RevBodyBB);
+            Value *Rn = B.CreateSub(R, ConstantInt::get(I64, 1),
+                                    Twine(Prefix) + ".rev.next");
+            Value *LoadPtr = B.CreateInBoundsGEP(
+                TmpTy, Tmp, {ConstantInt::get(I64, 0), Rn},
+                Twine(Prefix) + ".rev.ptr");
+            appendByte(B.CreateLoad(I8, LoadPtr, Twine(Prefix) + ".rev.ch"));
+            B.CreateBr(RevBB);
+            R->addIncoming(Rn, RevBodyBB);
+
+            B.SetInsertPoint(DoneBB);
+        };
+
+        auto appendSigned = [&](Value *Num, StringRef Prefix) {
+            auto *NegBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".neg", Fn);
+            auto *ContBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".cont", Fn);
+            Value *Neg = B.CreateICmpSLT(Num, ConstantInt::get(I64, 0),
+                                         Twine(Prefix) + ".isneg");
+            Value *Mag = B.CreateSelect(
+                Neg, B.CreateSub(ConstantInt::get(I64, 0), Num,
+                                 Twine(Prefix) + ".negmag"),
+                Num, Twine(Prefix) + ".mag");
+            B.CreateCondBr(Neg, NegBB, ContBB);
+
+            B.SetInsertPoint(NegBB);
+            appendByte(ConstantInt::get(I8, '-'));
+            B.CreateBr(ContBB);
+
+            B.SetInsertPoint(ContBB);
+            std::string AbsPrefix = (Twine(Prefix) + ".abs").str();
+            appendUnsigned(Mag, 10, false, AbsPrefix);
+        };
+
         unsigned ArgIdx = 0;
         for (const Seg &S : Segs) {
-            if (!S.isArg) {
+            if (S.kind == SegKind::Literal) {
                 for (char ch : S.lit)
                     appendByte(ConstantInt::get(
                         I8, static_cast<unsigned char>(ch)));
                 continue;
             }
+
             Argument *Arg = Fn->getArg(2 + ArgIdx++);
-            auto *Loop = BasicBlock::Create(Ctx, "morok.fmt.s.loop", Fn);
-            auto *Body = BasicBlock::Create(Ctx, "morok.fmt.s.body", Fn);
-            auto *Done = BasicBlock::Create(Ctx, "morok.fmt.s.done", Fn);
-            BasicBlock *Pre = B.GetInsertBlock();
-            B.CreateBr(Loop);
-            B.SetInsertPoint(Loop);
-            PHINode *J = B.CreatePHI(I64, 2, "morok.fmt.s.j");
-            J->addIncoming(ConstantInt::get(I64, 0), Pre);
-            Value *Ch = B.CreateLoad(I8, B.CreateGEP(I8, Arg, {J}));
-            B.CreateCondBr(B.CreateICmpEQ(Ch, ConstantInt::get(I8, 0)), Done,
-                           Body);
-            B.SetInsertPoint(Body);
-            appendByte(Ch);
-            Value *Jn = B.CreateAdd(J, ConstantInt::get(I64, 1));
-            J->addIncoming(Jn, Body);
-            B.CreateBr(Loop);
-            B.SetInsertPoint(Done);
+            switch (S.kind) {
+            case SegKind::String: {
+                auto *Loop = BasicBlock::Create(Ctx, "morok.fmt.s.loop", Fn);
+                auto *Body = BasicBlock::Create(Ctx, "morok.fmt.s.body", Fn);
+                auto *Done = BasicBlock::Create(Ctx, "morok.fmt.s.done", Fn);
+                BasicBlock *Pre = B.GetInsertBlock();
+                B.CreateBr(Loop);
+                B.SetInsertPoint(Loop);
+                PHINode *J = B.CreatePHI(I64, 2, "morok.fmt.s.j");
+                J->addIncoming(ConstantInt::get(I64, 0), Pre);
+                Value *Ch = B.CreateLoad(I8, B.CreateGEP(I8, Arg, {J}));
+                B.CreateCondBr(B.CreateICmpEQ(Ch, ConstantInt::get(I8, 0)),
+                               Done, Body);
+                B.SetInsertPoint(Body);
+                appendByte(Ch);
+                Value *Jn = B.CreateAdd(J, ConstantInt::get(I64, 1));
+                J->addIncoming(Jn, Body);
+                B.CreateBr(Loop);
+                B.SetInsertPoint(Done);
+                break;
+            }
+            case SegKind::UnsignedDec:
+                appendUnsigned(Arg, 10, false, "morok.fmt.u");
+                break;
+            case SegKind::SignedDec:
+                appendSigned(Arg, "morok.fmt.d");
+                break;
+            case SegKind::Hex:
+                appendUnsigned(Arg, 16, false, "morok.fmt.x");
+                break;
+            case SegKind::HexUpper:
+                appendUnsigned(Arg, 16, true, "morok.fmt.X");
+                break;
+            case SegKind::Char:
+                appendByte(B.CreateTrunc(Arg, I8, "morok.fmt.c"));
+                break;
+            case SegKind::Literal:
+                break;
+            }
         }
 
         // NUL-terminate at min(total, size-1) when size > 0, again routing the
@@ -987,38 +1382,616 @@ bool inlineConstantFormatCalls(Module &M) {
         return Fn;
     };
 
-    SmallVector<CallInst *, 16> Calls;
-    for (User *U : Snprintf->users())
-        if (auto *CI = dyn_cast<CallInst>(U))
-            if (CI->getCalledFunction() == Snprintf && CI->arg_size() >= 3)
-                Calls.push_back(CI);
+    auto getPrintHelper = [&](const std::string &Fmt,
+                              const std::vector<Seg> &Segs,
+                              bool HasStream) -> Function * {
+        std::string Key = (HasStream ? "fprintf:" : "printf:") + Fmt;
+        auto It = PrintHelperCache.find(Key);
+        if (It != PrintHelperCache.end())
+            return It->second;
+
+        SmallVector<Type *, 8> Params;
+        if (HasStream)
+            Params.push_back(Ptr);
+        for (const Seg &S : Segs) {
+            if (!isArg(S.kind))
+                continue;
+            if (S.kind == SegKind::String)
+                Params.push_back(Ptr);
+            else
+                Params.push_back(I64);
+        }
+
+        auto *Fn = Function::Create(FunctionType::get(I32, Params, false),
+                                    GlobalValue::InternalLinkage,
+                                    "morok.print." + Twine(Counter++), &M);
+        Fn->setDSOLocal(true);
+        Fn->addFnAttr(Attribute::NoInline);
+        Fn->addFnAttr(Attribute::OptimizeNone);
+
+        IRBuilder<> B(BasicBlock::Create(Ctx, "entry", Fn));
+        AllocaInst *Cnt = B.CreateAlloca(I64, nullptr, "morok.print.cnt");
+        B.CreateStore(ConstantInt::get(I64, 0), Cnt);
+
+        FunctionCallee Putchar = M.getOrInsertFunction(
+            "putchar", FunctionType::get(I32, {I32}, false));
+        FunctionCallee Fputc = M.getOrInsertFunction(
+            "fputc", FunctionType::get(I32, {I32, Ptr}, false));
+        Argument *Stream = HasStream ? Fn->getArg(0) : nullptr;
+
+        auto appendByte = [&](Value *ByteVal) {
+            Value *Ch = B.CreateZExtOrTrunc(ByteVal, I32, "morok.print.ch");
+            if (HasStream)
+                B.CreateCall(Fputc, {Ch, Stream});
+            else
+                B.CreateCall(Putchar, {Ch});
+            Value *C = B.CreateLoad(I64, Cnt);
+            B.CreateStore(B.CreateAdd(C, ConstantInt::get(I64, 1)), Cnt);
+        };
+
+        auto appendUnsigned = [&](Value *Num, unsigned Base, bool Upper,
+                                  StringRef Prefix) {
+            auto *TmpTy = ArrayType::get(I8, 65);
+            AllocaInst *Tmp =
+                B.CreateAlloca(TmpTy, nullptr, Twine(Prefix) + ".tmp");
+            BasicBlock *Pre = B.GetInsertBlock();
+            auto *ZeroBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".zero", Fn);
+            auto *LoopBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".loop", Fn);
+            auto *RevBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".rev", Fn);
+            auto *RevBodyBB =
+                BasicBlock::Create(Ctx, Twine(Prefix) + ".rev.body", Fn);
+            auto *DoneBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".done", Fn);
+
+            B.CreateCondBr(B.CreateICmpEQ(Num, ConstantInt::get(I64, 0)),
+                           ZeroBB, LoopBB);
+
+            B.SetInsertPoint(ZeroBB);
+            appendByte(ConstantInt::get(I8, '0'));
+            B.CreateBr(DoneBB);
+
+            B.SetInsertPoint(LoopBB);
+            PHINode *V = B.CreatePHI(I64, 2, Twine(Prefix) + ".v");
+            PHINode *J = B.CreatePHI(I64, 2, Twine(Prefix) + ".j");
+            V->addIncoming(Num, Pre);
+            J->addIncoming(ConstantInt::get(I64, 0), Pre);
+            Value *Rem = B.CreateURem(V, ConstantInt::get(I64, Base),
+                                      Twine(Prefix) + ".rem");
+            Value *Digit = B.CreateTrunc(Rem, I8, Twine(Prefix) + ".digit");
+            Value *DecCh = B.CreateAdd(Digit, ConstantInt::get(I8, '0'),
+                                       Twine(Prefix) + ".dec");
+            Value *HexCh = B.CreateAdd(
+                Digit, ConstantInt::get(I8, (Upper ? 'A' : 'a') - 10),
+                Twine(Prefix) + ".hex");
+            Value *Ch = B.CreateSelect(
+                B.CreateICmpULT(Rem, ConstantInt::get(I64, 10)),
+                DecCh, HexCh, Twine(Prefix) + ".ch");
+            Value *PtrTmp = B.CreateInBoundsGEP(
+                TmpTy, Tmp, {ConstantInt::get(I64, 0), J},
+                Twine(Prefix) + ".tmp.ptr");
+            B.CreateStore(Ch, PtrTmp);
+            Value *NextV = B.CreateUDiv(V, ConstantInt::get(I64, Base),
+                                        Twine(Prefix) + ".next.v");
+            Value *NextJ = B.CreateAdd(J, ConstantInt::get(I64, 1),
+                                       Twine(Prefix) + ".next.j");
+            V->addIncoming(NextV, LoopBB);
+            J->addIncoming(NextJ, LoopBB);
+            B.CreateCondBr(B.CreateICmpNE(NextV, ConstantInt::get(I64, 0)),
+                           LoopBB, RevBB);
+
+            B.SetInsertPoint(RevBB);
+            PHINode *R = B.CreatePHI(I64, 2, Twine(Prefix) + ".rev.i");
+            R->addIncoming(NextJ, LoopBB);
+            B.CreateCondBr(B.CreateICmpNE(R, ConstantInt::get(I64, 0)),
+                           RevBodyBB, DoneBB);
+
+            B.SetInsertPoint(RevBodyBB);
+            Value *Rn = B.CreateSub(R, ConstantInt::get(I64, 1),
+                                    Twine(Prefix) + ".rev.next");
+            Value *LoadPtr = B.CreateInBoundsGEP(
+                TmpTy, Tmp, {ConstantInt::get(I64, 0), Rn},
+                Twine(Prefix) + ".rev.ptr");
+            appendByte(B.CreateLoad(I8, LoadPtr, Twine(Prefix) + ".rev.ch"));
+            B.CreateBr(RevBB);
+            R->addIncoming(Rn, RevBodyBB);
+
+            B.SetInsertPoint(DoneBB);
+        };
+
+        auto appendSigned = [&](Value *Num, StringRef Prefix) {
+            auto *NegBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".neg", Fn);
+            auto *ContBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".cont", Fn);
+            Value *Neg = B.CreateICmpSLT(Num, ConstantInt::get(I64, 0),
+                                         Twine(Prefix) + ".isneg");
+            Value *Mag = B.CreateSelect(
+                Neg, B.CreateSub(ConstantInt::get(I64, 0), Num,
+                                 Twine(Prefix) + ".negmag"),
+                Num, Twine(Prefix) + ".mag");
+            B.CreateCondBr(Neg, NegBB, ContBB);
+
+            B.SetInsertPoint(NegBB);
+            appendByte(ConstantInt::get(I8, '-'));
+            B.CreateBr(ContBB);
+
+            B.SetInsertPoint(ContBB);
+            std::string AbsPrefix = (Twine(Prefix) + ".abs").str();
+            appendUnsigned(Mag, 10, false, AbsPrefix);
+        };
+
+        unsigned ArgIdx = HasStream ? 1u : 0u;
+        for (const Seg &S : Segs) {
+            if (S.kind == SegKind::Literal) {
+                for (char ch : S.lit)
+                    appendByte(ConstantInt::get(
+                        I8, static_cast<unsigned char>(ch)));
+                continue;
+            }
+
+            Argument *Arg = Fn->getArg(ArgIdx++);
+            switch (S.kind) {
+            case SegKind::String: {
+                auto *Loop = BasicBlock::Create(Ctx, "morok.print.s.loop", Fn);
+                auto *Body = BasicBlock::Create(Ctx, "morok.print.s.body", Fn);
+                auto *Done = BasicBlock::Create(Ctx, "morok.print.s.done", Fn);
+                BasicBlock *Pre = B.GetInsertBlock();
+                B.CreateBr(Loop);
+                B.SetInsertPoint(Loop);
+                PHINode *J = B.CreatePHI(I64, 2, "morok.print.s.j");
+                J->addIncoming(ConstantInt::get(I64, 0), Pre);
+                Value *Ch = B.CreateLoad(I8, B.CreateGEP(I8, Arg, {J}));
+                B.CreateCondBr(B.CreateICmpEQ(Ch, ConstantInt::get(I8, 0)),
+                               Done, Body);
+                B.SetInsertPoint(Body);
+                appendByte(Ch);
+                Value *Jn = B.CreateAdd(J, ConstantInt::get(I64, 1));
+                J->addIncoming(Jn, Body);
+                B.CreateBr(Loop);
+                B.SetInsertPoint(Done);
+                break;
+            }
+            case SegKind::UnsignedDec:
+                appendUnsigned(Arg, 10, false, "morok.print.u");
+                break;
+            case SegKind::SignedDec:
+                appendSigned(Arg, "morok.print.d");
+                break;
+            case SegKind::Hex:
+                appendUnsigned(Arg, 16, false, "morok.print.x");
+                break;
+            case SegKind::HexUpper:
+                appendUnsigned(Arg, 16, true, "morok.print.X");
+                break;
+            case SegKind::Char:
+                appendByte(B.CreateTrunc(Arg, I8, "morok.print.c"));
+                break;
+            case SegKind::Literal:
+                break;
+            }
+        }
+
+        Value *C = B.CreateLoad(I64, Cnt);
+        B.CreateRet(B.CreateTrunc(C, I32));
+
+        PrintHelperCache[Key] = Fn;
+        return Fn;
+    };
+
+    auto getScanIntHelper = [&](bool Signed) -> Function * {
+        StringRef Key = Signed ? "d" : "u";
+        auto It = ScanHelperCache.find(Key);
+        if (It != ScanHelperCache.end())
+            return It->second;
+
+        auto *Fn = Function::Create(FunctionType::get(I32, {Ptr, Ptr}, false),
+                                    GlobalValue::InternalLinkage,
+                                    Signed ? "morok.scan.d" : "morok.scan.u",
+                                    &M);
+        Fn->setDSOLocal(true);
+        Fn->addFnAttr(Attribute::NoInline);
+        Fn->addFnAttr(Attribute::OptimizeNone);
+
+        Argument *Input = Fn->getArg(0);
+        Argument *Out = Fn->getArg(1);
+
+        auto *EntryBB = BasicBlock::Create(Ctx, "entry", Fn);
+        auto *SkipBB = BasicBlock::Create(Ctx, "morok.scan.skip", Fn);
+        auto *SkipBodyBB =
+            BasicBlock::Create(Ctx, "morok.scan.skip.body", Fn);
+        auto *AfterSkipBB =
+            BasicBlock::Create(Ctx, "morok.scan.after.skip", Fn);
+        auto *LoopBB = BasicBlock::Create(Ctx, "morok.scan.digits", Fn);
+        auto *DigitBB =
+            BasicBlock::Create(Ctx, "morok.scan.digit.body", Fn);
+        auto *DoneBB = BasicBlock::Create(Ctx, "morok.scan.done", Fn);
+        auto *StoreBB = BasicBlock::Create(Ctx, "morok.scan.store", Fn);
+        auto *FailBB = BasicBlock::Create(Ctx, "morok.scan.fail", Fn);
+
+        IRBuilder<> B(EntryBB);
+        B.CreateBr(SkipBB);
+
+        B.SetInsertPoint(SkipBB);
+        PHINode *SkipIdx = B.CreatePHI(I64, 2, "morok.scan.skip.i");
+        SkipIdx->addIncoming(ConstantInt::get(I64, 0), EntryBB);
+        Value *SkipCh = B.CreateLoad(
+            I8, B.CreateGEP(I8, Input, {SkipIdx}, "morok.scan.skip.ptr"),
+            "morok.scan.skip.ch");
+        auto isCh = [&](Value *Ch, unsigned char C) {
+            return B.CreateICmpEQ(Ch, ConstantInt::get(I8, C));
+        };
+        Value *Space = isCh(SkipCh, ' ');
+        Space = B.CreateOr(Space, isCh(SkipCh, '\t'));
+        Space = B.CreateOr(Space, isCh(SkipCh, '\n'));
+        Space = B.CreateOr(Space, isCh(SkipCh, '\r'));
+        Space = B.CreateOr(Space, isCh(SkipCh, '\f'));
+        Space = B.CreateOr(Space, isCh(SkipCh, '\v'));
+        B.CreateCondBr(Space, SkipBodyBB, AfterSkipBB);
+
+        B.SetInsertPoint(SkipBodyBB);
+        Value *SkipNext =
+            B.CreateAdd(SkipIdx, ConstantInt::get(I64, 1),
+                        "morok.scan.skip.next");
+        SkipIdx->addIncoming(SkipNext, SkipBodyBB);
+        B.CreateBr(SkipBB);
+
+        B.SetInsertPoint(AfterSkipBB);
+        Value *FirstCh = B.CreateLoad(
+            I8, B.CreateGEP(I8, Input, {SkipIdx}, "morok.scan.first.ptr"),
+            "morok.scan.first.ch");
+        Value *Neg = ConstantInt::getFalse(Ctx);
+        Value *Start = SkipIdx;
+        if (Signed) {
+            Value *IsMinus = isCh(FirstCh, '-');
+            Value *IsPlus = isCh(FirstCh, '+');
+            Value *HasSign = B.CreateOr(IsMinus, IsPlus, "morok.scan.sign");
+            Start = B.CreateSelect(
+                HasSign, B.CreateAdd(SkipIdx, ConstantInt::get(I64, 1)),
+                SkipIdx, "morok.scan.start");
+            Neg = IsMinus;
+        }
+        B.CreateBr(LoopBB);
+
+        B.SetInsertPoint(LoopBB);
+        PHINode *Idx = B.CreatePHI(I64, 2, "morok.scan.i");
+        PHINode *Acc = B.CreatePHI(I64, 2, "morok.scan.acc");
+        PHINode *Seen = B.CreatePHI(Type::getInt1Ty(Ctx), 2,
+                                    "morok.scan.seen");
+        Idx->addIncoming(Start, AfterSkipBB);
+        Acc->addIncoming(ConstantInt::get(I64, 0), AfterSkipBB);
+        Seen->addIncoming(ConstantInt::getFalse(Ctx), AfterSkipBB);
+        Value *Ch = B.CreateLoad(
+            I8, B.CreateGEP(I8, Input, {Idx}, "morok.scan.ptr"),
+            "morok.scan.ch");
+        Value *Ch32 = B.CreateZExt(Ch, I32, "morok.scan.ch32");
+        Value *Digit32 =
+            B.CreateSub(Ch32, ConstantInt::get(I32, '0'),
+                        "morok.scan.digit32");
+        Value *IsDigit = B.CreateICmpULE(Digit32, ConstantInt::get(I32, 9),
+                                         "morok.scan.isdigit");
+        B.CreateCondBr(IsDigit, DigitBB, DoneBB);
+
+        B.SetInsertPoint(DigitBB);
+        Value *NextAcc = B.CreateAdd(
+            B.CreateMul(Acc, ConstantInt::get(I64, 10),
+                        "morok.scan.acc.scale"),
+            B.CreateZExt(Digit32, I64), "morok.scan.acc.next");
+        Value *NextIdx =
+            B.CreateAdd(Idx, ConstantInt::get(I64, 1), "morok.scan.i.next");
+        Idx->addIncoming(NextIdx, DigitBB);
+        Acc->addIncoming(NextAcc, DigitBB);
+        Seen->addIncoming(ConstantInt::getTrue(Ctx), DigitBB);
+        B.CreateBr(LoopBB);
+
+        B.SetInsertPoint(DoneBB);
+        B.CreateCondBr(Seen, StoreBB, FailBB);
+
+        B.SetInsertPoint(StoreBB);
+        Value *Narrow = B.CreateTrunc(Acc, I32, "morok.scan.narrow");
+        if (Signed) {
+            Value *Negative =
+                B.CreateSub(ConstantInt::get(I32, 0), Narrow,
+                            "morok.scan.negative");
+            Narrow = B.CreateSelect(Neg, Negative, Narrow,
+                                    "morok.scan.signed");
+        }
+        B.CreateStore(Narrow, Out);
+        B.CreateRet(ConstantInt::get(I32, 1));
+
+        B.SetInsertPoint(FailBB);
+        B.CreateRet(ConstantInt::get(I32, 0));
+
+        ScanHelperCache[Key] = Fn;
+        return Fn;
+    };
+
+    auto getScanAsmLineHelper = [&]() -> Function * {
+        StringRef Key = "asm-line";
+        auto It = ScanHelperCache.find(Key);
+        if (It != ScanHelperCache.end())
+            return It->second;
+
+        auto *Fn = Function::Create(
+            FunctionType::get(I32, {Ptr, Ptr, Ptr}, false),
+            GlobalValue::InternalLinkage, "morok.scan.asmline", &M);
+        Fn->setDSOLocal(true);
+        Fn->addFnAttr(Attribute::NoInline);
+        Fn->addFnAttr(Attribute::OptimizeNone);
+
+        Argument *Input = Fn->getArg(0);
+        Argument *WordOut = Fn->getArg(1);
+        Argument *RestOut = Fn->getArg(2);
+
+        auto *EntryBB = BasicBlock::Create(Ctx, "entry", Fn);
+        auto *Skip1BB = BasicBlock::Create(Ctx, "morok.scan.skip1", Fn);
+        auto *Skip1BodyBB =
+            BasicBlock::Create(Ctx, "morok.scan.skip1.body", Fn);
+        auto *WordBB = BasicBlock::Create(Ctx, "morok.scan.word", Fn);
+        auto *WordBodyBB =
+            BasicBlock::Create(Ctx, "morok.scan.word.body", Fn);
+        auto *AfterWordBB =
+            BasicBlock::Create(Ctx, "morok.scan.after.word", Fn);
+        auto *WordFailBB =
+            BasicBlock::Create(Ctx, "morok.scan.word.fail", Fn);
+        auto *Skip2BB = BasicBlock::Create(Ctx, "morok.scan.skip2", Fn);
+        auto *Skip2BodyBB =
+            BasicBlock::Create(Ctx, "morok.scan.skip2.body", Fn);
+        auto *RestBB = BasicBlock::Create(Ctx, "morok.scan.rest", Fn);
+        auto *RestBodyBB =
+            BasicBlock::Create(Ctx, "morok.scan.rest.body", Fn);
+        auto *DoneBB = BasicBlock::Create(Ctx, "morok.scan.asm.done", Fn);
+
+        IRBuilder<> B(EntryBB);
+        auto isCh = [&](Value *Ch, unsigned char C) {
+            return B.CreateICmpEQ(Ch, ConstantInt::get(I8, C));
+        };
+        auto isSpace = [&](Value *Ch) {
+            Value *Space = isCh(Ch, ' ');
+            Space = B.CreateOr(Space, isCh(Ch, '\t'));
+            Space = B.CreateOr(Space, isCh(Ch, '\n'));
+            Space = B.CreateOr(Space, isCh(Ch, '\r'));
+            Space = B.CreateOr(Space, isCh(Ch, '\f'));
+            return B.CreateOr(Space, isCh(Ch, '\v'));
+        };
+        B.CreateBr(Skip1BB);
+
+        B.SetInsertPoint(Skip1BB);
+        PHINode *Skip1 = B.CreatePHI(I64, 2, "morok.scan.skip1.i");
+        Skip1->addIncoming(ConstantInt::get(I64, 0), EntryBB);
+        Value *Skip1Ch = B.CreateLoad(
+            I8, B.CreateGEP(I8, Input, {Skip1}, "morok.scan.skip1.ptr"),
+            "morok.scan.skip1.ch");
+        B.CreateCondBr(isSpace(Skip1Ch), Skip1BodyBB, WordBB);
+
+        B.SetInsertPoint(Skip1BodyBB);
+        Value *Skip1Next =
+            B.CreateAdd(Skip1, ConstantInt::get(I64, 1),
+                        "morok.scan.skip1.next");
+        Skip1->addIncoming(Skip1Next, Skip1BodyBB);
+        B.CreateBr(Skip1BB);
+
+        B.SetInsertPoint(WordBB);
+        PHINode *WordSrc = B.CreatePHI(I64, 2, "morok.scan.word.src");
+        PHINode *WordLen = B.CreatePHI(I64, 2, "morok.scan.word.len");
+        WordSrc->addIncoming(Skip1, Skip1BB);
+        WordLen->addIncoming(ConstantInt::get(I64, 0), Skip1BB);
+        Value *WordCh = B.CreateLoad(
+            I8, B.CreateGEP(I8, Input, {WordSrc}, "morok.scan.word.in"),
+            "morok.scan.word.ch");
+        Value *WordDone = B.CreateOr(isCh(WordCh, '\0'), isSpace(WordCh));
+        WordDone = B.CreateOr(
+            WordDone, B.CreateICmpEQ(WordLen, ConstantInt::get(I64, 31)));
+        B.CreateCondBr(WordDone, AfterWordBB, WordBodyBB);
+
+        B.SetInsertPoint(WordBodyBB);
+        B.CreateStore(WordCh, B.CreateGEP(I8, WordOut, {WordLen},
+                                          "morok.scan.word.out"));
+        Value *WordSrcNext =
+            B.CreateAdd(WordSrc, ConstantInt::get(I64, 1),
+                        "morok.scan.word.src.next");
+        Value *WordLenNext =
+            B.CreateAdd(WordLen, ConstantInt::get(I64, 1),
+                        "morok.scan.word.len.next");
+        WordSrc->addIncoming(WordSrcNext, WordBodyBB);
+        WordLen->addIncoming(WordLenNext, WordBodyBB);
+        B.CreateBr(WordBB);
+
+        B.SetInsertPoint(AfterWordBB);
+        B.CreateStore(ConstantInt::get(I8, 0),
+                      B.CreateGEP(I8, WordOut, {WordLen},
+                                  "morok.scan.word.nul"));
+        B.CreateCondBr(B.CreateICmpEQ(WordLen, ConstantInt::get(I64, 0)),
+                       WordFailBB, Skip2BB);
+
+        B.SetInsertPoint(WordFailBB);
+        B.CreateRet(ConstantInt::get(I32, 0));
+
+        B.SetInsertPoint(Skip2BB);
+        PHINode *Skip2 = B.CreatePHI(I64, 2, "morok.scan.skip2.i");
+        Skip2->addIncoming(WordSrc, AfterWordBB);
+        Value *Skip2Ch = B.CreateLoad(
+            I8, B.CreateGEP(I8, Input, {Skip2}, "morok.scan.skip2.ptr"),
+            "morok.scan.skip2.ch");
+        B.CreateCondBr(isSpace(Skip2Ch), Skip2BodyBB, RestBB);
+
+        B.SetInsertPoint(Skip2BodyBB);
+        Value *Skip2Next =
+            B.CreateAdd(Skip2, ConstantInt::get(I64, 1),
+                        "morok.scan.skip2.next");
+        Skip2->addIncoming(Skip2Next, Skip2BodyBB);
+        B.CreateBr(Skip2BB);
+
+        B.SetInsertPoint(RestBB);
+        PHINode *RestSrc = B.CreatePHI(I64, 2, "morok.scan.rest.src");
+        PHINode *RestLen = B.CreatePHI(I64, 2, "morok.scan.rest.len");
+        RestSrc->addIncoming(Skip2, Skip2BB);
+        RestLen->addIncoming(ConstantInt::get(I64, 0), Skip2BB);
+        Value *RestCh = B.CreateLoad(
+            I8, B.CreateGEP(I8, Input, {RestSrc}, "morok.scan.rest.in"),
+            "morok.scan.rest.ch");
+        Value *RestDone = B.CreateOr(isCh(RestCh, '\0'), isCh(RestCh, '\n'));
+        RestDone = B.CreateOr(
+            RestDone, B.CreateICmpEQ(RestLen, ConstantInt::get(I64, 255)));
+        B.CreateCondBr(RestDone, DoneBB, RestBodyBB);
+
+        B.SetInsertPoint(RestBodyBB);
+        B.CreateStore(RestCh, B.CreateGEP(I8, RestOut, {RestLen},
+                                          "morok.scan.rest.out"));
+        Value *RestSrcNext =
+            B.CreateAdd(RestSrc, ConstantInt::get(I64, 1),
+                        "morok.scan.rest.src.next");
+        Value *RestLenNext =
+            B.CreateAdd(RestLen, ConstantInt::get(I64, 1),
+                        "morok.scan.rest.len.next");
+        RestSrc->addIncoming(RestSrcNext, RestBodyBB);
+        RestLen->addIncoming(RestLenNext, RestBodyBB);
+        B.CreateBr(RestBB);
+
+        B.SetInsertPoint(DoneBB);
+        B.CreateStore(ConstantInt::get(I8, 0),
+                      B.CreateGEP(I8, RestOut, {RestLen},
+                                  "morok.scan.rest.nul"));
+        B.CreateRet(B.CreateSelect(
+            B.CreateICmpEQ(RestLen, ConstantInt::get(I64, 0)),
+            ConstantInt::get(I32, 1), ConstantInt::get(I32, 2),
+            "morok.scan.assignments"));
+
+        ScanHelperCache[Key] = Fn;
+        return Fn;
+    };
+
+    struct FormatCall {
+        CallInst *call;
+        BoundaryKind kind;
+    };
+    SmallVector<FormatCall, 16> Calls;
+    if (Snprintf)
+        for (User *U : Snprintf->users())
+            if (auto *CI = dyn_cast<CallInst>(U))
+                if (CI->getCalledFunction() == Snprintf && CI->arg_size() >= 3)
+                    Calls.push_back({CI, BoundaryKind::Snprintf});
+    if (Sprintf)
+        for (User *U : Sprintf->users())
+            if (auto *CI = dyn_cast<CallInst>(U))
+                if (CI->getCalledFunction() == Sprintf && CI->arg_size() >= 2)
+                    Calls.push_back({CI, BoundaryKind::Sprintf});
+    if (Printf)
+        for (User *U : Printf->users())
+            if (auto *CI = dyn_cast<CallInst>(U))
+                if (CI->getCalledFunction() == Printf && CI->arg_size() >= 1)
+                    Calls.push_back({CI, BoundaryKind::Printf});
+    if (Fprintf)
+        for (User *U : Fprintf->users())
+            if (auto *CI = dyn_cast<CallInst>(U))
+                if (CI->getCalledFunction() == Fprintf && CI->arg_size() >= 2)
+                    Calls.push_back({CI, BoundaryKind::Fprintf});
+    if (Sscanf)
+        for (User *U : Sscanf->users())
+            if (auto *CI = dyn_cast<CallInst>(U))
+                if (CI->getCalledFunction() == Sscanf && CI->arg_size() >= 3)
+                    Calls.push_back({CI, BoundaryKind::Sscanf});
 
     bool Changed = false;
-    for (CallInst *CI : Calls) {
+    for (FormatCall FC : Calls) {
+        CallInst *CI = FC.call;
+        const bool IsSnprintf = FC.kind == BoundaryKind::Snprintf;
+        const bool IsSprintf = FC.kind == BoundaryKind::Sprintf;
+        const bool IsPrintf = FC.kind == BoundaryKind::Printf;
+        const bool IsFprintf = FC.kind == BoundaryKind::Fprintf;
+        const bool IsSscanf = FC.kind == BoundaryKind::Sscanf;
+        const unsigned FmtArg =
+            IsSnprintf ? 2u : (IsSprintf || IsFprintf || IsSscanf ? 1u : 0u);
+        const unsigned FirstVarArg =
+            IsSnprintf ? 3u : (IsSprintf || IsFprintf || IsSscanf ? 2u : 1u);
         std::string Fmt;
-        if (!constFmt(CI->getArgOperand(2), Fmt))
+        if (!constFmt(CI->getArgOperand(FmtArg), Fmt))
             continue;
+        if (IsSscanf) {
+            const std::string AsmLineFmt = "%31s %255[^\n]";
+            if (Fmt == AsmLineFmt) {
+                if (CI->arg_size() != 4 ||
+                    !CI->getArgOperand(2)->getType()->isPointerTy() ||
+                    !CI->getArgOperand(3)->getType()->isPointerTy())
+                    continue;
+                IRBuilder<> B(CI);
+                Function *Helper = getScanAsmLineHelper();
+                CallInst *New = B.CreateCall(
+                    Helper->getFunctionType(), Helper,
+                    {CI->getArgOperand(0), CI->getArgOperand(2),
+                     CI->getArgOperand(3)});
+                New->setDebugLoc(CI->getDebugLoc());
+                if (!CI->use_empty())
+                    CI->replaceAllUsesWith(New);
+                CI->eraseFromParent();
+                Changed = true;
+                continue;
+            }
+            if (CI->arg_size() != 3 ||
+                (Fmt != "%d" && Fmt != "%u") ||
+                !CI->getArgOperand(2)->getType()->isPointerTy())
+                continue;
+            IRBuilder<> B(CI);
+            Function *Helper = getScanIntHelper(Fmt == "%d");
+            CallInst *New = B.CreateCall(
+                Helper->getFunctionType(), Helper,
+                {CI->getArgOperand(0), CI->getArgOperand(2)});
+            New->setDebugLoc(CI->getDebugLoc());
+            if (!CI->use_empty())
+                CI->replaceAllUsesWith(New);
+            CI->eraseFromParent();
+            Changed = true;
+            continue;
+        }
+
         std::vector<Seg> Segs;
         unsigned ArgCount = 0;
         if (!parse(Fmt, Segs, ArgCount))
             continue;
-        // The variadic %s arguments must match the format and all be pointers.
-        if (ArgCount != CI->arg_size() - 3)
+        if (ArgCount != CI->arg_size() - FirstVarArg)
             continue;
+
         bool ok = true;
-        for (unsigned k = 0; k < ArgCount; ++k)
-            if (!CI->getArgOperand(3 + k)->getType()->isPointerTy())
+        unsigned VarIdx = 0;
+        for (const Seg &S : Segs) {
+            if (!isArg(S.kind))
+                continue;
+            Value *Arg = CI->getArgOperand(FirstVarArg + VarIdx++);
+            if (S.kind == SegKind::String) {
+                if (!Arg->getType()->isPointerTy())
+                    ok = false;
+            } else if (!Arg->getType()->isIntegerTy()) {
                 ok = false;
+            }
+        }
         if (!ok)
             continue;
 
-        Function *Helper = getHelper(Fmt, Segs, ArgCount);
         IRBuilder<> B(CI);
-        SmallVector<Value *, 8> Args{
-            CI->getArgOperand(0),
-            B.CreateZExtOrTrunc(CI->getArgOperand(1), I64)};
-        for (unsigned k = 0; k < ArgCount; ++k)
-            Args.push_back(CI->getArgOperand(3 + k));
+        Function *Helper = nullptr;
+        SmallVector<Value *, 8> Args;
+        if (IsPrintf || IsFprintf) {
+            Helper = getPrintHelper(Fmt, Segs, IsFprintf);
+            if (IsFprintf)
+                Args.push_back(CI->getArgOperand(0));
+        } else {
+            Helper = getBufferHelper(Fmt, Segs);
+            Args.push_back(CI->getArgOperand(0));
+            if (IsSnprintf)
+                Args.push_back(B.CreateZExtOrTrunc(CI->getArgOperand(1), I64));
+            else
+                Args.push_back(ConstantInt::get(I64, ~std::uint64_t{0}));
+        }
+
+        VarIdx = 0;
+        for (const Seg &S : Segs) {
+            if (!isArg(S.kind))
+                continue;
+            Value *Arg = CI->getArgOperand(FirstVarArg + VarIdx++);
+            if (S.kind == SegKind::String) {
+                Args.push_back(Arg);
+            } else if (S.kind == SegKind::SignedDec) {
+                Args.push_back(B.CreateSExtOrTrunc(Arg, I64));
+            } else {
+                Args.push_back(B.CreateZExtOrTrunc(Arg, I64));
+            }
+        }
         CallInst *New = B.CreateCall(Helper->getFunctionType(), Helper, Args);
         New->setDebugLoc(CI->getDebugLoc());
         if (!CI->use_empty())

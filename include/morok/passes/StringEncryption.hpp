@@ -45,12 +45,14 @@ bool stringEncryptModule(llvm::Module &M, const StrEncParams &params,
 /// seal channel exists (integrity tail).  No-op if the seed or seal is absent.
 bool bindStringSeedToSeal(llvm::Module &M, morok::ir::IRRandom &rng);
 
-/// Replace `snprintf(buf, size, fmt, ...)` calls whose format is a constant
-/// string containing only `%s`/`%%`/literals with a generated, size-bounded
-/// per-format helper.  This removes the recoverable format-string constant
-/// (e.g. "%s@%s$%s&%s") *and* the observable snprintf call boundary that an
-/// in-process hook reads the secret canonicalization from.  Returns true if any
-/// call was rewritten.
+/// Replace supported constant-format `snprintf`/`sprintf`, `printf`/`fprintf`,
+/// simple `sscanf("%d"/"%u")`, and `sscanf("%31s %255[^\n]")` calls with
+/// generated per-site helpers.  The printer grammar is intentionally narrow
+/// (`%s`, `%c`, simple integer decimal/hex, `%%`, and literals).  This removes
+/// recoverable format constants (e.g. "%s@%s$%s&%s") and clean libc
+/// formatting/parsing boundaries that in-process hooks use to read
+/// canonicalized secrets.  Unsupported printf/scanf features are intentionally
+/// left untouched.
 bool inlineConstantFormatCalls(llvm::Module &M);
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-strenc`).

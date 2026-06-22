@@ -63,6 +63,12 @@ set(_timing_false_positive_workload
     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/timing_false_positive.c")
 set(_release_audit_driver
     "${CMAKE_CURRENT_SOURCE_DIR}/release_audit_test.py")
+set(_boundary_trace_driver
+    "${CMAKE_CURRENT_SOURCE_DIR}/boundary_trace_audit.py")
+set(_boundary_trace_config
+    "${CMAKE_CURRENT_SOURCE_DIR}/boundary_trace.toml")
+set(_boundary_trace_workload
+    "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/boundary_trace.c")
 set(_vtable_integrity_driver
     "${CMAKE_CURRENT_SOURCE_DIR}/vtable_integrity_dispatch.sh")
 set(_vtable_integrity_config
@@ -127,6 +133,20 @@ if(Python3_EXECUTABLE)
     REQUIRED_FILES
       "${CMAKE_SOURCE_DIR}/tools/morok-audit.py;${_release_audit_driver}"
     TIMEOUT 30)
+
+  add_test(NAME "e2e/boundary_trace_audit"
+    COMMAND "${Python3_EXECUTABLE}" "${_boundary_trace_driver}"
+            "${CMAKE_C_COMPILER}"
+            "$<TARGET_FILE:morok_plugin>"
+            "${_sysroot}"
+            "${_boundary_trace_workload}"
+            "${_boundary_trace_config}"
+            9091)
+  set_tests_properties("e2e/boundary_trace_audit" PROPERTIES
+    LABELS "e2e;security;adversarial"
+    REQUIRED_FILES
+      "$<TARGET_FILE:morok_plugin>;${_boundary_trace_driver};${_boundary_trace_config};${_boundary_trace_workload}"
+    TIMEOUT 120)
 else()
   message(STATUS "release audit e2e skipped (Python3 not found).")
 endif()

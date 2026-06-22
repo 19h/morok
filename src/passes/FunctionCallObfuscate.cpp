@@ -151,6 +151,8 @@ std::vector<std::uint64_t> darwinAliasHashes(StringRef Name, const Module &M) {
         return {hashName("_platform_strlen", M)};
     if (Name == "strcpy")
         return {hashName("_platform_strcpy", M)};
+    if (Name == "strncpy")
+        return {hashName("_platform_strncpy", M)};
     if (Name == "strcmp")
         return {hashName("_platform_strcmp", M)};
     if (Name == "strncmp")

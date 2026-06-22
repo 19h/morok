@@ -1,0 +1,9 @@
+[global]
+preset = "low"
+
+[passes.string_encryption]
+enabled = true
+probability = 100
+
+[passes.function_call_obfuscate]
+enabled = true

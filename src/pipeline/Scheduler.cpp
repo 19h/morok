@@ -591,9 +591,10 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
     // original direct call sites still expose argument attributes/use shapes.
     if (InitialModuleGrowthOk &&
         config_.passes.str_enc.enabled.value_or(false)) {
-        // Inline constant all-%s snprintf formats first, so the recoverable
-        // format constants and snprintf boundaries are gone before the dead
-        // format globals are swept (and the remaining strings encrypted).
+        // Inline supported constant printf-family and simple sscanf formats
+        // first, so recoverable format constants and hookable libc boundaries
+        // are gone before the dead format globals are swept (and the remaining
+        // strings encrypted).
         changed |= passes::inlineConstantFormatCalls(M);
         passes::StrEncParams sp;
         sp.probability = config_.passes.str_enc.probability.value_or(100);
