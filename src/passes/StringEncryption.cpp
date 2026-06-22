@@ -22,8 +22,10 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
@@ -57,6 +59,11 @@ constexpr std::uint64_t kUnrollThreshold = 64; // ≤ this ⇒ unrolled, else lo
 // never inflates the stack frame.  Larger strings fall back to the in-place
 // global decryptor instead of the stack path.
 constexpr std::uint64_t kMaxStackStringBytes = 4096;
+// Load-scoped plaintext decrypts and re-encrypts the entire string around each
+// load.  Keep it for small straight-line loads only; loops or large buffers use
+// function-scoped lifetime so runtime work stays proportional to activations,
+// not load executions.
+constexpr std::uint64_t kMaxLoadScopedPlaintextBytes = 4096;
 constexpr int kCtorDecryptPriority = 0;
 
 bool hasSpecialSectionSemantics(StringRef Section) {
@@ -71,9 +78,8 @@ bool hasSpecialSectionSemantics(StringRef Section) {
     // Obj-C runtime, unwinder, or linker expects structured plaintext, and lazy
     // in-place decryptors may fault on read-only mappings.
     if (Section.starts_with("__TEXT,") ||
-        Section.starts_with("__DATA_CONST,") ||
-        Section.contains("__cstring") || Section.contains("cstring_literals") ||
-        Section.contains("__objc_"))
+        Section.starts_with("__DATA_CONST,") || Section.contains("__cstring") ||
+        Section.contains("cstring_literals") || Section.contains("__objc_"))
         return true;
 
     if (Section.starts_with(".rodata") || Section.starts_with(".rdata") ||
@@ -173,8 +179,7 @@ void emitStaticAnalysisBarrier(IRBuilderBase &B, const Module &M) {
 Value *emitVolatileStableZero(IRBuilderBase &B, std::uint64_t Salt,
                               StringRef Prefix) {
     auto *I64 = B.getInt64Ty();
-    AllocaInst *Slot =
-        B.CreateAlloca(I64, nullptr, Twine(Prefix) + ".slot");
+    AllocaInst *Slot = B.CreateAlloca(I64, nullptr, Twine(Prefix) + ".slot");
     B.CreateStore(ConstantInt::get(I64, Salt), Slot, /*isVolatile=*/true);
     LoadInst *A =
         B.CreateLoad(I64, Slot, /*isVolatile=*/true, Twine(Prefix) + ".a");
@@ -184,8 +189,7 @@ Value *emitVolatileStableZero(IRBuilderBase &B, std::uint64_t Salt,
 }
 
 Value *emitDecodedByte(IRBuilderBase &B, Value *CipherByte, Value *KsByte,
-                       Value *ByteZero, bool AddCombined,
-                       StringRef Prefix) {
+                       Value *ByteZero, bool AddCombined, StringRef Prefix) {
     Value *MaskedKs = B.CreateXor(KsByte, ByteZero, Twine(Prefix) + ".km");
     if (!AddCombined)
         return B.CreateXor(CipherByte, MaskedKs, Twine(Prefix) + ".x");
@@ -193,17 +197,15 @@ Value *emitDecodedByte(IRBuilderBase &B, Value *CipherByte, Value *KsByte,
     auto *I32 = B.getInt32Ty();
     Value *Cipher32 = B.CreateZExt(CipherByte, I32, Twine(Prefix) + ".c32");
     Value *Ks32 = B.CreateZExt(MaskedKs, I32, Twine(Prefix) + ".k32");
-    Value *NegKs =
-        B.CreateAdd(B.CreateXor(Ks32, ConstantInt::get(I32, 0xff),
-                                Twine(Prefix) + ".kn"),
-                    ConstantInt::get(I32, 1), Twine(Prefix) + ".ka");
+    Value *NegKs = B.CreateAdd(
+        B.CreateXor(Ks32, ConstantInt::get(I32, 0xff), Twine(Prefix) + ".kn"),
+        ConstantInt::get(I32, 1), Twine(Prefix) + ".ka");
     Value *Plain32 = B.CreateAdd(Cipher32, NegKs, Twine(Prefix) + ".p32");
     return B.CreateTrunc(Plain32, CipherByte->getType(), Twine(Prefix) + ".p");
 }
 
 Value *emitEncodedByte(IRBuilderBase &B, Value *PlainByte, Value *KsByte,
-                       Value *ByteZero, bool AddCombined,
-                       StringRef Prefix) {
+                       Value *ByteZero, bool AddCombined, StringRef Prefix) {
     Value *MaskedKs = B.CreateXor(KsByte, ByteZero, Twine(Prefix) + ".km");
     if (!AddCombined)
         return B.CreateXor(PlainByte, MaskedKs, Twine(Prefix) + ".x");
@@ -212,8 +214,7 @@ Value *emitEncodedByte(IRBuilderBase &B, Value *PlainByte, Value *KsByte,
     Value *Plain32 = B.CreateZExt(PlainByte, I32, Twine(Prefix) + ".p32");
     Value *Ks32 = B.CreateZExt(MaskedKs, I32, Twine(Prefix) + ".k32");
     Value *Cipher32 = B.CreateAdd(Plain32, Ks32, Twine(Prefix) + ".c32");
-    return B.CreateTrunc(Cipher32, PlainByte->getType(),
-                         Twine(Prefix) + ".c");
+    return B.CreateTrunc(Cipher32, PlainByte->getType(), Twine(Prefix) + ".c");
 }
 
 struct UseSite {
@@ -288,11 +289,9 @@ void emitDecryptUnrolled(IRBuilder<> &B, const Cipher &c, Function *seedFn,
     auto *i64 = Type::getInt64Ty(B.getContext());
     Value *seedLoad = B.CreateCall(seedFn, {}, "morok.str.seed.v");
     emitStaticAnalysisBarrier(B, *seedFn->getParent());
-    Value *seedMix =
-        B.CreateAdd(seedLoad,
-                    emitVolatileStableZero(B, c.key ^ c.mul,
-                                           "morok.str.mix"),
-                    "morok.str.k.mix");
+    Value *seedMix = B.CreateAdd(
+        seedLoad, emitVolatileStableZero(B, c.key ^ c.mul, "morok.str.mix"),
+        "morok.str.k.mix");
     Value *rtKey = B.CreateXor(seedMix, ConstantInt::get(i64, c.key));
     Value *byteZero = B.CreateTrunc(
         emitVolatileStableZero(B, c.key + c.mul, "morok.str.byte.mix"), i8,
@@ -319,11 +318,10 @@ void emitEncodeUnrolled(IRBuilder<> &B, const Cipher &c, Function *seedFn,
     auto *i64 = Type::getInt64Ty(B.getContext());
     Value *seedLoad = B.CreateCall(seedFn, {}, "morok.str.reseed.v");
     emitStaticAnalysisBarrier(B, *seedFn->getParent());
-    Value *seedMix =
-        B.CreateAdd(seedLoad,
-                    emitVolatileStableZero(B, c.key ^ c.mul,
-                                           "morok.str.reenc.mix"),
-                    "morok.str.reenc.k.mix");
+    Value *seedMix = B.CreateAdd(
+        seedLoad,
+        emitVolatileStableZero(B, c.key ^ c.mul, "morok.str.reenc.mix"),
+        "morok.str.reenc.k.mix");
     Value *rtKey = B.CreateXor(seedMix, ConstantInt::get(i64, c.key));
     Value *byteZero = B.CreateTrunc(
         emitVolatileStableZero(B, c.key + c.mul, "morok.str.reenc.byte.mix"),
@@ -343,8 +341,7 @@ void emitEncodeUnrolled(IRBuilder<> &B, const Cipher &c, Function *seedFn,
     }
 }
 
-Function *createStackDecryptHelper(Module &M, const Cipher &C,
-                                   Function *SeedFn,
+Function *createStackDecryptHelper(Module &M, const Cipher &C, Function *SeedFn,
                                    GlobalVariable *CipherText, ArrayType *ArrTy,
                                    std::uint64_t Len) {
     LLVMContext &Ctx = M.getContext();
@@ -375,16 +372,14 @@ Function *createStackDecryptHelper(Module &M, const Cipher &C,
     IRBuilder<> EB(Entry);
     Value *SeedLoad = EB.CreateCall(SeedFn, {}, "morok.str.stack.k");
     emitStaticAnalysisBarrier(EB, M);
-    Value *SeedMix =
-        EB.CreateAdd(SeedLoad,
-                     emitVolatileStableZero(EB, C.key ^ C.mul,
-                                            "morok.str.stack.mix"),
-                     "morok.str.stack.k.mix");
+    Value *SeedMix = EB.CreateAdd(
+        SeedLoad,
+        emitVolatileStableZero(EB, C.key ^ C.mul, "morok.str.stack.mix"),
+        "morok.str.stack.k.mix");
     Value *RtKey = EB.CreateXor(SeedMix, ConstantInt::get(I64, C.key),
                                 "morok.str.stack.k0");
     Value *ByteZero = EB.CreateTrunc(
-        emitVolatileStableZero(EB, C.key + C.mul,
-                               "morok.str.stack.byte.mix"),
+        emitVolatileStableZero(EB, C.key + C.mul, "morok.str.stack.byte.mix"),
         I8, "morok.str.stack.byte.zero");
     EB.CreateBr(Loop);
 
@@ -423,8 +418,8 @@ Value *emitStackString(Instruction *InsertBefore, const Cipher &C,
         createStackDecryptHelper(M, C, SeedFn, CipherText, ArrTy, Len);
     auto *I64 = Type::getInt64Ty(M.getContext());
     // Hoist the buffer to the entry block (a static alloca) so it is allocated
-    // once per call activation, not once per loop iteration: a per-use alloca in
-    // a loop body is never released until the function returns, so an
+    // once per call activation, not once per loop iteration: a per-use alloca
+    // in a loop body is never released until the function returns, so an
     // attacker-controlled loop count would exhaust the stack.  The decrypt call
     // and pointer materialization stay at the use site, refilling the buffer.
     IRBuilder<> EB(&*F->getEntryBlock().getFirstInsertionPt());
@@ -535,6 +530,28 @@ bool collectLoadUseSites(Value *V, SmallVectorImpl<LoadInst *> &Loads,
     return true;
 }
 
+bool loadScopeSitesInLoop(ArrayRef<LoadInst *> Loads) {
+    SmallPtrSet<Function *, 8> Checked;
+    for (LoadInst *RootLI : Loads) {
+        if (!RootLI || !RootLI->getParent())
+            continue;
+        Function *F = RootLI->getFunction();
+        if (!F || F->isDeclaration() || !Checked.insert(F).second)
+            continue;
+
+        DominatorTree DT(*F);
+        LoopInfo LI(DT);
+        for (LoadInst *CandidateLI : Loads) {
+            if (!CandidateLI || !CandidateLI->getParent() ||
+                CandidateLI->getFunction() != F)
+                continue;
+            if (LI.getLoopFor(CandidateLI->getParent()))
+                return true;
+        }
+    }
+    return false;
+}
+
 bool hasMustTailReturn(const SmallPtrSetImpl<Function *> &Funcs) {
     for (Function *F : Funcs) {
         if (!F || F->isDeclaration())
@@ -570,9 +587,8 @@ GlobalVariable *createRefCount(Module &M) {
     return GV;
 }
 
-bool materializeStackUses(GlobalVariable *GV, const Cipher &C,
-                          Function *SeedFn, ArrayType *ArrTy,
-                          std::uint64_t Len) {
+bool materializeStackUses(GlobalVariable *GV, const Cipher &C, Function *SeedFn,
+                          ArrayType *ArrTy, std::uint64_t Len) {
     // Large strings would put a large buffer on the frame at each use; leave
     // those to the in-place global decryptor.
     if (Len > kMaxStackStringBytes)
@@ -603,8 +619,8 @@ bool materializeStackUses(GlobalVariable *GV, const Cipher &C,
     // single consuming call instead of persisting in the frame until the
     // function returns — narrowing the byte-granular memory-scan window the
     // field report used to recover decrypted strings.  A using instruction that
-    // is a terminator (invoke) has no in-block successor to anchor the scrub and
-    // is simply left unscrubbed.
+    // is a terminator (invoke) has no in-block successor to anchor the scrub
+    // and is simply left unscrubbed.
     for (const auto &KV : PerInst) {
         Instruction *Use = KV.first;
         Value *Buf = KV.second;
@@ -649,16 +665,16 @@ SeedProvider createSeedProvider(Module &M, ir::IRRandom &rng) {
 
     Constant *blobInit =
         ConstantDataArray::get(ctx, ArrayRef<std::uint8_t>(blob));
-    auto *blobGV = new GlobalVariable(M, blobInit->getType(),
-                                      /*isConstant=*/true,
-                                      GlobalValue::PrivateLinkage, blobInit,
-                                      "morok.str.kdf.blob");
+    auto *blobGV =
+        new GlobalVariable(M, blobInit->getType(),
+                           /*isConstant=*/true, GlobalValue::PrivateLinkage,
+                           blobInit, "morok.str.kdf.blob");
     blobGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
     auto *arrTy = cast<ArrayType>(blobGV->getValueType());
 
-    auto *fn = Function::Create(FunctionType::get(i64, false),
-                                GlobalValue::InternalLinkage, "morok.str.seed",
-                                &M);
+    auto *fn =
+        Function::Create(FunctionType::get(i64, false),
+                         GlobalValue::InternalLinkage, "morok.str.seed", &M);
     fn->setDSOLocal(true);
     fn->addFnAttr(Attribute::NoInline);
     fn->addFnAttr(Attribute::OptimizeNone);
@@ -675,9 +691,8 @@ SeedProvider createSeedProvider(Module &M, ir::IRRandom &rng) {
     PHINode *h = LB.CreatePHI(i64, 2, "morok.str.seed.h");
     iv->addIncoming(ConstantInt::get(i64, 0), entry);
     h->addIncoming(ConstantInt::get(i64, kdfSeed), entry);
-    Value *bp = LB.CreateInBoundsGEP(arrTy, blobGV,
-                                     {ConstantInt::get(i64, 0), iv},
-                                     "morok.str.seed.bp");
+    Value *bp = LB.CreateInBoundsGEP(
+        arrTy, blobGV, {ConstantInt::get(i64, 0), iv}, "morok.str.seed.bp");
     LoadInst *byte = LB.CreateLoad(i8, bp, "morok.str.seed.byte");
     byte->setVolatile(true);
     byte->setAlignment(Align(1));
@@ -713,8 +728,8 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
     std::uint64_t forcedBytes = 0;
     std::uint64_t randomBytes = 0;
     auto tryQueueCandidate = [](std::vector<StringCandidate> &Candidates,
-                                std::uint64_t &QueuedBytes,
-                                GlobalVariable *GV, std::uint64_t Bytes) {
+                                std::uint64_t &QueuedBytes, GlobalVariable *GV,
+                                std::uint64_t Bytes) {
         if (Candidates.size() >= kMaxEncryptedStrings ||
             QueuedBytes + Bytes > kMaxEncryptedTotalBytes)
             return;
@@ -759,8 +774,8 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
 
     // One runtime-opaque module seed underlies every per-string key.  It is
     // produced by a seed function that hashes a fixed const blob at runtime
-    // (see createSeedProvider), so no literal seed constant sits in the file for
-    // a static "read the word, decrypt the pool" recovery; seedVal is the
+    // (see createSeedProvider), so no literal seed constant sits in the file
+    // for a static "read the word, decrypt the pool" recovery; seedVal is the
     // compile-time hash the runtime reproduces.
     const SeedProvider seedProv = createSeedProvider(M, rng);
     Function *seedFn = seedProv.fn;
@@ -790,8 +805,7 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
             plain[i] = static_cast<std::uint8_t>(raw[i]);
         // Only length-pad read-only C strings; a mutable global may be indexed
         // up to its original size by the program, so its size must not change.
-        if (gv->isConstant() && cda->isCString() &&
-            gv->getSection().empty()) {
+        if (gv->isConstant() && cda->isCString() && gv->getSection().empty()) {
             constexpr std::uint64_t kBlock = 16;
             const std::uint64_t blocks =
                 (n + kBlock - 1) / kBlock + rng.range(3);
@@ -827,17 +841,18 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
             const auto linkage = gv->getLinkage();
             // Preserve the original address space — replaceAllUsesWith requires
             // the replacement to have the identical pointer type, so a new
-            // global in addrspace(0) replacing an addrspace(N) string is invalid
-            // IR (a verifier/assertion failure).  Preserve the alignment too:
-            // the program's existing loads/GEPs may rely on it, so forcing
-            // Align(1) is undefined behavior.
+            // global in addrspace(0) replacing an addrspace(N) string is
+            // invalid IR (a verifier/assertion failure).  Preserve the
+            // alignment too: the program's existing loads/GEPs may rely on it,
+            // so forcing Align(1) is undefined behavior.
             const unsigned addrSpace = gv->getAddressSpace();
             const Align align = gv->getAlign().valueOrOne();
             gv->setName(""); // free the name for the replacement
-            target = new GlobalVariable(M, cipherInit->getType(),
-                                        /*isConstant=*/true, linkage, cipherInit,
-                                        nm, /*InsertBefore=*/nullptr,
-                                        GlobalValue::NotThreadLocal, addrSpace);
+            target =
+                new GlobalVariable(M, cipherInit->getType(),
+                                   /*isConstant=*/true, linkage, cipherInit, nm,
+                                   /*InsertBefore=*/nullptr,
+                                   GlobalValue::NotThreadLocal, addrSpace);
             target->setUnnamedAddr(addr);
             target->setAlignment(align);
             gv->replaceAllUsesWith(target);
@@ -858,8 +873,8 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
         // Lazily decrypt in place only when there is no safe stack rewrite.
         // For originally-constant strings whose address does not escape through
         // static data, bound the plaintext lifetime to active user frames: the
-        // first frame decrypts, nested/recursive frames share the plaintext, and
-        // the last returning frame re-encrypts it.  Escaped/static-address
+        // first frame decrypts, nested/recursive frames share the plaintext,
+        // and the last returning frame re-encrypts it.  Escaped/static-address
         // strings retain the constructor fallback because no function-scope
         // release point can prove all observers are done with the address.
         // musttail users cannot take an inserted function-exit release before
@@ -872,13 +887,16 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
             stackCandidate && !escapes && !users.empty();
         SmallVector<LoadInst *, 16> LoadScopeSites;
         SmallPtrSet<Value *, 16> SeenLoadUses;
-        const bool loadScopedPlaintext =
+        const bool loadOnlyUses =
             scopedCandidate &&
             collectLoadUseSites(target, LoadScopeSites, SeenLoadUses) &&
             !LoadScopeSites.empty();
-        const bool functionScopedPlaintext =
-            scopedCandidate && !loadScopedPlaintext &&
-            !hasMustTailReturn(users);
+        const bool loadScopedPlaintext =
+            loadOnlyUses && storedLen <= kMaxLoadScopedPlaintextBytes &&
+            !loadScopeSitesInLoop(LoadScopeSites);
+        const bool functionScopedPlaintext = scopedCandidate &&
+                                             !loadScopedPlaintext &&
+                                             !hasMustTailReturn(users);
         const bool scopedPlaintext =
             loadScopedPlaintext || functionScopedPlaintext;
         target->setConstant(false); // mutated in place by its decryptor
@@ -967,10 +985,10 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
                 emitVolatileStableZero(B, c.key ^ c.mul, "morok.str.loop.mix"),
                 "morok.str.loop.k.mix");
             Value *rtKey = B.CreateXor(seedMix, ConstantInt::get(i64, c.key));
-            Value *byteZero = B.CreateTrunc(
-                emitVolatileStableZero(B, c.key + c.mul,
-                                       "morok.str.loop.byte.mix"),
-                i8, "morok.str.loop.byte.zero");
+            Value *byteZero =
+                B.CreateTrunc(emitVolatileStableZero(B, c.key + c.mul,
+                                                     "morok.str.loop.byte.mix"),
+                              i8, "morok.str.loop.byte.zero");
             B.CreateBr(loop);
 
             B.SetInsertPoint(loop);
@@ -1040,16 +1058,16 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
             } else {
                 auto *loop =
                     BasicBlock::Create(ctx, "morok.str.reloop", releaseFn);
-                auto *loopExit = BasicBlock::Create(
-                    ctx, "morok.str.reloopexit", releaseFn);
+                auto *loopExit =
+                    BasicBlock::Create(ctx, "morok.str.reloopexit", releaseFn);
                 Value *seedLoad =
                     RB.CreateCall(seedFn, {}, "morok.str.reloop.seed");
                 emitStaticAnalysisBarrier(RB, M);
-                Value *seedMix = RB.CreateAdd(
-                    seedLoad,
-                    emitVolatileStableZero(RB, c.key ^ c.mul,
-                                           "morok.str.reloop.mix"),
-                    "morok.str.reloop.k.mix");
+                Value *seedMix =
+                    RB.CreateAdd(seedLoad,
+                                 emitVolatileStableZero(RB, c.key ^ c.mul,
+                                                        "morok.str.reloop.mix"),
+                                 "morok.str.reloop.k.mix");
                 Value *rtKey =
                     RB.CreateXor(seedMix, ConstantInt::get(i64, c.key));
                 Value *byteZero = RB.CreateTrunc(
@@ -1070,9 +1088,8 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
                 Value *enc = emitEncodedByte(RB, plainByte, ksByte, byteZero,
                                              c.add, "morok.str.reloop");
                 RB.CreateStore(enc, ptr);
-                Value *next =
-                    RB.CreateAdd(iv, ConstantInt::get(i64, 1),
-                                 "morok.str.reloop.next");
+                Value *next = RB.CreateAdd(iv, ConstantInt::get(i64, 1),
+                                           "morok.str.reloop.next");
                 iv->addIncoming(next, loop);
                 RB.CreateCondBr(
                     RB.CreateICmpULT(next, ConstantInt::get(i64, storedLen)),
@@ -1190,7 +1207,15 @@ bool inlineConstantFormatCalls(Module &M) {
     auto *I64 = Type::getInt64Ty(Ctx);
     auto *Ptr = PointerType::getUnqual(Ctx);
 
-    enum class SegKind { Literal, String, UnsignedDec, SignedDec, Hex, HexUpper, Char };
+    enum class SegKind {
+        Literal,
+        String,
+        UnsignedDec,
+        SignedDec,
+        Hex,
+        HexUpper,
+        Char
+    };
     struct Seg {
         SegKind kind;
         std::string lit;
@@ -1294,13 +1319,12 @@ bool inlineConstantFormatCalls(Module &M) {
     unsigned Counter = 0;
 
     auto emitFormatCountReturn = [&](IRBuilder<> &B, Value *Count) {
-        Value *TooLarge = B.CreateICmpUGT(
-            Count, ConstantInt::get(I64, 0x7fffffffULL),
-            "morok.fmt.ret.overflow");
+        Value *TooLarge =
+            B.CreateICmpUGT(Count, ConstantInt::get(I64, 0x7fffffffULL),
+                            "morok.fmt.ret.overflow");
         Value *Trunc = B.CreateTrunc(Count, I32, "morok.fmt.ret.trunc");
-        Value *Ret = B.CreateSelect(
-            TooLarge, ConstantInt::getSigned(I32, -1), Trunc,
-            "morok.fmt.ret");
+        Value *Ret = B.CreateSelect(TooLarge, ConstantInt::getSigned(I32, -1),
+                                    Trunc, "morok.fmt.ret");
         B.CreateRet(Ret);
     };
 
@@ -1337,7 +1361,7 @@ bool inlineConstantFormatCalls(Module &M) {
         B.CreateStore(ConstantInt::get(I64, 0), Cnt);
 
         // Append one byte with exact snprintf-style bounds: the store always
-        // executes but lands in a scratch slot when the output is full.  sprintf
+        // executes but lands in a scratch slot when the output is full. sprintf
         // calls pass size_t(-1), so this degenerates to unbounded sprintf
         // semantics while sharing one helper body.
         auto appendByte = [&](Value *ByteVal) {
@@ -1385,12 +1409,12 @@ bool inlineConstantFormatCalls(Module &M) {
             Value *HexCh = B.CreateAdd(
                 Digit, ConstantInt::get(I8, (Upper ? 'A' : 'a') - 10),
                 Twine(Prefix) + ".hex");
-            Value *Ch = B.CreateSelect(
-                B.CreateICmpULT(Rem, ConstantInt::get(I64, 10)),
-                DecCh, HexCh, Twine(Prefix) + ".ch");
-            Value *PtrTmp = B.CreateInBoundsGEP(
-                TmpTy, Tmp, {ConstantInt::get(I64, 0), J},
-                Twine(Prefix) + ".tmp.ptr");
+            Value *Ch =
+                B.CreateSelect(B.CreateICmpULT(Rem, ConstantInt::get(I64, 10)),
+                               DecCh, HexCh, Twine(Prefix) + ".ch");
+            Value *PtrTmp =
+                B.CreateInBoundsGEP(TmpTy, Tmp, {ConstantInt::get(I64, 0), J},
+                                    Twine(Prefix) + ".tmp.ptr");
             B.CreateStore(Ch, PtrTmp);
             Value *NextV = B.CreateUDiv(V, ConstantInt::get(I64, Base),
                                         Twine(Prefix) + ".next.v");
@@ -1410,9 +1434,9 @@ bool inlineConstantFormatCalls(Module &M) {
             B.SetInsertPoint(RevBodyBB);
             Value *Rn = B.CreateSub(R, ConstantInt::get(I64, 1),
                                     Twine(Prefix) + ".rev.next");
-            Value *LoadPtr = B.CreateInBoundsGEP(
-                TmpTy, Tmp, {ConstantInt::get(I64, 0), Rn},
-                Twine(Prefix) + ".rev.ptr");
+            Value *LoadPtr =
+                B.CreateInBoundsGEP(TmpTy, Tmp, {ConstantInt::get(I64, 0), Rn},
+                                    Twine(Prefix) + ".rev.ptr");
             appendByte(B.CreateLoad(I8, LoadPtr, Twine(Prefix) + ".rev.ch"));
             B.CreateBr(RevBB);
             R->addIncoming(Rn, RevBodyBB);
@@ -1425,10 +1449,11 @@ bool inlineConstantFormatCalls(Module &M) {
             auto *ContBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".cont", Fn);
             Value *Neg = B.CreateICmpSLT(Num, ConstantInt::get(I64, 0),
                                          Twine(Prefix) + ".isneg");
-            Value *Mag = B.CreateSelect(
-                Neg, B.CreateSub(ConstantInt::get(I64, 0), Num,
-                                 Twine(Prefix) + ".negmag"),
-                Num, Twine(Prefix) + ".mag");
+            Value *Mag =
+                B.CreateSelect(Neg,
+                               B.CreateSub(ConstantInt::get(I64, 0), Num,
+                                           Twine(Prefix) + ".negmag"),
+                               Num, Twine(Prefix) + ".mag");
             B.CreateCondBr(Neg, NegBB, ContBB);
 
             B.SetInsertPoint(NegBB);
@@ -1444,8 +1469,8 @@ bool inlineConstantFormatCalls(Module &M) {
         for (const Seg &S : Segs) {
             if (S.kind == SegKind::Literal) {
                 for (char ch : S.lit)
-                    appendByte(ConstantInt::get(
-                        I8, static_cast<unsigned char>(ch)));
+                    appendByte(
+                        ConstantInt::get(I8, static_cast<unsigned char>(ch)));
                 continue;
             }
 
@@ -1588,12 +1613,12 @@ bool inlineConstantFormatCalls(Module &M) {
             Value *HexCh = B.CreateAdd(
                 Digit, ConstantInt::get(I8, (Upper ? 'A' : 'a') - 10),
                 Twine(Prefix) + ".hex");
-            Value *Ch = B.CreateSelect(
-                B.CreateICmpULT(Rem, ConstantInt::get(I64, 10)),
-                DecCh, HexCh, Twine(Prefix) + ".ch");
-            Value *PtrTmp = B.CreateInBoundsGEP(
-                TmpTy, Tmp, {ConstantInt::get(I64, 0), J},
-                Twine(Prefix) + ".tmp.ptr");
+            Value *Ch =
+                B.CreateSelect(B.CreateICmpULT(Rem, ConstantInt::get(I64, 10)),
+                               DecCh, HexCh, Twine(Prefix) + ".ch");
+            Value *PtrTmp =
+                B.CreateInBoundsGEP(TmpTy, Tmp, {ConstantInt::get(I64, 0), J},
+                                    Twine(Prefix) + ".tmp.ptr");
             B.CreateStore(Ch, PtrTmp);
             Value *NextV = B.CreateUDiv(V, ConstantInt::get(I64, Base),
                                         Twine(Prefix) + ".next.v");
@@ -1613,9 +1638,9 @@ bool inlineConstantFormatCalls(Module &M) {
             B.SetInsertPoint(RevBodyBB);
             Value *Rn = B.CreateSub(R, ConstantInt::get(I64, 1),
                                     Twine(Prefix) + ".rev.next");
-            Value *LoadPtr = B.CreateInBoundsGEP(
-                TmpTy, Tmp, {ConstantInt::get(I64, 0), Rn},
-                Twine(Prefix) + ".rev.ptr");
+            Value *LoadPtr =
+                B.CreateInBoundsGEP(TmpTy, Tmp, {ConstantInt::get(I64, 0), Rn},
+                                    Twine(Prefix) + ".rev.ptr");
             appendByte(B.CreateLoad(I8, LoadPtr, Twine(Prefix) + ".rev.ch"));
             B.CreateBr(RevBB);
             R->addIncoming(Rn, RevBodyBB);
@@ -1628,10 +1653,11 @@ bool inlineConstantFormatCalls(Module &M) {
             auto *ContBB = BasicBlock::Create(Ctx, Twine(Prefix) + ".cont", Fn);
             Value *Neg = B.CreateICmpSLT(Num, ConstantInt::get(I64, 0),
                                          Twine(Prefix) + ".isneg");
-            Value *Mag = B.CreateSelect(
-                Neg, B.CreateSub(ConstantInt::get(I64, 0), Num,
-                                 Twine(Prefix) + ".negmag"),
-                Num, Twine(Prefix) + ".mag");
+            Value *Mag =
+                B.CreateSelect(Neg,
+                               B.CreateSub(ConstantInt::get(I64, 0), Num,
+                                           Twine(Prefix) + ".negmag"),
+                               Num, Twine(Prefix) + ".mag");
             B.CreateCondBr(Neg, NegBB, ContBB);
 
             B.SetInsertPoint(NegBB);
@@ -1647,8 +1673,8 @@ bool inlineConstantFormatCalls(Module &M) {
         for (const Seg &S : Segs) {
             if (S.kind == SegKind::Literal) {
                 for (char ch : S.lit)
-                    appendByte(ConstantInt::get(
-                        I8, static_cast<unsigned char>(ch)));
+                    appendByte(
+                        ConstantInt::get(I8, static_cast<unsigned char>(ch)));
                 continue;
             }
 
@@ -1707,10 +1733,10 @@ bool inlineConstantFormatCalls(Module &M) {
         if (It != ScanHelperCache.end())
             return It->second;
 
-        auto *Fn = Function::Create(FunctionType::get(I32, {Ptr, Ptr}, false),
-                                    GlobalValue::InternalLinkage,
-                                    Signed ? "morok.scan.d" : "morok.scan.u",
-                                    &M);
+        auto *Fn =
+            Function::Create(FunctionType::get(I32, {Ptr, Ptr}, false),
+                             GlobalValue::InternalLinkage,
+                             Signed ? "morok.scan.d" : "morok.scan.u", &M);
         Fn->setDSOLocal(true);
         Fn->addFnAttr(Attribute::NoInline);
         Fn->addFnAttr(Attribute::OptimizeNone);
@@ -1720,13 +1746,11 @@ bool inlineConstantFormatCalls(Module &M) {
 
         auto *EntryBB = BasicBlock::Create(Ctx, "entry", Fn);
         auto *SkipBB = BasicBlock::Create(Ctx, "morok.scan.skip", Fn);
-        auto *SkipBodyBB =
-            BasicBlock::Create(Ctx, "morok.scan.skip.body", Fn);
+        auto *SkipBodyBB = BasicBlock::Create(Ctx, "morok.scan.skip.body", Fn);
         auto *AfterSkipBB =
             BasicBlock::Create(Ctx, "morok.scan.after.skip", Fn);
         auto *LoopBB = BasicBlock::Create(Ctx, "morok.scan.digits", Fn);
-        auto *DigitBB =
-            BasicBlock::Create(Ctx, "morok.scan.digit.body", Fn);
+        auto *DigitBB = BasicBlock::Create(Ctx, "morok.scan.digit.body", Fn);
         auto *DoneBB = BasicBlock::Create(Ctx, "morok.scan.done", Fn);
         auto *StoreBB = BasicBlock::Create(Ctx, "morok.scan.store", Fn);
         auto *FailBB = BasicBlock::Create(Ctx, "morok.scan.fail", Fn);
@@ -1752,9 +1776,8 @@ bool inlineConstantFormatCalls(Module &M) {
         B.CreateCondBr(Space, SkipBodyBB, AfterSkipBB);
 
         B.SetInsertPoint(SkipBodyBB);
-        Value *SkipNext =
-            B.CreateAdd(SkipIdx, ConstantInt::get(I64, 1),
-                        "morok.scan.skip.next");
+        Value *SkipNext = B.CreateAdd(SkipIdx, ConstantInt::get(I64, 1),
+                                      "morok.scan.skip.next");
         SkipIdx->addIncoming(SkipNext, SkipBodyBB);
         B.CreateBr(SkipBB);
 
@@ -1778,26 +1801,23 @@ bool inlineConstantFormatCalls(Module &M) {
         B.SetInsertPoint(LoopBB);
         PHINode *Idx = B.CreatePHI(I64, 2, "morok.scan.i");
         PHINode *Acc = B.CreatePHI(I64, 2, "morok.scan.acc");
-        PHINode *Seen = B.CreatePHI(Type::getInt1Ty(Ctx), 2,
-                                    "morok.scan.seen");
+        PHINode *Seen = B.CreatePHI(Type::getInt1Ty(Ctx), 2, "morok.scan.seen");
         Idx->addIncoming(Start, AfterSkipBB);
         Acc->addIncoming(ConstantInt::get(I64, 0), AfterSkipBB);
         Seen->addIncoming(ConstantInt::getFalse(Ctx), AfterSkipBB);
-        Value *Ch = B.CreateLoad(
-            I8, B.CreateGEP(I8, Input, {Idx}, "morok.scan.ptr"),
-            "morok.scan.ch");
+        Value *Ch =
+            B.CreateLoad(I8, B.CreateGEP(I8, Input, {Idx}, "morok.scan.ptr"),
+                         "morok.scan.ch");
         Value *Ch32 = B.CreateZExt(Ch, I32, "morok.scan.ch32");
         Value *Digit32 =
-            B.CreateSub(Ch32, ConstantInt::get(I32, '0'),
-                        "morok.scan.digit32");
+            B.CreateSub(Ch32, ConstantInt::get(I32, '0'), "morok.scan.digit32");
         Value *IsDigit = B.CreateICmpULE(Digit32, ConstantInt::get(I32, 9),
                                          "morok.scan.isdigit");
         B.CreateCondBr(IsDigit, DigitBB, DoneBB);
 
         B.SetInsertPoint(DigitBB);
         Value *NextAcc = B.CreateAdd(
-            B.CreateMul(Acc, ConstantInt::get(I64, 10),
-                        "morok.scan.acc.scale"),
+            B.CreateMul(Acc, ConstantInt::get(I64, 10), "morok.scan.acc.scale"),
             B.CreateZExt(Digit32, I64), "morok.scan.acc.next");
         Value *NextIdx =
             B.CreateAdd(Idx, ConstantInt::get(I64, 1), "morok.scan.i.next");
@@ -1812,11 +1832,9 @@ bool inlineConstantFormatCalls(Module &M) {
         B.SetInsertPoint(StoreBB);
         Value *Narrow = B.CreateTrunc(Acc, I32, "morok.scan.narrow");
         if (Signed) {
-            Value *Negative =
-                B.CreateSub(ConstantInt::get(I32, 0), Narrow,
-                            "morok.scan.negative");
-            Narrow = B.CreateSelect(Neg, Negative, Narrow,
-                                    "morok.scan.signed");
+            Value *Negative = B.CreateSub(ConstantInt::get(I32, 0), Narrow,
+                                          "morok.scan.negative");
+            Narrow = B.CreateSelect(Neg, Negative, Narrow, "morok.scan.signed");
         }
         B.CreateStore(Narrow, Out);
         B.CreateRet(ConstantInt::get(I32, 1));
@@ -1850,18 +1868,15 @@ bool inlineConstantFormatCalls(Module &M) {
         auto *Skip1BodyBB =
             BasicBlock::Create(Ctx, "morok.scan.skip1.body", Fn);
         auto *WordBB = BasicBlock::Create(Ctx, "morok.scan.word", Fn);
-        auto *WordBodyBB =
-            BasicBlock::Create(Ctx, "morok.scan.word.body", Fn);
+        auto *WordBodyBB = BasicBlock::Create(Ctx, "morok.scan.word.body", Fn);
         auto *AfterWordBB =
             BasicBlock::Create(Ctx, "morok.scan.after.word", Fn);
-        auto *WordFailBB =
-            BasicBlock::Create(Ctx, "morok.scan.word.fail", Fn);
+        auto *WordFailBB = BasicBlock::Create(Ctx, "morok.scan.word.fail", Fn);
         auto *Skip2BB = BasicBlock::Create(Ctx, "morok.scan.skip2", Fn);
         auto *Skip2BodyBB =
             BasicBlock::Create(Ctx, "morok.scan.skip2.body", Fn);
         auto *RestBB = BasicBlock::Create(Ctx, "morok.scan.rest", Fn);
-        auto *RestBodyBB =
-            BasicBlock::Create(Ctx, "morok.scan.rest.body", Fn);
+        auto *RestBodyBB = BasicBlock::Create(Ctx, "morok.scan.rest.body", Fn);
         auto *DoneBB = BasicBlock::Create(Ctx, "morok.scan.asm.done", Fn);
 
         IRBuilder<> B(EntryBB);
@@ -1887,9 +1902,8 @@ bool inlineConstantFormatCalls(Module &M) {
         B.CreateCondBr(isSpace(Skip1Ch), Skip1BodyBB, WordBB);
 
         B.SetInsertPoint(Skip1BodyBB);
-        Value *Skip1Next =
-            B.CreateAdd(Skip1, ConstantInt::get(I64, 1),
-                        "morok.scan.skip1.next");
+        Value *Skip1Next = B.CreateAdd(Skip1, ConstantInt::get(I64, 1),
+                                       "morok.scan.skip1.next");
         Skip1->addIncoming(Skip1Next, Skip1BodyBB);
         B.CreateBr(Skip1BB);
 
@@ -1907,22 +1921,20 @@ bool inlineConstantFormatCalls(Module &M) {
         B.CreateCondBr(WordDone, AfterWordBB, WordBodyBB);
 
         B.SetInsertPoint(WordBodyBB);
-        B.CreateStore(WordCh, B.CreateGEP(I8, WordOut, {WordLen},
-                                          "morok.scan.word.out"));
-        Value *WordSrcNext =
-            B.CreateAdd(WordSrc, ConstantInt::get(I64, 1),
-                        "morok.scan.word.src.next");
-        Value *WordLenNext =
-            B.CreateAdd(WordLen, ConstantInt::get(I64, 1),
-                        "morok.scan.word.len.next");
+        B.CreateStore(
+            WordCh, B.CreateGEP(I8, WordOut, {WordLen}, "morok.scan.word.out"));
+        Value *WordSrcNext = B.CreateAdd(WordSrc, ConstantInt::get(I64, 1),
+                                         "morok.scan.word.src.next");
+        Value *WordLenNext = B.CreateAdd(WordLen, ConstantInt::get(I64, 1),
+                                         "morok.scan.word.len.next");
         WordSrc->addIncoming(WordSrcNext, WordBodyBB);
         WordLen->addIncoming(WordLenNext, WordBodyBB);
         B.CreateBr(WordBB);
 
         B.SetInsertPoint(AfterWordBB);
-        B.CreateStore(ConstantInt::get(I8, 0),
-                      B.CreateGEP(I8, WordOut, {WordLen},
-                                  "morok.scan.word.nul"));
+        B.CreateStore(
+            ConstantInt::get(I8, 0),
+            B.CreateGEP(I8, WordOut, {WordLen}, "morok.scan.word.nul"));
         B.CreateCondBr(B.CreateICmpEQ(WordLen, ConstantInt::get(I64, 0)),
                        WordFailBB, Skip2BB);
 
@@ -1938,9 +1950,8 @@ bool inlineConstantFormatCalls(Module &M) {
         B.CreateCondBr(isSpace(Skip2Ch), Skip2BodyBB, RestBB);
 
         B.SetInsertPoint(Skip2BodyBB);
-        Value *Skip2Next =
-            B.CreateAdd(Skip2, ConstantInt::get(I64, 1),
-                        "morok.scan.skip2.next");
+        Value *Skip2Next = B.CreateAdd(Skip2, ConstantInt::get(I64, 1),
+                                       "morok.scan.skip2.next");
         Skip2->addIncoming(Skip2Next, Skip2BodyBB);
         B.CreateBr(Skip2BB);
 
@@ -1958,26 +1969,24 @@ bool inlineConstantFormatCalls(Module &M) {
         B.CreateCondBr(RestDone, DoneBB, RestBodyBB);
 
         B.SetInsertPoint(RestBodyBB);
-        B.CreateStore(RestCh, B.CreateGEP(I8, RestOut, {RestLen},
-                                          "morok.scan.rest.out"));
-        Value *RestSrcNext =
-            B.CreateAdd(RestSrc, ConstantInt::get(I64, 1),
-                        "morok.scan.rest.src.next");
-        Value *RestLenNext =
-            B.CreateAdd(RestLen, ConstantInt::get(I64, 1),
-                        "morok.scan.rest.len.next");
+        B.CreateStore(
+            RestCh, B.CreateGEP(I8, RestOut, {RestLen}, "morok.scan.rest.out"));
+        Value *RestSrcNext = B.CreateAdd(RestSrc, ConstantInt::get(I64, 1),
+                                         "morok.scan.rest.src.next");
+        Value *RestLenNext = B.CreateAdd(RestLen, ConstantInt::get(I64, 1),
+                                         "morok.scan.rest.len.next");
         RestSrc->addIncoming(RestSrcNext, RestBodyBB);
         RestLen->addIncoming(RestLenNext, RestBodyBB);
         B.CreateBr(RestBB);
 
         B.SetInsertPoint(DoneBB);
-        B.CreateStore(ConstantInt::get(I8, 0),
-                      B.CreateGEP(I8, RestOut, {RestLen},
-                                  "morok.scan.rest.nul"));
-        B.CreateRet(B.CreateSelect(
-            B.CreateICmpEQ(RestLen, ConstantInt::get(I64, 0)),
-            ConstantInt::get(I32, 1), ConstantInt::get(I32, 2),
-            "morok.scan.assignments"));
+        B.CreateStore(
+            ConstantInt::get(I8, 0),
+            B.CreateGEP(I8, RestOut, {RestLen}, "morok.scan.rest.nul"));
+        B.CreateRet(
+            B.CreateSelect(B.CreateICmpEQ(RestLen, ConstantInt::get(I64, 0)),
+                           ConstantInt::get(I32, 1), ConstantInt::get(I32, 2),
+                           "morok.scan.assignments"));
 
         ScanHelperCache[Key] = Fn;
         return Fn;
@@ -2038,10 +2047,10 @@ bool inlineConstantFormatCalls(Module &M) {
                     continue;
                 IRBuilder<> B(CI);
                 Function *Helper = getScanAsmLineHelper();
-                CallInst *New = B.CreateCall(
-                    Helper->getFunctionType(), Helper,
-                    {CI->getArgOperand(0), CI->getArgOperand(2),
-                     CI->getArgOperand(3)});
+                CallInst *New =
+                    B.CreateCall(Helper->getFunctionType(), Helper,
+                                 {CI->getArgOperand(0), CI->getArgOperand(2),
+                                  CI->getArgOperand(3)});
                 New->setDebugLoc(CI->getDebugLoc());
                 if (!CI->use_empty())
                     CI->replaceAllUsesWith(New);
@@ -2049,15 +2058,14 @@ bool inlineConstantFormatCalls(Module &M) {
                 Changed = true;
                 continue;
             }
-            if (CI->arg_size() != 3 ||
-                (Fmt != "%d" && Fmt != "%u") ||
+            if (CI->arg_size() != 3 || (Fmt != "%d" && Fmt != "%u") ||
                 !CI->getArgOperand(2)->getType()->isPointerTy())
                 continue;
             IRBuilder<> B(CI);
             Function *Helper = getScanIntHelper(Fmt == "%d");
-            CallInst *New = B.CreateCall(
-                Helper->getFunctionType(), Helper,
-                {CI->getArgOperand(0), CI->getArgOperand(2)});
+            CallInst *New =
+                B.CreateCall(Helper->getFunctionType(), Helper,
+                             {CI->getArgOperand(0), CI->getArgOperand(2)});
             New->setDebugLoc(CI->getDebugLoc());
             if (!CI->use_empty())
                 CI->replaceAllUsesWith(New);

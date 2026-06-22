@@ -1950,8 +1950,10 @@ entry:
     const std::size_t decoyGlobals = countGlobals(*M, "morok.decoy.str.");
     CHECK(decoyGlobals >= 6u);
     CHECK(countFunctions(*M, "morok.dbglog.") == 5u);
+    CHECK(countFunctions(*M, "morok.decoy.site.") == decoyGlobals);
     CHECK(countGlobals(*M, "morok.dbglog.state.") == 5u);
-    CHECK(countUserCallsToPrefix(*M, "morok.dbglog.") == decoyGlobals);
+    CHECK(countUserCallsToPrefix(*M, "morok.dbglog.") == 0u);
+    CHECK(countUserCallsToPrefix(*M, "morok.decoy.site.") == decoyGlobals);
     CHECK_FALSE(hasReadableByteString(*M, "__TARGET_TRIPLE__"));
 
     GlobalVariable *LinkerUsed = M->getGlobalVariable("llvm.used");
@@ -1968,6 +1970,24 @@ entry:
             CHECK(constantReferencesGlobal(LinkerUsed->getInitializer(), &F));
             CHECK(constantReferencesGlobal(CompilerUsed->getInitializer(), &F));
         }
+
+    std::size_t siteHelpers = 0;
+    for (Function &F : *M) {
+        if (!F.getName().starts_with("morok.decoy.site."))
+            continue;
+        ++siteHelpers;
+        CHECK(F.hasFnAttribute(Attribute::NoInline));
+        CHECK(constantReferencesGlobal(LinkerUsed->getInitializer(), &F));
+        CHECK(constantReferencesGlobal(CompilerUsed->getInitializer(), &F));
+        bool callsLogger = false;
+        for (Instruction &I : instructions(F))
+            if (auto *CI = dyn_cast<CallInst>(&I))
+                if (Function *Callee = CI->getCalledFunction())
+                    callsLogger |=
+                        Callee->getName().starts_with("morok.dbglog.");
+        CHECK(callsLogger);
+    }
+    CHECK(siteHelpers == decoyGlobals);
 
     for (GlobalVariable &GV : M->globals()) {
         if (GV.getName().starts_with("morok.decoy.str.")) {
@@ -2039,20 +2059,26 @@ attributes #2 = { memory(read) }
     morok::ir::IRRandom rng(engine);
     CHECK(morok::passes::decoyStringsModule(*M, rng));
 
-    auto callsDbglog = [](Function &F) {
+    auto callsPrefix = [](Function &F, StringRef Prefix) {
         for (Instruction &I : instructions(F))
             if (auto *CI = dyn_cast<CallInst>(&I))
                 if (Function *C = CI->getCalledFunction())
-                    if (C->getName().starts_with("morok.dbglog."))
+                    if (C->getName().starts_with(Prefix))
                         return true;
         return false;
     };
 
-    CHECK(callsDbglog(*M->getFunction("normal")));            // ordinary -> yes
-    CHECK_FALSE(callsDbglog(*M->getFunction("naked_fn")));    // naked
-    CHECK_FALSE(callsDbglog(*M->getFunction("avail_ext")));   // ODR-fixed body
-    CHECK_FALSE(callsDbglog(*M->getFunction("readnone_fn"))); // memory(none)
-    CHECK_FALSE(callsDbglog(*M->getFunction("readonly_fn"))); // memory(read)
+    CHECK(callsPrefix(*M->getFunction("normal"),
+                      "morok.decoy.site.")); // ordinary -> yes
+    CHECK_FALSE(callsPrefix(*M->getFunction("normal"), "morok.dbglog."));
+    CHECK_FALSE(callsPrefix(*M->getFunction("naked_fn"),
+                            "morok.decoy.site.")); // naked
+    CHECK_FALSE(callsPrefix(*M->getFunction("avail_ext"),
+                            "morok.decoy.site.")); // ODR-fixed body
+    CHECK_FALSE(callsPrefix(*M->getFunction("readnone_fn"),
+                            "morok.decoy.site.")); // memory(none)
+    CHECK_FALSE(callsPrefix(*M->getFunction("readonly_fn"),
+                            "morok.decoy.site.")); // memory(read)
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -14055,6 +14081,105 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("stringEncryptModule keeps load-scoped decryptors out of loops") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("loop-load-string", ctx);
+    M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+    GlobalVariable *Text =
+        makePrivateString(*M, "loop.str", std::string(128, 'l'));
+
+    auto *I8 = Type::getInt8Ty(ctx);
+    auto *I32 = Type::getInt32Ty(ctx);
+    auto *I64 = Type::getInt64Ty(ctx);
+    FunctionType *FT = FunctionType::get(I32, {I64}, false);
+    Function *Scan =
+        Function::Create(FT, GlobalValue::ExternalLinkage, "scan_loop", *M);
+    Argument *Limit = Scan->getArg(0);
+    Limit->setName("n");
+
+    BasicBlock *Entry = BasicBlock::Create(ctx, "entry", Scan);
+    BasicBlock *Body = BasicBlock::Create(ctx, "body", Scan);
+    BasicBlock *Exit = BasicBlock::Create(ctx, "exit", Scan);
+    IRBuilder<> B(Entry);
+    B.CreateBr(Body);
+
+    B.SetInsertPoint(Body);
+    PHINode *I = B.CreatePHI(I64, 2, "i");
+    PHINode *Sum = B.CreatePHI(I32, 2, "sum");
+    I->addIncoming(B.getInt64(0), Entry);
+    Sum->addIncoming(B.getInt32(0), Entry);
+    Value *Ptr = B.CreateInBoundsGEP(Text->getValueType(), Text,
+                                     {B.getInt64(0), I}, "p");
+    Value *Byte = B.CreateLoad(I8, Ptr, "c");
+    Value *Wide = B.CreateZExt(Byte, I32, "cz");
+    Value *NextSum = B.CreateAdd(Sum, Wide, "sum.next");
+    Value *Next = B.CreateAdd(I, B.getInt64(1), "next");
+    I->addIncoming(Next, Body);
+    Sum->addIncoming(NextSum, Body);
+    B.CreateCondBr(B.CreateICmpULT(Next, Limit, "more"), Body, Exit);
+
+    B.SetInsertPoint(Exit);
+    B.CreateRet(NextSum);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6115);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+
+    Function *Use = M->getFunction("scan_loop");
+    REQUIRE(Use);
+    BasicBlock *LoopBody = nullptr;
+    for (BasicBlock &BB : *Use)
+        if (BB.getName() == "body")
+            LoopBody = &BB;
+    REQUIRE(LoopBody);
+    CHECK(countCallsTo(*Use, "morok.strdec") == 1u);
+    CHECK(countCallsTo(*Use, "morok.strrel") == 1u);
+    CHECK(countCallsTo(*LoopBody, "morok.strdec") == 0u);
+    CHECK(countCallsTo(*LoopBody, "morok.strrel") == 0u);
+    CHECK_FALSE(hasReadableByteString(*M, std::string(128, 'l')));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("stringEncryptModule avoids load-scoped decryptors for large loads") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("large-load-string", ctx);
+    M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
+    const std::string LargeText(5000, 'q');
+    GlobalVariable *Text = makePrivateString(*M, "large.load.str", LargeText);
+
+    auto *I8 = Type::getInt8Ty(ctx);
+    auto *I64 = Type::getInt64Ty(ctx);
+    Function *Marker =
+        Function::Create(FunctionType::get(Type::getVoidTy(ctx), false),
+                         GlobalValue::ExternalLinkage, "marker", *M);
+    FunctionType *FT = FunctionType::get(I8, {I64}, false);
+    Function *Use =
+        Function::Create(FT, GlobalValue::ExternalLinkage, "use_large", *M);
+    Argument *Index = Use->getArg(0);
+    Index->setName("i");
+
+    IRBuilder<> B(BasicBlock::Create(ctx, "entry", Use));
+    Value *Ptr = B.CreateInBoundsGEP(Text->getValueType(), Text,
+                                     {B.getInt64(0), Index}, "p");
+    Value *Byte = B.CreateLoad(I8, Ptr, "c");
+    B.CreateCall(Marker->getFunctionType(), Marker, {});
+    B.CreateRet(Byte);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6116);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+
+    Function *Rewritten = M->getFunction("use_large");
+    REQUIRE(Rewritten);
+    CHECK(countCallsTo(*Rewritten, "morok.strdec") == 1u);
+    CHECK(countCallsTo(*Rewritten, "morok.strrel") == 1u);
+    CHECK_FALSE(callToPrecedes(*Rewritten, "morok.strrel", "marker"));
+    CHECK_FALSE(hasReadableByteString(*M, LargeText));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("stringEncryptModule preserves musttail returns in fallback users") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -14678,6 +14803,20 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "UF6"));
     CHECK(countFunctions(*M, "morok.strsite") >= decoyGlobals);
     CHECK(countFunctions(*M, "morok.strdec") == 0u);
+    Function *Main = M->getFunction("main");
+    REQUIRE(Main);
+    CHECK(countNamedAllocas(*Main, "morok.str.stack.buf") == 0u);
+    std::size_t siteHelpers = 0;
+    std::size_t siteHelpersWithStackStrings = 0;
+    for (Function &F : *M) {
+        if (!F.getName().starts_with("morok.decoy.site."))
+            continue;
+        ++siteHelpers;
+        if (countNamedAllocas(F, "morok.str.stack.buf") >= 1u)
+            ++siteHelpersWithStackStrings;
+    }
+    CHECK(siteHelpers == decoyGlobals);
+    CHECK(siteHelpersWithStackStrings == decoyGlobals);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -15007,9 +15146,11 @@ define i32 @caller() {
             if (CDA->getElementType()->isIntegerTy(8))
                 CHECK(CDA->getRawDataValues().find("puts") == StringRef::npos);
     }
-    // Linux/manual resolution uses only a per-site hash: no API-name cloak
-    // global or shared dlsym string path is needed for the target symbol.
-    CHECK(countGlobals(*M, "morok.cloak.c") == 0u);
+    // Linux/manual resolution stays hash-first and has no dlsym import.  If the
+    // hand scanner misses a platform symbol, the fallback resolves dlsym
+    // through the same hash resolver and passes a per-site cloaked target name.
+    CHECK(M->getFunction("dlsym") == nullptr);
+    CHECK(countGlobals(*M, "morok.cloak.c") >= 1u);
 
     // The first miss publishes only a pending hash/out/continuation request
     // before faulting; the handler resumes a hidden block that resolves by hash
@@ -15059,7 +15200,7 @@ define i32 @caller() {
     CHECK(M->getFunction("dlsym") == nullptr);
     CHECK(M->getFunction("morok.fco.resolve.elf") == nullptr);
     CHECK(countCallsToPrefix(*Handler, "morok.fco.resolve.elf.") == 0u);
-    CHECK(countCallsToPrefix(*Caller, "morok.fco.resolve.elf.") == 1u);
+    CHECK(countCallsToPrefix(*Caller, "morok.fco.resolve.elf.") >= 2u);
     Function *Install = M->getFunction("morok.fco.ex.install");
     REQUIRE(Install);
     CHECK(countCallsToPrefix(*Install, "morok.fco.resolve.elf.") == 0u);
@@ -15069,8 +15210,9 @@ define i32 @caller() {
     CHECK(hasResolveBlock);
     CHECK(indirectUsesCachedPointer);
     CHECK(resolverCallHasSiteSalt);
+    CHECK(countNamedInstructions(*Caller, "morok.fco.dlsym.fallback") >= 1u);
     CHECK(countInlineAsmCalls(*Caller) >= 1u);
-    CHECK(countNamedAllocas(*Caller, "morok.cloak.mix") == 0u);
+    CHECK(countNamedAllocas(*Caller, "morok.cloak.mix") >= 1u);
     CHECK(countNamedAllocas(*Caller, "morok.fco.ex.slot") == 1u);
     CHECK(countNamedInstructions(*Caller, "morok.fco.cache.encoded") >= 1u);
     CHECK(countNamedInstructions(*Caller, "morok.fco.cache.raw") >= 1u);
