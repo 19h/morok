@@ -791,6 +791,18 @@ std::size_t countInlineAsmBodies(Function &F, StringRef needle) {
     return n;
 }
 
+// Count inline-asm calls whose template is EXACTLY `body` (not a substring),
+// so a bare "mfence" is distinguished from a multi-line clflush+mfence stub.
+std::size_t countInlineAsmExact(Function &F, StringRef body) {
+    std::size_t n = 0;
+    for (Instruction &I : instructions(F))
+        if (auto *CB = dyn_cast<CallBase>(&I))
+            if (auto *Asm = dyn_cast<InlineAsm>(CB->getCalledOperand()))
+                if (Asm->getAsmString() == body)
+                    ++n;
+    return n;
+}
+
 bool inlineAsmHasRawDollar(Function &F) {
     for (Instruction &I : instructions(F)) {
         auto *CB = dyn_cast<CallBase>(&I);
@@ -16460,6 +16472,17 @@ entry:
         findNamedInstruction(*Ctor, "morok.corroborate.dbi.jit.changed");
     REQUIRE(DbiJitChanged != nullptr);
     CHECK_FALSE(valueFeedsNamedInstruction(DbiJitChanged,
+                                           "morok.seal.fold.anti_debug"));
+    // #226: the SMC byte-patch tripwire must serialize the instruction stream
+    // with CPUID (not a non-serializing mfence) before re-executing the patched
+    // bytes, and its host/microarch-sensitive verdict must NOT reach the
+    // consumed anti_debug seal (telemetry/gate scoring only).
+    CHECK(countInlineAsmExact(*Smc, "mfence") == 0u);
+    CHECK(countInlineAsmExact(*Smc, "cpuid") >= 2u);
+    Instruction *SmcChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.dbi.smc.changed");
+    REQUIRE(SmcChanged != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(SmcChanged,
                                            "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Smc, "morok.antihook.dbi.smc.gate.arm") >=
           1u);

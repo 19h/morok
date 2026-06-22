@@ -10068,12 +10068,14 @@ Function *dbiSmcTripwireProbe(Module &M, const Triple &TT) {
     auto *patchStore = WB.CreateStore(patchByte, patchPtr);
     patchStore->setVolatile(true);
     if (TT.getArch() == Triple::x86_64) {
-        auto *fenceTy = FunctionType::get(Type::getVoidTy(ctx), false);
-        InlineAsm *fence =
-            InlineAsm::get(fenceTy, "mfence",
-                           "~{memory},~{dirflag},~{fpsr},~{flags}",
-                           /*hasSideEffects=*/true);
-        WB.CreateCall(fenceTy, fence, {});
+        // mfence only orders memory; it is NOT instruction-serializing and does
+        // not flush prefetched/decoded bytes, so the just-written code byte
+        // could execute from a stale fetch and trip on a clean host. CPUID is
+        // architecturally serializing (Intel SDM Vol. 3A 8.1.3, self-modifying
+        // code): it flushes the pipeline so the patched/restored byte is
+        // refetched before the call below.
+        (void)emitCpuid(WB, M, ConstantInt::get(i32, 0),
+                        ConstantInt::get(i32, 0));
     }
     Value *patchResult =
         WB.CreateCall(target, {}, "morok.antihook.dbi.smc.patch.result");
@@ -10087,12 +10089,14 @@ Function *dbiSmcTripwireProbe(Module &M, const Triple &TT) {
     auto *restorePatch = WB.CreateStore(oldPatch, patchPtr);
     restorePatch->setVolatile(true);
     if (TT.getArch() == Triple::x86_64) {
-        auto *fenceTy = FunctionType::get(Type::getVoidTy(ctx), false);
-        InlineAsm *fence =
-            InlineAsm::get(fenceTy, "mfence",
-                           "~{memory},~{dirflag},~{fpsr},~{flags}",
-                           /*hasSideEffects=*/true);
-        WB.CreateCall(fenceTy, fence, {});
+        // mfence only orders memory; it is NOT instruction-serializing and does
+        // not flush prefetched/decoded bytes, so the just-written code byte
+        // could execute from a stale fetch and trip on a clean host. CPUID is
+        // architecturally serializing (Intel SDM Vol. 3A 8.1.3, self-modifying
+        // code): it flushes the pipeline so the patched/restored byte is
+        // refetched before the call below.
+        (void)emitCpuid(WB, M, ConstantInt::get(i32, 0),
+                        ConstantInt::get(i32, 0));
     }
     if (TT.isOSLinux()) {
         Value *rc = emitLinuxMprotect(WB, M, TT, page, ConstantInt::get(ip, 4096),
@@ -21305,8 +21309,13 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
                           "morok.gate.dbi.smc");
         foldState(B, state, diff, 0xE62D41B98A3F570CULL,
                   "morok.antihook.dbi.smc");
-        foldEnforcedFlag(B, state, changed, 0x73B5D02E6C49A18FULL,
-                         "morok.antihook.dbi.smc.changed");
+        // Instruction-cache/uop coherence for self-modifying code is microarch-
+        // sensitive; even with CPUID serialization a stale fetch on some hosts
+        // cannot be fully excluded, so keep the SMC byte-patch verdict out of
+        // the consumed anti_debug seal and treat it as telemetry / gate scoring
+        // only (#226) — matching the host-sensitive sandbox-signal policy above.
+        foldFlag(B, state, changed, 0x73B5D02E6C49A18FULL,
+                 "morok.antihook.dbi.smc.changed");
     }
     if (Function *mprotectSmc = linuxMprotectSmcProbe(M, state, rng, tt)) {
         Value *diff =
