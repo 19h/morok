@@ -678,6 +678,64 @@ ReadFileIR emitReadSmallFile(IRBuilder<> &B, Module &M, Function *Fn,
     return out;
 }
 
+ReadFileIR emitReadPathValue(IRBuilder<> &B, Module &M, Function *Fn,
+                             Value *Path, std::uint64_t BufBytes,
+                             const Triple &TT, StringRef Prefix) {
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    std::uint32_t ptraceNr = 0;
+    std::uint32_t prctlNr = 0;
+    std::uint32_t openatNr = 0;
+    std::uint32_t readNr = 0;
+    std::uint32_t closeNr = 0;
+
+    ReadFileIR out;
+    out.bufTy = ArrayType::get(i8, BufBytes);
+    out.buf = B.CreateAlloca(out.bufTy, nullptr, Twine(Prefix) + ".buf");
+
+    Value *fd = nullptr;
+    const bool hasLinuxSyscalls =
+        linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr);
+    if (hasLinuxSyscalls) {
+        Value *fdLong = emitLinuxSyscall(B, M, TT, openatNr,
+                                         {ConstantInt::getSigned(ip, -100),
+                                          Path, ConstantInt::get(ip, 0),
+                                          ConstantInt::get(ip, 0)});
+        fdLong->setName(Twine(Prefix) + ".fd");
+        fd = B.CreateTruncOrBitCast(fdLong, i32, Twine(Prefix) + ".fd.i32");
+    } else {
+        fd = B.CreateCall(openDecl(M), {Path, ConstantInt::get(i32, 0)},
+                          Twine(Prefix) + ".fd");
+    }
+
+    auto *readBB = BasicBlock::Create(ctx, Twine(Prefix) + ".read", Fn);
+    out.ret0 = BasicBlock::Create(ctx, Twine(Prefix) + ".miss", Fn);
+    Value *badFd = B.CreateICmpSLT(fd, ConstantInt::getSigned(i32, 0),
+                                   Twine(Prefix) + ".fd.bad");
+    B.CreateCondBr(badFd, out.ret0, readBB);
+
+    IRBuilder<> RB(readBB);
+    Value *bufPtr = RB.CreateInBoundsGEP(
+        out.bufTy, out.buf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+        Twine(Prefix) + ".ptr");
+    if (hasLinuxSyscalls) {
+        out.n =
+            emitLinuxSyscall(RB, M, TT, readNr,
+                             {fd, bufPtr, ConstantInt::get(ip, BufBytes - 1)});
+        out.n->setName(Twine(Prefix) + ".read.n");
+        emitLinuxSyscall(RB, M, TT, closeNr, {fd});
+    } else {
+        out.n = RB.CreateCall(readDecl(M),
+                              {fd, bufPtr, ConstantInt::get(ip, BufBytes - 1)},
+                              Twine(Prefix) + ".read.n");
+        RB.CreateCall(closeDecl(M), {fd});
+    }
+    out.afterRead = readBB;
+    return out;
+}
+
 void emitLinuxMemfdReexecCtor(Module &M, ir::IRRandom &rng, const Triple &TT) {
     if (!useDirectLinuxSyscalls(M, TT) ||
         M.getFunction("morok.antidbg.memfd"))
@@ -7507,6 +7565,64 @@ Value *bufferHasLiteral(IRBuilder<> &B, Module &M, AllocaInst *Buf, Value *N,
     return out;
 }
 
+bool linuxDbiParentSyscalls(const Triple &TT, std::uint32_t &Getppid,
+                            std::uint32_t &Readlinkat) {
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        Getppid = 110;
+        Readlinkat = 267;
+        return true;
+    case Triple::aarch64:
+        Getppid = 173;
+        Readlinkat = 78;
+        return true;
+    default:
+        return false;
+    }
+}
+
+Value *emitValgrindRunningRequest(IRBuilder<> &B, Module &M) {
+    const Triple TT(M.getTargetTriple());
+    if (TT.getArch() != Triple::x86_64)
+        return ConstantInt::get(Type::getInt64Ty(M.getContext()), 0);
+
+    LLVMContext &ctx = M.getContext();
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *argsTy = ArrayType::get(i64, 6);
+    AllocaInst *args =
+        B.CreateAlloca(argsTy, nullptr, "morok.antihook.dbi.valgrind.args");
+    for (unsigned i = 0; i < 6; ++i) {
+        B.CreateStore(ConstantInt::get(i64, i == 0 ? 0x1001ULL : 0ULL),
+                      B.CreateInBoundsGEP(
+                          argsTy, args,
+                          {ConstantInt::get(intPtrTy(M), 0),
+                           ConstantInt::get(intPtrTy(M), i)}));
+    }
+    Value *argsPtr = B.CreateInBoundsGEP(
+        argsTy, args, {ConstantInt::get(intPtrTy(M), 0),
+                       ConstantInt::get(intPtrTy(M), 0)},
+        "morok.antihook.dbi.valgrind.args.ptr");
+    auto *asmTy = FunctionType::get(i64, {ptr}, false);
+    auto emitRequest = [&](StringRef Name, StringRef Rotations) -> Value * {
+        InlineAsm *request = InlineAsm::get(
+            asmTy, (Twine("xorq %rdx, %rdx\n\t") + Rotations +
+                    "\n\txchgq %rbx, %rbx\n\tmovq %rdx, $0")
+                       .str(),
+            "=r,{rax},~{rdx},~{rdi},~{memory},~{dirflag},~{fpsr},~{flags}",
+            /*hasSideEffects=*/true);
+        return B.CreateCall(asmTy, request, {argsPtr}, Name);
+    };
+    Value *standard = emitRequest(
+        "morok.antihook.dbi.valgrind.magic.std",
+        "rolq $$3, %rdi\n\trolq $$13, %rdi\n\trolq $$61, %rdi\n\trolq $$51, %rdi");
+    Value *issueVariant = emitRequest(
+        "morok.antihook.dbi.valgrind.magic.issue",
+        "rolq $$3, %rdi\n\trolq $$13, %rdi\n\trolq $$29, %rdi\n\trolq $$61, %rdi");
+    return B.CreateOr(standard, issueVariant,
+                      "morok.antihook.dbi.valgrind.magic");
+}
+
 GlobalVariable *dbiSmcGate(Module &M) {
     if (auto *existing = M.getGlobalVariable("morok.antihook.dbi.smc.gate",
                                              /*AllowInternal=*/true))
@@ -7654,6 +7770,7 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
     auto *i32 = Type::getInt32Ty(ctx);
     auto *i64 = Type::getInt64Ty(ctx);
     auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
 
     auto *fn = Function::Create(FunctionType::get(i64, false),
                                 GlobalValue::PrivateLinkage,
@@ -7687,8 +7804,32 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
         MB, M, maps.buf, maps.n,
         {0x72, 0x65, 0x2e, 0x66, 0x72, 0x69, 0x64, 0x61}, 8192,
         "morok.antihook.dbi.maps.sig2");
-    Value *mapSig = MB.CreateOr(MB.CreateOr(mapSig0, mapSig1), mapSig2,
-                                "morok.antihook.dbi.maps.sig");
+    Value *mapDyn = bufferHasLiteral(
+        MB, M, maps.buf, maps.n,
+        {0x6c, 0x69, 0x62, 0x64, 0x79, 0x6e, 0x61, 0x6d, 0x6f, 0x72, 0x69,
+         0x6f},
+        8192, "morok.antihook.dbi.maps.dynamorio");
+    Value *mapQbdi = bufferHasLiteral(
+        MB, M, maps.buf, maps.n,
+        {0x6c, 0x69, 0x62, 0x51, 0x42, 0x44, 0x49}, 8192,
+        "morok.antihook.dbi.maps.qbdi");
+    Value *mapVgPreload = bufferHasLiteral(
+        MB, M, maps.buf, maps.n,
+        {0x76, 0x67, 0x70, 0x72, 0x65, 0x6c, 0x6f, 0x61, 0x64, 0x5f}, 8192,
+        "morok.antihook.dbi.maps.vgpreload");
+    Value *mapValgrind = bufferHasLiteral(
+        MB, M, maps.buf, maps.n,
+        {0x76, 0x61, 0x6c, 0x67, 0x72, 0x69, 0x6e, 0x64}, 8192,
+        "morok.antihook.dbi.maps.valgrind");
+    Value *mapQemu = bufferHasLiteral(
+        MB, M, maps.buf, maps.n, {0x71, 0x65, 0x6d, 0x75, 0x2d}, 8192,
+        "morok.antihook.dbi.maps.qemu");
+    Value *mapSig = MB.CreateOr(
+        MB.CreateOr(MB.CreateOr(mapSig0, mapSig1), mapSig2),
+        MB.CreateOr(MB.CreateOr(mapDyn, mapQbdi),
+                    MB.CreateOr(MB.CreateOr(mapVgPreload, mapValgrind),
+                                mapQemu)),
+        "morok.antihook.dbi.maps.sig");
     incrementDiff(MB, diff, mapSig, "morok.antihook.dbi.maps");
     MB.CreateBr(afterMapsBB);
 
@@ -7732,7 +7873,109 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
                     "morok.antihook.dbi.thread.sig");
     incrementDiff(TB, diff, threadSig, "morok.antihook.dbi.thread");
 
-    ReadFileIR tcp = emitReadSmallFile(TB, M, fn, "/proc/net/tcp", 4096, rng, TT);
+    FunctionCallee dlsym =
+        M.getOrInsertFunction("dlsym", FunctionType::get(ptr, {ptr, ptr}, false));
+    Value *rtldDefault = ConstantPointerNull::get(ptr);
+    Value *drAppStart = TB.CreateCall(
+        dlsym, {rtldDefault, ir::emitCloakedSymbol(TB, M, "dr_app_start", rng)},
+        "morok.antihook.dbi.dlsym.dr");
+    Value *qbdiCodeRange = TB.CreateCall(
+        dlsym,
+        {rtldDefault,
+         ir::emitCloakedSymbol(TB, M, "QBDI_addCodeRangeCB", rng)},
+        "morok.antihook.dbi.dlsym.qbdi");
+    Value *symbolSig = TB.CreateOr(
+        TB.CreateICmpNE(drAppStart, ConstantPointerNull::get(ptr),
+                        "morok.antihook.dbi.dlsym.dr.hit"),
+        TB.CreateICmpNE(qbdiCodeRange, ConstantPointerNull::get(ptr),
+                        "morok.antihook.dbi.dlsym.qbdi.hit"),
+        "morok.antihook.dbi.dlsym.sig");
+    incrementDiff(TB, diff, symbolSig, "morok.antihook.dbi.dlsym");
+
+    Value *vgMagic = emitValgrindRunningRequest(TB, M);
+    Value *vgHit =
+        TB.CreateICmpNE(vgMagic, ConstantInt::get(i64, 0),
+                        "morok.antihook.dbi.valgrind.hit");
+    incrementDiff(TB, diff, vgHit, "morok.antihook.dbi.valgrind");
+
+    auto *afterParentBB = BasicBlock::Create(ctx, "after.parent", fn);
+    std::uint32_t getppidNr = 0;
+    std::uint32_t readlinkatNr = 0;
+    if (linuxDbiParentSyscalls(TT, getppidNr, readlinkatNr) &&
+        linuxCoreSyscalls(TT, ptraceNr, prctlNr, openatNr, readNr, closeNr)) {
+        Value *ppid = emitLinuxSyscall(TB, M, TT, getppidNr, {});
+        ppid->setName("morok.antihook.dbi.parent.pid");
+        auto *pathTy = ArrayType::get(i8, 96);
+        auto *exeTy = ArrayType::get(i8, 256);
+        AllocaInst *commPath =
+            TB.CreateAlloca(pathTy, nullptr, "morok.antihook.dbi.parent.comm.path");
+        Value *commPathPtr = TB.CreateInBoundsGEP(
+            pathTy, commPath, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+            "morok.antihook.dbi.parent.comm.path.ptr");
+        FunctionCallee snprintfFn = M.getOrInsertFunction(
+            "snprintf", FunctionType::get(i32, {ptr, ip, ptr}, true));
+        TB.CreateCall(snprintfFn,
+                      {commPathPtr, ConstantInt::get(ip, 96),
+                       ir::emitCloakedSymbol(TB, M, "/proc/%ld/comm", rng),
+                       ppid},
+                      "morok.antihook.dbi.parent.comm.path.n");
+        ReadFileIR comm = emitReadPathValue(
+            TB, M, fn, commPathPtr, 128, TT, "morok.antihook.dbi.parent.comm");
+        auto *afterCommBB = BasicBlock::Create(ctx, "after.parent.comm", fn);
+
+        IRBuilder<> CMissB(comm.ret0);
+        CMissB.CreateBr(afterCommBB);
+
+        IRBuilder<> CB(comm.afterRead);
+        Value *commQemu = bufferHasLiteral(
+            CB, M, comm.buf, comm.n, {0x71, 0x65, 0x6d, 0x75, 0x2d}, 128,
+            "morok.antihook.dbi.parent.comm.qemu");
+        Value *commValgrind = bufferHasLiteral(
+            CB, M, comm.buf, comm.n,
+            {0x76, 0x61, 0x6c, 0x67, 0x72, 0x69, 0x6e, 0x64}, 128,
+            "morok.antihook.dbi.parent.comm.valgrind");
+        incrementDiff(CB, diff, CB.CreateOr(commQemu, commValgrind),
+                      "morok.antihook.dbi.parent.comm");
+        CB.CreateBr(afterCommBB);
+
+        IRBuilder<> PCB(afterCommBB);
+        AllocaInst *exePath =
+            PCB.CreateAlloca(pathTy, nullptr, "morok.antihook.dbi.parent.exe.path");
+        AllocaInst *exeBuf =
+            PCB.CreateAlloca(exeTy, nullptr, "morok.antihook.dbi.parent.exe.buf");
+        Value *exePathPtr = PCB.CreateInBoundsGEP(
+            pathTy, exePath, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+            "morok.antihook.dbi.parent.exe.path.ptr");
+        Value *exeBufPtr = PCB.CreateInBoundsGEP(
+            exeTy, exeBuf, {ConstantInt::get(ip, 0), ConstantInt::get(ip, 0)},
+            "morok.antihook.dbi.parent.exe.ptr");
+        PCB.CreateCall(snprintfFn,
+                       {exePathPtr, ConstantInt::get(ip, 96),
+                        ir::emitCloakedSymbol(PCB, M, "/proc/%ld/exe", rng),
+                        ppid},
+                       "morok.antihook.dbi.parent.exe.path.n");
+        Value *exeN = emitLinuxSyscall(
+            PCB, M, TT, readlinkatNr,
+            {ConstantInt::getSigned(ip, -100), exePathPtr, exeBufPtr,
+             ConstantInt::get(ip, 255)});
+        exeN->setName("morok.antihook.dbi.parent.exe.readlink");
+        Value *exeQemu = bufferHasLiteral(
+            PCB, M, exeBuf, exeN, {0x71, 0x65, 0x6d, 0x75, 0x2d}, 256,
+            "morok.antihook.dbi.parent.exe.qemu");
+        Value *exeValgrind = bufferHasLiteral(
+            PCB, M, exeBuf, exeN,
+            {0x76, 0x61, 0x6c, 0x67, 0x72, 0x69, 0x6e, 0x64}, 256,
+            "morok.antihook.dbi.parent.exe.valgrind");
+        incrementDiff(PCB, diff, PCB.CreateOr(exeQemu, exeValgrind),
+                      "morok.antihook.dbi.parent.exe");
+        PCB.CreateBr(afterParentBB);
+    } else {
+        TB.CreateBr(afterParentBB);
+    }
+
+    IRBuilder<> APB(afterParentBB);
+    ReadFileIR tcp =
+        emitReadSmallFile(APB, M, fn, "/proc/net/tcp", 4096, rng, TT);
 
     IRBuilder<> TFB(tcp.ret0);
     TFB.CreateBr(retBB);

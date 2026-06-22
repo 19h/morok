@@ -15828,6 +15828,7 @@ entry:
     CHECK(M->getFunction("dlsym") != nullptr);
     CHECK(M->getFunction("dlopen") != nullptr);
     CHECK(M->getFunction("getenv") == nullptr);
+    CHECK(M->getFunction("snprintf") != nullptr);
     CHECK(M->getFunction("readlink") == nullptr);
     CHECK(M->getFunction("open") == nullptr);
     CHECK(M->getFunction("lseek") == nullptr);
@@ -15938,8 +15939,38 @@ entry:
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.sleep.skip") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.maps.sig") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.maps.dynamorio") >= 1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.maps.qbdi") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.maps.vgpreload") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.maps.valgrind") >= 1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.maps.qemu") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.thread.sig") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.port.sig0") >= 1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.dlsym.dr") >= 1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.dlsym.qbdi") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.valgrind.magic") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.valgrind.hit") >= 1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.parent.pid") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.parent.comm.qemu") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.parent.comm.valgrind") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.parent.exe.readlink") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.parent.exe.qemu") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.parent.exe.valgrind") >= 1u);
+    Instruction *DbiChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.dbi.changed");
+    REQUIRE(DbiChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(DbiChanged,
+                                     "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Smc, "morok.antihook.dbi.smc.gate.arm") >=
           1u);
     std::size_t smcGateStores = 0;
@@ -16019,8 +16050,18 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/exe"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/maps"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/environ"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/comm"));
+    CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/exe"));
     CHECK_FALSE(hasReadableByteString(*M, "LD_PRELOAD"));
     CHECK_FALSE(hasReadableByteString(*M, "LD_AUDIT"));
+    CHECK_FALSE(hasReadableByteString(*M, "libdynamorio"));
+    CHECK_FALSE(hasReadableByteString(*M, "libQBDI"));
+    CHECK_FALSE(hasReadableByteString(*M, "vgpreload_"));
+    CHECK_FALSE(hasReadableByteString(*M, "valgrind"));
+    CHECK_FALSE(hasReadableByteString(*M, "qemu-"));
+    CHECK_FALSE(hasReadableByteString(*M, "dr_app_start"));
+    CHECK_FALSE(hasReadableByteString(*M, "QBDI_addCodeRangeCB"));
+    CHECK_FALSE(hasReadableByteString(*M, "ASAN_OPTIONS"));
     CHECK_FALSE(hasReadableByteString(*M, "MSHookFunction"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
