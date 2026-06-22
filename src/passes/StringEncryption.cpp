@@ -450,6 +450,42 @@ void collectUsingFunctions(Value *V, SmallPtrSetImpl<Function *> &Funcs,
     }
 }
 
+bool collectLoadUseSites(Value *V, SmallVectorImpl<LoadInst *> &Loads,
+                         SmallPtrSetImpl<Value *> &Seen) {
+    if (!Seen.insert(V).second)
+        return true;
+
+    for (Use &U : V->uses()) {
+        User *Usr = U.getUser();
+        if (auto *LI = dyn_cast<LoadInst>(Usr)) {
+            if (LI->getPointerOperand() != U.get())
+                return false;
+            Loads.push_back(LI);
+            continue;
+        }
+        if (isa<GetElementPtrInst>(Usr) || isa<BitCastInst>(Usr) ||
+            isa<AddrSpaceCastInst>(Usr)) {
+            if (!collectLoadUseSites(Usr, Loads, Seen))
+                return false;
+            continue;
+        }
+        if (auto *CE = dyn_cast<ConstantExpr>(Usr)) {
+            switch (CE->getOpcode()) {
+            case Instruction::GetElementPtr:
+            case Instruction::BitCast:
+            case Instruction::AddrSpaceCast:
+                if (!collectLoadUseSites(CE, Loads, Seen))
+                    return false;
+                continue;
+            default:
+                return false;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
 bool hasMustTailReturn(const SmallPtrSetImpl<Function *> &Funcs) {
     for (Function *F : Funcs) {
         if (!F || F->isDeclaration())
@@ -782,6 +818,12 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
         const bool scopedPlaintext =
             stackCandidate && !escapes && !users.empty() &&
             !hasMustTailReturn(users);
+        SmallVector<LoadInst *, 16> LoadScopeSites;
+        SmallPtrSet<Value *, 16> SeenLoadUses;
+        const bool loadScopedPlaintext =
+            scopedPlaintext &&
+            collectLoadUseSites(target, LoadScopeSites, SeenLoadUses) &&
+            !LoadScopeSites.empty();
         target->setConstant(false); // mutated in place by its decryptor
         auto *decFn =
             Function::Create(FunctionType::get(voidTy, false),
@@ -996,22 +1038,38 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
             // constructor can observe ciphertext through escaped static data.
             appendToGlobalCtors(M, decFn, kCtorDecryptPriority);
         } else {
-            for (Function *UF : users) {
-                if (UF->isDeclaration())
-                    continue;
-                IRBuilder<> EB(&*UF->getEntryBlock().getFirstInsertionPt());
-                EB.CreateCall(decFn->getFunctionType(), decFn, {});
-                if (releaseFn) {
-                    SmallVector<Instruction *, 8> Exits;
-                    for (BasicBlock &BB : *UF)
-                        if (Instruction *Term = BB.getTerminator())
-                            if (isa<ReturnInst>(Term) || isa<ResumeInst>(Term) ||
-                                isa<CleanupReturnInst>(Term))
-                                Exits.push_back(Term);
-                    for (Instruction *Exit : Exits) {
-                        IRBuilder<> XB(Exit);
-                        XB.CreateCall(releaseFn->getFunctionType(), releaseFn,
+            if (releaseFn && loadScopedPlaintext) {
+                SmallPtrSet<LoadInst *, 16> Emitted;
+                for (LoadInst *LI : LoadScopeSites) {
+                    if (!Emitted.insert(LI).second)
+                        continue;
+                    IRBuilder<> LB(LI);
+                    LB.CreateCall(decFn->getFunctionType(), decFn, {});
+                    if (Instruction *Next = LI->getNextNode()) {
+                        IRBuilder<> RB(Next);
+                        RB.CreateCall(releaseFn->getFunctionType(), releaseFn,
                                       {});
+                    }
+                }
+            } else {
+                for (Function *UF : users) {
+                    if (UF->isDeclaration())
+                        continue;
+                    IRBuilder<> EB(&*UF->getEntryBlock().getFirstInsertionPt());
+                    EB.CreateCall(decFn->getFunctionType(), decFn, {});
+                    if (releaseFn) {
+                        SmallVector<Instruction *, 8> Exits;
+                        for (BasicBlock &BB : *UF)
+                            if (Instruction *Term = BB.getTerminator())
+                                if (isa<ReturnInst>(Term) ||
+                                    isa<ResumeInst>(Term) ||
+                                    isa<CleanupReturnInst>(Term))
+                                    Exits.push_back(Term);
+                        for (Instruction *Exit : Exits) {
+                            IRBuilder<> XB(Exit);
+                            XB.CreateCall(releaseFn->getFunctionType(),
+                                          releaseFn, {});
+                        }
                     }
                 }
             }

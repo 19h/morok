@@ -13770,6 +13770,38 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("stringEncryptModule re-encrypts direct load strings after use") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@raw = private constant [8 x i8] c"scoped!\00"
+
+declare void @marker()
+
+define i8 @use_raw(i64 %i) {
+entry:
+  %p = getelementptr inbounds [8 x i8], ptr @raw, i64 0, i64 %i
+  %c = load i8, ptr %p
+  call void @marker()
+  ret i8 %c
+}
+)ir");
+    REQUIRE(M);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6110);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+
+    Function *Use = M->getFunction("use_raw");
+    REQUIRE(Use);
+    CHECK(countCallsTo(*Use, "morok.strdec") == 1u);
+    CHECK(countCallsTo(*Use, "morok.strrel") == 1u);
+    CHECK(callToPrecedes(*Use, "morok.strrel", "marker"));
+    CHECK(ctorPrioritiesFor(*M, "morok.strdec").empty());
+    CHECK_FALSE(hasReadableByteString(*M, "scoped!"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("stringEncryptModule preserves musttail returns in fallback users") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
