@@ -259,11 +259,17 @@ std::uint64_t scoreEvidenceMask(std::uint64_t Salt) {
     return 1ULL << (Mixed & 63ULL);
 }
 
+constexpr std::uint32_t kSoftScoreWeight = 4;
+constexpr std::uint32_t kSoftScoreThreshold = kSoftScoreWeight * 2;
+
 void foldSoftScore(IRBuilderBase &B, Value *Flag, std::uint64_t Salt,
                    const Twine &Name) {
+    // Timing currently contributes two independent soft signals. Keep the
+    // weighted gate reachable while foldWeightedFlag still requires distinct
+    // evidence bits before committing into the seal.
     runtime_seal::foldWeightedFlag(
-        B, runtime_seal::kAntiDebugChannel, Flag, /*Weight=*/4,
-        scoreEvidenceMask(Salt), /*Threshold=*/32,
+        B, runtime_seal::kAntiDebugChannel, Flag, kSoftScoreWeight,
+        scoreEvidenceMask(Salt), kSoftScoreThreshold,
         Salt ^ 0xC6A4A7935BD1E995ULL, Name + ".score");
 }
 

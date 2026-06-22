@@ -19148,6 +19148,16 @@ define i32 @main() { ret i32 0 }
           1u);
     CHECK(countNamedInstructions(*Oracle,
                                  "morok.timing.bad.distribution.score") >= 1u);
+    CHECK(countNamedInstructions(
+              *Oracle, "morok.timing.divergent.distribution.score") >= 1u);
+    CHECK(hasNamedIcmpWithConstant(
+        *Oracle, "morok.timing.bad.distribution.score.enough", 8u));
+    CHECK(hasNamedIcmpWithConstant(
+        *Oracle, "morok.timing.divergent.distribution.score.enough", 8u));
+    CHECK_FALSE(hasNamedIcmpWithConstant(
+        *Oracle, "morok.timing.bad.distribution.score.enough", 32u));
+    CHECK_FALSE(hasNamedIcmpWithConstant(
+        *Oracle, "morok.timing.divergent.distribution.score.enough", 32u));
     // The x86 timestamp read lives in a CPUID-gated helper (rdtscp + rdtsc
     // fallback); the probe calls it rather than inlining the asm.
     Function *Tsc = M->getFunction("morok.timing.tsc.read");
