@@ -399,6 +399,8 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.fco.enabled, src.fco.enabled);
     mergeOpt(dst.anti_hook.enabled, src.anti_hook.enabled);
     mergeOpt(dst.anti_dbg.enabled, src.anti_dbg.enabled);
+    mergeOpt(dst.anti_dbg.distribution_signed,
+             src.anti_dbg.distribution_signed);
     mergeOpt(dst.anti_class_dump.enabled, src.anti_class_dump.enabled);
     mergeOpt(dst.windows_pe_foundation.enabled,
              src.windows_pe_foundation.enabled);

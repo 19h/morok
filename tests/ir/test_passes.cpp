@@ -18332,8 +18332,15 @@ entry:
     CHECK(M->getFunction("sysctl") == nullptr);
     CHECK(M->getFunction("csops") == nullptr);
     CHECK(M->getFunction("task_get_exception_ports") == nullptr);
+    CHECK(M->getFunction("SecTaskCreateFromSelf") == nullptr);
+    CHECK(M->getFunction("SecTaskCopyValueForEntitlement") == nullptr);
+    CHECK(M->getFunction("CFStringCreateWithCString") == nullptr);
+    CHECK(M->getFunction("CFBooleanGetValue") == nullptr);
+    CHECK(M->getFunction("CFRelease") == nullptr);
     CHECK(M->getFunction("getpid") == nullptr);
     CHECK(M->getFunction("syscall") == nullptr);
+    CHECK(M->getFunction("dlopen") != nullptr);
+    CHECK(M->getFunction("dlsym") != nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
     CHECK(countNamedInstructions(*Ctor, "morok.antidbg.exc.task_ports") >= 1u);
     CHECK(countNamedInstructions(*Ctor,
@@ -18356,6 +18363,42 @@ entry:
     CHECK(
         countNamedInstructions(*M->getFunction("morok.antidbg.darwin.dr.scrub"),
                                "morok.antidbg.dr.thread.set") >= 1u);
+    Function *GetTaskAllow =
+        M->getFunction("morok.antidbg.darwin.get_task_allow");
+    REQUIRE(GetTaskAllow != nullptr);
+    CHECK(countNamedInstructions(*GetTaskAllow,
+                                 "morok.antidbg.get_task_allow.security.handle") >=
+          1u);
+    CHECK(countNamedInstructions(*GetTaskAllow,
+                                 "morok.antidbg.get_task_allow.sectask.create") >=
+          1u);
+    CHECK(countNamedInstructions(*GetTaskAllow,
+                                 "morok.antidbg.get_task_allow.sectask.copy") >=
+          1u);
+    CHECK(countNamedInstructions(*GetTaskAllow,
+                                 "morok.antidbg.get_task_allow.cfstring.create") >=
+          1u);
+    CHECK(countNamedInstructions(*GetTaskAllow,
+                                 "morok.antidbg.get_task_allow.cfboolean.get") >=
+          1u);
+    CHECK(countNamedInstructions(*GetTaskAllow,
+                                 "morok.antidbg.get_task_allow.entitlement.true") >=
+          1u);
+    CHECK(countNamedInstructions(*Ctor,
+                                 "morok.antidbg.get_task_allow.ready") >= 1u);
+    Instruction *GetTaskAllowPresent =
+        findNamedInstruction(*Ctor, "morok.antidbg.get_task_allow.present");
+    REQUIRE(GetTaskAllowPresent != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(GetTaskAllowPresent,
+                                           "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(hasReadableByteString(
+        *M, "/System/Library/Frameworks/Security.framework/Security"));
+    CHECK_FALSE(hasReadableByteString(
+        *M, "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"));
+    CHECK_FALSE(hasReadableByteString(*M, "SecTaskCreateFromSelf"));
+    CHECK_FALSE(hasReadableByteString(*M, "SecTaskCopyValueForEntitlement"));
+    CHECK_FALSE(hasReadableByteString(*M,
+                                      "com.apple.security.get-task-allow"));
     CHECK(M->getFunction("pthread_create") != nullptr);
     CHECK(M->getFunction("pthread_detach") != nullptr);
     CHECK(M->getFunction("sleep") != nullptr);
@@ -18365,6 +18408,38 @@ entry:
         countStoresToBaseWithOpaqueSource(*M, "morok.cloak.buf");
     CHECK(cloakStores >= 8u);
     CHECK(opaqueCloakStores == cloakStores);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("antiDebuggingModule gates macOS get-task-allow enforcement on "
+          "distribution signing") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "arm64-apple-macosx13.0.0"
+define i32 @main() {
+entry:
+  ret i32 0
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(196);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::antiDebuggingModule(
+        *M, rng, /*allowSelfTrace=*/true, /*distributionSigned=*/true));
+
+    Function *Ctor = M->getFunction("morok.antidbg");
+    Function *GetTaskAllow =
+        M->getFunction("morok.antidbg.darwin.get_task_allow");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(GetTaskAllow != nullptr);
+    CHECK(M->getFunction("SecTaskCreateFromSelf") == nullptr);
+    CHECK(M->getFunction("SecTaskCopyValueForEntitlement") == nullptr);
+    CHECK_FALSE(hasReadableByteString(*M,
+                                      "com.apple.security.get-task-allow"));
+    Instruction *Present =
+        findNamedInstruction(*Ctor, "morok.antidbg.get_task_allow.present");
+    REQUIRE(Present != nullptr);
+    CHECK(valueFeedsNamedInstruction(Present, "morok.seal.fold.anti_debug"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

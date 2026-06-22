@@ -404,6 +404,14 @@ struct ToggleConfig {
     Opt<bool> enabled;
 };
 
+struct AntiDebuggingConfig {
+    Opt<bool> enabled;
+    // Only release/distribution pipelines should set this.  Developer and
+    // ad-hoc macOS builds commonly carry get-task-allow=true, so entitlement
+    // probes must remain telemetry-only unless this is explicit.
+    Opt<bool> distribution_signed;
+};
+
 struct PlatformRuntimeConfig {
     Opt<bool> enabled;
     Opt<std::string> direct_syscalls; // auto | always | never
@@ -466,7 +474,7 @@ struct PassConfig {
     ToggleConfig indir_branch;
     ToggleConfig fco;
     ToggleConfig anti_hook;
-    ToggleConfig anti_dbg;
+    AntiDebuggingConfig anti_dbg;
     ToggleConfig anti_class_dump;
     ToggleConfig windows_pe_foundation;
     ToggleConfig windows_peb_heap_debug;

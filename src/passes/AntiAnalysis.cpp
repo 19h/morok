@@ -3655,6 +3655,205 @@ void emitDarwinImageCensus(IRBuilder<> &B, Module &M, GlobalVariable *State) {
     B.SetInsertPoint(done);
 }
 
+Function *darwinGetTaskAllowProbe(Module &M, ir::IRRandom &rng) {
+    if (Function *existing =
+            M.getFunction("morok.antidbg.darwin.get_task_allow"))
+        return existing;
+    const Triple TT(M.getTargetTriple());
+    if (!TT.isOSDarwin())
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i32, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antidbg.darwin.get_task_allow", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "resolve", fn);
+    auto *taskBB = BasicBlock::Create(ctx, "task", fn);
+    auto *keyBB = BasicBlock::Create(ctx, "key", fn);
+    auto *copyBB = BasicBlock::Create(ctx, "copy", fn);
+    auto *releaseTaskBB = BasicBlock::Create(ctx, "release.task", fn);
+    auto *valueBB = BasicBlock::Create(ctx, "value", fn);
+    auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
+    auto *retAbsentBB = BasicBlock::Create(ctx, "ret.absent", fn);
+
+    FunctionCallee dlopen = M.getOrInsertFunction(
+        "dlopen", FunctionType::get(ptr, {ptr, i32}, false));
+    FunctionCallee dlsym =
+        M.getOrInsertFunction("dlsym", FunctionType::get(ptr, {ptr, ptr}, false));
+
+    IRBuilder<> B(entry);
+    Value *securityPath = ir::emitCloakedSymbol(
+        B, M, "/System/Library/Frameworks/Security.framework/Security", rng);
+    Value *coreFoundationPath = ir::emitCloakedSymbol(
+        B, M,
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+        rng);
+    Value *secHandle = B.CreateCall(
+        dlopen, {securityPath, ConstantInt::get(i32, 1)},
+        "morok.antidbg.get_task_allow.security.handle");
+    Value *cfHandle = B.CreateCall(
+        dlopen, {coreFoundationPath, ConstantInt::get(i32, 1)},
+        "morok.antidbg.get_task_allow.cf.handle");
+    Value *handlesReady = B.CreateAnd(
+        B.CreateICmpNE(secHandle, ConstantPointerNull::get(ptr)),
+        B.CreateICmpNE(cfHandle, ConstantPointerNull::get(ptr)),
+        "morok.antidbg.get_task_allow.handles.ready");
+    B.CreateCondBr(handlesReady, resolveBB, ret0BB);
+
+    IRBuilder<> RB(resolveBB);
+    Value *createName =
+        ir::emitCloakedSymbol(RB, M, "SecTaskCreateFromSelf", rng);
+    Value *copyName =
+        ir::emitCloakedSymbol(RB, M, "SecTaskCopyValueForEntitlement", rng);
+    Value *stringName =
+        ir::emitCloakedSymbol(RB, M, "CFStringCreateWithCString", rng);
+    Value *boolName = ir::emitCloakedSymbol(RB, M, "CFBooleanGetValue", rng);
+    Value *releaseName = ir::emitCloakedSymbol(RB, M, "CFRelease", rng);
+    Value *secTaskCreate =
+        RB.CreateCall(dlsym, {secHandle, createName},
+                      "morok.antidbg.get_task_allow.sectask.create");
+    Value *secTaskCopy =
+        RB.CreateCall(dlsym, {secHandle, copyName},
+                      "morok.antidbg.get_task_allow.sectask.copy");
+    Value *cfStringCreate =
+        RB.CreateCall(dlsym, {cfHandle, stringName},
+                      "morok.antidbg.get_task_allow.cfstring.create");
+    Value *cfBooleanGet =
+        RB.CreateCall(dlsym, {cfHandle, boolName},
+                      "morok.antidbg.get_task_allow.cfboolean.get");
+    Value *cfRelease =
+        RB.CreateCall(dlsym, {cfHandle, releaseName},
+                      "morok.antidbg.get_task_allow.cfrelease");
+    Value *resolvedReady = RB.CreateAnd(
+        RB.CreateAnd(RB.CreateICmpNE(secTaskCreate,
+                                     ConstantPointerNull::get(ptr)),
+                     RB.CreateICmpNE(secTaskCopy,
+                                     ConstantPointerNull::get(ptr))),
+        RB.CreateAnd(
+            RB.CreateAnd(RB.CreateICmpNE(cfStringCreate,
+                                         ConstantPointerNull::get(ptr)),
+                         RB.CreateICmpNE(cfBooleanGet,
+                                         ConstantPointerNull::get(ptr))),
+            RB.CreateICmpNE(cfRelease, ConstantPointerNull::get(ptr))),
+        "morok.antidbg.get_task_allow.resolved.ready");
+    RB.CreateCondBr(resolvedReady, taskBB, ret0BB);
+
+    IRBuilder<> TB(taskBB);
+    auto *createTy = FunctionType::get(ptr, {ptr}, false);
+    Value *task = TB.CreateCall(
+        createTy,
+        TB.CreateIntToPtr(secTaskCreate, ptr,
+                          "morok.antidbg.get_task_allow.sectask.create.ptr"),
+        {ConstantPointerNull::get(ptr)}, "morok.antidbg.get_task_allow.task");
+    TB.CreateCondBr(
+        TB.CreateICmpNE(task, ConstantPointerNull::get(ptr),
+                        "morok.antidbg.get_task_allow.task.present"),
+        keyBB, ret0BB);
+
+    IRBuilder<> KB(keyBB);
+    Value *keyBytes = ir::emitCloakedSymbol(
+        KB, M, "com.apple.security.get-task-allow", rng);
+    auto *stringCreateTy = FunctionType::get(ptr, {ptr, ptr, i32}, false);
+    Value *key = KB.CreateCall(
+        stringCreateTy,
+        KB.CreateIntToPtr(cfStringCreate, ptr,
+                          "morok.antidbg.get_task_allow.cfstring.create.ptr"),
+        {ConstantPointerNull::get(ptr), keyBytes,
+         ConstantInt::get(i32, 0x08000100)},
+        "morok.antidbg.get_task_allow.key");
+    KB.CreateCondBr(
+        KB.CreateICmpNE(key, ConstantPointerNull::get(ptr),
+                        "morok.antidbg.get_task_allow.key.present"),
+        copyBB, releaseTaskBB);
+
+    auto *releaseTy = FunctionType::get(Type::getVoidTy(ctx), {ptr}, false);
+    IRBuilder<> RTB(releaseTaskBB);
+    RTB.CreateCall(releaseTy,
+                   RTB.CreateIntToPtr(cfRelease, ptr,
+                                      "morok.antidbg.get_task_allow.release.ptr"),
+                   {task});
+    RTB.CreateBr(ret0BB);
+
+    IRBuilder<> CB(copyBB);
+    auto *copyTy = FunctionType::get(ptr, {ptr, ptr, ptr}, false);
+    Value *value = CB.CreateCall(
+        copyTy,
+        CB.CreateIntToPtr(secTaskCopy, ptr,
+                          "morok.antidbg.get_task_allow.sectask.copy.ptr"),
+        {task, key, ConstantPointerNull::get(ptr)},
+        "morok.antidbg.get_task_allow.value");
+    CB.CreateCall(releaseTy,
+                  CB.CreateIntToPtr(cfRelease, ptr,
+                                    "morok.antidbg.get_task_allow.release.key.ptr"),
+                  {key});
+    CB.CreateCall(releaseTy,
+                  CB.CreateIntToPtr(cfRelease, ptr,
+                                    "morok.antidbg.get_task_allow.release.task.ptr"),
+                  {task});
+    CB.CreateCondBr(
+        CB.CreateICmpNE(value, ConstantPointerNull::get(ptr),
+                        "morok.antidbg.get_task_allow.value.present"),
+        valueBB, retAbsentBB);
+
+    IRBuilder<> VB(valueBB);
+    auto *boolGetTy = FunctionType::get(i8, {ptr}, false);
+    Value *boolByte = VB.CreateCall(
+        boolGetTy,
+        VB.CreateIntToPtr(cfBooleanGet, ptr,
+                          "morok.antidbg.get_task_allow.cfboolean.get.ptr"),
+        {value}, "morok.antidbg.get_task_allow.bool");
+    VB.CreateCall(releaseTy,
+                  VB.CreateIntToPtr(cfRelease, ptr,
+                                    "morok.antidbg.get_task_allow.release.value.ptr"),
+                  {value});
+    Value *present = VB.CreateICmpNE(
+        boolByte, ConstantInt::get(i8, 0),
+        "morok.antidbg.get_task_allow.entitlement.true");
+    VB.CreateRet(VB.CreateSelect(present, ConstantInt::get(i32, 3),
+                                 ConstantInt::get(i32, 1),
+                                 "morok.antidbg.get_task_allow.result"));
+
+    IRBuilder<> R0(ret0BB);
+    R0.CreateRet(ConstantInt::get(i32, 0));
+
+    IRBuilder<> RAB(retAbsentBB);
+    RAB.CreateRet(ConstantInt::get(i32, 1));
+
+    return fn;
+}
+
+void emitDarwinGetTaskAllowCheck(IRBuilder<> &B, Module &M,
+                                 GlobalVariable *State, ir::IRRandom &rng,
+                                 bool DistributionSigned) {
+    Function *probe = darwinGetTaskAllowProbe(M, rng);
+    if (!probe)
+        return;
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    Value *bits =
+        B.CreateCall(probe->getFunctionType(), probe, {},
+                     "morok.antidbg.get_task_allow.bits");
+    Value *ready = B.CreateICmpNE(
+        B.CreateAnd(bits, ConstantInt::get(i32, 1)),
+        ConstantInt::get(i32, 0), "morok.antidbg.get_task_allow.ready");
+    Value *present = B.CreateICmpNE(
+        B.CreateAnd(bits, ConstantInt::get(i32, 2)),
+        ConstantInt::get(i32, 0), "morok.antidbg.get_task_allow.present");
+    foldFlag(B, State, ready, 0x835A60B27E4D19C3ULL,
+             "morok.antidbg.get_task_allow.ready");
+    foldFlag(B, State, present, 0xC421BE9D735AF062ULL,
+             "morok.antidbg.get_task_allow.present");
+    if (DistributionSigned)
+        sealFold(B, present, 0xC421BE9D735AF062ULL);
+}
+
 bool darwinDebugStateShape(const Triple &TT, std::uint32_t &Flavor,
                            std::uint32_t &Count32, std::uint32_t &Words64) {
     switch (TT.getArch()) {
@@ -3843,7 +4042,7 @@ Function *darwinDrWatchThread(Module &M, const Triple &TT) {
 
 void emitDarwinAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
                          ir::IRRandom &rng, const Triple &TT,
-                         bool StartLiveWatchers) {
+                         bool StartLiveWatchers, bool DistributionSigned) {
     IRBuilder<> B(&Ctor->getEntryBlock());
     // PT_DENY_ATTACH via direct svc (no imported ptrace to interpose).  Bind its
     // result to the verdict: it returns 0 on an untraced process, so a nonzero
@@ -3864,6 +4063,7 @@ void emitDarwinAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
                  "morok.antidbg.csops.exc.gta.absent");
         sealFold(B, coherent, 0xD13C7A5E92604B8FULL);
     }
+    emitDarwinGetTaskAllowCheck(B, M, State, rng, DistributionSigned);
     emitDarwinDyldCensus(B, M, State, rng);
     emitDarwinImageCensus(B, M, State);
     if (StartLiveWatchers) {
@@ -24269,7 +24469,8 @@ void emitWindowsAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
 
 } // namespace
 
-bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
+bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace,
+                         bool DistributionSigned) {
     const Triple tt(M.getTargetTriple());
     const bool startLiveWatchers = !moduleUsesForkOrSignalApis(M);
 
@@ -24285,7 +24486,8 @@ bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace) {
         emitLinuxAntiDebug(M, ctor, state, rng, tt, AllowSelfTrace,
                            startLiveWatchers);
     else if (tt.isOSDarwin())
-        emitDarwinAntiDebug(M, ctor, state, rng, tt, startLiveWatchers);
+        emitDarwinAntiDebug(M, ctor, state, rng, tt, startLiveWatchers,
+                            DistributionSigned);
     else if (tt.isOSWindows())
         emitWindowsAntiDebug(M, ctor, state, rng, tt);
     else

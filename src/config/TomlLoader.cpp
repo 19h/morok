@@ -465,6 +465,11 @@ void parseToggle(const toml::table &t, ToggleConfig &c) {
     c.enabled = readBool(t["enabled"]);
 }
 
+void parseAntiDebugging(const toml::table &t, AntiDebuggingConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.distribution_signed = readBool(t["distribution_signed"]);
+}
+
 void parsePasses(const toml::table &p, PassConfig &pc) {
     if (auto *t = p["bcf"].as_table())
         parseBcf(*t, pc.bcf);
@@ -573,7 +578,7 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
     if (auto *t = p["anti_hooking"].as_table())
         parseToggle(*t, pc.anti_hook);
     if (auto *t = p["anti_debugging"].as_table())
-        parseToggle(*t, pc.anti_dbg);
+        parseAntiDebugging(*t, pc.anti_dbg);
     if (auto *t = p["anti_class_dump"].as_table())
         parseToggle(*t, pc.anti_class_dump);
     if (auto *t = p["windows_pe_foundation"].as_table())

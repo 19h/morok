@@ -709,6 +709,17 @@ TEST_CASE("policy array is parsed in order with inline overrides") {
     CHECK(r.config.policies[1].overrides.sub.enabled == false);
 }
 
+TEST_CASE("anti-debugging parses explicit distribution-signed gate") {
+    const auto r = loadFromString(R"(
+    [passes.anti_debugging]
+    enabled = true
+    distribution_signed = true
+  )");
+    REQUIRE(r.ok);
+    CHECK(r.config.passes.anti_dbg.enabled == true);
+    CHECK(r.config.passes.anti_dbg.distribution_signed == true);
+}
+
 TEST_CASE("loaded policies resolve end-to-end") {
     const auto r = loadFromString(R"(
     [global]

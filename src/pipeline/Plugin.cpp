@@ -122,6 +122,13 @@ cl::opt<bool> MorokFailClosedOnUnsealed(
     "morok-fail-closed-on-unsealed", cl::init(false),
     cl::desc("Corrupt seal-dependent key material when the post-link code_size "
              "slot is unsealed, so an unsealed binary fails closed."));
+// Release/distribution signing assertion for macOS entitlement probes.  This is
+// deliberately not implied by presets: max/high are used for local differential
+// runs where get-task-allow may legitimately be true.
+cl::opt<bool> MorokDistributionSigned(
+    "morok-distribution-signed", cl::init(false),
+    cl::desc("Treat the target as distribution-signed; macOS get-task-allow "
+             "entitlement findings may poison the anti-debug seal."));
 
 // Whether the auto-injection (clang -fpass-plugin) entry points should fire.
 // On Unix this is driven by the `-morok` cl::opt (`-mllvm -morok`).  On Windows
@@ -188,6 +195,10 @@ morok::config::Config loadConfig() {
     if (MorokFailClosedOnUnsealed ||
         std::getenv("MOROK_FAIL_CLOSED_ON_UNSEALED") != nullptr)
         cfg.passes.fail_closed_on_unsealed = true;
+
+    if (MorokDistributionSigned ||
+        std::getenv("MOROK_DISTRIBUTION_SIGNED") != nullptr)
+        cfg.passes.anti_dbg.distribution_signed = true;
 
     return cfg;
 }

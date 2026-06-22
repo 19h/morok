@@ -690,7 +690,8 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         changed |= passes::windowsProcessMitigationsModule(M, rng);
     if (config_.passes.anti_dbg.enabled.value_or(false))
         changed |= passes::antiDebuggingModule(
-            M, rng, !config_.passes.trap_oracles.enabled.value_or(false));
+            M, rng, !config_.passes.trap_oracles.enabled.value_or(false),
+            config_.passes.anti_dbg.distribution_signed.value_or(false));
     if (config_.passes.timing_oracles.enabled.value_or(false))
         changed |= passes::timingOracleModule(M, rng);
     if (config_.passes.scheduler_step_oracles.enabled.value_or(false))
