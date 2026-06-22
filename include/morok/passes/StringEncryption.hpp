@@ -37,12 +37,11 @@ struct StrEncParams {
 bool stringEncryptModule(llvm::Module &M, const StrEncParams &params,
                          morok::ir::IRRandom &rng);
 
-/// Bind the runtime string-seed provider (morok.str.seed) to the anti-debug
-/// runtime seal: the per-string keystream seed is XORed with a KDF of the seal
-/// delta, which is zero on a clean run (strings decrypt normally) and nonzero
-/// once any analysis verdict trips (debugger/ptrace/anti-hook), so the whole
-/// string pool decodes to garbage under dynamic analysis.  Must run after the
-/// seal channel exists (integrity tail).  No-op if the seed or seal is absent.
+/// Bind the runtime string-seed provider (morok.str.seed) to available runtime
+/// seal roots: the per-string keystream seed is XORed with KDFs of clean-zero
+/// seal deltas, so strings decrypt normally on a clean/enrolled run and decode
+/// to garbage once anti-analysis or environment-binding channels are dirtied.
+/// Must run after seal channels exist (integrity tail).  No-op if absent.
 bool bindStringSeedToSeal(llvm::Module &M, morok::ir::IRRandom &rng);
 
 /// Replace supported constant-format `snprintf`/`sprintf`, `printf`/`fprintf`,

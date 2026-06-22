@@ -29,6 +29,7 @@
 #include "morok/passes/DataFlowIntegrity.hpp"
 #include "morok/passes/DecoyStrings.hpp"
 #include "morok/passes/DispatcherlessRouting.hpp"
+#include "morok/passes/EnvBindingKdf.hpp"
 #include "morok/passes/ExternalOpaquePredicates.hpp"
 #include "morok/passes/ExternalSecretBinding.hpp"
 #include "morok/passes/Flattening.hpp"
@@ -454,6 +455,10 @@ PassPluginLibraryInfo getPluginInfo() {
                     }
                     if (name == "morok-proofbind") {
                         MPM.addPass(passes::ExternalSecretBindingPass());
+                        return true;
+                    }
+                    if (name == "morok-envbind") {
+                        MPM.addPass(passes::EnvBindingKdfPass());
                         return true;
                     }
                     if (name == "morok-tracer") {

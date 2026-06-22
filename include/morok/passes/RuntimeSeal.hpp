@@ -18,6 +18,7 @@ namespace morok::passes::runtime_seal {
 
 inline constexpr llvm::StringLiteral kAntiDebugChannel = "anti_debug";
 inline constexpr llvm::StringLiteral kExternalProofChannel = "external_proof";
+inline constexpr llvm::StringLiteral kEnvBindingChannel = "env_binding";
 inline constexpr llvm::StringLiteral kTracerChannel = "tracer";
 inline constexpr llvm::StringLiteral kFaultPagedPayloadChannel =
     "fault_paged_payload";

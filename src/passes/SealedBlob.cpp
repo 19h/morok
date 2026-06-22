@@ -345,6 +345,17 @@ Function *defineAccessor(Module &M, const BlobPlan &Plan,
                                                  "morok.sealed.proof.kdf"),
                          "morok.sealed.proof.key");
     }
+    if (hasSource(Params, "env_binding")) {
+        Value *Delta = runtime_seal::emitChannelDelta(
+            EB, runtime_seal::kEnvBindingChannel, "morok.sealed.env.delta");
+        Dynamic = EB.CreateXor(
+            Dynamic,
+            runtime_seal::emitKdf64(EB, Delta,
+                                    Plan.salt0 ^ Plan.salt1 ^
+                                        0xE47C9143B51D6F2AULL,
+                                    "morok.sealed.env.kdf"),
+            "morok.sealed.env.key");
+    }
     if (hasSource(Params, "code_region"))
         Dynamic = EB.CreateXor(Dynamic, emitStableAddressZero(EB, Fn),
                                "morok.sealed.code.key");

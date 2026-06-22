@@ -164,6 +164,13 @@ TEST_CASE("merge handles every pass family") {
     src.external_secret_binding.identity_policy = "raw";
     src.external_secret_binding.bind_to_runtime_seal = true;
     src.external_secret_binding.virtualize_helpers = false;
+    src.env_binding_kdf.enabled = true;
+    src.env_binding_kdf.mode = "auto";
+    src.env_binding_kdf.expected_digest = "0x8877665544332211";
+    src.env_binding_kdf.identity_policy = "ascii_lower_strip_ws";
+    src.env_binding_kdf.min_factors = 3u;
+    src.env_binding_kdf.bind_to_runtime_seal = true;
+    src.env_binding_kdf.virtualize_helpers = false;
     src.self_checksum.enabled = true;
     src.self_checksum.probability = 82u;
     src.self_checksum.max_constants = 7u;
@@ -366,6 +373,13 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.external_secret_binding.identity_policy == "raw");
     CHECK(dst.external_secret_binding.bind_to_runtime_seal == true);
     CHECK(dst.external_secret_binding.virtualize_helpers == false);
+    CHECK(dst.env_binding_kdf.enabled == true);
+    CHECK(dst.env_binding_kdf.mode == "auto");
+    CHECK(dst.env_binding_kdf.expected_digest == "0x8877665544332211");
+    CHECK(dst.env_binding_kdf.identity_policy == "ascii_lower_strip_ws");
+    CHECK(dst.env_binding_kdf.min_factors == 3u);
+    CHECK(dst.env_binding_kdf.bind_to_runtime_seal == true);
+    CHECK(dst.env_binding_kdf.virtualize_helpers == false);
     CHECK(dst.self_checksum.enabled == true);
     CHECK(dst.self_checksum.probability == 82u);
     CHECK(dst.self_checksum.max_constants == 7u);

@@ -208,6 +208,19 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.external_secret_binding.bind_to_runtime_seal);
     mergeOpt(dst.external_secret_binding.virtualize_helpers,
              src.external_secret_binding.virtualize_helpers);
+    // Environment-bound host identity KDF
+    mergeOpt(dst.env_binding_kdf.enabled, src.env_binding_kdf.enabled);
+    mergeOpt(dst.env_binding_kdf.mode, src.env_binding_kdf.mode);
+    mergeOpt(dst.env_binding_kdf.expected_digest,
+             src.env_binding_kdf.expected_digest);
+    mergeOpt(dst.env_binding_kdf.identity_policy,
+             src.env_binding_kdf.identity_policy);
+    mergeOpt(dst.env_binding_kdf.min_factors,
+             src.env_binding_kdf.min_factors);
+    mergeOpt(dst.env_binding_kdf.bind_to_runtime_seal,
+             src.env_binding_kdf.bind_to_runtime_seal);
+    mergeOpt(dst.env_binding_kdf.virtualize_helpers,
+             src.env_binding_kdf.virtualize_helpers);
     // Tracer attestation
     mergeOpt(dst.tracer_attestation.enabled, src.tracer_attestation.enabled);
     mergeOpt(dst.tracer_attestation.mode, src.tracer_attestation.mode);

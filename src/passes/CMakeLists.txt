@@ -21,6 +21,7 @@ add_library(morok_passes STATIC
   AliasOpaquePredicates.cpp
   ExternalOpaquePredicates.cpp
   ExternalSecretBinding.cpp
+  EnvBindingKdf.cpp
   CoherentDecoys.cpp
   CodeRegionKdf.cpp
   DataFlowIntegrity.cpp

@@ -202,6 +202,16 @@ struct ExternalSecretBindingConfig {
     Opt<bool> virtualize_helpers;
 };
 
+struct EnvBindingKdfConfig {
+    Opt<bool> enabled;
+    Opt<std::string> mode;
+    Opt<std::string> expected_digest;
+    Opt<std::string> identity_policy;
+    Opt<std::uint32_t> min_factors;
+    Opt<bool> bind_to_runtime_seal;
+    Opt<bool> virtualize_helpers;
+};
+
 struct TracerAttestationConfig {
     Opt<bool> enabled;
     Opt<std::string> mode;
@@ -429,6 +439,7 @@ struct PassConfig {
     HashSelfDecryptConfig hash_self_decrypt;
     FaultPagedPayloadConfig fault_paged_payload;
     ExternalSecretBindingConfig external_secret_binding;
+    EnvBindingKdfConfig env_binding_kdf;
     TracerAttestationConfig tracer_attestation;
     SealedBlobConfig sealed_blob;
     SelfChecksumConfig self_checksum;

@@ -24,6 +24,7 @@
 #include "morok/passes/DataFlowIntegrity.hpp"
 #include "morok/passes/DecoyStrings.hpp"
 #include "morok/passes/DispatcherlessRouting.hpp"
+#include "morok/passes/EnvBindingKdf.hpp"
 #include "morok/passes/ExternalOpaquePredicates.hpp"
 #include "morok/passes/ExternalSecretBinding.hpp"
 #include "morok/passes/Flattening.hpp"
@@ -246,6 +247,7 @@ bool hasSensitiveGeneratedPrefix(StringRef Name) {
            Name.starts_with("morok.sealed.") ||
            Name.starts_with("morok.mg.node.") ||
            Name.starts_with("morok.mg.diff.") ||
+           Name.starts_with("morok.envbind.") ||
            Name.starts_with("morok.fpp.") ||
            Name.starts_with("morok.fission") ||
            Name.starts_with("morok.antidbg") ||
@@ -554,6 +556,24 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
             config_.passes.external_secret_binding.virtualize_helpers.value_or(
                 true);
         changed |= passes::externalSecretBindingModule(M, p, rng);
+    }
+
+    if (InitialModuleGrowthOk &&
+        config_.passes.env_binding_kdf.enabled.value_or(false)) {
+        passes::EnvBindingKdfParams p;
+        p.mode = config_.passes.env_binding_kdf.mode.value_or("auto");
+        p.expected_digest =
+            config_.passes.env_binding_kdf.expected_digest.value_or("");
+        p.identity_policy =
+            config_.passes.env_binding_kdf.identity_policy.value_or(
+                "ascii_lower_strip_ws");
+        p.min_factors =
+            config_.passes.env_binding_kdf.min_factors.value_or(2);
+        p.bind_to_runtime_seal =
+            config_.passes.env_binding_kdf.bind_to_runtime_seal.value_or(true);
+        p.virtualize_helpers =
+            config_.passes.env_binding_kdf.virtualize_helpers.value_or(true);
+        changed |= passes::envBindingKdfModule(M, p, rng);
     }
 
     // Tracer attestation emits only generated helpers/constructors here. Seed

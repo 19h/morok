@@ -1222,29 +1222,35 @@ bool bindStringSeedToSeal(Module &M, ir::IRRandom &rng) {
     Function *Seed = M.getFunction("morok.str.seed");
     if (!Seed || Seed->isDeclaration())
         return false;
-    GlobalVariable *Seal =
-        runtime_seal::findChannel(M, runtime_seal::kAntiDebugChannel);
-    if (!Seal || !Seal->hasInitializer())
-        return false;
-    const std::uint64_t S0 = runtime_seal::initialValue(Seal);
 
     bool changed = false;
-    for (BasicBlock &BB : *Seed) {
-        auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
-        if (!RI || !RI->getReturnValue())
-            continue;
-        IRBuilder<> B(RI);
-        Value *RV = RI->getReturnValue();
-        // KDF(delta) is exactly 0 when the seal is clean (delta == 0), so the
-        // seed — and therefore every decrypted string — is byte-identical on a
-        // clean run and garbage once an analysis verdict has been folded in.
-        Value *Delta =
-            runtime_seal::emitDelta(B, Seal, S0, "morok.str.seed.seal");
-        Value *Key = runtime_seal::emitKdf64(B, Delta, rng.next(),
-                                             "morok.str.seed.seal.kdf");
-        RI->setOperand(0, B.CreateXor(RV, Key, "morok.str.seed.sealed"));
-        changed = true;
-    }
+    auto BindChannel = [&](StringRef Channel, StringRef Prefix,
+                           StringRef ResultName) {
+        GlobalVariable *Seal = runtime_seal::findChannel(M, Channel);
+        if (!Seal || !Seal->hasInitializer())
+            return;
+        const std::uint64_t S0 = runtime_seal::initialValue(Seal);
+        for (BasicBlock &BB : *Seed) {
+            auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+            if (!RI || !RI->getReturnValue())
+                continue;
+            IRBuilder<> B(RI);
+            Value *RV = RI->getReturnValue();
+            // KDF(delta) is exactly 0 when the seal is clean (delta == 0), so
+            // the seed — and therefore every decrypted string — is byte-
+            // identical on a clean run and garbage once a bound channel is
+            // dirtied.
+            Value *Delta = runtime_seal::emitDelta(B, Seal, S0, Prefix);
+            Value *Key = runtime_seal::emitKdf64(
+                B, Delta, rng.next(), (Twine(Prefix) + ".kdf"));
+            RI->setOperand(0, B.CreateXor(RV, Key, ResultName));
+            changed = true;
+        }
+    };
+    BindChannel(runtime_seal::kAntiDebugChannel, "morok.str.seed.seal",
+                "morok.str.seed.sealed");
+    BindChannel(runtime_seal::kEnvBindingChannel, "morok.str.seed.env",
+                "morok.str.seed.env.bound");
     return changed;
 }
 

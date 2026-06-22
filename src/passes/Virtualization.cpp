@@ -1688,6 +1688,9 @@ Value *emitStreamKey(Builder &B, Value *Offset, const Encoding &Enc) {
     foldSealChannel(runtime_seal::kExternalProofChannel, 0x3C3276BA47C1A99DULL,
                     "morok.vm.proof.seal", "morok.vm.proof.seal.kdf",
                     "morok.vm.proof.seal.fold", "morok.vm.key.external_proof");
+    foldSealChannel(runtime_seal::kEnvBindingChannel, 0x87A5C2F19B4E306DULL,
+                    "morok.vm.env.seal", "morok.vm.env.seal.kdf",
+                    "morok.vm.env.seal.fold", "morok.vm.key.env_binding");
     foldSealChannel(runtime_seal::kTracerChannel, 0xD4E7B93A8F15C26DULL,
                     "morok.vm.tracer.seal", "morok.vm.tracer.seal.kdf",
                     "morok.vm.tracer.seal.fold", "morok.vm.key.tracer");

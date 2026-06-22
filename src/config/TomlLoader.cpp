@@ -248,6 +248,16 @@ void parseExternalSecretBinding(const toml::table &t,
     c.virtualize_helpers = readBool(t["virtualize_helpers"]);
 }
 
+void parseEnvBindingKdf(const toml::table &t, EnvBindingKdfConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.mode = readString(t["mode"]);
+    c.expected_digest = readString(t["expected_digest"]);
+    c.identity_policy = readString(t["identity_policy"]);
+    c.min_factors = readU32(t["min_factors"]);
+    c.bind_to_runtime_seal = readBool(t["bind_to_runtime_seal"]);
+    c.virtualize_helpers = readBool(t["virtualize_helpers"]);
+}
+
 void parseTracerAttestation(const toml::table &t,
                             TracerAttestationConfig &c) {
     c.enabled = readBool(t["enabled"]);
@@ -504,6 +514,10 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseFaultPagedPayload(*t, pc.fault_paged_payload);
     if (auto *t = p["external_secret_binding"].as_table())
         parseExternalSecretBinding(*t, pc.external_secret_binding);
+    if (auto *t = p["env_binding_kdf"].as_table())
+        parseEnvBindingKdf(*t, pc.env_binding_kdf);
+    if (auto *t = p["environment_binding_kdf"].as_table())
+        parseEnvBindingKdf(*t, pc.env_binding_kdf);
     if (auto *t = p["tracer_attestation"].as_table())
         parseTracerAttestation(*t, pc.tracer_attestation);
     if (auto *t = p["sealed_blob"].as_table())

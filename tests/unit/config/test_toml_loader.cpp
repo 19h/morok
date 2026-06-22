@@ -286,6 +286,14 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     identity_policy = "raw"
     bind_to_runtime_seal = true
     virtualize_helpers = false
+    [passes.env_binding_kdf]
+    enabled = true
+    mode = "auto"
+    expected_digest = "0x8877665544332211"
+    identity_policy = "ascii_lower_strip_ws"
+    min_factors = 3
+    bind_to_runtime_seal = true
+    virtualize_helpers = false
     [passes.tracer_attestation]
     enabled = true
     mode = "linux_ptrace"
@@ -531,6 +539,15 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.external_secret_binding.identity_policy == "raw");
     CHECK(r.config.passes.external_secret_binding.bind_to_runtime_seal == true);
     CHECK(r.config.passes.external_secret_binding.virtualize_helpers == false);
+    CHECK(r.config.passes.env_binding_kdf.enabled == true);
+    CHECK(r.config.passes.env_binding_kdf.mode == "auto");
+    CHECK(r.config.passes.env_binding_kdf.expected_digest ==
+          "0x8877665544332211");
+    CHECK(r.config.passes.env_binding_kdf.identity_policy ==
+          "ascii_lower_strip_ws");
+    CHECK(r.config.passes.env_binding_kdf.min_factors == 3u);
+    CHECK(r.config.passes.env_binding_kdf.bind_to_runtime_seal == true);
+    CHECK(r.config.passes.env_binding_kdf.virtualize_helpers == false);
     CHECK(r.config.passes.tracer_attestation.enabled == true);
     CHECK(r.config.passes.tracer_attestation.mode == "linux_ptrace");
     CHECK(r.config.passes.tracer_attestation.shares == 3u);

@@ -25,6 +25,7 @@
 #include "morok/passes/DataFlowIntegrity.hpp"
 #include "morok/passes/DecoyStrings.hpp"
 #include "morok/passes/DispatcherlessRouting.hpp"
+#include "morok/passes/EnvBindingKdf.hpp"
 #include "morok/passes/ExternalOpaquePredicates.hpp"
 #include "morok/passes/ExternalSecretBinding.hpp"
 #include "morok/passes/FaultPagedPayload.hpp"
@@ -8542,6 +8543,38 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("virtualizeModule keys VM stream on environment binding seal") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @vm_env(i32 %a, i32 %b) {
+entry:
+  %x = mul i32 %a, 17
+  %y = add i32 %x, %b
+  ret i32 %y
+}
+)ir");
+    Function *F = M->getFunction("vm_env");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1776);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::runtime_seal::getChannel(
+        *M, morok::passes::runtime_seal::kEnvBindingChannel, rng);
+
+    CHECK(morok::passes::virtualizeModule(
+        *M,
+        {/*probability=*/100, /*max_functions=*/1,
+         /*max_instructions=*/64, /*max_registers=*/96},
+        rng));
+
+    Function *Helper = M->getFunction("morok.vm.vm_env.exec");
+    REQUIRE(Helper);
+    CHECK(M->getGlobalVariable("morok.seal.root.env_binding", true) !=
+          nullptr);
+    CHECK(countNamedInstructions(*Helper, "morok.vm.env.seal.kdf.key") >= 1u);
+    CHECK(countNamedInstructions(*Helper, "morok.vm.key.env_binding") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("virtualizeModule lifts multi-block branching control flow") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -9864,6 +9897,107 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("envBindingKdfModule emits host collector and seal binding") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() {
+entry:
+  ret i32 0
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(146001);
+    morok::ir::IRRandom rng(engine);
+
+    morok::passes::EnvBindingKdfParams params;
+    params.expected_digest = "0x1122334455667788";
+    params.min_factors = 2;
+    CHECK(morok::passes::envBindingKdfModule(*M, params, rng));
+
+    GlobalVariable *Seal = M->getGlobalVariable(
+        "morok.seal.root.env_binding", /*AllowInternal=*/true);
+    REQUIRE(Seal != nullptr);
+    CHECK(M->getGlobalVariable("morok.envbind.accum", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.envbind.mask", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.envbind.done", true) != nullptr);
+
+    Function *Feed = M->getFunction("morok.envbind.feed");
+    Function *Finish = M->getFunction("morok.envbind.finish");
+    Function *Ctor = M->getFunction("morok.envbind.collect");
+    REQUIRE(Feed != nullptr);
+    REQUIRE(Finish != nullptr);
+    REQUIRE(Ctor != nullptr);
+    CHECK(Feed->hasFnAttribute(Attribute::NoInline));
+    CHECK(Finish->hasFnAttribute(Attribute::NoInline));
+    CHECK(countCallsTo(*Ctor, "morok.envbind.feed") >= 4u);
+    CHECK(countCallsTo(*Ctor, "morok.envbind.finish") == 1u);
+    CHECK(hasInlineAsmCall(*Ctor));
+    CHECK(M->getGlobalVariable("llvm.global_ctors", true) != nullptr);
+    CHECK_FALSE(hasReadableByteString(*M, "/etc/machine-id"));
+    CHECK_FALSE(hasReadableByteString(*M, "/sys/class/dmi"));
+
+    bool feedLoadsIdentityByte = false;
+    for (Instruction &I : instructions(*Feed))
+        if (auto *LI = dyn_cast<LoadInst>(&I))
+            feedLoadsIdentityByte |= LI->isVolatile() &&
+                                     LI->getName() ==
+                                         "morok.envbind.feed.byte";
+    CHECK(feedLoadsIdentityByte);
+    CHECK(countNamedInstructions(*Finish,
+                                 "morok.envbind.finish.contribution") == 1u);
+    CHECK(countNamedInstructions(*Finish,
+                                 "morok.envbind.finish.expected.diff") == 1u);
+    CHECK(countNamedInstructions(*Finish,
+                                 "morok.envbind.finish.missing.nonzero") == 1u);
+    CHECK(countNamedInstructions(*Finish, "morok.envbind.finish.seal.next") ==
+          1u);
+
+    bool finishStoresSeal = false;
+    bool finishScrubsAccum = false;
+    for (Instruction &I : instructions(*Finish)) {
+        if (auto *SI = dyn_cast<StoreInst>(&I)) {
+            finishStoresSeal |= SI->getPointerOperand() == Seal;
+            finishScrubsAccum |=
+                SI->getPointerOperand()->getName() == "morok.envbind.accum";
+        }
+    }
+    CHECK(finishStoresSeal);
+    CHECK(finishScrubsAccum);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("envBindingKdfModule honors feed API mode and seal opt-out") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() {
+entry:
+  ret i32 0
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(146002);
+    morok::ir::IRRandom rng(engine);
+
+    morok::passes::EnvBindingKdfParams params;
+    params.mode = "feed_api";
+    params.bind_to_runtime_seal = false;
+    params.virtualize_helpers = false;
+    CHECK(morok::passes::envBindingKdfModule(*M, params, rng));
+
+    Function *Feed = M->getFunction("morok.envbind.feed");
+    Function *Finish = M->getFunction("morok.envbind.finish");
+    REQUIRE(Feed != nullptr);
+    REQUIRE(Finish != nullptr);
+    CHECK(Feed->hasFnAttribute("morok.envbind.no_vm"));
+    CHECK(Finish->hasFnAttribute("morok.envbind.no_vm"));
+    CHECK(M->getFunction("morok.envbind.collect") == nullptr);
+    CHECK(M->getGlobalVariable("morok.seal.root.env_binding", true) ==
+          nullptr);
+    CHECK(countNamedInstructions(*Finish, "morok.envbind.finish.seal.next") ==
+          0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("tracerAttestationModule emits direct Linux buddy share producer") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -10013,16 +10147,21 @@ entry:
 
     auto engine = morok::core::Xoshiro256pp::fromSeed(95201);
     morok::ir::IRRandom rng(engine);
+    morok::passes::runtime_seal::getChannel(
+        *M, morok::passes::runtime_seal::kEnvBindingChannel, rng);
     morok::passes::SealedBlobParams params;
     params.max_blobs = 2;
     params.max_blob_bytes = 32;
-    params.key_sources = {"runtime_seal", "external_proof", "code_region"};
+    params.key_sources = {"runtime_seal", "external_proof", "env_binding",
+                          "code_region"};
     params.runtime_keyed_magic = true;
     params.magic_bytes = 4;
     CHECK(morok::passes::sealedBlobModule(*M, params, rng));
 
     CHECK_FALSE(hasReadableByteString(*M, "magic"));
     CHECK(M->getGlobalVariable("morok.seal.root.anti_debug", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.seal.root.env_binding", true) !=
+          nullptr);
     GlobalVariable *Cipher =
         M->getGlobalVariable("morok.sealed.cipher.0", true);
     REQUIRE(Cipher != nullptr);
@@ -10034,6 +10173,7 @@ entry:
     REQUIRE(Open != nullptr);
     CHECK(Open->hasFnAttribute(Attribute::NoInline));
     CHECK(countNamedInstructions(*Open, "morok.sealed.cipher.byte") >= 1u);
+    CHECK(countNamedInstructions(*Open, "morok.sealed.env.key") >= 1u);
     CHECK(countNamedInstructions(*Open, "morok.sealed.addr.zero") >= 1u);
     CHECK(countNamedInstructions(*Open, "morok.sealed.tag.window") >= 1u);
     CHECK(countNamedInstructions(*Open, "morok.sealed.tag.poison") >= 1u);
@@ -14276,6 +14416,13 @@ TEST_CASE("stringEncryptModule falls back to per-string decryptors") {
     CHECK(countGlobals(*M, "morok.cloak.seed") == 0u);
     CHECK(countGlobals(*M, "morok.str.kdf.blob") == 1u);
     CHECK(M->getFunction("morok.str.seed") != nullptr);
+    morok::passes::runtime_seal::getChannel(
+        *M, morok::passes::runtime_seal::kEnvBindingChannel, rng);
+    CHECK(morok::passes::bindStringSeedToSeal(*M, rng));
+    Function *Seed = M->getFunction("morok.str.seed");
+    REQUIRE(Seed != nullptr);
+    CHECK(countNamedInstructions(*Seed, "morok.str.seed.env.kdf.key") >= 1u);
+    CHECK(countNamedInstructions(*Seed, "morok.str.seed.env.bound") >= 1u);
     CHECK(countGlobals(*M, "morok.k1") == 0u);
     CHECK(M->getFunction("morok.gf8mul") == nullptr);
     CHECK(countFunctions(*M, "morok.strdec") == 2u);
