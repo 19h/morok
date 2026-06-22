@@ -2736,6 +2736,13 @@ Function *linuxPtraceStopCoherenceCheck(Module &M, ir::IRRandom &rng,
         SB, M, wchan.buf, wchan.n,
         {'p', 't', 'r', 'a', 'c', 'e', '_', 's', 't', 'o', 'p'}, 64,
         "morok.antidbg.ptrace_stop.wchan.ptrace_stop");
+    Value *wchanSignalStop = parseFixedBufferPrefix(
+        SB, M, wchan.buf, wchan.n,
+        {'d', 'o', '_', 's', 'i', 'g', 'n', 'a', 'l', '_', 's', 't', 'o', 'p'},
+        64, "morok.antidbg.ptrace_stop.wchan.signal_stop");
+    wchanStop =
+        SB.CreateOr(wchanStop, wchanSignalStop,
+                    "morok.antidbg.ptrace_stop.wchan.stop");
     StatStateIR statState = parseLinuxStatState(
         SB, M, stat.buf, stat.n, 1024, "morok.antidbg.ptrace_stop.stat");
     Value *status = SB.CreateCall(StatusFn->getFunctionType(), StatusFn, {},

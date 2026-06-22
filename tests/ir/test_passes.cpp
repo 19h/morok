@@ -18253,6 +18253,9 @@ entry:
     CHECK(countNamedInstructions(
               *PtraceStop,
               "morok.antidbg.ptrace_stop.wchan.ptrace_stop") >= 1u);
+    CHECK(countNamedInstructions(
+              *PtraceStop,
+              "morok.antidbg.ptrace_stop.wchan.signal_stop") >= 1u);
     CHECK(countNamedInstructions(*PtraceStop,
                                  "morok.antidbg.ptrace_stop.stat.state.stop") >=
           1u);
@@ -18605,6 +18608,7 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "gcore"));
     CHECK_FALSE(hasReadableByteString(*M, "TracerPid"));
     CHECK_FALSE(hasReadableByteString(*M, "ptrace_stop"));
+    CHECK_FALSE(hasReadableByteString(*M, "do_signal_stop"));
     CHECK_FALSE(hasReadableByteString(*M, "SigBlk"));
     CHECK_FALSE(hasReadableByteString(*M, "SigCgt"));
     CHECK_FALSE(hasReadableByteString(*M, ".nscd-cache"));
@@ -18706,6 +18710,9 @@ define i32 @main() { ret i32 0 }
               *Sigmask, "morok.antidbg.sigmask.rt_sigprocmask") >= 1u);
     CHECK(countNamedInstructions(
               *PtraceStop, "morok.antidbg.ptrace_stop.kernel.uname") >= 1u);
+    CHECK(countNamedInstructions(
+              *PtraceStop,
+              "morok.antidbg.ptrace_stop.wchan.signal_stop") >= 1u);
     CHECK(countCallsTo(*Ctor, "morok.antidbg.parent") == 1u);
     CHECK(countNamedInstructions(*Parent, "morok.antidbg.parent.comm.hit") >=
           1u);
