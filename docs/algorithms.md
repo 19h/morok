@@ -68,12 +68,12 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   *Mutable* string globals (which the program may itself read/write or decrypt in
   place) use exactly this in-place model so the program observes the recovered
   plaintext.
-- Generated `morok.decoy.str.*` globals are deliberately excluded from string
-  encryption.  They are honeypot plaintext for cheap triage tools like
-  `strings`; encrypting them removes the bait and makes the binary look cleaner
-  than intended.  The decoy globals, fake logging functions, and volatile log
-  state are also retained through `llvm.used` / `llvm.compiler.used` so linker
-  garbage collection does not accidentally discard the bait.
+- Generated `morok.decoy.str.*` globals are routed through the same encryption
+  path as real strings.  The fake logging functions consume bytes into volatile
+  hash state without capturing the pointer, so decoys can use per-callsite stack
+  materialization and cannot be bucketed as cheap plaintext bait.  The logging
+  functions and volatile log state are retained through `llvm.used` /
+  `llvm.compiler.used` so linker garbage collection does not discard the calls.
 - Length hiding: read-only C strings are padded to a random multiple of a block
   size (16) with random trailing bytes before encryption.  The runtime consumer
   still stops at the original NUL, but the stored array size no longer reveals

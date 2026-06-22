@@ -1893,14 +1893,16 @@ entry:
     for (Function &F : *M)
         if (F.getName().starts_with("morok.dbglog.")) {
             CHECK(countVolatileAccesses(F) == 2u);
+            CHECK(F.getArg(0)->hasNoCaptureAttr());
             CHECK(constantReferencesGlobal(LinkerUsed->getInitializer(), &F));
             CHECK(constantReferencesGlobal(CompilerUsed->getInitializer(), &F));
         }
 
     for (GlobalVariable &GV : M->globals()) {
         if (GV.getName().starts_with("morok.decoy.str.")) {
-            CHECK(constantReferencesGlobal(LinkerUsed->getInitializer(), &GV));
-            CHECK(
+            CHECK_FALSE(
+                constantReferencesGlobal(LinkerUsed->getInitializer(), &GV));
+            CHECK_FALSE(
                 constantReferencesGlobal(CompilerUsed->getInitializer(), &GV));
             continue;
         }
@@ -1909,7 +1911,7 @@ entry:
         auto *StateTy = dyn_cast<StructType>(GV.getValueType());
         REQUIRE(StateTy != nullptr);
         REQUIRE(StateTy->getNumElements() == 2u);
-        CHECK(StateTy->getElementType(0)->isPointerTy());
+        CHECK(StateTy->getElementType(0)->isIntegerTy(64));
         CHECK(StateTy->getElementType(1)->isIntegerTy(32));
         CHECK(constantReferencesGlobal(LinkerUsed->getInitializer(), &GV));
         CHECK(constantReferencesGlobal(CompilerUsed->getInitializer(), &GV));
@@ -14577,22 +14579,33 @@ TEST_CASE("stringEncryptModule preserves address space alignment and section") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
-TEST_CASE(
-    "stringEncryptModule leaves generated decoy strings as plaintext bait") {
+TEST_CASE("stringEncryptModule encrypts generated decoy strings") {
     LLVMContext ctx;
-    auto M = std::make_unique<Module>("decoy-strings", ctx);
-    M->setTargetTriple(Triple("x86_64-unknown-linux-gnu"));
-    makePrivateString(*M, "morok.decoy.str.test", "decoy-visible");
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+
+define i32 @main(i32 %x) {
+entry:
+  %y = add i32 %x, 1
+  ret i32 %y
+}
+)ir");
+
+    auto decoyEngine = morok::core::Xoshiro256pp::fromSeed(0xDEC0);
+    morok::ir::IRRandom decoyRng(decoyEngine);
+    CHECK(morok::passes::decoyStringsModule(*M, decoyRng));
+    const std::size_t decoyGlobals = countGlobals(*M, "morok.decoy.str.");
+    REQUIRE(decoyGlobals >= 6u);
+    CHECK(hasReadableByteString(*M, "RD-CNWDI"));
 
     auto engine = morok::core::Xoshiro256pp::fromSeed(308);
     morok::ir::IRRandom rng(engine);
-    CHECK_FALSE(morok::passes::stringEncryptModule(
+    CHECK(morok::passes::stringEncryptModule(
         *M, morok::passes::StrEncParams{}, rng));
 
-    GlobalVariable *Decoy = M->getGlobalVariable("morok.decoy.str.test", true);
-    REQUIRE(Decoy);
-    CHECK(Decoy->isConstant());
-    CHECK(hasReadableByteString(*M, "decoy-visible"));
+    CHECK_FALSE(hasReadableByteString(*M, "RD-CNWDI"));
+    CHECK_FALSE(hasReadableByteString(*M, "UF6"));
+    CHECK(countFunctions(*M, "morok.strsite") >= decoyGlobals);
     CHECK(countFunctions(*M, "morok.strdec") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }

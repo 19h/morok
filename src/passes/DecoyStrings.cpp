@@ -24,6 +24,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Support/ModRef.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <array>
@@ -150,7 +151,9 @@ std::vector<Function *> createLogFunctions(
     for (std::size_t i = 0; i < kLogFnNames.size(); ++i) {
         // Volatile state global — each function writes here, preventing
         // the optimizer from proving the call has no side effects.
-        auto *stateTy = StructType::get(Ctx, {ptrTy, i32Ty});
+        auto *i8Ty = Type::getInt8Ty(Ctx);
+        auto *i64Ty = Type::getInt64Ty(Ctx);
+        auto *stateTy = StructType::get(Ctx, {i64Ty, i32Ty});
         auto *state = new GlobalVariable(
             M, stateTy, false, GlobalValue::PrivateLinkage,
             ConstantAggregateZero::get(stateTy),
@@ -161,18 +164,53 @@ std::vector<Function *> createLogFunctions(
         auto *fn = Function::Create(logFnTy, GlobalValue::InternalLinkage,
                                     kLogFnNames[i], &M);
         fn->setDoesNotThrow();
+        fn->addParamAttr(0,
+                         Attribute::getWithCaptureInfo(Ctx,
+                                                       CaptureInfo::none()));
+        fn->addParamAttr(0, Attribute::ReadOnly);
         Retained.push_back(fn);
 
-        BasicBlock *bb = BasicBlock::Create(Ctx, "entry", fn);
+        BasicBlock *entry = BasicBlock::Create(Ctx, "entry", fn);
+        BasicBlock *loop = BasicBlock::Create(Ctx, "morok.dbglog.hash", fn);
+        BasicBlock *body =
+            BasicBlock::Create(Ctx, "morok.dbglog.hash.body", fn);
+        BasicBlock *done =
+            BasicBlock::Create(Ctx, "morok.dbglog.hash.done", fn);
         auto argIt = fn->arg_begin();
         Value *msgPtr = &*argIt++;
         Value *level = &*argIt;
 
-        IRBuilder<NoFolder> B(bb);
+        IRBuilder<NoFolder> B(entry);
+        B.CreateBr(loop);
 
-        // Store the message pointer to the first slot (volatile).
+        B.SetInsertPoint(loop);
+        PHINode *idx = B.CreatePHI(i64Ty, 2, "morok.dbglog.i");
+        PHINode *acc = B.CreatePHI(i64Ty, 2, "morok.dbglog.h");
+        idx->addIncoming(ConstantInt::get(i64Ty, 0), entry);
+        acc->addIncoming(ConstantInt::get(i64Ty, 0x9E3779B97F4A7C15ULL),
+                         entry);
+        Value *chPtr = B.CreateInBoundsGEP(i8Ty, msgPtr, {idx},
+                                           "morok.dbglog.ch.ptr");
+        Value *ch = B.CreateLoad(i8Ty, chPtr, "morok.dbglog.ch");
+        B.CreateCondBr(B.CreateICmpEQ(ch, ConstantInt::get(i8Ty, 0),
+                                      "morok.dbglog.done"),
+                       done, body);
+
+        B.SetInsertPoint(body);
+        Value *mix = B.CreateXor(acc, B.CreateZExt(ch, i64Ty),
+                                 "morok.dbglog.mix");
+        mix = B.CreateMul(mix, ConstantInt::get(i64Ty, 0x100000001B3ULL),
+                          "morok.dbglog.mix");
+        Value *next =
+            B.CreateAdd(idx, ConstantInt::get(i64Ty, 1), "morok.dbglog.next");
+        idx->addIncoming(next, body);
+        acc->addIncoming(mix, body);
+        B.CreateBr(loop);
+
+        B.SetInsertPoint(done);
+        // Store the consumed message hash to the first slot (volatile).
         auto *slot0 = B.CreateStructGEP(stateTy, state, 0);
-        auto *s0 = B.CreateStore(msgPtr, slot0);
+        auto *s0 = B.CreateStore(acc, slot0);
         s0->setVolatile(true);
 
         // Store the level to the second slot (volatile).
@@ -275,7 +313,6 @@ bool decoyStringsModule(Module &M, ir::IRRandom &rng) {
             GlobalValue::PrivateLinkage, strConst,
             "morok.decoy.str." + Twine(i));
         strGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-        retained.push_back(strGV);
 
         // Pick a random target function and a random position in its entry
         // block (but always after the first instruction, so allocas stay

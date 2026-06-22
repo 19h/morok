@@ -99,9 +99,11 @@ bool eligible(const GlobalVariable &gv) {
         return false;
     if (gv.getName().starts_with("llvm."))
         return false;
-    // Decoy string globals are deliberate bait: they must remain discoverable
-    // by cheap triage such as `strings` while real user strings are encrypted.
-    if (gv.getName().starts_with("morok."))
+    // Most generated globals carry runtime metadata, not user-visible strings.
+    // Decoy string globals are intentionally routed through the same encryption
+    // path as real strings so static triage cannot bucket them as fake bait.
+    if (gv.getName().starts_with("morok.") &&
+        !gv.getName().starts_with("morok.decoy.str."))
         return false;
     // Ordinary custom-section user strings are still encrypted, but sections
     // with loader/runtime/read-only semantics are left untouched.
