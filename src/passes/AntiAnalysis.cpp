@@ -19865,6 +19865,8 @@ Function *windowsTextChecksumProbe(Module &M, GlobalVariable *State,
     Value *int3Seen =
         DB.CreateICmpNE(int3Count, ConstantInt::get(i32, 0),
                         "morok.win.textchk.int3.seen");
+    Value *int3Patched =
+        DB.CreateAnd(int3Seen, cleanMismatch, "morok.win.textchk.int3.patched");
     foldState(DB, State, hashFinal, rng.next(), "morok.win.textchk.hash.mix");
     foldState(DB, State, cleanResult, rng.next(),
               "morok.win.textchk.clean.diff.mix");
@@ -19872,7 +19874,7 @@ Function *windowsTextChecksumProbe(Module &M, GlobalVariable *State,
              "morok.win.textchk.clean");
     foldState(DB, State, int3Count, rng.next(),
               "morok.win.textchk.int3.count.mix");
-    foldEnforcedFlag(DB, State, int3Seen, 0x58CB4E1A93D627B5ULL,
+    foldEnforcedFlag(DB, State, int3Patched, 0x58CB4E1A93D627B5ULL,
                      "morok.win.textchk.int3");
     DB.CreateBr(retBB);
 

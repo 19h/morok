@@ -17821,6 +17821,8 @@ entry:
                                  "morok.win.textchk.clean.mismatch") >= 1u);
     CHECK(countNamedInstructions(*WinText,
                                  "morok.win.textchk.int3.seen") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.int3.patched") >= 1u);
     CHECK(countNamedInstructions(*PeText,
                                  "morok.win.pe.text.execute.flag") >= 1u);
     CHECK(countNamedInstructions(*PeText, "morok.win.pe.text.pack") >= 1u);
@@ -17837,7 +17839,18 @@ entry:
     Instruction *Int3Seen =
         findNamedInstruction(*WinText, "morok.win.textchk.int3.seen");
     REQUIRE(Int3Seen != nullptr);
-    CHECK(valueFeedsNamedInstruction(Int3Seen, "morok.seal.fold.anti_debug"));
+    Instruction *CleanMismatch =
+        findNamedInstruction(*WinText, "morok.win.textchk.clean.mismatch");
+    REQUIRE(CleanMismatch != nullptr);
+    Instruction *Int3Patched =
+        findNamedInstruction(*WinText, "morok.win.textchk.int3.patched");
+    REQUIRE(Int3Patched != nullptr);
+    CHECK(valueFeedsNamedInstruction(Int3Seen,
+                                     "morok.win.textchk.int3.patched"));
+    CHECK(valueFeedsNamedInstruction(CleanMismatch,
+                                     "morok.win.textchk.int3.patched"));
+    CHECK(valueFeedsNamedInstruction(Int3Patched,
+                                     "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*WinDr, "morok.win.dr.ntdll") >= 1u);
     CHECK(countNamedInstructions(*WinDr,
                                  "morok.win.dr.ntgetcontextthread") >= 1u);
@@ -17944,6 +17957,8 @@ entry:
                                  "morok.win.textchk.clean.mismatch") >= 1u);
     CHECK(countNamedInstructions(*WinText,
                                  "morok.win.textchk.int3.seen") >= 1u);
+    CHECK(countNamedInstructions(*WinText,
+                                 "morok.win.textchk.int3.patched") >= 1u);
     CHECK(countNamedInstructions(*PeText, "morok.win.pe.text.pack") >= 1u);
     CHECK(countNamedInstructions(*CleanText,
                                  "morok.win.textchk.clean.path.buffer") >= 1u);
@@ -17953,7 +17968,18 @@ entry:
     Instruction *Int3Seen =
         findNamedInstruction(*WinText, "morok.win.textchk.int3.seen");
     REQUIRE(Int3Seen != nullptr);
-    CHECK(valueFeedsNamedInstruction(Int3Seen, "morok.seal.fold.anti_debug"));
+    Instruction *CleanMismatch =
+        findNamedInstruction(*WinText, "morok.win.textchk.clean.mismatch");
+    REQUIRE(CleanMismatch != nullptr);
+    Instruction *Int3Patched =
+        findNamedInstruction(*WinText, "morok.win.textchk.int3.patched");
+    REQUIRE(Int3Patched != nullptr);
+    CHECK(valueFeedsNamedInstruction(Int3Seen,
+                                     "morok.win.textchk.int3.patched"));
+    CHECK(valueFeedsNamedInstruction(CleanMismatch,
+                                     "morok.win.textchk.int3.patched"));
+    CHECK(valueFeedsNamedInstruction(Int3Patched,
+                                     "morok.seal.fold.anti_debug"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
