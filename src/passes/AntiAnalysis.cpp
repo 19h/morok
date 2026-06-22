@@ -9341,6 +9341,107 @@ Value *bufferHasLiteral(IRBuilder<> &B, Module &M, AllocaInst *Buf, Value *N,
     return out;
 }
 
+Value *bufferHasLinuxAnonymousExecMap(IRBuilder<> &B, Module &M,
+                                      AllocaInst *Buf, Value *N,
+                                      std::uint64_t MaxBytes,
+                                      const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    Function *fn = B.GetInsertBlock()->getParent();
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *ip = intPtrTy(M);
+
+    auto *foundSlot = B.CreateAlloca(i1, nullptr, Name + ".found");
+    auto *idxSlot = B.CreateAlloca(ip, nullptr, Name + ".idx.slot");
+    B.CreateStore(ConstantInt::getFalse(ctx), foundSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 1), idxSlot)->setVolatile(true);
+
+    auto *loopBB = BasicBlock::Create(ctx, (Name + ".loop").str(), fn);
+    auto *bodyBB = BasicBlock::Create(ctx, (Name + ".body").str(), fn);
+    auto *hitBB = BasicBlock::Create(ctx, (Name + ".hit").str(), fn);
+    auto *nextBB = BasicBlock::Create(ctx, (Name + ".next").str(), fn);
+    auto *doneBB = BasicBlock::Create(ctx, (Name + ".done").str(), fn);
+    B.CreateBr(loopBB);
+
+    IRBuilder<> LB(loopBB);
+    auto *found = LB.CreateLoad(i1, foundSlot, Name + ".found.v");
+    found->setVolatile(true);
+    auto *idx = LB.CreateLoad(ip, idxSlot, Name + ".idx");
+    idx->setVolatile(true);
+    Value *end = LB.CreateAdd(idx, ConstantInt::get(ip, 86), Name + ".end");
+    Value *withinRead = LB.CreateICmpSLE(end, N, Name + ".within.read");
+    Value *withinBuf = LB.CreateICmpULE(end, ConstantInt::get(ip, MaxBytes),
+                                        Name + ".within.buf");
+    LB.CreateCondBr(LB.CreateAnd(LB.CreateAnd(withinRead, withinBuf),
+                                 LB.CreateNot(found)),
+                    bodyBB, doneBB);
+
+    IRBuilder<> MB(bodyBB);
+    auto isChar = [&](Value *V, char C) {
+        return MB.CreateICmpEQ(
+            V, ConstantInt::get(i8, static_cast<unsigned char>(C)));
+    };
+    Value *prev = loadAt(MB, M, i8, Buf,
+                         MB.CreateSub(idx, ConstantInt::get(ip, 1)),
+                         Name + ".prev");
+    Value *p0 = loadAt(MB, M, i8, Buf, idx, Name + ".perm0");
+    Value *p1 = loadAt(MB, M, i8, Buf,
+                       MB.CreateAdd(idx, ConstantInt::get(ip, 1)),
+                       Name + ".perm1");
+    Value *p2 = loadAt(MB, M, i8, Buf,
+                       MB.CreateAdd(idx, ConstantInt::get(ip, 2)),
+                       Name + ".perm2");
+    Value *p3 = loadAt(MB, M, i8, Buf,
+                       MB.CreateAdd(idx, ConstantInt::get(ip, 3)),
+                       Name + ".perm3");
+    Value *after = loadAt(MB, M, i8, Buf,
+                          MB.CreateAdd(idx, ConstantInt::get(ip, 4)),
+                          Name + ".after");
+    Value *permWindow = MB.CreateAnd(
+        MB.CreateAnd(isChar(prev, ' '), isChar(after, ' ')),
+        MB.CreateAnd(
+            MB.CreateAnd(MB.CreateOr(isChar(p0, 'r'), isChar(p0, '-')),
+                         MB.CreateOr(isChar(p1, 'w'), isChar(p1, '-'))),
+            MB.CreateAnd(MB.CreateOr(isChar(p2, 'x'), isChar(p2, '-')),
+                         MB.CreateOr(isChar(p3, 'p'), isChar(p3, 's')))),
+        Name + ".perms");
+    Value *seenSlash = ConstantInt::getFalse(ctx);
+    Value *seenNewline = ConstantInt::getFalse(ctx);
+    for (std::uint64_t off = 5; off < 86; ++off) {
+        Value *ch = loadAt(MB, M, i8, Buf,
+                           MB.CreateAdd(idx, ConstantInt::get(ip, off)),
+                           Name + ".path.ch");
+        Value *beforeNl = MB.CreateNot(seenNewline);
+        seenSlash =
+            MB.CreateOr(seenSlash, MB.CreateAnd(beforeNl, isChar(ch, '/')),
+                        Name + ".path.slash");
+        seenNewline =
+            MB.CreateOr(seenNewline, isChar(ch, '\n'), Name + ".path.nl");
+    }
+    Value *anonExec = MB.CreateAnd(
+        permWindow,
+        MB.CreateAnd(MB.CreateAnd(isChar(p2, 'x'), isChar(p3, 'p')),
+                     MB.CreateNot(seenSlash)),
+        Name + ".anon.exec");
+    MB.CreateCondBr(anonExec, hitBB, nextBB);
+
+    IRBuilder<> HB(hitBB);
+    HB.CreateStore(ConstantInt::getTrue(ctx), foundSlot)->setVolatile(true);
+    HB.CreateBr(doneBB);
+
+    IRBuilder<> NB(nextBB);
+    NB.CreateStore(NB.CreateAdd(idx, ConstantInt::get(ip, 1),
+                                Name + ".idx.next"),
+                   idxSlot)
+        ->setVolatile(true);
+    NB.CreateBr(loopBB);
+
+    B.SetInsertPoint(doneBB);
+    auto *out = B.CreateLoad(i1, foundSlot, Name + ".out");
+    out->setVolatile(true);
+    return out;
+}
+
 bool linuxDbiParentSyscalls(const Triple &TT, std::uint32_t &Getppid,
                             std::uint32_t &Readlinkat) {
     switch (TT.getArch()) {
@@ -10049,7 +10150,10 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
 
     IRBuilder<> B(entry);
     AllocaInst *diff = B.CreateAlloca(i64, nullptr, "morok.antihook.dbi.diff");
+    AllocaInst *jitDiff =
+        B.CreateAlloca(i64, nullptr, "morok.antihook.dbi.jit.diff");
     B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), jitDiff)->setVolatile(true);
     ReadFileIR maps =
         emitReadSmallFile(B, M, fn, "/proc/self/maps", 8192, rng, TT);
 
@@ -10089,13 +10193,39 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
     Value *mapQemu = bufferHasLiteral(
         MB, M, maps.buf, maps.n, {0x71, 0x65, 0x6d, 0x75, 0x2d}, 8192,
         "morok.antihook.dbi.maps.qemu");
+    Value *mapPin = bufferHasLiteral(
+        MB, M, maps.buf, maps.n, {0x70, 0x69, 0x6e, 0x62, 0x69, 0x6e}, 8192,
+        "morok.antihook.dbi.maps.pinbin");
+    Value *mapLibPin = bufferHasLiteral(
+        MB, M, maps.buf, maps.n, {0x6c, 0x69, 0x62, 0x70, 0x69, 0x6e}, 8192,
+        "morok.antihook.dbi.maps.libpin");
     Value *mapSig = MB.CreateOr(
         MB.CreateOr(MB.CreateOr(mapSig0, mapSig1), mapSig2),
         MB.CreateOr(MB.CreateOr(mapDyn, mapQbdi),
                     MB.CreateOr(MB.CreateOr(mapVgPreload, mapValgrind),
-                                mapQemu)),
+                                MB.CreateOr(mapQemu,
+                                            MB.CreateOr(mapPin, mapLibPin)))),
         "morok.antihook.dbi.maps.sig");
     incrementDiff(MB, diff, mapSig, "morok.antihook.dbi.maps");
+    Value *mapJitCache = bufferHasLiteral(
+        MB, M, maps.buf, maps.n,
+        {0x6a, 0x69, 0x74, 0x2d, 0x63, 0x61, 0x63, 0x68, 0x65}, 8192,
+        "morok.antihook.dbi.jit.maps.jitcache");
+    Value *mapCodeCache = bufferHasLiteral(
+        MB, M, maps.buf, maps.n,
+        {0x63, 0x6f, 0x64, 0x65, 0x2d, 0x63, 0x61, 0x63, 0x68, 0x65}, 8192,
+        "morok.antihook.dbi.jit.maps.codecache");
+    Value *mapTcgCache = bufferHasLiteral(
+        MB, M, maps.buf, maps.n, {0x74, 0x63, 0x67, 0x2d}, 8192,
+        "morok.antihook.dbi.jit.maps.tcgcache");
+    Value *mapAnonExec = bufferHasLinuxAnonymousExecMap(
+        MB, M, maps.buf, maps.n, 8192,
+        "morok.antihook.dbi.jit.maps.anon");
+    Value *mapJitShape =
+        MB.CreateOr(MB.CreateOr(mapJitCache, mapCodeCache),
+                    MB.CreateOr(mapTcgCache, mapAnonExec),
+                    "morok.antihook.dbi.jit.maps.shape");
+    incrementDiff(MB, jitDiff, mapJitShape, "morok.antihook.dbi.jit.maps");
     MB.CreateBr(afterMapsBB);
 
     IRBuilder<> TB(afterMapsBB);
@@ -10257,7 +10387,20 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
     PB.CreateBr(retBB);
 
     IRBuilder<> RB(retBB);
-    emitRetDiff(RB, diff);
+    auto *hard = RB.CreateLoad(i64, diff, "morok.antihook.dbi.diff.hard");
+    hard->setVolatile(true);
+    auto *soft =
+        RB.CreateLoad(i64, jitDiff, "morok.antihook.dbi.jit.diff.soft");
+    soft->setVolatile(true);
+    Value *packedHard =
+        RB.CreateAnd(hard, ConstantInt::get(i64, 0xffffffffULL),
+                     "morok.antihook.dbi.diff.pack.hard");
+    Value *packedSoft = RB.CreateShl(
+        RB.CreateAnd(soft, ConstantInt::get(i64, 0xffffffffULL),
+                     "morok.antihook.dbi.jit.diff.pack.soft"),
+        ConstantInt::get(i64, 32), "morok.antihook.dbi.jit.diff.shift");
+    RB.CreateRet(RB.CreateOr(packedHard, packedSoft,
+                             "morok.antihook.dbi.diff.ret"));
     return fn;
 }
 
@@ -21058,15 +21201,28 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng) {
     }
     if (Function *dbi = linuxDbiSignatureProbe(M, rng, tt)) {
         Value *diff = B.CreateCall(dbi, {}, "morok.antihook.dbi.diff");
+        Value *hardDiff =
+            B.CreateAnd(diff, ConstantInt::get(B.getInt64Ty(), 0xffffffffULL),
+                        "morok.antihook.dbi.hard.diff");
+        Value *jitDiff = B.CreateLShr(
+            diff, ConstantInt::get(B.getInt64Ty(), 32),
+            "morok.antihook.dbi.jit.soft.diff");
         Value *changed =
-            B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0),
+            B.CreateICmpNE(hardDiff, ConstantInt::get(B.getInt64Ty(), 0),
                            "morok.corroborate.dbi.changed");
+        Value *jitChanged =
+            B.CreateICmpNE(jitDiff, ConstantInt::get(B.getInt64Ty(), 0),
+                           "morok.corroborate.dbi.jit.changed");
         addHardGateSignal(B, gate, changed, 3, 0xC68E4901B2F75AD3ULL,
                           "morok.gate.dbi");
+        addSoftGateSignal(B, gate, jitChanged, 1, 0xE35D91A7C42B608FULL,
+                          "morok.gate.dbi.jit");
         foldState(B, state, diff, 0x1B89E4C76F20DA53ULL,
                   "morok.antihook.dbi");
         foldEnforcedFlag(B, state, changed, 0xF4A7812C39D60E5BULL,
                          "morok.antihook.dbi.changed");
+        foldFlag(B, state, jitChanged, 0x9C41B7E620D83AF5ULL,
+                 "morok.antihook.dbi.jit.changed");
     }
     if (Function *negativeTiming = negativeTimingProbe(M, rng, tt)) {
         Value *diff =

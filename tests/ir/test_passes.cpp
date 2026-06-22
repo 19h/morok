@@ -16370,6 +16370,23 @@ entry:
     CHECK(countNamedInstructions(*Dbi,
                                  "morok.antihook.dbi.maps.valgrind") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.maps.qemu") >= 1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.maps.pinbin") >=
+          1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.maps.libpin") >=
+          1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.jit.maps.jitcache") >=
+          1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.jit.maps.codecache") >=
+          1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.jit.maps.tcgcache") >=
+          1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.jit.maps.anon") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.jit.diff.shift") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.thread.sig") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.port.sig0") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.dlsym.dr") >= 1u);
@@ -16394,6 +16411,11 @@ entry:
     REQUIRE(DbiChanged != nullptr);
     CHECK(valueFeedsNamedInstruction(DbiChanged,
                                      "morok.seal.fold.anti_debug"));
+    Instruction *DbiJitChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.dbi.jit.changed");
+    REQUIRE(DbiJitChanged != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(DbiJitChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Smc, "morok.antihook.dbi.smc.gate.arm") >=
           1u);
     std::size_t smcGateStores = 0;
@@ -16508,6 +16530,7 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.gate.sandbox.soft") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.negative.timing.soft") >=
           1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.dbi.jit.soft") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.mprotect.hard") >= 1u);
     CHECK(countNamedInstructions(*Ctor,
                                  "morok.corroborate.mprotect.changed") >= 1u);
@@ -16568,6 +16591,11 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "vgpreload_"));
     CHECK_FALSE(hasReadableByteString(*M, "valgrind"));
     CHECK_FALSE(hasReadableByteString(*M, "qemu-"));
+    CHECK_FALSE(hasReadableByteString(*M, "pinbin"));
+    CHECK_FALSE(hasReadableByteString(*M, "libpin"));
+    CHECK_FALSE(hasReadableByteString(*M, "jit-cache"));
+    CHECK_FALSE(hasReadableByteString(*M, "code-cache"));
+    CHECK_FALSE(hasReadableByteString(*M, "tcg-"));
     CHECK_FALSE(hasReadableByteString(*M, "QEMU"));
     CHECK_FALSE(hasReadableByteString(*M, "TCGTCGTCGTCG"));
     CHECK_FALSE(hasReadableByteString(*M, "dr_app_start"));
