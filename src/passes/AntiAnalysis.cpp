@@ -3526,7 +3526,7 @@ DarwinCsopsSignals emitDarwinCsopsCheck(IRBuilder<> &B, Module &M,
         B.CreateICmpNE(B.CreateAnd(flags, ConstantInt::get(i32, 0x10000000)),
                        ConstantInt::get(i32, 0));
     Value *ok = B.CreateICmpEQ(rc, ConstantInt::get(i32, 0));
-    Value *dbgFlag = B.CreateAnd(ok, debugged);
+    Value *dbgFlag = B.CreateAnd(ok, debugged, "morok.antidbg.csops.debugged");
     foldFlag(B, State, dbgFlag, 0xF1D88C6C72195307ULL, "morok.antidbg.csops");
     sealFold(B, dbgFlag, 0xF1D88C6C72195307ULL);
 
@@ -4095,6 +4095,139 @@ void emitDarwinGetTaskAllowCheck(IRBuilder<> &B, Module &M,
         sealFold(B, present, 0xC421BE9D735AF062ULL);
 }
 
+Function *darwinCsrPolicyProbe(Module &M, ir::IRRandom &rng) {
+    if (Function *existing = M.getFunction("morok.antidbg.darwin.csr_policy"))
+        return existing;
+    const Triple TT(M.getTargetTriple());
+    if (!TT.isOSDarwin())
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i32, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antidbg.darwin.csr_policy", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *resolveBB = BasicBlock::Create(ctx, "resolve", fn);
+    auto *callBB = BasicBlock::Create(ctx, "call", fn);
+    auto *readBB = BasicBlock::Create(ctx, "read", fn);
+    auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
+
+    FunctionCallee dlopen =
+        M.getOrInsertFunction("dlopen", FunctionType::get(ptr, {ptr, i32}, false));
+    FunctionCallee dlsym =
+        M.getOrInsertFunction("dlsym", FunctionType::get(ptr, {ptr, ptr}, false));
+
+    IRBuilder<> B(entry);
+    auto *config = B.CreateAlloca(i32, nullptr, "morok.antidbg.csr.config");
+    B.CreateStore(ConstantInt::get(i32, 0), config);
+    Value *selfHandle = B.CreateCall(
+        dlopen, {ConstantPointerNull::get(ptr), ConstantInt::get(i32, 1)},
+        "morok.antidbg.csr.dlopen");
+    B.CreateCondBr(
+        B.CreateICmpNE(selfHandle, ConstantPointerNull::get(ptr),
+                       "morok.antidbg.csr.dlopen.ready"),
+        resolveBB, ret0BB);
+
+    IRBuilder<> RB(resolveBB);
+    Value *csrName = ir::emitCloakedSymbol(RB, M, "csr_get_active_config", rng);
+    Value *csrGetActive =
+        RB.CreateCall(dlsym, {selfHandle, csrName}, "morok.antidbg.csr.resolve");
+    RB.CreateCondBr(
+        RB.CreateICmpNE(csrGetActive, ConstantPointerNull::get(ptr),
+                        "morok.antidbg.csr.resolve.ready"),
+        callBB, ret0BB);
+
+    IRBuilder<> CB(callBB);
+    auto *csrTy = FunctionType::get(i32, {ptr}, false);
+    Value *rc = CB.CreateCall(
+        csrTy,
+        CB.CreateIntToPtr(csrGetActive, ptr, "morok.antidbg.csr.resolve.ptr"),
+        {config}, "morok.antidbg.csr.call");
+    CB.CreateCondBr(
+        CB.CreateICmpEQ(rc, ConstantInt::get(i32, 0),
+                        "morok.antidbg.csr.call.ok"),
+        readBB, ret0BB);
+
+    IRBuilder<> VB(readBB);
+    constexpr std::uint32_t kCsrDebugMask = 0x18;
+    constexpr std::uint32_t kCsrFullDisableMask = 0x77f;
+    Value *value = VB.CreateLoad(i32, config, "morok.antidbg.csr.value");
+    Value *debugBits =
+        VB.CreateAnd(value, ConstantInt::get(i32, kCsrDebugMask),
+                     "morok.antidbg.csr.debug.bits");
+    Value *relaxed =
+        VB.CreateICmpNE(debugBits, ConstantInt::get(i32, 0),
+                        "morok.antidbg.csr.task_kernel_debug");
+    Value *fullMask =
+        VB.CreateAnd(value, ConstantInt::get(i32, kCsrFullDisableMask),
+                     "morok.antidbg.csr.full.mask");
+    Value *fullDisabled =
+        VB.CreateICmpEQ(fullMask, ConstantInt::get(i32, kCsrFullDisableMask),
+                        "morok.antidbg.csr.full_disabled");
+    Value *relaxedBit = VB.CreateSelect(relaxed, ConstantInt::get(i32, 2),
+                                        ConstantInt::get(i32, 0),
+                                        "morok.antidbg.csr.relaxed.bit");
+    Value *fullBit = VB.CreateSelect(fullDisabled, ConstantInt::get(i32, 4),
+                                     ConstantInt::get(i32, 0),
+                                     "morok.antidbg.csr.full.bit");
+    Value *result =
+        VB.CreateOr(ConstantInt::get(i32, 1), relaxedBit,
+                    "morok.antidbg.csr.result.relaxed");
+    result = VB.CreateOr(result, fullBit, "morok.antidbg.csr.result");
+    VB.CreateRet(result);
+
+    IRBuilder<> R0(ret0BB);
+    R0.CreateRet(ConstantInt::get(i32, 0));
+
+    return fn;
+}
+
+void emitDarwinCsrPolicyCheck(IRBuilder<> &B, Module &M, GlobalVariable *State,
+                              ir::IRRandom &rng, Value *CsDebugged) {
+    Function *probe = darwinCsrPolicyProbe(M, rng);
+    if (!probe)
+        return;
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    Value *bits = B.CreateCall(probe->getFunctionType(), probe, {},
+                               "morok.antidbg.csr.bits");
+    Value *ready =
+        B.CreateICmpNE(B.CreateAnd(bits, ConstantInt::get(i32, 1)),
+                       ConstantInt::get(i32, 0), "morok.antidbg.csr.ready");
+    Value *relaxed =
+        B.CreateICmpNE(B.CreateAnd(bits, ConstantInt::get(i32, 2)),
+                       ConstantInt::get(i32, 0),
+                       "morok.antidbg.csr.policy.relaxed");
+    Value *fullDisabled =
+        B.CreateICmpNE(B.CreateAnd(bits, ConstantInt::get(i32, 4)),
+                       ConstantInt::get(i32, 0),
+                       "morok.antidbg.csr.policy.full_disabled");
+    foldFlag(B, State, ready, 0xF065A9724C9B713DULL,
+             "morok.antidbg.csr.ready");
+    foldFlag(B, State, relaxed, 0xAD3D1808D6E2B94FULL,
+             "morok.antidbg.csr.relaxed");
+    foldFlag(B, State, fullDisabled, 0x63B2F5C0A9173E6DULL,
+             "morok.antidbg.csr.full_disabled");
+    if (!CsDebugged)
+        return;
+    Value *corroborated =
+        B.CreateAnd(relaxed, CsDebugged, "morok.antidbg.csr.csops.debugged");
+    foldFlag(B, State, corroborated, 0x9E56CF43875B2011ULL,
+             "morok.antidbg.csr.csops");
+    sealFold(B, corroborated, 0x9E56CF43875B2011ULL);
+    Value *fullCorroborated =
+        B.CreateAnd(fullDisabled, CsDebugged,
+                    "morok.antidbg.csr.csops.full_disabled");
+    foldFlag(B, State, fullCorroborated, 0x7A4152DB0E89C3B5ULL,
+             "morok.antidbg.csr.csops.full");
+    sealFold(B, fullCorroborated, 0x7A4152DB0E89C3B5ULL);
+}
+
 bool darwinDebugStateShape(const Triple &TT, std::uint32_t &Flavor,
                            std::uint32_t &Count32, std::uint32_t &Words64) {
     switch (TT.getArch()) {
@@ -4306,6 +4439,7 @@ void emitDarwinAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
         sealFold(B, coherent, 0xD13C7A5E92604B8FULL);
     }
     emitDarwinGetTaskAllowCheck(B, M, State, rng, DistributionSigned);
+    emitDarwinCsrPolicyCheck(B, M, State, rng, csops.debugged);
     emitDarwinDyldCensus(B, M, State, rng);
     emitDarwinImageCensus(B, M, State);
     if (StartLiveWatchers) {

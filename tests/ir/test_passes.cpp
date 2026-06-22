@@ -349,6 +349,44 @@ void checkDarwinExceptionPortVariableReplyParser(Function &F, StringRef Prefix) 
     checkMissing(".reply.descriptors.ok");
 }
 
+bool hasReadableByteString(Module &M, StringRef needle);
+
+void checkDarwinCsrPolicySignals(Module &M, Function &F) {
+    Function *Csr = M.getFunction("morok.antidbg.darwin.csr_policy");
+    REQUIRE(Csr != nullptr);
+    CHECK(M.getFunction("csr_get_active_config") == nullptr);
+    CHECK(countNamedInstructions(*Csr, "morok.antidbg.csr.dlopen") >= 1u);
+    CHECK(countNamedInstructions(*Csr, "morok.antidbg.csr.resolve") >= 1u);
+    CHECK(countNamedInstructions(*Csr, "morok.antidbg.csr.call") >= 1u);
+    CHECK(countNamedInstructions(*Csr, "morok.antidbg.csr.debug.bits") >= 1u);
+    CHECK(countNamedInstructions(*Csr,
+                                 "morok.antidbg.csr.task_kernel_debug") >= 1u);
+    CHECK(countNamedInstructions(*Csr, "morok.antidbg.csr.full_disabled") >=
+          1u);
+    CHECK(countNamedInstructions(F, "morok.antidbg.csr.ready") >= 1u);
+    Instruction *Relaxed =
+        findNamedInstruction(F, "morok.antidbg.csr.policy.relaxed");
+    Instruction *FullDisabled =
+        findNamedInstruction(F, "morok.antidbg.csr.policy.full_disabled");
+    Instruction *Corroborated =
+        findNamedInstruction(F, "morok.antidbg.csr.csops.debugged");
+    Instruction *FullCorroborated =
+        findNamedInstruction(F, "morok.antidbg.csr.csops.full_disabled");
+    REQUIRE(Relaxed != nullptr);
+    REQUIRE(FullDisabled != nullptr);
+    REQUIRE(Corroborated != nullptr);
+    REQUIRE(FullCorroborated != nullptr);
+    CHECK(valueFeedsNamedInstruction(Relaxed,
+                                     "morok.antidbg.csr.csops.debugged"));
+    CHECK(valueFeedsNamedInstruction(FullDisabled,
+                                     "morok.antidbg.csr.csops.full_disabled"));
+    CHECK(valueFeedsNamedInstruction(Corroborated,
+                                     "morok.seal.fold.anti_debug"));
+    CHECK(valueFeedsNamedInstruction(FullCorroborated,
+                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(hasReadableByteString(M, "csr_get_active_config"));
+}
+
 void checkGateScoring(Function &F) {
     CHECK(countNamedInstructions(F, "morok.gate.hard.score") >= 1u);
     CHECK(countNamedInstructions(F, "morok.gate.soft.score") >= 1u);
@@ -18490,6 +18528,7 @@ entry:
     CHECK(M->getFunction("sysctl") == nullptr);
     CHECK(M->getFunction("csops") == nullptr);
     CHECK(M->getFunction("task_get_exception_ports") == nullptr);
+    CHECK(M->getFunction("csr_get_active_config") == nullptr);
     CHECK(M->getFunction("SecTaskCreateFromSelf") == nullptr);
     CHECK(M->getFunction("SecTaskCopyValueForEntitlement") == nullptr);
     CHECK(M->getFunction("CFStringCreateWithCString") == nullptr);
@@ -18521,6 +18560,7 @@ entry:
     checkDarwinCsopsTaskAllowSignals(*Ctor);
     checkDarwinCsopsTaskAllowSignals(*Probe);
     checkDarwinCsopsExceptionCoherence(*Ctor);
+    checkDarwinCsrPolicySignals(*M, *Ctor);
     CHECK(functionHasConstantInt(*Ctor, 0x7FE));
     CHECK(M->getFunction("task_threads") != nullptr);
     CHECK(M->getFunction("thread_get_state") != nullptr);
@@ -18755,6 +18795,7 @@ entry:
     CHECK(M->getFunction("sysctl") == nullptr);
     CHECK(M->getFunction("csops") == nullptr);
     CHECK(M->getFunction("task_get_exception_ports") == nullptr);
+    CHECK(M->getFunction("csr_get_active_config") == nullptr);
     CHECK(M->getFunction("getenv") != nullptr);
     CHECK(M->getFunction("_NSGetEnviron") != nullptr);
     Function *RawEnv = M->getFunction("morok.antidbg.rawenv.contains");
@@ -18793,6 +18834,7 @@ entry:
     checkDarwinCsopsTaskAllowSignals(*M->getFunction("morok.antidbg"));
     checkDarwinCsopsTaskAllowSignals(*M->getFunction("morok.antidbg.probe"));
     checkDarwinCsopsExceptionCoherence(*M->getFunction("morok.antidbg"));
+    checkDarwinCsrPolicySignals(*M, *M->getFunction("morok.antidbg"));
     CHECK(functionHasConstantInt(*M->getFunction("morok.antidbg"), 0x7FE));
     // M3: the loaded-image census enumerates dyld images to flag foreign
     // dylibs.
