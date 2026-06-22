@@ -17386,6 +17386,16 @@ entry:
     CHECK(countNamedAllocas(*Maps, "morok.antihook.env.read.count") == 1u);
     CHECK(countNamedAllocas(*Maps, "morok.antihook.env.preload.state") == 1u);
     CHECK(countNamedAllocas(*Maps, "morok.antihook.env.audit.state") == 1u);
+    CHECK(countNamedAllocas(*Maps, "morok.antihook.env.frida.state") == 1u);
+    CHECK(countNamedAllocas(*Maps,
+                            "morok.antihook.env.dynamo.home.state") == 1u);
+    CHECK(countNamedAllocas(*Maps,
+                            "morok.antihook.env.dynamo.options.state") == 1u);
+    CHECK(countNamedAllocas(
+              *Maps, "morok.antihook.env.dynamo.autoinject.state") == 1u);
+    CHECK(countNamedAllocas(*Maps, "morok.antihook.env.pin.root.state") == 1u);
+    CHECK(countNamedAllocas(*Maps, "morok.antihook.env.pin.ld.state") == 1u);
+    CHECK(countNamedAllocas(*Maps, "morok.antihook.env.valgrind.state") == 1u);
     CHECK(
         hasNamedIcmpWithConstant(*Maps, "morok.antihook.env.read.limit", 16u));
     CHECK(countNamedInstructions(*Maps, "morok.antihook.env.read.next") >= 1u);
@@ -17397,7 +17407,27 @@ entry:
     CHECK(countNamedInstructions(*Maps, "morok.antihook.env.preload.hit") >=
           1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.env.audit.hit") >= 1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.frida.log.hit") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Maps, "morok.antihook.env.dynamo.home.hit") >= 1u);
+    CHECK(countNamedInstructions(
+              *Maps, "morok.antihook.env.dynamo.options.hit") >= 1u);
+    CHECK(countNamedInstructions(
+              *Maps, "morok.antihook.env.dynamo.autoinject.hit") >= 1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.pin.root.hit") >=
+          1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.pin.ld.hit") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Maps, "morok.antihook.env.valgrind.opts.hit") >= 1u);
+    CHECK(countNamedInstructions(*Maps, "morok.antihook.env.dbi") >= 1u);
     CHECK_FALSE(functionHasConstantInt(*Maps, 8181u));
+    Instruction *CensusChanged =
+        findNamedInstruction(*Ctor, "morok.negative.modules.extra");
+    REQUIRE(CensusChanged != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(CensusChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*M->getFunction("morok.antihook"),
                                  "morok.antihook.prologue.x86.hit") >= 1u);
     CHECK(M->getFunction("morok.antihook.static.atbase") == nullptr);
@@ -17408,6 +17438,13 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "/proc/%ld/exe"));
     CHECK_FALSE(hasReadableByteString(*M, "LD_PRELOAD"));
     CHECK_FALSE(hasReadableByteString(*M, "LD_AUDIT"));
+    CHECK_FALSE(hasReadableByteString(*M, "FRIDA_LOG_LEVEL"));
+    CHECK_FALSE(hasReadableByteString(*M, "DYNAMORIO_HOME"));
+    CHECK_FALSE(hasReadableByteString(*M, "DYNAMORIO_OPTIONS"));
+    CHECK_FALSE(hasReadableByteString(*M, "DYNAMORIO_AUTOINJECT"));
+    CHECK_FALSE(hasReadableByteString(*M, "PIN_ROOT"));
+    CHECK_FALSE(hasReadableByteString(*M, "PIN_APP_LD_LIBRARY_PATH"));
+    CHECK_FALSE(hasReadableByteString(*M, "VALGRIND_OPTS"));
     CHECK_FALSE(hasReadableByteString(*M, "libdynamorio"));
     CHECK_FALSE(hasReadableByteString(*M, "libQBDI"));
     CHECK_FALSE(hasReadableByteString(*M, "vgpreload_"));
@@ -17939,6 +17976,8 @@ entry:
     REQUIRE(Fpu != nullptr);
     Function *Smc = M->getFunction("morok.antihook.dbi.smc");
     REQUIRE(Smc != nullptr);
+    Function *WinEnv = M->getFunction("morok.win.env.dbi");
+    REQUIRE(WinEnv != nullptr);
     Function *WriteWatch = M->getFunction("morok.win.writewatch.probe");
     REQUIRE(WriteWatch != nullptr);
     Function *Direct6 = M->getFunction("morok.win.sys.direct6");
@@ -17965,6 +18004,8 @@ entry:
     CHECK(M->getFunction("GetWriteWatch") == nullptr);
     CHECK(M->getFunction("ResetWriteWatch") == nullptr);
     CHECK(M->getFunction("VirtualAlloc") == nullptr);
+    CHECK(M->getFunction("GetEnvironmentStringsA") == nullptr);
+    CHECK(M->getFunction("GetEnvironmentStringsW") == nullptr);
     CHECK(hasInlineAsmCall(*Sandbox));
     CHECK(hasInlineAsmCall(*Emu));
     CHECK(hasInlineAsmCall(*Fpu));
@@ -18017,6 +18058,25 @@ entry:
     CHECK(countNamedInstructions(*Smc, "morok.antihook.dbi.smc.trip") >= 1u);
     checkSmcCoherencyProbe(*Smc);
     checkWindowsSmcThreadRaceProbe(*M, *Smc);
+    CHECK(countNamedInstructions(*WinEnv, "morok.win.env.dbi.frida.log.hit") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *WinEnv, "morok.win.env.dbi.dynamo.home.hit") >= 1u);
+    CHECK(countNamedInstructions(
+              *WinEnv, "morok.win.env.dbi.dynamo.options.hit") >= 1u);
+    CHECK(countNamedInstructions(
+              *WinEnv, "morok.win.env.dbi.dynamo.autoinject.hit") >= 1u);
+    CHECK(countNamedInstructions(*WinEnv, "morok.win.env.dbi.pin.root.hit") >=
+          1u);
+    CHECK(countNamedInstructions(*WinEnv, "morok.win.env.dbi.pin.ld.hit") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *WinEnv, "morok.win.env.dbi.valgrind.opts.hit") >= 1u);
+    Instruction *WinEnvChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.win.env.dbi.changed");
+    REQUIRE(WinEnvChanged != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(WinEnvChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*WriteWatch,
                                  "morok.win.writewatch.ntalloc.pack") >= 1u);
     CHECK(countNamedInstructions(*WriteWatch,
@@ -19452,6 +19512,15 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Ctor, "morok.antidbg.dyld.raw.found") >= 8u);
     CHECK(countNamedInstructions(*Ctor, "morok.antidbg.dyld.coherence") >= 8u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.dbi.env.raw.found") >=
+          7u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.dbi.env.coherence") >=
+          7u);
+    Instruction *DarwinDbiEnv =
+        findNamedInstruction(*Ctor, "morok.antidbg.dbi.env.found");
+    REQUIRE(DarwinDbiEnv != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(DarwinDbiEnv,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Ctor, "morok.imgcensus.library.apple") >=
           1u);
     CHECK(countNamedInstructions(
@@ -19521,11 +19590,18 @@ entry:
     CHECK(M->getFunction("pthread_detach") != nullptr);
     CHECK(M->getFunction("sleep") != nullptr);
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_INSERT_LIBRARIES"));
+    CHECK_FALSE(hasReadableByteString(*M, "FRIDA_LOG_LEVEL"));
+    CHECK_FALSE(hasReadableByteString(*M, "DYNAMORIO_HOME"));
+    CHECK_FALSE(hasReadableByteString(*M, "DYNAMORIO_OPTIONS"));
+    CHECK_FALSE(hasReadableByteString(*M, "DYNAMORIO_AUTOINJECT"));
+    CHECK_FALSE(hasReadableByteString(*M, "PIN_ROOT"));
+    CHECK_FALSE(hasReadableByteString(*M, "PIN_APP_LD_LIBRARY_PATH"));
+    CHECK_FALSE(hasReadableByteString(*M, "VALGRIND_OPTS"));
     CHECK_FALSE(hasReadableByteString(*M, "/Library/Apple"));
     CHECK_FALSE(hasReadableByteString(*M, "get-task-allow"));
     auto [cloakStores, opaqueCloakStores] =
         countStoresToBaseWithOpaqueSource(*M, "morok.cloak.buf");
-    CHECK(cloakStores >= 8u);
+    CHECK(cloakStores >= 15u);
     CHECK(opaqueCloakStores == cloakStores);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
@@ -19731,6 +19807,15 @@ entry:
     CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
                                  "morok.antidbg.dyld.coherence") >= 8u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
+                                 "morok.antidbg.dbi.env.raw.found") >= 7u);
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
+                                 "morok.antidbg.dbi.env.coherence") >= 7u);
+    Instruction *DarwinDbiEnv = findNamedInstruction(
+        *M->getFunction("morok.antidbg"), "morok.antidbg.dbi.env.found");
+    REQUIRE(DarwinDbiEnv != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(DarwinDbiEnv,
+                                           "morok.seal.fold.anti_debug"));
+    CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
                                  "morok.imgcensus.library.apple") >= 1u);
     CHECK(countNamedInstructions(
               *M->getFunction("morok.antidbg"),
@@ -19792,14 +19877,21 @@ entry:
     CHECK(countNamedInstructions(
               *M->getFunction("morok.watchdog.heartbeat.watch"),
               "morok.watchdog.heartbeat.missing") >= 1u);
-    CHECK(countGlobals(*M, "morok.cloak.c") >= 8u);
+    CHECK(countGlobals(*M, "morok.cloak.c") >= 15u);
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_INSERT_LIBRARIES"));
+    CHECK_FALSE(hasReadableByteString(*M, "FRIDA_LOG_LEVEL"));
+    CHECK_FALSE(hasReadableByteString(*M, "DYNAMORIO_HOME"));
+    CHECK_FALSE(hasReadableByteString(*M, "DYNAMORIO_OPTIONS"));
+    CHECK_FALSE(hasReadableByteString(*M, "DYNAMORIO_AUTOINJECT"));
+    CHECK_FALSE(hasReadableByteString(*M, "PIN_ROOT"));
+    CHECK_FALSE(hasReadableByteString(*M, "PIN_APP_LD_LIBRARY_PATH"));
+    CHECK_FALSE(hasReadableByteString(*M, "VALGRIND_OPTS"));
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_PRINT"));
     CHECK_FALSE(hasReadableByteString(*M, "/Library/Apple"));
     CHECK_FALSE(hasReadableByteString(*M, "get-task-allow"));
     auto [cloakStores, opaqueCloakStores] =
         countStoresToBaseWithOpaqueSource(*M, "morok.cloak.buf");
-    CHECK(cloakStores >= 8u);
+    CHECK(cloakStores >= 15u);
     CHECK(opaqueCloakStores == cloakStores);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }

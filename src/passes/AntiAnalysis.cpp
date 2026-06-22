@@ -13,6 +13,7 @@
 #include "morok/passes/RuntimeSeal.hpp"
 #include "morok/runtime/PlatformRuntime.hpp"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Attributes.h"
@@ -6274,6 +6275,43 @@ void emitDarwinDyldCensus(IRBuilder<> &B, Module &M, GlobalVariable *State,
                        "morok.antianalysis.dyld.coherence");
         sealFold(B, coherence, salts[i] ^ 0xA6D3674B9C12F0E5ULL);
     }
+
+    constexpr std::array<StringLiteral, 7> dbiNames = {
+        StringLiteral("FRIDA_LOG_LEVEL"),
+        StringLiteral("DYNAMORIO_HOME"),
+        StringLiteral("DYNAMORIO_OPTIONS"),
+        StringLiteral("DYNAMORIO_AUTOINJECT"),
+        StringLiteral("PIN_ROOT"),
+        StringLiteral("PIN_APP_LD_LIBRARY_PATH"),
+        StringLiteral("VALGRIND_OPTS"),
+    };
+    constexpr std::array<std::uint64_t, 7> dbiSalts = {
+        0x9A68F1327C40D5BEULL, 0xD4810E2B6F3A59C7ULL,
+        0x3E7B2C91A540F86DULL, 0xB15C4079E2D63AF8ULL,
+        0x6C29F5A18E03B74DULL, 0xF07D36B94C12A5E8ULL,
+        0x24E8A9C75F3D610BULL,
+    };
+    for (std::size_t i = 0; i < dbiNames.size(); ++i) {
+        Value *name = ir::emitCloakedSymbol(B, M, dbiNames[i], rng);
+        Value *getenvFound = B.CreateICmpNE(
+            B.CreateCall(getenv, {name}, "morok.antidbg.dbi.env.getenv.value"),
+            ConstantPointerNull::get(ptr),
+            "morok.antidbg.dbi.env.getenv.found");
+        Value *rawFound = B.CreateCall(
+            rawEnvContains,
+            {name, ConstantInt::get(
+                       i32, static_cast<std::uint32_t>(dbiNames[i].size()))},
+            "morok.antidbg.dbi.env.raw.found");
+        Value *found =
+            B.CreateOr(getenvFound, rawFound, "morok.antidbg.dbi.env.found");
+        Value *coherence = B.CreateXor(getenvFound, rawFound,
+                                       "morok.antidbg.dbi.env.coherence");
+        foldFlag(B, State, found, dbiSalts[i], "morok.antidbg.dbi.env",
+                 /*ScoreSoftSignal=*/true);
+        foldFlag(B, State, coherence,
+                 dbiSalts[i] ^ 0xA7D43E90B26C51F8ULL,
+                 "morok.antidbg.dbi.env.coherence");
+    }
 }
 
 // M3: enumerate loaded images and flag any that is NOT the main executable
@@ -9944,10 +9982,30 @@ Function *linuxMapsCensusProbe(Module &M, ir::IRRandom &rng,
         B.CreateAlloca(i32, nullptr, "morok.antihook.env.preload.state");
     AllocaInst *envAuditState =
         B.CreateAlloca(i32, nullptr, "morok.antihook.env.audit.state");
+    AllocaInst *envFridaState =
+        B.CreateAlloca(i32, nullptr, "morok.antihook.env.frida.state");
+    AllocaInst *envDynamoHomeState =
+        B.CreateAlloca(i32, nullptr, "morok.antihook.env.dynamo.home.state");
+    AllocaInst *envDynamoOptionsState =
+        B.CreateAlloca(i32, nullptr,
+                       "morok.antihook.env.dynamo.options.state");
+    AllocaInst *envDynamoAutoinjectState = B.CreateAlloca(
+        i32, nullptr, "morok.antihook.env.dynamo.autoinject.state");
+    AllocaInst *envPinRootState =
+        B.CreateAlloca(i32, nullptr, "morok.antihook.env.pin.root.state");
+    AllocaInst *envPinLdState =
+        B.CreateAlloca(i32, nullptr, "morok.antihook.env.pin.ld.state");
+    AllocaInst *envValgrindState =
+        B.CreateAlloca(i32, nullptr, "morok.antihook.env.valgrind.state");
     B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
     B.CreateStore(ConstantInt::get(ip, 0), envReads);
     B.CreateStore(ConstantInt::get(i32, 0), envPreloadState);
     B.CreateStore(ConstantInt::get(i32, 0), envAuditState);
+    for (AllocaInst *state :
+         {envFridaState, envDynamoHomeState, envDynamoOptionsState,
+          envDynamoAutoinjectState, envPinRootState, envPinLdState,
+          envValgrindState})
+        B.CreateStore(ConstantInt::get(i32, 0), state);
     Value *path = ir::emitCloakedSymbol(B, M, "/proc/self/maps", rng);
 
     std::uint32_t ptraceNr = 0;
@@ -10138,7 +10196,7 @@ Function *linuxMapsCensusProbe(Module &M, ir::IRRandom &rng,
     Value *envCh = loadAt(ESB, M, i8, buf, envIdx, "morok.antihook.env.ch");
     Value *envIsNul = ESB.CreateICmpEQ(
         envCh, ConstantInt::get(i8, 0), "morok.antihook.env.nul");
-    auto expectedMarkerByte = [&](Value *State, StringRef Marker,
+    auto expectedMarkerByte = [&](Value *State, ArrayRef<std::uint8_t> Marker,
                                   StringRef Prefix) -> Value * {
         Value *expected = ConstantInt::get(i8, 0);
         for (int k = static_cast<int>(Marker.size()) - 1; k >= 0; --k) {
@@ -10148,14 +10206,14 @@ Function *linuxMapsCensusProbe(Module &M, ir::IRRandom &rng,
             expected = ESB.CreateSelect(
                 atState,
                 ConstantInt::get(
-                    i8, static_cast<unsigned>(
-                            static_cast<unsigned char>(
-                                Marker[static_cast<std::size_t>(k)]))),
+                    i8,
+                    static_cast<unsigned>(Marker[static_cast<std::size_t>(k)])),
                 expected, Twine(Prefix) + ".expected." + Twine(k));
         }
         return expected;
     };
-    auto advanceMarker = [&](AllocaInst *StateSlot, StringRef Marker,
+    auto advanceMarker = [&](AllocaInst *StateSlot,
+                             ArrayRef<std::uint8_t> Marker,
                              StringRef Prefix) -> Value * {
         Value *state =
             ESB.CreateLoad(i32, StateSlot, Twine(Prefix) + ".state.cur");
@@ -10185,12 +10243,68 @@ Function *linuxMapsCensusProbe(Module &M, ir::IRRandom &rng,
         return ESB.CreateAnd(ESB.CreateNot(envIsNul), hit,
                              Twine(Prefix) + ".hit.byte");
     };
-    Value *hitPreload = advanceMarker(envPreloadState, "LD_PRELOAD=",
+    constexpr std::array<std::uint8_t, 11> kEnvPreload = {
+        0x4c, 0x44, 0x5f, 0x50, 0x52, 0x45, 0x4c, 0x4f, 0x41, 0x44, 0x3d};
+    constexpr std::array<std::uint8_t, 9> kEnvAudit = {
+        0x4c, 0x44, 0x5f, 0x41, 0x55, 0x44, 0x49, 0x54, 0x3d};
+    constexpr std::array<std::uint8_t, 16> kEnvFridaLog = {
+        0x46, 0x52, 0x49, 0x44, 0x41, 0x5f, 0x4c, 0x4f,
+        0x47, 0x5f, 0x4c, 0x45, 0x56, 0x45, 0x4c, 0x3d};
+    constexpr std::array<std::uint8_t, 15> kEnvDynamoHome = {
+        0x44, 0x59, 0x4e, 0x41, 0x4d, 0x4f, 0x52, 0x49,
+        0x4f, 0x5f, 0x48, 0x4f, 0x4d, 0x45, 0x3d};
+    constexpr std::array<std::uint8_t, 18> kEnvDynamoOptions = {
+        0x44, 0x59, 0x4e, 0x41, 0x4d, 0x4f, 0x52, 0x49, 0x4f,
+        0x5f, 0x4f, 0x50, 0x54, 0x49, 0x4f, 0x4e, 0x53, 0x3d};
+    constexpr std::array<std::uint8_t, 21> kEnvDynamoAutoinject = {
+        0x44, 0x59, 0x4e, 0x41, 0x4d, 0x4f, 0x52, 0x49, 0x4f, 0x5f, 0x41,
+        0x55, 0x54, 0x4f, 0x49, 0x4e, 0x4a, 0x45, 0x43, 0x54, 0x3d};
+    constexpr std::array<std::uint8_t, 9> kEnvPinRoot = {
+        0x50, 0x49, 0x4e, 0x5f, 0x52, 0x4f, 0x4f, 0x54, 0x3d};
+    constexpr std::array<std::uint8_t, 24> kEnvPinLd = {
+        0x50, 0x49, 0x4e, 0x5f, 0x41, 0x50, 0x50, 0x5f,
+        0x4c, 0x44, 0x5f, 0x4c, 0x49, 0x42, 0x52, 0x41,
+        0x52, 0x59, 0x5f, 0x50, 0x41, 0x54, 0x48, 0x3d};
+    constexpr std::array<std::uint8_t, 14> kEnvValgrind = {
+        0x56, 0x41, 0x4c, 0x47, 0x52, 0x49, 0x4e,
+        0x44, 0x5f, 0x4f, 0x50, 0x54, 0x53, 0x3d};
+    Value *hitPreload = advanceMarker(envPreloadState, kEnvPreload,
                                       "morok.antihook.env.preload");
-    Value *hitAudit =
-        advanceMarker(envAuditState, "LD_AUDIT=", "morok.antihook.env.audit");
+    Value *hitAudit = advanceMarker(envAuditState, kEnvAudit,
+                                    "morok.antihook.env.audit");
+    Value *hitFrida = advanceMarker(envFridaState, kEnvFridaLog,
+                                    "morok.antihook.env.frida.log");
+    Value *hitDynamoHome =
+        advanceMarker(envDynamoHomeState, kEnvDynamoHome,
+                      "morok.antihook.env.dynamo.home");
+    Value *hitDynamoOptions =
+        advanceMarker(envDynamoOptionsState, kEnvDynamoOptions,
+                      "morok.antihook.env.dynamo.options");
+    Value *hitDynamoAutoinject =
+        advanceMarker(envDynamoAutoinjectState, kEnvDynamoAutoinject,
+                      "morok.antihook.env.dynamo.autoinject");
+    Value *hitPinRoot =
+        advanceMarker(envPinRootState, kEnvPinRoot,
+                      "morok.antihook.env.pin.root");
+    Value *hitPinLd = advanceMarker(envPinLdState, kEnvPinLd,
+                                    "morok.antihook.env.pin.ld");
+    Value *hitValgrind =
+        advanceMarker(envValgrindState, kEnvValgrind,
+                      "morok.antihook.env.valgrind.opts");
     incrementDiff(ESB, diff, hitPreload, "morok.antihook.env.preload");
     incrementDiff(ESB, diff, hitAudit, "morok.antihook.env.audit");
+    Value *hitDynamo = ESB.CreateOr(
+        ESB.CreateOr(hitDynamoHome, hitDynamoOptions,
+                     "morok.antihook.env.dynamo.home.options"),
+        hitDynamoAutoinject, "morok.antihook.env.dynamo");
+    Value *hitPin =
+        ESB.CreateOr(hitPinRoot, hitPinLd, "morok.antihook.env.pin");
+    Value *hitDbi = ESB.CreateOr(
+        ESB.CreateOr(hitFrida, hitDynamo, "morok.antihook.env.dbi.frida.dynamo"),
+        ESB.CreateOr(hitPin, hitValgrind,
+                     "morok.antihook.env.dbi.pin.valgrind"),
+        "morok.antihook.env.dbi");
+    incrementDiff(ESB, diff, hitDbi, "morok.antihook.env.dbi");
     ESB.CreateBr(envScanNextBB);
 
     IRBuilder<> ESN(envScanNextBB);
@@ -20165,6 +20279,226 @@ Function *windowsSuspiciousWideModuleName(Module &M) {
     return fn;
 }
 
+Function *windowsDbiEnvironmentProbe(Module &M, const Triple &TT) {
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
+        intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.win.env.dbi"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    constexpr std::uint32_t kWinEnvStateDead = 255;
+    constexpr std::uint32_t kWinEnvMaxChars = 8192;
+
+    Function *pebReader = windowsPebReader(M);
+    if (!pebReader)
+        return nullptr;
+
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.env.dbi", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *paramsBB = BasicBlock::Create(ctx, "params", fn);
+    auto *envBB = BasicBlock::Create(ctx, "env", fn);
+    auto *loopBB = BasicBlock::Create(ctx, "loop", fn);
+    auto *bodyBB = BasicBlock::Create(ctx, "body", fn);
+    auto *nextBB = BasicBlock::Create(ctx, "next", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *diff = B.CreateAlloca(i64, nullptr, "morok.win.env.dbi.diff");
+    AllocaInst *fridaState =
+        B.CreateAlloca(i32, nullptr, "morok.win.env.dbi.frida.state");
+    AllocaInst *dynamoHomeState =
+        B.CreateAlloca(i32, nullptr, "morok.win.env.dbi.dynamo.home.state");
+    AllocaInst *dynamoOptionsState =
+        B.CreateAlloca(i32, nullptr, "morok.win.env.dbi.dynamo.options.state");
+    AllocaInst *dynamoAutoinjectState =
+        B.CreateAlloca(i32, nullptr,
+                       "morok.win.env.dbi.dynamo.autoinject.state");
+    AllocaInst *pinRootState =
+        B.CreateAlloca(i32, nullptr, "morok.win.env.dbi.pin.root.state");
+    AllocaInst *pinLdState =
+        B.CreateAlloca(i32, nullptr, "morok.win.env.dbi.pin.ld.state");
+    AllocaInst *valgrindState =
+        B.CreateAlloca(i32, nullptr, "morok.win.env.dbi.valgrind.state");
+    B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
+    for (AllocaInst *state :
+         {fridaState, dynamoHomeState, dynamoOptionsState,
+          dynamoAutoinjectState, pinRootState, pinLdState, valgrindState})
+        B.CreateStore(ConstantInt::get(i32, 0), state);
+
+    Value *peb = B.CreateCall(pebReader, {}, "morok.win.env.dbi.peb");
+    B.CreateCondBr(B.CreateICmpNE(peb, ConstantInt::get(ip, 0),
+                                  "morok.win.env.dbi.peb.present"),
+                   paramsBB, retBB);
+
+    IRBuilder<> PB(paramsBB);
+    Value *pebPtr = PB.CreateIntToPtr(peb, ptr, "morok.win.env.dbi.peb.ptr");
+    Value *params =
+        loadAt(PB, M, ip, pebPtr, 0x20, "morok.win.env.dbi.params");
+    PB.CreateCondBr(PB.CreateICmpNE(params, ConstantInt::get(ip, 0),
+                                    "morok.win.env.dbi.params.present"),
+                    envBB, retBB);
+
+    IRBuilder<> EB(envBB);
+    Value *paramsPtr =
+        EB.CreateIntToPtr(params, ptr, "morok.win.env.dbi.params.ptr");
+    Value *env = loadAt(EB, M, ip, paramsPtr, 0x80,
+                        "morok.win.env.dbi.block");
+    EB.CreateCondBr(EB.CreateICmpNE(env, ConstantInt::get(ip, 0),
+                                    "morok.win.env.dbi.block.present"),
+                    loopBB, retBB);
+
+    IRBuilder<> LB(loopBB);
+    PHINode *idx = LB.CreatePHI(i32, 2, "morok.win.env.dbi.idx");
+    PHINode *prevNul = LB.CreatePHI(i8, 2, "morok.win.env.dbi.prev.nul");
+    idx->addIncoming(ConstantInt::get(i32, 0), envBB);
+    prevNul->addIncoming(ConstantInt::get(i8, 1), envBB);
+    LB.CreateCondBr(LB.CreateICmpULT(idx, ConstantInt::get(i32, kWinEnvMaxChars),
+                                     "morok.win.env.dbi.idx.live"),
+                    bodyBB, retBB);
+
+    IRBuilder<> WB(bodyBB);
+    Value *envPtr = WB.CreateIntToPtr(env, ptr, "morok.win.env.dbi.block.ptr");
+    Value *idxIp = WB.CreateZExt(idx, ip, "morok.win.env.dbi.idx.ip");
+    Value *ch = loadAt(WB, M, i16, envPtr,
+                       WB.CreateMul(idxIp, ConstantInt::get(ip, 2),
+                                    "morok.win.env.dbi.byte.off"),
+                       "morok.win.env.dbi.ch");
+    Value *low = WB.CreateAnd(WB.CreateZExt(ch, i32), ConstantInt::get(i32, 0xff),
+                              "morok.win.env.dbi.low");
+    Value *isUpper = WB.CreateAnd(
+        WB.CreateICmpUGE(low, ConstantInt::get(i32, 'A')),
+        WB.CreateICmpULE(low, ConstantInt::get(i32, 'Z')),
+        "morok.win.env.dbi.upper");
+    Value *lower = WB.CreateSelect(
+        isUpper, WB.CreateAdd(low, ConstantInt::get(i32, 'a' - 'A')), low,
+        "morok.win.env.dbi.lower");
+    Value *nul =
+        WB.CreateICmpEQ(ch, ConstantInt::get(i16, 0), "morok.win.env.dbi.nul");
+    Value *doubleNul =
+        WB.CreateAnd(WB.CreateICmpNE(prevNul, ConstantInt::get(i8, 0)), nul,
+                     "morok.win.env.dbi.done");
+
+    auto expectedMarkerChar = [&](Value *State, ArrayRef<std::uint8_t> Marker,
+                                  StringRef Prefix) -> Value * {
+        Value *expected = ConstantInt::get(i32, 0);
+        for (int k = static_cast<int>(Marker.size()) - 1; k >= 0; --k) {
+            Value *atState = WB.CreateICmpEQ(
+                State, ConstantInt::get(i32, static_cast<unsigned>(k)),
+                Twine(Prefix) + ".state." + Twine(k));
+            expected = WB.CreateSelect(
+                atState,
+                ConstantInt::get(
+                    i32,
+                    static_cast<unsigned>(Marker[static_cast<std::size_t>(k)])),
+                expected, Twine(Prefix) + ".expected." + Twine(k));
+        }
+        return expected;
+    };
+    auto advanceMarker = [&](AllocaInst *StateSlot,
+                             ArrayRef<std::uint8_t> Marker,
+                             StringRef Prefix) -> Value * {
+        Value *state =
+            WB.CreateLoad(i32, StateSlot, Twine(Prefix) + ".state.cur");
+        Value *alive = WB.CreateICmpNE(
+            state, ConstantInt::get(i32, kWinEnvStateDead),
+            Twine(Prefix) + ".state.live");
+        Value *expected = expectedMarkerChar(state, Marker, Prefix);
+        Value *matches =
+            WB.CreateICmpEQ(lower, expected, Twine(Prefix) + ".match");
+        Value *advance =
+            WB.CreateAnd(alive, matches, Twine(Prefix) + ".advance");
+        Value *advancedState =
+            WB.CreateAdd(state, ConstantInt::get(i32, 1),
+                         Twine(Prefix) + ".state.inc");
+        Value *nonNulState = WB.CreateSelect(
+            advance, advancedState, ConstantInt::get(i32, kWinEnvStateDead),
+            Twine(Prefix) + ".state.nonnull");
+        Value *nextState = WB.CreateSelect(
+            nul, ConstantInt::get(i32, 0), nonNulState,
+            Twine(Prefix) + ".state.next");
+        WB.CreateStore(nextState, StateSlot);
+        Value *hit =
+            WB.CreateICmpEQ(nextState,
+                            ConstantInt::get(
+                                i32, static_cast<unsigned>(Marker.size())),
+                            Twine(Prefix) + ".hit");
+        return WB.CreateAnd(WB.CreateNot(nul), hit, Twine(Prefix) + ".hit.byte");
+    };
+
+    constexpr std::array<std::uint8_t, 16> kFridaLog = {
+        0x66, 0x72, 0x69, 0x64, 0x61, 0x5f, 0x6c, 0x6f,
+        0x67, 0x5f, 0x6c, 0x65, 0x76, 0x65, 0x6c, 0x3d};
+    constexpr std::array<std::uint8_t, 15> kDynamoHome = {
+        0x64, 0x79, 0x6e, 0x61, 0x6d, 0x6f, 0x72, 0x69,
+        0x6f, 0x5f, 0x68, 0x6f, 0x6d, 0x65, 0x3d};
+    constexpr std::array<std::uint8_t, 18> kDynamoOptions = {
+        0x64, 0x79, 0x6e, 0x61, 0x6d, 0x6f, 0x72, 0x69, 0x6f,
+        0x5f, 0x6f, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x3d};
+    constexpr std::array<std::uint8_t, 21> kDynamoAutoinject = {
+        0x64, 0x79, 0x6e, 0x61, 0x6d, 0x6f, 0x72, 0x69, 0x6f, 0x5f, 0x61,
+        0x75, 0x74, 0x6f, 0x69, 0x6e, 0x6a, 0x65, 0x63, 0x74, 0x3d};
+    constexpr std::array<std::uint8_t, 9> kPinRoot = {
+        0x70, 0x69, 0x6e, 0x5f, 0x72, 0x6f, 0x6f, 0x74, 0x3d};
+    constexpr std::array<std::uint8_t, 24> kPinLd = {
+        0x70, 0x69, 0x6e, 0x5f, 0x61, 0x70, 0x70, 0x5f,
+        0x6c, 0x64, 0x5f, 0x6c, 0x69, 0x62, 0x72, 0x61,
+        0x72, 0x79, 0x5f, 0x70, 0x61, 0x74, 0x68, 0x3d};
+    constexpr std::array<std::uint8_t, 14> kValgrind = {
+        0x76, 0x61, 0x6c, 0x67, 0x72, 0x69, 0x6e,
+        0x64, 0x5f, 0x6f, 0x70, 0x74, 0x73, 0x3d};
+    Value *hitFrida =
+        advanceMarker(fridaState, kFridaLog, "morok.win.env.dbi.frida.log");
+    Value *hitDynamoHome = advanceMarker(
+        dynamoHomeState, kDynamoHome, "morok.win.env.dbi.dynamo.home");
+    Value *hitDynamoOptions = advanceMarker(
+        dynamoOptionsState, kDynamoOptions, "morok.win.env.dbi.dynamo.options");
+    Value *hitDynamoAutoinject =
+        advanceMarker(dynamoAutoinjectState, kDynamoAutoinject,
+                      "morok.win.env.dbi.dynamo.autoinject");
+    Value *hitPinRoot =
+        advanceMarker(pinRootState, kPinRoot, "morok.win.env.dbi.pin.root");
+    Value *hitPinLd =
+        advanceMarker(pinLdState, kPinLd, "morok.win.env.dbi.pin.ld");
+    Value *hitValgrind = advanceMarker(
+        valgrindState, kValgrind, "morok.win.env.dbi.valgrind.opts");
+    Value *hitDynamo = WB.CreateOr(
+        WB.CreateOr(hitDynamoHome, hitDynamoOptions,
+                    "morok.win.env.dbi.dynamo.home.options"),
+        hitDynamoAutoinject, "morok.win.env.dbi.dynamo");
+    Value *hitPin =
+        WB.CreateOr(hitPinRoot, hitPinLd, "morok.win.env.dbi.pin");
+    Value *hit = WB.CreateOr(
+        WB.CreateOr(hitFrida, hitDynamo, "morok.win.env.dbi.frida.dynamo"),
+        WB.CreateOr(hitPin, hitValgrind, "morok.win.env.dbi.pin.valgrind"),
+        "morok.win.env.dbi.hit");
+    incrementDiff(WB, diff, hit, "morok.win.env.dbi");
+    WB.CreateCondBr(doubleNul, retBB, nextBB);
+
+    IRBuilder<> NB(nextBB);
+    Value *nextIdx =
+        NB.CreateAdd(idx, ConstantInt::get(i32, 1), "morok.win.env.dbi.next");
+    Value *nulByte = NB.CreateZExt(nul, i8, "morok.win.env.dbi.nul.byte");
+    NB.CreateBr(loopBB);
+    idx->addIncoming(nextIdx, nextBB);
+    prevNul->addIncoming(nulByte, nextBB);
+
+    IRBuilder<> RB(retBB);
+    emitRetDiff(RB, diff);
+    return fn;
+}
+
 Function *windowsLdrSingleListAuditHelper(Module &M) {
     if (Function *existing = M.getFunction("morok.win.ldr.audit.list"))
         return existing;
@@ -29088,6 +29422,18 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                  "morok.antihook.census.changed");
         foldFlag(B, state, changed, 0xB2E746D9108CA53FULL,
                  "morok.negative.modules.extra");
+    }
+    if (Function *winEnv = windowsDbiEnvironmentProbe(M, tt)) {
+        Value *diff = B.CreateCall(winEnv, {}, "morok.win.env.dbi.diff");
+        Value *changed =
+            B.CreateICmpNE(diff, ConstantInt::get(B.getInt64Ty(), 0),
+                           "morok.corroborate.win.env.dbi.changed");
+        addSoftGateSignal(B, gate, changed, 1, 0xA0F3D65B914E27C8ULL,
+                          "morok.gate.win.env.dbi");
+        foldState(B, state, diff, 0x5D9E713AC80B42F6ULL,
+                  "morok.win.env.dbi");
+        foldFlag(B, state, changed, 0xE6A7402C9B51D38FULL,
+                 "morok.win.env.dbi.changed");
     }
     if (Function *wx = wxEnforceProbe(M, tt)) {
         Value *diff = B.CreateCall(wx, {}, "morok.antihook.wxorx.diff");
