@@ -16999,6 +16999,7 @@ entry:
     CHECK(hasInlineAsmCall(*Wx));
     CHECK(hasInlineAsmCall(*AntiDump));
     CHECK(M->getFunction("dlsym") != nullptr);
+    CHECK(M->getFunction("dladdr") == nullptr);
     CHECK(M->getFunction("getauxval") != nullptr);
     CHECK(M->getFunction("personality") == nullptr);
     CHECK(M->getFunction("exit") == nullptr);
@@ -17104,7 +17105,13 @@ entry:
     CHECK(countNamedInstructions(*Needed, "morok.antihook.got.needed.match") >=
           1u);
     CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.mprotect") >= 1u);
-    CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.rx") >= 1u);
+    CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.self.rx") >= 1u);
+    CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.dynamic.dtdebug") >=
+          1u);
+    CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.rdebug.map") >=
+          1u);
+    CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.module.seg.hit") >=
+          1u);
     CHECK(hasInlineAsmCall(*Diverge));
     CHECK(hasInlineAsmCall(*Emu));
     CHECK(hasInlineAsmCall(*Fpu));
@@ -17537,6 +17544,9 @@ entry:
     CHECK(countNamedInstructions(*Ctor,
                                  "morok.gate.loader.personality.soft") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.mprotect.hard") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.ra.range.hard") >= 1u);
+    CHECK(countNamedInstructions(*Ctor,
+                                 "morok.corroborate.ra.range.changed") >= 1u);
     CHECK(countNamedInstructions(*Ctor,
                                  "morok.corroborate.mprotect.changed") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.corroborate.schro.changed") >=
@@ -17547,6 +17557,11 @@ entry:
         findNamedInstruction(*Ctor, "morok.corroborate.mprotect.changed");
     REQUIRE(MprotectChanged != nullptr);
     CHECK(valueFeedsNamedInstruction(MprotectChanged,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *RaRangeChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.ra.range.changed");
+    REQUIRE(RaRangeChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(RaRangeChanged,
                                      "morok.seal.fold.anti_debug"));
     Instruction *SandboxChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.sandbox.changed");
@@ -18320,6 +18335,12 @@ entry:
     CHECK(valueFeedsNamedInstruction(EmuChanged,
                                      "morok.seal.fold.anti_debug"));
     checkFpuSimdProbe(*Fpu, *Ctor);
+    Instruction *WinRaRangeChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.ra.range.changed");
+    REQUIRE(WinRaRangeChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(WinRaRangeChanged,
+                                     "morok.seal.fold.anti_debug"));
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.ra.range.hard") >= 1u);
     Instruction *SandboxChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.sandbox.changed");
     REQUIRE(SandboxChanged != nullptr);
@@ -18405,6 +18426,8 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Wx, "morok.antihook.wxorx.rwx.hit") >= 1u);
     CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.query") >= 1u);
+    CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.type") >= 1u);
+    CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.image") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
     checkSealEnforcement(*M, *Work);
@@ -18446,6 +18469,10 @@ entry:
     REQUIRE(Smc != nullptr);
     Function *AntiDump = M->getFunction("morok.antihook.antidump.macho");
     REQUIRE(AntiDump != nullptr);
+    Function *Stack = M->getFunction("morok.antihook.stack.darwin");
+    REQUIRE(Stack != nullptr);
+    Function *Work = M->getFunction("work");
+    REQUIRE(Work != nullptr);
     checkSealEnforcement(*M, *Ctor);
     checkGateScoring(*Ctor);
     CHECK(countNamedInstructions(*Ctor, "morok.antihook.prologue.arm64.hit") >=
@@ -18469,6 +18496,15 @@ entry:
     CHECK(M->getFunction("morok.antihook.dbi.smc.lock.worker") == nullptr);
     CHECK(countNamedInstructions(*AntiDump,
                                  "morok.antidump.macho.section.name") >= 1u);
+    CHECK(countNamedInstructions(*Stack, "morok.antihook.stack.text") >= 1u);
+    CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
+    CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
+    Instruction *RaRangeChanged =
+        findNamedInstruction(*Ctor, "morok.corroborate.ra.range.changed");
+    REQUIRE(RaRangeChanged != nullptr);
+    CHECK(valueFeedsNamedInstruction(RaRangeChanged,
+                                     "morok.seal.fold.anti_debug"));
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.ra.range.hard") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.corroborate.antidump.changed") >=
           1u);
     CHECK(M->getFunction("morok.antihook.diverge.posix") == nullptr);

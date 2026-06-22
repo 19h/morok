@@ -11396,6 +11396,21 @@ Function *linuxStackOriginCheck(Module &M) {
     auto *baseBodyBB = BasicBlock::Create(ctx, "base.body", fn);
     auto *baseNextBB = BasicBlock::Create(ctx, "base.next", fn);
     auto *checkBB = BasicBlock::Create(ctx, "check", fn);
+    auto *dynamicLoopBB = BasicBlock::Create(ctx, "dynamic.loop", fn);
+    auto *dynamicBodyBB = BasicBlock::Create(ctx, "dynamic.body", fn);
+    auto *dynamicDebugBB = BasicBlock::Create(ctx, "dynamic.debug", fn);
+    auto *dynamicDebugReadBB =
+        BasicBlock::Create(ctx, "dynamic.debug.read", fn);
+    auto *dynamicMissBB = BasicBlock::Create(ctx, "dynamic.miss", fn);
+    auto *dynamicNextBB = BasicBlock::Create(ctx, "dynamic.next", fn);
+    auto *moduleLoopBB = BasicBlock::Create(ctx, "module.loop", fn);
+    auto *moduleBodyBB = BasicBlock::Create(ctx, "module.body", fn);
+    auto *moduleReadBB = BasicBlock::Create(ctx, "module.read", fn);
+    auto *modulePhLoopBB = BasicBlock::Create(ctx, "module.ph.loop", fn);
+    auto *modulePhBodyBB = BasicBlock::Create(ctx, "module.ph.body", fn);
+    auto *modulePhNextBB = BasicBlock::Create(ctx, "module.ph.next", fn);
+    auto *moduleNextBB = BasicBlock::Create(ctx, "module.next", fn);
+    auto *ret1BB = BasicBlock::Create(ctx, "ret1", fn);
     auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
 
     IRBuilder<> B(entry);
@@ -11446,10 +11461,164 @@ Function *linuxStackOriginCheck(Module &M) {
 
     IRBuilder<> CB(checkBB);
     Value *base = CB.CreateLoad(ip, baseSlot, "morok.antihook.stack.base.v");
-    Value *ok = CB.CreateCall(
+    Value *selfOk = CB.CreateCall(
         rxCheck, {target, atPhdr, phNum, phEnt, base, ConstantPointerNull::get(ptr)},
-        "morok.antihook.stack.rx");
-    CB.CreateRet(ok);
+        "morok.antihook.stack.self.rx");
+    CB.CreateCondBr(CB.CreateICmpNE(selfOk, ConstantInt::get(i32, 0),
+                                    "morok.antihook.stack.self.ok"),
+                    ret1BB, dynamicLoopBB);
+
+    IRBuilder<> DLB(dynamicLoopBB);
+    auto *dynIdx = DLB.CreatePHI(ip, 2, "morok.antihook.stack.dynamic.idx");
+    dynIdx->addIncoming(ConstantInt::get(ip, 0), checkBB);
+    Value *dynamicPresent =
+        DLB.CreateICmpNE(elfDynamicWeakSymbol(M), ConstantPointerNull::get(ptr),
+                         "morok.antihook.stack.dynamic.present");
+    Value *dynamicInRange =
+        DLB.CreateAnd(dynamicPresent,
+                      DLB.CreateICmpULT(dynIdx, ConstantInt::get(ip, 256)),
+                      "morok.antihook.stack.dynamic.keep");
+    DLB.CreateCondBr(dynamicInRange, dynamicBodyBB, ret0BB);
+
+    IRBuilder<> DDB(dynamicBodyBB);
+    Value *dynamicEntry = gepI8(
+        DDB, M, elfDynamicWeakSymbol(M),
+        DDB.CreateMul(dynIdx, ConstantInt::get(ip, 16),
+                      "morok.antihook.stack.dynamic.off"),
+        "morok.antihook.stack.dynamic.entry");
+    Value *dynTag =
+        loadAt(DDB, M, ip, dynamicEntry, 0ULL, "morok.antihook.stack.dynamic.tag");
+    Value *dynVal =
+        loadAt(DDB, M, ip, dynamicEntry, 8, "morok.antihook.stack.dynamic.val");
+    Value *isDebug =
+        DDB.CreateICmpEQ(dynTag, ConstantInt::get(ip, 21),
+                         "morok.antihook.stack.dynamic.dtdebug");
+    Value *isNull =
+        DDB.CreateICmpEQ(dynTag, ConstantInt::get(ip, 0),
+                         "morok.antihook.stack.dynamic.null");
+    DDB.CreateCondBr(isDebug, dynamicDebugBB, dynamicMissBB);
+
+    IRBuilder<> DGB(dynamicDebugBB);
+    Value *debugPtr =
+        DGB.CreateIntToPtr(dynVal, ptr, "morok.antihook.stack.rdebug.ptr");
+    DGB.CreateCondBr(DGB.CreateICmpNE(dynVal, ConstantInt::get(ip, 0),
+                                      "morok.antihook.stack.rdebug.present"),
+                     dynamicDebugReadBB, ret0BB);
+
+    IRBuilder<> DGR(dynamicDebugReadBB);
+    Value *linkMap =
+        loadAt(DGR, M, ptr, debugPtr, 8, "morok.antihook.stack.rdebug.map");
+    DGR.CreateCondBr(
+        DGR.CreateICmpNE(linkMap, ConstantPointerNull::get(ptr),
+                         "morok.antihook.stack.rdebug.map.present"),
+        moduleLoopBB, ret0BB);
+
+    IRBuilder<> DMB(dynamicMissBB);
+    DMB.CreateCondBr(isNull, ret0BB, dynamicNextBB);
+
+    IRBuilder<> DNB(dynamicNextBB);
+    Value *nextDyn = DNB.CreateAdd(dynIdx, ConstantInt::get(ip, 1),
+                                   "morok.antihook.stack.dynamic.next");
+    DNB.CreateBr(dynamicLoopBB);
+    dynIdx->addIncoming(nextDyn, dynamicNextBB);
+
+    IRBuilder<> MLB(moduleLoopBB);
+    auto *modulePtr = MLB.CreatePHI(ptr, 2, "morok.antihook.stack.module.ptr");
+    auto *moduleIdx = MLB.CreatePHI(ip, 2, "morok.antihook.stack.module.idx");
+    modulePtr->addIncoming(linkMap, dynamicDebugReadBB);
+    moduleIdx->addIncoming(ConstantInt::get(ip, 0), dynamicDebugReadBB);
+    Value *moduleReady = MLB.CreateAnd(
+        MLB.CreateICmpNE(modulePtr, ConstantPointerNull::get(ptr),
+                         "morok.antihook.stack.module.present"),
+        MLB.CreateICmpULT(moduleIdx, ConstantInt::get(ip, 128),
+                          "morok.antihook.stack.module.limit"),
+        "morok.antihook.stack.module.ready");
+    MLB.CreateCondBr(moduleReady, moduleBodyBB, ret0BB);
+
+    IRBuilder<> MDB(moduleBodyBB);
+    Value *moduleBase =
+        loadAt(MDB, M, ip, modulePtr, 0ULL, "morok.antihook.stack.module.base");
+    Value *moduleNext =
+        loadAt(MDB, M, ptr, modulePtr, 24, "morok.antihook.stack.module.next");
+    MDB.CreateCondBr(MDB.CreateICmpNE(moduleBase, ConstantInt::get(ip, 0),
+                                      "morok.antihook.stack.module.base.present"),
+                     moduleReadBB, moduleNextBB);
+
+    IRBuilder<> MRB(moduleReadBB);
+    Value *moduleBasePtr =
+        MRB.CreateIntToPtr(moduleBase, ptr,
+                           "morok.antihook.stack.module.base.ptr");
+    Value *elfMagic =
+        loadAt(MRB, M, i32, moduleBasePtr, 0ULL,
+               "morok.antihook.stack.module.elf.magic");
+    Value *elfClass =
+        loadAt(MRB, M, Type::getInt8Ty(ctx), moduleBasePtr, 4,
+               "morok.antihook.stack.module.elf.class");
+    Value *phOff =
+        loadAt(MRB, M, ip, moduleBasePtr, 32,
+               "morok.antihook.stack.module.phoff");
+    Value *phEnt16 =
+        loadAt(MRB, M, Type::getInt16Ty(ctx), moduleBasePtr, 54,
+               "morok.antihook.stack.module.phent");
+    Value *phNum16 =
+        loadAt(MRB, M, Type::getInt16Ty(ctx), moduleBasePtr, 56,
+               "morok.antihook.stack.module.phnum");
+    Value *phEntIp =
+        MRB.CreateZExt(phEnt16, ip, "morok.antihook.stack.module.phent.ip");
+    Value *phNumIp =
+        MRB.CreateZExt(phNum16, ip, "morok.antihook.stack.module.phnum.ip");
+    Value *validModule = MRB.CreateAnd(
+        MRB.CreateICmpEQ(elfMagic, ConstantInt::get(i32, 0x464c457f),
+                             "morok.antihook.stack.module.elf"),
+        MRB.CreateAnd(
+            MRB.CreateICmpEQ(elfClass, ConstantInt::get(Type::getInt8Ty(ctx), 2),
+                                 "morok.antihook.stack.module.elf64"),
+            MRB.CreateAnd(
+                MRB.CreateICmpUGE(phEntIp, ConstantInt::get(ip, 56),
+                                      "morok.antihook.stack.module.phent.ok"),
+                MRB.CreateICmpUGT(phNumIp, ConstantInt::get(ip, 0),
+                                  "morok.antihook.stack.module.phnum.ok"))),
+        "morok.antihook.stack.module.valid");
+    MRB.CreateCondBr(validModule, modulePhLoopBB, moduleNextBB);
+
+    IRBuilder<> MPL(modulePhLoopBB);
+    auto *phIdx = MPL.CreatePHI(ip, 2, "morok.antihook.stack.module.ph.idx");
+    phIdx->addIncoming(ConstantInt::get(ip, 0), moduleReadBB);
+    Value *phInRange =
+        MPL.CreateAnd(MPL.CreateICmpULT(phIdx, phNumIp),
+                      MPL.CreateICmpULT(phIdx, ConstantInt::get(ip, 128)),
+                      "morok.antihook.stack.module.ph.keep");
+    MPL.CreateCondBr(phInRange, modulePhBodyBB, moduleNextBB);
+
+    IRBuilder<> MPB(modulePhBodyBB);
+    Value *modulePhPtr = MPB.CreateIntToPtr(
+        MPB.CreateAdd(moduleBase,
+                      MPB.CreateAdd(phOff, MPB.CreateMul(phIdx, phEntIp),
+                                    "morok.antihook.stack.module.ph.rel"),
+                      "morok.antihook.stack.module.ph.addr"),
+        ptr, "morok.antihook.stack.module.ph");
+    Value *moduleHit =
+        emitElfExecSegmentHit(MPB, M, target, moduleBase, modulePhPtr,
+                              "morok.antihook.stack.module.seg");
+    MPB.CreateCondBr(moduleHit, ret1BB, modulePhNextBB);
+
+    IRBuilder<> MPN(modulePhNextBB);
+    Value *phNext =
+        MPN.CreateAdd(phIdx, ConstantInt::get(ip, 1),
+                      "morok.antihook.stack.module.ph.next");
+    MPN.CreateBr(modulePhLoopBB);
+    phIdx->addIncoming(phNext, modulePhNextBB);
+
+    IRBuilder<> MNB(moduleNextBB);
+    Value *nextModuleIdx =
+        MNB.CreateAdd(moduleIdx, ConstantInt::get(ip, 1),
+                      "morok.antihook.stack.module.idx.next");
+    MNB.CreateBr(moduleLoopBB);
+    modulePtr->addIncoming(moduleNext, moduleNextBB);
+    moduleIdx->addIncoming(nextModuleIdx, moduleNextBB);
+
+    IRBuilder<> R1(ret1BB);
+    R1.CreateRet(ConstantInt::get(i32, 1));
 
     IRBuilder<> R0(ret0BB);
     R0.CreateRet(ConstantInt::get(i32, 0));
@@ -11527,6 +11696,7 @@ Function *windowsStackOriginCheck(Module &M) {
     Value *state = loadAt(WB, M, i32, mbi, 32, "morok.antihook.stack.state");
     Value *protect =
         loadAt(WB, M, i32, mbi, 36, "morok.antihook.stack.protect");
+    Value *type = loadAt(WB, M, i32, mbi, 40, "morok.antihook.stack.type");
     Value *committed =
         WB.CreateICmpNE(WB.CreateAnd(state, ConstantInt::get(i32, 0x1000)),
                         ConstantInt::get(i32, 0));
@@ -11542,8 +11712,11 @@ Function *windowsStackOriginCheck(Module &M) {
     Value *rwx =
         WB.CreateICmpNE(WB.CreateAnd(protect, ConstantInt::get(i32, 0xC0)),
                         ConstantInt::get(i32, 0));
+    Value *image =
+        WB.CreateICmpEQ(type, ConstantInt::get(i32, 0x1000000),
+                        "morok.antihook.stack.image");
     Value *ok =
-        WB.CreateAnd(WB.CreateAnd(committed, exec),
+        WB.CreateAnd(WB.CreateAnd(WB.CreateAnd(committed, exec), image),
                      WB.CreateNot(WB.CreateOr(guard, WB.CreateOr(noaccess, rwx))),
                      "morok.antihook.stack.ok");
     WB.CreateRet(WB.CreateZExt(ok, i32));
@@ -11561,6 +11734,16 @@ Function *stackOriginCheck(Module &M) {
     return windowsStackOriginCheck(M);
 }
 
+FunctionCallee returnAddressDecl(Module &M) {
+    auto *ptr = PointerType::getUnqual(M.getContext());
+    SmallVector<Type *, 1> raOverloads;
+    if (Intrinsic::isOverloaded(Intrinsic::returnaddress))
+        raOverloads.push_back(ptr);
+    Function *returnAddressFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::returnaddress, raOverloads);
+    return FunctionCallee(returnAddressFn->getFunctionType(), returnAddressFn);
+}
+
 bool insertStackOriginChecks(Module &M, Function *Check, GlobalVariable *State,
                              const std::vector<Function *> &Targets,
                              ir::IRRandom &rng) {
@@ -11568,26 +11751,11 @@ bool insertStackOriginChecks(Module &M, Function *Check, GlobalVariable *State,
         return false;
     auto *i32 = Type::getInt32Ty(M.getContext());
     auto *ip = intPtrTy(M);
-    auto *ptr = PointerType::getUnqual(M.getContext());
     // Always request the canonical declaration for llvm.returnaddress via
     // Intrinsic::getOrInsertDeclaration so the backend recognizes and lowers it.
     // Whether the canonical name carries a pointer-mangling suffix depends on
-    // the LLVM version: older releases declare returnaddress with a fixed ptr
-    // return (non-overloaded, name "llvm.returnaddress"), while newer ones make
-    // it overloaded on the return pointer's address space (name
-    // "llvm.returnaddress.p0"). Hardcoding either form — or passing an overload
-    // type to a non-overloaded intrinsic — yields a function the backend never
-    // recognizes; it then survives codegen as an undefined external symbol and
-    // breaks linking (e.g. lld-link: undefined symbol: llvm.returnaddress.p0).
-    // Pass the overload type only when this LLVM actually overloads the
-    // intrinsic, so the right canonical name is produced on every version.
-    SmallVector<Type *, 1> raOverloads;
-    if (Intrinsic::isOverloaded(Intrinsic::returnaddress))
-        raOverloads.push_back(ptr);
-    Function *returnAddressFn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::returnaddress, raOverloads);
-    FunctionCallee returnAddress(returnAddressFn->getFunctionType(),
-                                 returnAddressFn);
+    // the LLVM version; returnAddressDecl handles both forms.
+    FunctionCallee returnAddress = returnAddressDecl(M);
     bool changed = false;
     std::uint32_t site = 1;
     for (Function *target : Targets) {
@@ -30657,6 +30825,7 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                        bool staticLinkExpected) {
     const Triple tt(M.getTargetTriple());
     LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
     auto *ptr = PointerType::getUnqual(ctx);
     constexpr std::uint32_t kMaxPrologueTargets = 16;
 
@@ -30949,7 +31118,27 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         foldFlag(B, state, changed, 0x8A6357D1C49E20BFULL,
                  "morok.negative.timing.changed");
     }
-    insertStackOriginChecks(M, stackOriginCheck(M), state, prologueTargets, rng);
+    Function *stackCheck = stackOriginCheck(M);
+    if (stackCheck) {
+        FunctionCallee returnAddress = returnAddressDecl(M);
+        Value *ra =
+            B.CreateCall(returnAddress, {ConstantInt::get(i32, 0)},
+                         "morok.antihook.ra.range.ctor.ra");
+        Value *addr =
+            B.CreatePtrToInt(ra, intPtrTy(M),
+                             "morok.antihook.ra.range.ctor.addr");
+        Value *ok =
+            B.CreateCall(stackCheck->getFunctionType(), stackCheck, {addr},
+                         "morok.antihook.ra.range.ctor.module");
+        Value *changed =
+            B.CreateICmpEQ(ok, ConstantInt::get(i32, 0),
+                           "morok.corroborate.ra.range.changed");
+        addHardGateSignal(B, gate, changed, 3, 0xD86F21B49C0A753EULL,
+                          "morok.gate.ra.range");
+        foldEnforcedFlag(B, state, changed, 0x3C791E5A6B20D48FULL,
+                         "morok.antihook.ra.range.changed");
+    }
+    insertStackOriginChecks(M, stackCheck, state, prologueTargets, rng);
     Function *gotRecheckProbe =
         gotProbe ? linuxGotRecheckProbe(M, gotProbe, state) : nullptr;
     appendPrologueTarget(prologueTargets, gotRecheckProbe);
