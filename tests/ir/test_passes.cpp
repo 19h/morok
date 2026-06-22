@@ -17009,6 +17009,15 @@ entry:
     CHECK(M->getFunction("sysconf") != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
     CHECK(M->getFunction("nanosleep") != nullptr);
+    CHECK(countNamedInstructions(*Ctor, "morok.antihook.stub.getpid.hit") >=
+          1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antihook.stub.sigaction.hit") >=
+          1u);
+    Instruction *LinuxStub =
+        findNamedInstruction(*Ctor, "morok.antihook.stub.getpid.hit");
+    REQUIRE(LinuxStub != nullptr);
+    CHECK(valueFeedsNamedInstruction(LinuxStub,
+                                     "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Clean, "morok.antihook.mac.mem.mix") >= 1u);
     CHECK(countNamedInstructions(*Clean, "morok.antihook.mac.file.mix") >= 1u);
     CHECK(countNamedInstructions(*Clean, "morok.negative.text.int3") >= 1u);
@@ -18086,6 +18095,15 @@ entry:
     CHECK(countNamedInstructions(*Vm, "morok.antihook.vm.private.exec") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.antihook.prologue.x86.hit") >=
           1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antihook.stub.getpid.hit") >=
+          1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antihook.stub.sigaction.hit") >=
+          1u);
+    Instruction *DarwinStub =
+        findNamedInstruction(*Ctor, "morok.antihook.stub.getpid.hit");
+    REQUIRE(DarwinStub != nullptr);
+    CHECK(valueFeedsNamedInstruction(DarwinStub,
+                                     "morok.seal.fold.anti_debug"));
     CHECK(M->getFunction("_NSGetExecutablePath") != nullptr);
     CHECK(M->getFunction("_dyld_image_count") != nullptr);
     CHECK(M->getFunction("_dyld_get_image_header") != nullptr);
@@ -18127,6 +18145,8 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.gate.dbi.overhead.soft") == 0u);
     CHECK(countNamedInstructions(
               *Ctor, "morok.corroborate.dbi.overhead.changed") == 0u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antihook.stub.getpid.hit") ==
+          0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

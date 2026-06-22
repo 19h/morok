@@ -37,6 +37,7 @@
 #include <array>
 #include <cstdint>
 #include <initializer_list>
+#include <string>
 #include <vector>
 
 using namespace llvm;
@@ -7737,6 +7738,29 @@ Value *emitX86ProloguePattern(IRBuilder<> &B, Module &M, Function *Target) {
         B.CreateOr(shortJcc, nearJcc), "morok.antihook.prologue.x86.hit");
 }
 
+Value *emitX86ImportStubPattern(IRBuilder<> &B, Module &M, Value *Target,
+                                const Twine &Name) {
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    Value *b0 = loadCodeByte(B, M, Target, 0, Name + ".b0");
+    Value *b1 = loadCodeByte(B, M, Target, 1, Name + ".b1");
+    Value *b5 = loadCodeByte(B, M, Target, 5, Name + ".b5");
+
+    Value *relJmp = B.CreateICmpEQ(b0, ConstantInt::get(i8, 0xE9),
+                                   Name + ".e9");
+    Value *pushRet = B.CreateAnd(B.CreateICmpEQ(b0, ConstantInt::get(i8, 0x68)),
+                                 B.CreateICmpEQ(b5, ConstantInt::get(i8, 0xC3)),
+                                 Name + ".pushret");
+    Value *shortJmp = B.CreateICmpEQ(b0, ConstantInt::get(i8, 0xEB),
+                                     Name + ".eb");
+    Value *shortJcc = byteInRange(B, b0, 0x70, 0x7F, Name + ".jcc8");
+    Value *nearJcc = B.CreateAnd(
+        B.CreateICmpEQ(b0, ConstantInt::get(i8, 0x0F)),
+        byteInRange(B, b1, 0x80, 0x8F, Name + ".jcc32"), Name + ".0fjcc");
+
+    return B.CreateOr(B.CreateOr(relJmp, B.CreateOr(pushRet, shortJmp)),
+                      B.CreateOr(shortJcc, nearJcc), Name + ".hit");
+}
+
 Value *wordMaskEq(IRBuilder<> &B, Value *Word, std::uint32_t Mask,
                   std::uint32_t Expected, const Twine &Name) {
     auto *i32 = Type::getInt32Ty(B.getContext());
@@ -14846,6 +14870,89 @@ void emitProloguePatternChecks(IRBuilder<> &B, Module &M, const Triple &TT,
         foldEnforcedFlag(
             B, State, hit, rng.next() ^ (0x9E3779B97F4A7C15ULL * site++),
             "morok.antihook.prologue");
+    }
+}
+
+StringRef canonicalImportName(Function &F) {
+    StringRef name = F.getName();
+    if (name.starts_with("\01"))
+        name = name.drop_front();
+    return name;
+}
+
+bool posixStubIntegrityTarget(const Triple &TT, Function &F, StringRef &Label,
+                              std::uint64_t &Salt) {
+    if (!F.isDeclaration() || F.isIntrinsic())
+        return false;
+
+    StringRef name = canonicalImportName(F);
+    auto match = [&](StringRef symbol, StringRef label,
+                     std::uint64_t salt) -> bool {
+        if (name != symbol)
+            return false;
+        Label = label;
+        Salt = salt;
+        return true;
+    };
+
+    if (TT.isOSLinux()) {
+        return match("getpid", "getpid", 0x2B61D73C9E84A51FULL) ||
+               match("getppid", "getppid", 0x8C14F0A35D69E2B7ULL) ||
+               match("sigaction", "sigaction", 0x41E8B27D6C903AF5ULL) ||
+               match("clock_gettime", "clock_gettime",
+                     0xF17A4C59B603D82EULL) ||
+               match("nanosleep", "nanosleep", 0x6D8B203FCA91475EULL) ||
+               match("getauxval", "getauxval", 0xB4E59178A2C63D0FULL) ||
+               match("sysconf", "sysconf", 0x39C6A18F52D70B4EULL);
+    }
+
+    if (TT.isOSDarwin()) {
+        return match("getpid", "getpid", 0xC5309E4B71A6D28FULL) ||
+               match("getppid", "getppid", 0x7A91D4F628C35BE0ULL) ||
+               match("sigaction", "sigaction", 0xE28B5C13A97F406DULL) ||
+               match("getpagesize", "getpagesize", 0x1F63B8D40A95C2E7ULL) ||
+               match("clock_gettime", "clock_gettime",
+                     0xAB04D7C95E3162F8ULL) ||
+               match("mach_absolute_time", "mach_absolute_time",
+                     0x5D276F90C13A8BE4ULL) ||
+               match("_NSGetExecutablePath", "nsgetpath",
+                     0x90E4B36A1C58F72DULL) ||
+               match("_dyld_image_count", "dyld_count",
+                     0x4B75A92C6E10D3F8ULL) ||
+               match("_dyld_get_image_header", "dyld_header",
+                     0xD62C0F81B3E95A47ULL) ||
+               match("_dyld_get_image_vmaddr_slide", "dyld_slide",
+                     0x269F74B0E5C813ADULL) ||
+               match("mach_vm_region", "mach_vm_region",
+                     0x8F03C6A15D72E4B9ULL) ||
+               match("mach_port_deallocate", "mach_port_deallocate",
+                     0x3A7D91C40E6B58F2ULL);
+    }
+
+    return false;
+}
+
+void emitPosixStubIntegrityChecks(IRBuilder<> &B, Module &M, const Triple &TT,
+                                  GlobalVariable *State,
+                                  ir::IRRandom &rng) {
+    const bool x86 =
+        TT.getArch() == Triple::x86 || TT.getArch() == Triple::x86_64;
+    if (!x86 || (!TT.isOSLinux() && !TT.isOSDarwin()))
+        return;
+
+    std::uint32_t site = 1;
+    for (Function &F : M) {
+        StringRef label;
+        std::uint64_t salt = 0;
+        if (!posixStubIntegrityTarget(TT, F, label, salt))
+            continue;
+
+        std::string base = (Twine("morok.antihook.stub.") + label).str();
+        Value *hit = emitX86ImportStubPattern(B, M, &F, base);
+        foldEnforcedFlag(
+            B, State, hit,
+            rng.next() ^ salt ^ (0xA24BAED4963EE407ULL * site++),
+            base);
     }
 }
 
@@ -30153,6 +30260,7 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
     }
     insertStackOriginChecks(M, stackOriginCheck(M), state, prologueTargets, rng);
     emitProloguePatternChecks(B, M, tt, state, prologueTargets, rng);
+    emitPosixStubIntegrityChecks(B, M, tt, state, rng);
     if (gotProbe)
         insertAntiHookGotRecheckSites(M, linuxGotRecheckProbe(M, gotProbe, state),
                                       rng);
