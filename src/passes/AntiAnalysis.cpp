@@ -18810,6 +18810,499 @@ Value *windowsCurrentTebThread(IRBuilder<> &B, Module &M, const Twine &Name) {
     return loadAt(B, M, ip, tebPtr, 0x48ULL, Name);
 }
 
+GlobalVariable *windowsPageGuardCanary(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.win.pageguard.canary",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i8 = Type::getInt8Ty(M.getContext());
+    auto *ty = ArrayType::get(i8, 4096);
+    auto *gv = new GlobalVariable(M, ty, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantAggregateZero::get(ty),
+                                  "morok.win.pageguard.canary");
+    gv->setAlignment(Align(4096));
+    return gv;
+}
+
+GlobalVariable *windowsPageGuardI32Global(Module &M, StringRef Name) {
+    if (auto *existing = M.getGlobalVariable(Name, /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i32, 0), Name);
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(4));
+    return gv;
+}
+
+GlobalVariable *windowsPageGuardHit(Module &M) {
+    return windowsPageGuardI32Global(M, "morok.win.pageguard.hit");
+}
+
+GlobalVariable *windowsPageGuardArmed(Module &M) {
+    return windowsPageGuardI32Global(M, "morok.win.pageguard.armed");
+}
+
+GlobalVariable *windowsPageGuardThread(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.win.pageguard.thread",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *ip = intPtrTy(M);
+    auto *gv = new GlobalVariable(M, ip, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(ip, 0),
+                                  "morok.win.pageguard.thread");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(8));
+    return gv;
+}
+
+Function *windowsPageGuardExceptionHandler(Module &M) {
+    if (Function *existing = M.getFunction("morok.win.pageguard.veh"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i32, {ptr}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.pageguard.veh", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *exceptionPointers = fn->getArg(0);
+    exceptionPointers->setName("morok.win.pageguard.exception.ptrs");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *readBB = BasicBlock::Create(ctx, "read", fn);
+    auto *inspectBB = BasicBlock::Create(ctx, "inspect", fn);
+    auto *ownedBB = BasicBlock::Create(ctx, "owned", fn);
+    auto *hitBB = BasicBlock::Create(ctx, "hit", fn);
+    auto *searchBB = BasicBlock::Create(ctx, "search", fn);
+
+    IRBuilder<> B(entry);
+    B.CreateCondBr(B.CreateICmpNE(exceptionPointers,
+                                  ConstantPointerNull::get(ptr),
+                                  "morok.win.pageguard.veh.args"),
+                   readBB, searchBB);
+
+    IRBuilder<> RB(readBB);
+    Value *record =
+        loadAt(RB, M, ptr, exceptionPointers, 0ULL,
+               "morok.win.pageguard.veh.record");
+    RB.CreateCondBr(RB.CreateICmpNE(record, ConstantPointerNull::get(ptr),
+                                    "morok.win.pageguard.veh.record.ready"),
+                    inspectBB, searchBB);
+
+    IRBuilder<> IB(inspectBB);
+    Value *code =
+        loadAt(IB, M, i32, record, 0ULL, "morok.win.pageguard.veh.code");
+    Value *guardCode =
+        IB.CreateICmpEQ(code, ConstantInt::get(i32, 0x80000001u),
+                        "morok.win.pageguard.veh.code.match");
+    IB.CreateCondBr(guardCode, ownedBB, searchBB);
+
+    IRBuilder<> OB(ownedBB);
+    Value *armed = OB.CreateLoad(i32, windowsPageGuardArmed(M),
+                                 "morok.win.pageguard.veh.armed");
+    cast<LoadInst>(armed)->setVolatile(true);
+    Value *owner = OB.CreateLoad(ip, windowsPageGuardThread(M),
+                                 "morok.win.pageguard.veh.thread");
+    cast<LoadInst>(owner)->setVolatile(true);
+    Value *current =
+        windowsCurrentTebThread(OB, M, "morok.win.pageguard.veh.current.thread");
+    Value *numParams =
+        loadAt(OB, M, i32, record, 24, "morok.win.pageguard.veh.params");
+    Value *faultAddr =
+        loadAt(OB, M, ip, record, 40, "morok.win.pageguard.veh.fault.addr");
+    Value *canaryBase =
+        OB.CreatePtrToInt(windowsPageGuardCanary(M), ip,
+                          "morok.win.pageguard.veh.canary.base");
+    Value *canaryEnd =
+        OB.CreateAdd(canaryBase, ConstantInt::get(ip, 4096),
+                     "morok.win.pageguard.veh.canary.end");
+    Value *hasFaultAddr = OB.CreateAnd(
+        OB.CreateICmpUGT(numParams, ConstantInt::get(i32, 1),
+                         "morok.win.pageguard.veh.params.addr"),
+        OB.CreateICmpNE(faultAddr, ConstantInt::get(ip, 0),
+                        "morok.win.pageguard.veh.fault.nonzero"),
+        "morok.win.pageguard.veh.fault.described");
+    Value *faultInCanary = OB.CreateAnd(
+        OB.CreateICmpUGE(faultAddr, canaryBase,
+                         "morok.win.pageguard.veh.fault.after.base"),
+        OB.CreateICmpULT(faultAddr, canaryEnd,
+                         "morok.win.pageguard.veh.fault.before.end"),
+        "morok.win.pageguard.veh.fault.in.canary");
+    Value *addressOk =
+        OB.CreateSelect(hasFaultAddr, faultInCanary,
+                        ConstantInt::getTrue(ctx),
+                        "morok.win.pageguard.veh.address.ok");
+    Value *owned = OB.CreateAnd(
+        OB.CreateAnd(OB.CreateICmpNE(armed, ConstantInt::get(i32, 0),
+                                     "morok.win.pageguard.veh.armed.on"),
+                     OB.CreateICmpNE(owner, ConstantInt::get(ip, 0),
+                                     "morok.win.pageguard.veh.thread.set"),
+                     "morok.win.pageguard.veh.owner.ready"),
+        OB.CreateAnd(OB.CreateICmpEQ(owner, current,
+                                     "morok.win.pageguard.veh.thread.match"),
+                     addressOk, "morok.win.pageguard.veh.address.owned"),
+        "morok.win.pageguard.veh.owned");
+    OB.CreateCondBr(owned, hitBB, searchBB);
+
+    IRBuilder<> HB(hitBB);
+    Value *marker = HB.CreateOr(
+        HB.CreateXor(code,
+                     HB.CreateTrunc(HB.CreateXor(current, faultAddr),
+                                    i32,
+                                    "morok.win.pageguard.veh.fault.thread.low"),
+                     "morok.win.pageguard.veh.marker.mix"),
+        ConstantInt::get(i32, 1), "morok.win.pageguard.veh.marker");
+    HB.CreateStore(marker, windowsPageGuardHit(M))->setVolatile(true);
+    HB.CreateRet(ConstantInt::getSigned(i32, -1));
+
+    IRBuilder<> SB(searchBB);
+    SB.CreateRet(ConstantInt::get(i32, 0));
+    return fn;
+}
+
+Function *windowsPageGuardProbe(Module &M, GlobalVariable *State,
+                                ir::IRRandom &rng, const Triple &TT) {
+    if (!TT.isOSWindows() || TT.getArch() != Triple::x86_64 ||
+        intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.win.pageguard.probe"))
+        return existing;
+
+    Function *direct11 = windowsDirectSyscall11Thunk(M);
+    Function *handler = windowsPageGuardExceptionHandler(M);
+    if (!direct11 || !handler)
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(
+        FunctionType::get(Type::getVoidTy(ctx), {i32, i32, ip, ip, i1},
+                          false),
+        GlobalValue::PrivateLinkage, "morok.win.pageguard.probe", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto argIt = fn->arg_begin();
+    Argument *protectSsn = &*argIt++;
+    protectSsn->setName("protect_ssn");
+    Argument *querySsn = &*argIt++;
+    querySsn->setName("query_ssn");
+    Argument *rtlAdd = &*argIt++;
+    rtlAdd->setName("rtladd");
+    Argument *rtlRemove = &*argIt++;
+    rtlRemove->setName("rtlremove");
+    Argument *corroborated = &*argIt;
+    corroborated->setName("corroborated");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *registerBB = BasicBlock::Create(ctx, "register", fn);
+    auto *protectBB = BasicBlock::Create(ctx, "protect", fn);
+    auto *preQueryBB = BasicBlock::Create(ctx, "prequery", fn);
+    auto *touchBB = BasicBlock::Create(ctx, "touch", fn);
+    auto *postQueryBB = BasicBlock::Create(ctx, "postquery", fn);
+    auto *restoreBB = BasicBlock::Create(ctx, "restore", fn);
+    auto *removeGateBB = BasicBlock::Create(ctx, "remove.gate", fn);
+    auto *removeBB = BasicBlock::Create(ctx, "remove", fn);
+    auto *foldBB = BasicBlock::Create(ctx, "fold", fn);
+
+    IRBuilder<> B(entry);
+    auto *mbiTy = ArrayType::get(i8, 48);
+    AllocaInst *baseSlot =
+        B.CreateAlloca(ip, nullptr, "morok.win.pageguard.base.slot");
+    AllocaInst *sizeSlot =
+        B.CreateAlloca(ip, nullptr, "morok.win.pageguard.size.slot");
+    AllocaInst *oldProt =
+        B.CreateAlloca(i32, nullptr, "morok.win.pageguard.oldprot");
+    AllocaInst *retLen =
+        B.CreateAlloca(ip, nullptr, "morok.win.pageguard.retlen");
+    AllocaInst *preMbi =
+        B.CreateAlloca(mbiTy, nullptr, "morok.win.pageguard.pre.mbi");
+    AllocaInst *postMbi =
+        B.CreateAlloca(mbiTy, nullptr, "morok.win.pageguard.post.mbi");
+    AllocaInst *vehHandle =
+        B.CreateAlloca(ptr, nullptr, "morok.win.pageguard.veh.handle.slot");
+    AllocaInst *preMissSlot =
+        B.CreateAlloca(i32, nullptr, "morok.win.pageguard.pre.miss.slot");
+    AllocaInst *faultMissSlot =
+        B.CreateAlloca(i32, nullptr, "morok.win.pageguard.fault.miss.slot");
+    AllocaInst *postDivergeSlot =
+        B.CreateAlloca(i32, nullptr, "morok.win.pageguard.post.diverge.slot");
+    B.CreateStore(ConstantInt::get(ip, 0), baseSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), sizeSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), oldProt)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), retLen)->setVolatile(true);
+    B.CreateStore(ConstantPointerNull::get(ptr), vehHandle)
+        ->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), preMissSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), faultMissSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), postDivergeSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), windowsPageGuardHit(M))
+        ->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), windowsPageGuardArmed(M))
+        ->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), windowsPageGuardThread(M))
+        ->setVolatile(true);
+
+    Value *ready = B.CreateAnd(
+        B.CreateAnd(B.CreateICmpNE(protectSsn, ConstantInt::get(i32, 0),
+                                   "morok.win.pageguard.protect.ssn.ready"),
+                    B.CreateICmpNE(querySsn, ConstantInt::get(i32, 0),
+                                   "morok.win.pageguard.query.ssn.ready"),
+                    "morok.win.pageguard.syscalls.ready"),
+        B.CreateAnd(B.CreateICmpNE(rtlAdd, ConstantInt::get(ip, 0),
+                                   "morok.win.pageguard.rtladd.ready"),
+                    B.CreateICmpNE(rtlRemove, ConstantInt::get(ip, 0),
+                                   "morok.win.pageguard.rtlremove.ready"),
+                    "morok.win.pageguard.veh.apis.ready"),
+        "morok.win.pageguard.ready");
+    foldFlag(B, State, B.CreateNot(ready, "morok.win.pageguard.missing"),
+             0x784F63B20C9E11D7ULL, "morok.win.pageguard.missing");
+    B.CreateCondBr(ready, registerBB, foldBB);
+
+    IRBuilder<> RegB(registerBB);
+    auto *addTy = FunctionType::get(ptr, {i32, ptr}, false);
+    Value *handle = RegB.CreateCall(
+        addTy, RegB.CreateIntToPtr(rtlAdd, ptr,
+                                   "morok.win.pageguard.rtladd.ptr"),
+        {ConstantInt::get(i32, 1), handler},
+        "morok.win.pageguard.veh.handle");
+    RegB.CreateStore(handle, vehHandle)->setVolatile(true);
+    Value *handleReady =
+        RegB.CreateICmpNE(handle, ConstantPointerNull::get(ptr),
+                          "morok.win.pageguard.veh.handle.ready");
+    foldFlag(RegB, State,
+             RegB.CreateNot(handleReady,
+                            "morok.win.pageguard.veh.handle.missing"),
+             0x42B79D6A18E503CFULL,
+             "morok.win.pageguard.veh.handle.missing");
+    RegB.CreateCondBr(handleReady, protectBB, foldBB);
+
+    IRBuilder<> PB(protectBB);
+    Value *canaryBase =
+        PB.CreatePtrToInt(windowsPageGuardCanary(M), ip,
+                          "morok.win.pageguard.canary.base");
+    PB.CreateStore(canaryBase, baseSlot)->setVolatile(true);
+    PB.CreateStore(ConstantInt::get(ip, 4096), sizeSlot)->setVolatile(true);
+    Value *guardProtect = PB.CreateZExt(
+        PB.CreateOr(ConstantInt::get(i32, 0x4), ConstantInt::get(i32, 0x100),
+                    "morok.win.pageguard.guard.prot"),
+        ip, "morok.win.pageguard.guard.prot.ip");
+    Value *protectStatus = emitWindowsDirect11(
+        PB, direct11,
+        {protectSsn, ConstantInt::getSigned(ip, -1),
+         PB.CreatePtrToInt(baseSlot, ip, "morok.win.pageguard.base.slot.ip"),
+         PB.CreatePtrToInt(sizeSlot, ip, "morok.win.pageguard.size.slot.ip"),
+         guardProtect,
+         PB.CreatePtrToInt(oldProt, ip, "morok.win.pageguard.oldprot.ip")},
+        "morok.win.pageguard.protect.status");
+    Value *protectStatus32 =
+        PB.CreateTrunc(protectStatus, i32,
+                       "morok.win.pageguard.protect.status.i32");
+    foldState(PB, State, protectStatus, rng.next(),
+              "morok.win.pageguard.protect.status.mix");
+    PB.CreateCondBr(PB.CreateICmpSGE(protectStatus32, ConstantInt::get(i32, 0),
+                                     "morok.win.pageguard.protect.ok"),
+                    preQueryBB, removeGateBB);
+
+    IRBuilder<> PQ(preQueryBB);
+    PQ.CreateStore(ConstantInt::get(ip, 0), retLen)->setVolatile(true);
+    Value *preStatus = emitWindowsDirect11(
+        PQ, direct11,
+        {querySsn, ConstantInt::getSigned(ip, -1), canaryBase,
+         ConstantInt::get(ip, 0),
+         PQ.CreatePtrToInt(preMbi, ip, "morok.win.pageguard.pre.mbi.ip"),
+         ConstantInt::get(ip, 48),
+         PQ.CreatePtrToInt(retLen, ip, "morok.win.pageguard.pre.retlen.ip")},
+        "morok.win.pageguard.prequery.status");
+    Value *preStatus32 =
+        PQ.CreateTrunc(preStatus, i32,
+                       "morok.win.pageguard.prequery.status.i32");
+    Value *preState =
+        loadAt(PQ, M, i32, preMbi, 32, "morok.win.pageguard.pre.mbi.state");
+    Value *preProtect =
+        loadAt(PQ, M, i32, preMbi, 36, "morok.win.pageguard.pre.mbi.protect");
+    Value *preQueryOk =
+        PQ.CreateICmpSGE(preStatus32, ConstantInt::get(i32, 0),
+                         "morok.win.pageguard.prequery.ok");
+    Value *preCommitted =
+        PQ.CreateICmpEQ(preState, ConstantInt::get(i32, 0x1000),
+                        "morok.win.pageguard.pre.committed");
+    Value *preGuardBit = PQ.CreateICmpNE(
+        PQ.CreateAnd(preProtect, ConstantInt::get(i32, 0x100),
+                     "morok.win.pageguard.pre.guard.bit"),
+        ConstantInt::get(i32, 0), "morok.win.pageguard.pre.guard.present");
+    Value *preGuarded =
+        PQ.CreateAnd(PQ.CreateAnd(preQueryOk, preCommitted,
+                                  "morok.win.pageguard.pre.valid"),
+                     preGuardBit, "morok.win.pageguard.pre.guarded");
+    Value *preGuardMissing =
+        PQ.CreateAnd(preQueryOk, PQ.CreateNot(preGuardBit),
+                     "morok.win.pageguard.pre.guard.missing");
+    PQ.CreateStore(PQ.CreateZExt(preGuardMissing, i32), preMissSlot)
+        ->setVolatile(true);
+    foldState(PQ, State, preStatus, rng.next(),
+              "morok.win.pageguard.prequery.status.mix");
+    foldState(PQ, State, preProtect, rng.next(),
+              "morok.win.pageguard.pre.protect.mix");
+    PQ.CreateCondBr(preGuarded, touchBB, restoreBB);
+
+    IRBuilder<> TB(touchBB);
+    Value *current =
+        windowsCurrentTebThread(TB, M, "morok.win.pageguard.current.thread");
+    TB.CreateStore(ConstantInt::get(i32, 0), windowsPageGuardHit(M))
+        ->setVolatile(true);
+    TB.CreateStore(current, windowsPageGuardThread(M))->setVolatile(true);
+    TB.CreateStore(ConstantInt::get(i32, 0x5D4A9C31),
+                   windowsPageGuardArmed(M))
+        ->setVolatile(true);
+    Value *canaryPtr =
+        TB.CreateIntToPtr(canaryBase, ptr, "morok.win.pageguard.canary.ptr");
+    auto *canaryByte =
+        TB.CreateLoad(i8, canaryPtr, "morok.win.pageguard.touch.byte");
+    canaryByte->setVolatile(true);
+    canaryByte->setAlignment(Align(1));
+    TB.CreateStore(ConstantInt::get(i32, 0), windowsPageGuardArmed(M))
+        ->setVolatile(true);
+    TB.CreateStore(ConstantInt::get(ip, 0), windowsPageGuardThread(M))
+        ->setVolatile(true);
+    Value *hit = TB.CreateLoad(i32, windowsPageGuardHit(M),
+                               "morok.win.pageguard.hit.value");
+    cast<LoadInst>(hit)->setVolatile(true);
+    Value *faultMissed = TB.CreateICmpEQ(hit, ConstantInt::get(i32, 0),
+                                         "morok.win.pageguard.fault.missed");
+    TB.CreateStore(TB.CreateZExt(faultMissed, i32), faultMissSlot)
+        ->setVolatile(true);
+    foldState(TB, State, TB.CreateZExt(canaryByte, i64),
+              rng.next(), "morok.win.pageguard.touch.byte.mix");
+    TB.CreateBr(postQueryBB);
+
+    IRBuilder<> PostB(postQueryBB);
+    PostB.CreateStore(ConstantInt::get(ip, 0), retLen)->setVolatile(true);
+    Value *postStatus = emitWindowsDirect11(
+        PostB, direct11,
+        {querySsn, ConstantInt::getSigned(ip, -1), canaryBase,
+         ConstantInt::get(ip, 0),
+         PostB.CreatePtrToInt(postMbi, ip,
+                              "morok.win.pageguard.post.mbi.ip"),
+         ConstantInt::get(ip, 48),
+         PostB.CreatePtrToInt(retLen, ip,
+                              "morok.win.pageguard.post.retlen.ip")},
+        "morok.win.pageguard.postquery.status");
+    Value *postStatus32 =
+        PostB.CreateTrunc(postStatus, i32,
+                          "morok.win.pageguard.postquery.status.i32");
+    Value *postProtect =
+        loadAt(PostB, M, i32, postMbi, 36,
+               "morok.win.pageguard.post.mbi.protect");
+    Value *postQueryOk =
+        PostB.CreateICmpSGE(postStatus32, ConstantInt::get(i32, 0),
+                            "morok.win.pageguard.postquery.ok");
+    Value *postGuardStill = PostB.CreateAnd(
+        postQueryOk,
+        PostB.CreateICmpNE(
+            PostB.CreateAnd(postProtect, ConstantInt::get(i32, 0x100),
+                            "morok.win.pageguard.post.guard.bit"),
+            ConstantInt::get(i32, 0),
+            "morok.win.pageguard.post.guard.present"),
+        "morok.win.pageguard.post.guard.still");
+    PostB.CreateStore(PostB.CreateZExt(postGuardStill, i32), postDivergeSlot)
+        ->setVolatile(true);
+    foldState(PostB, State, postStatus, rng.next(),
+              "morok.win.pageguard.postquery.status.mix");
+    foldState(PostB, State, postProtect, rng.next(),
+              "morok.win.pageguard.post.protect.mix");
+    PostB.CreateBr(restoreBB);
+
+    IRBuilder<> RestB(restoreBB);
+    Value *oldProtect =
+        RestB.CreateLoad(i32, oldProt, "morok.win.pageguard.oldprot.value");
+    cast<LoadInst>(oldProtect)->setVolatile(true);
+    RestB.CreateStore(canaryBase, baseSlot)->setVolatile(true);
+    RestB.CreateStore(ConstantInt::get(ip, 4096), sizeSlot)->setVolatile(true);
+    Value *restoreStatus = emitWindowsDirect11(
+        RestB, direct11,
+        {protectSsn, ConstantInt::getSigned(ip, -1),
+         RestB.CreatePtrToInt(baseSlot, ip,
+                              "morok.win.pageguard.restore.base.slot.ip"),
+         RestB.CreatePtrToInt(sizeSlot, ip,
+                              "morok.win.pageguard.restore.size.slot.ip"),
+         RestB.CreateZExt(oldProtect, ip,
+                          "morok.win.pageguard.restore.oldprot.ip"),
+         RestB.CreatePtrToInt(oldProt, ip,
+                              "morok.win.pageguard.restore.oldprot.ptr.ip")},
+        "morok.win.pageguard.restore.status");
+    foldState(RestB, State, restoreStatus, rng.next(),
+              "morok.win.pageguard.restore.status.mix");
+    RestB.CreateBr(removeGateBB);
+
+    IRBuilder<> RGB(removeGateBB);
+    Value *oldHandle =
+        RGB.CreateLoad(ptr, vehHandle, "morok.win.pageguard.veh.handle.value");
+    cast<LoadInst>(oldHandle)->setVolatile(true);
+    RGB.CreateCondBr(RGB.CreateICmpNE(oldHandle,
+                                      ConstantPointerNull::get(ptr),
+                                      "morok.win.pageguard.remove.needed"),
+                     removeBB, foldBB);
+
+    IRBuilder<> RMB(removeBB);
+    auto *removeTy = FunctionType::get(i32, {ptr}, false);
+    Value *removeStatus = RMB.CreateCall(
+        removeTy,
+        RMB.CreateIntToPtr(rtlRemove, ptr,
+                           "morok.win.pageguard.rtlremove.ptr"),
+        {oldHandle}, "morok.win.pageguard.remove.status");
+    foldState(RMB, State, removeStatus, rng.next(),
+              "morok.win.pageguard.remove.status.mix");
+    RMB.CreateBr(foldBB);
+
+    IRBuilder<> FB(foldBB);
+    Value *preMiss = FB.CreateICmpNE(
+        FB.CreateLoad(i32, preMissSlot, "morok.win.pageguard.pre.miss.value"),
+        ConstantInt::get(i32, 0), "morok.win.pageguard.pre.miss.flag");
+    cast<LoadInst>(cast<ICmpInst>(preMiss)->getOperand(0))->setVolatile(true);
+    Value *faultMiss = FB.CreateICmpNE(
+        FB.CreateLoad(i32, faultMissSlot,
+                      "morok.win.pageguard.fault.miss.value"),
+        ConstantInt::get(i32, 0), "morok.win.pageguard.fault.miss.flag");
+    cast<LoadInst>(cast<ICmpInst>(faultMiss)->getOperand(0))->setVolatile(true);
+    Value *postDiverged = FB.CreateICmpNE(
+        FB.CreateLoad(i32, postDivergeSlot,
+                      "morok.win.pageguard.post.diverge.value"),
+        ConstantInt::get(i32, 0), "morok.win.pageguard.post.diverge.flag");
+    cast<LoadInst>(cast<ICmpInst>(postDiverged)->getOperand(0))
+        ->setVolatile(true);
+    Value *rawProblem = FB.CreateOr(
+        FB.CreateOr(preMiss, faultMiss, "morok.win.pageguard.primary.problem"),
+        postDiverged, "morok.win.pageguard.raw.problem");
+    Value *hardPrimary = FB.CreateOr(
+        FB.CreateOr(preMiss, faultMiss,
+                    "morok.win.pageguard.hard.primary.problem"),
+        postDiverged, "morok.win.pageguard.hard.raw.problem");
+    Value *corroboratedProblem =
+        FB.CreateAnd(hardPrimary, corroborated,
+                     "morok.win.pageguard.corroborated.problem");
+    foldFlag(FB, State, rawProblem, 0xD218A7F09C6B53E1ULL,
+             "morok.win.pageguard.raw.problem");
+    foldEnforcedFlag(FB, State, corroboratedProblem,
+                     0x6890C2D5B71E4FA3ULL,
+                     "morok.win.pageguard.corroborated.problem");
+    FB.CreateRetVoid();
+    return fn;
+}
+
 Function *windowsInvalidHandleExceptionHandler(Module &M) {
     if (Function *existing =
             M.getFunction("morok.win.attach.invalid.exception.handler"))
@@ -19724,13 +20217,15 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
     Function *scanner = windowsSyscallStubScanner(M);
     Function *direct11 = windowsDirectSyscall11Thunk(M);
     Function *watcher = windowsRemoteBreakinWatchThread(M, State);
+    Function *pageGuard = windowsPageGuardProbe(M, State, rng, TT);
     GlobalVariable *invalidExceptionSeen =
         windowsInvalidHandleExceptionSeen(M);
     Function *uefFilter = windowsUnhandledExceptionFilter(M);
     GlobalVariable *uefReached = windowsUefReachedFlag(M);
     if (!pebReader || !moduleByHash || !resolver || !patchRet ||
         !patchRemote || !invalidProbe || !selfDebug || !scanner || !direct11 ||
-        !watcher || !invalidExceptionSeen || !uefFilter || !uefReached)
+        !watcher || !pageGuard || !invalidExceptionSeen || !uefFilter ||
+        !uefReached)
         return nullptr;
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
@@ -19771,6 +20266,10 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
         resolver,
         {ntdll, ConstantInt::get(i64, fnv1aName("NtProtectVirtualMemory"))},
         "morok.win.attach.ntprotect");
+    Value *ntQueryVirtualMemory = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64, fnv1aName("NtQueryVirtualMemory"))},
+        "morok.win.attach.pageguard.ntqueryvm");
     Value *ntClose = RB.CreateCall(
         resolver, {ntdll, ConstantInt::get(i64, fnv1aName("NtClose"))},
         "morok.win.attach.ntclose");
@@ -19976,6 +20475,8 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
               "morok.win.attach.remote.breakin.mix");
     foldState(RB, State, dbgBreak, rng.next(),
               "morok.win.attach.dbg.breakpoint.mix");
+    foldState(RB, State, ntQueryVirtualMemory, rng.next(),
+              "morok.win.attach.pageguard.ntqueryvm.mix");
     foldState(RB, State, ntGetNextThread, rng.next(),
               "morok.win.attach.watch.ntgetnextthread.mix");
     foldState(RB, State, ntQueryInformationThread, rng.next(),
@@ -20085,6 +20586,26 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
         "morok.win.attach.patch.failed");
     foldEnforcedFlag(RB, State, patchFailed, 0xE57B1490C6A32D8FULL,
                      "morok.win.attach.patch.failed");
+    Value *pageGuardProtectPack = RB.CreateCall(
+        scanner->getFunctionType(), scanner,
+        {RB.CreateIntToPtr(ntProtect, ptr,
+                           "morok.win.attach.pageguard.protect.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.attach.pageguard.protect.pack");
+    Value *pageGuardQueryPack = RB.CreateCall(
+        scanner->getFunctionType(), scanner,
+        {RB.CreateIntToPtr(ntQueryVirtualMemory, ptr,
+                           "morok.win.attach.pageguard.queryvm.ptr"),
+         ConstantInt::getTrue(ctx)},
+        "morok.win.attach.pageguard.queryvm.pack");
+    Value *pageGuardProtectSsn = RB.CreateTrunc(
+        pageGuardProtectPack, i32, "morok.win.attach.pageguard.protect.ssn");
+    Value *pageGuardQuerySsn = RB.CreateTrunc(
+        pageGuardQueryPack, i32, "morok.win.attach.pageguard.queryvm.ssn");
+    foldState(RB, State, pageGuardProtectPack, rng.next(),
+              "morok.win.attach.pageguard.protect.pack.mix");
+    foldState(RB, State, pageGuardQueryPack, rng.next(),
+              "morok.win.attach.pageguard.queryvm.pack.mix");
     emitWindowsRemoteBreakinWatcherStart(
         RB, M, State, rng, scanner, direct11, watcher, remoteBreakin,
         ntGetNextThread, ntQueryInformationThread, ntClose,
@@ -20139,6 +20660,13 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
              0x5C9D21E8A70F43B6ULL, "morok.win.attach.uef.missing");
     foldEnforcedFlag(UD, State, uefMissed, 0xF1386C24D9E0A57BULL,
                      "morok.win.attach.uef.routing");
+    Value *pageGuardCorroboration = UD.CreateOr(
+        UD.CreateOr(invalidExceptionDelivered, patchFailed,
+                    "morok.win.attach.pageguard.attach.corroboration"),
+        uefMissed, "morok.win.attach.pageguard.corroborated.signal");
+    UD.CreateCall(pageGuard->getFunctionType(), pageGuard,
+                  {pageGuardProtectSsn, pageGuardQuerySsn, rtlAddVeh,
+                   rtlRemoveVeh, pageGuardCorroboration});
     UD.CreateBr(retBB);
 
     IRBuilder<> RetB(retBB);

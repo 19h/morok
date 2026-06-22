@@ -18952,6 +18952,8 @@ define i32 @main() { ret i32 0 }
     Function *Uef = M->getFunction("morok.win.attach.uef.filter");
     Function *SelfDbg = M->getFunction("morok.win.attach.selfdbg");
     Function *Watcher = M->getFunction("morok.win.attach.watch.thread");
+    Function *PageGuard = M->getFunction("morok.win.pageguard.probe");
+    Function *PageGuardVeh = M->getFunction("morok.win.pageguard.veh");
     Function *Direct11 = M->getFunction("morok.win.sys.direct11");
     Function *Resolve = M->getFunction("morok.win.pe.resolve");
     REQUIRE(Ctor != nullptr);
@@ -18963,6 +18965,8 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Uef != nullptr);
     REQUIRE(SelfDbg != nullptr);
     REQUIRE(Watcher != nullptr);
+    REQUIRE(PageGuard != nullptr);
+    REQUIRE(PageGuardVeh != nullptr);
     REQUIRE(Direct11 != nullptr);
     REQUIRE(Resolve != nullptr);
     CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
@@ -18988,6 +18992,10 @@ define i32 @main() { ret i32 0 }
           nullptr);
     CHECK(M->getGlobalVariable("morok.win.attach.watch.hits", true) !=
           nullptr);
+    CHECK(M->getGlobalVariable("morok.win.pageguard.canary", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.pageguard.hit", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.pageguard.armed", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.pageguard.thread", true) != nullptr);
     checkSealEnforcement(*M, *Probe);
     CHECK(M->getFunction("DbgUiRemoteBreakin") == nullptr);
     CHECK(M->getFunction("DbgBreakPoint") == nullptr);
@@ -18997,6 +19005,8 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("NtCreateThreadEx") == nullptr);
     CHECK(M->getFunction("NtDelayExecution") == nullptr);
     CHECK(M->getFunction("NtGetNextThread") == nullptr);
+    CHECK(M->getFunction("NtProtectVirtualMemory") == nullptr);
+    CHECK(M->getFunction("NtQueryVirtualMemory") == nullptr);
     CHECK(M->getFunction("NtQueryInformationThread") == nullptr);
     CHECK(M->getFunction("NtSetInformationThread") == nullptr);
     CHECK(M->getFunction("RtlAddVectoredExceptionHandler") == nullptr);
@@ -19019,6 +19029,14 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.dbg.breakpoint") >=
           1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.ntprotect") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.pageguard.ntqueryvm") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.pageguard.protect.pack") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.pageguard.queryvm.pack") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.pageguard.corroborated.signal") >= 1u);
     CHECK(countNamedInstructions(
               *Probe, "morok.win.attach.watch.ntcreatethreadex") >= 1u);
     CHECK(countNamedInstructions(
@@ -19159,11 +19177,47 @@ define i32 @main() { ret i32 0 }
               *Watcher, "morok.win.attach.watch.breakin.thread") >= 1u);
     CHECK(countNamedInstructions(*Watcher,
                                  "morok.win.attach.watch.delay.status") >= 1u);
+    CHECK(countNamedInstructions(*PageGuard,
+                                 "morok.win.pageguard.protect.status") >= 1u);
+    CHECK(countNamedInstructions(*PageGuard,
+                                 "morok.win.pageguard.prequery.status") >= 1u);
+    CHECK(countNamedInstructions(*PageGuard,
+                                 "morok.win.pageguard.pre.guard.missing") >=
+          1u);
+    CHECK(countNamedInstructions(*PageGuard,
+                                 "morok.win.pageguard.touch.byte") >= 1u);
+    CHECK(countNamedInstructions(*PageGuard,
+                                 "morok.win.pageguard.fault.missed") >= 1u);
+    CHECK(countNamedInstructions(*PageGuard,
+                                 "morok.win.pageguard.post.guard.still") >=
+          1u);
+    CHECK(countNamedInstructions(*PageGuard,
+                                 "morok.win.pageguard.restore.status") >= 1u);
+    CHECK(countNamedInstructions(*PageGuard,
+                                 "morok.win.pageguard.raw.problem") >= 1u);
+    CHECK(countNamedInstructions(
+              *PageGuard, "morok.win.pageguard.corroborated.problem") >= 1u);
+    CHECK(countNamedInstructions(*PageGuardVeh,
+                                 "morok.win.pageguard.veh.code.match") >= 1u);
+    CHECK(countNamedInstructions(*PageGuardVeh,
+                                 "morok.win.pageguard.veh.owned") >= 1u);
+    CHECK(countNamedInstructions(*PageGuardVeh,
+                                 "morok.win.pageguard.veh.marker") >= 1u);
     Instruction *BreakinThread =
         findNamedInstruction(*Watcher, "morok.win.attach.watch.breakin.thread");
     REQUIRE(BreakinThread != nullptr);
     CHECK_FALSE(valueFeedsNamedInstruction(BreakinThread,
                                            "morok.seal.fold.anti_debug"));
+    Instruction *PageGuardRaw =
+        findNamedInstruction(*PageGuard, "morok.win.pageguard.raw.problem");
+    REQUIRE(PageGuardRaw != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(PageGuardRaw,
+                                           "morok.seal.fold.anti_debug"));
+    Instruction *PageGuardCorroborated = findNamedInstruction(
+        *PageGuard, "morok.win.pageguard.corroborated.problem");
+    REQUIRE(PageGuardCorroborated != nullptr);
+    CHECK(valueFeedsNamedInstruction(PageGuardCorroborated,
+                                     "morok.seal.fold.anti_debug"));
     bool uefHasContinueSearch = false;
     for (Instruction &I : instructions(*Uef))
         if (auto *Ret = dyn_cast<ReturnInst>(&I))
