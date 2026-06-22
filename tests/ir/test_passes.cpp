@@ -16801,6 +16801,8 @@ entry:
     REQUIRE(Clean != nullptr);
     Function *Got = M->getFunction("morok.antihook.got.plt");
     REQUIRE(Got != nullptr);
+    Function *Loader = M->getFunction("morok.antihook.loader.auxv");
+    REQUIRE(Loader != nullptr);
     Function *GotRecheck = M->getFunction("morok.antihook.got.recheck");
     REQUIRE(GotRecheck != nullptr);
     Function *Rx = M->getFunction("morok.antihook.elf.rx");
@@ -16905,10 +16907,13 @@ entry:
     CHECK_FALSE(gotNeededUsesLinuxRtldDefault);
     CHECK(hasInlineAsmCall(*Clean));
     CHECK(hasInlineAsmCall(*Got));
+    CHECK(hasInlineAsmCall(*Loader));
     CHECK(hasInlineAsmCall(*Maps));
     CHECK(hasInlineAsmCall(*Wx));
     CHECK(hasInlineAsmCall(*AntiDump));
     CHECK(M->getFunction("dlsym") != nullptr);
+    CHECK(M->getFunction("getauxval") != nullptr);
+    CHECK(M->getFunction("personality") == nullptr);
     CHECK(M->getFunction("exit") == nullptr);
     CHECK(M->getFunction("dlopen") != nullptr);
     CHECK(M->getFunction("getenv") == nullptr);
@@ -16964,6 +16969,26 @@ entry:
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.protect.ok") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.mprotect") >= 1u);
     CHECK(countNamedInstructions(*Got, "morok.antihook.got.rx") >= 1u);
+    CHECK(countCallsTo(*Loader, "getauxval") == 4u);
+    CHECK(countNamedInstructions(*Loader,
+                                 "morok.antihook.loader.atentry") >= 1u);
+    CHECK(countNamedInstructions(*Loader,
+                                 "morok.antihook.loader.e_entry") >= 1u);
+    CHECK(countNamedInstructions(*Loader,
+                                 "morok.antihook.loader.bias.byte") >= 1u);
+    CHECK(countNamedInstructions(*Loader,
+                                 "morok.antihook.loader.bias.mismatch") >= 1u);
+    CHECK(countNamedInstructions(
+              *Loader, "morok.antihook.loader.personality.norand") >= 1u);
+    CHECK(namedGepUsesConstantOffset(*Loader,
+                                     "morok.antihook.loader.ph.vaddr.ptr",
+                                     16u));
+    CHECK(namedGepUsesConstantOffset(*Loader,
+                                     "morok.antihook.loader.e_entry.ptr",
+                                     24u));
+    CHECK(functionHasConstantInt(*Loader, 9u)); // AT_ENTRY
+    CHECK(functionHasConstantInt(*Loader, 135u)); // x86_64 personality
+    CHECK(functionHasConstantInt(*Loader, 0x40000u)); // ADDR_NO_RANDOMIZE
     CHECK(countNamedInstructions(*GotRecheck,
                                  "morok.antihook.got.recheck.diff") >= 1u);
     CHECK(countNamedInstructions(*GotRecheck,
@@ -17311,6 +17336,9 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.gate.negative.timing.soft") >=
           1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.dbi.jit.soft") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.loader.bias.soft") >= 1u);
+    CHECK(countNamedInstructions(*Ctor,
+                                 "morok.gate.loader.personality.soft") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.mprotect.hard") >= 1u);
     CHECK(countNamedInstructions(*Ctor,
                                  "morok.corroborate.mprotect.changed") >= 1u);
@@ -17332,6 +17360,19 @@ entry:
         *Ctor, "morok.corroborate.negative.timing.changed");
     REQUIRE(NegativeTimingChanged != nullptr);
     CHECK_FALSE(valueFeedsNamedInstruction(NegativeTimingChanged,
+                                           "morok.seal.fold.anti_debug"));
+    CHECK(countCallsTo(*Ctor, "morok.antihook.loader.auxv") == 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antihook.loader.bias.byte") >=
+          1u);
+    Instruction *LoaderBiasMismatch = findNamedInstruction(
+        *Ctor, "morok.corroborate.loader.bias.mismatch");
+    REQUIRE(LoaderBiasMismatch != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(LoaderBiasMismatch,
+                                           "morok.seal.fold.anti_debug"));
+    Instruction *LoaderNoRandomize = findNamedInstruction(
+        *Ctor, "morok.corroborate.loader.no_randomize");
+    REQUIRE(LoaderNoRandomize != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(LoaderNoRandomize,
                                            "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Ctor, "morok.negative.modules.extra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
@@ -17478,10 +17519,22 @@ entry:
             *M, rng, /*staticLinkExpected=*/true));
         Function *Probe = M->getFunction("morok.antihook.static.atbase");
         REQUIRE(Probe != nullptr);
+        Function *Loader = M->getFunction("morok.antihook.loader.auxv");
+        REQUIRE(Loader != nullptr);
+        Function *Ctor = M->getFunction("morok.antihook");
+        REQUIRE(Ctor != nullptr);
         CHECK(hasInlineAsmCall(*Probe));
         CHECK(countNamedInstructions(*Probe,
                                      "morok.antihook.static.atbase.trip") >=
               1u);
+        CHECK(countCallsTo(*Ctor, "morok.antihook.loader.auxv") == 1u);
+        CHECK(namedGepUsesConstantOffset(*Loader,
+                                         "morok.antihook.loader.ph.vaddr.ptr",
+                                         8u));
+        CHECK(namedGepUsesConstantOffset(*Loader,
+                                         "morok.antihook.loader.e_entry.ptr",
+                                         24u));
+        CHECK(functionHasConstantInt(*Loader, 136u)); // ARM personality
         CHECK_FALSE(verifyModule(*M, &errs()));
     }
 }
@@ -17516,10 +17569,18 @@ entry:
     REQUIRE(Ctor != nullptr);
     Function *Clean = M->getFunction("morok.antihook.clean.elf");
     REQUIRE(Clean != nullptr);
+    Function *Loader = M->getFunction("morok.antihook.loader.auxv");
+    REQUIRE(Loader != nullptr);
 
     CHECK(countNamedInstructions(*Clean, "morok.negative.text.brk0") >= 1u);
     CHECK(countNamedInstructions(*Clean, "morok.negative.text.int3.long") ==
           0u);
+    CHECK(countCallsTo(*Ctor, "morok.antihook.loader.auxv") == 1u);
+    CHECK(countNamedInstructions(*Loader,
+                                 "morok.antihook.loader.atentry") >= 1u);
+    CHECK(functionHasConstantInt(*Loader, 92u)); // aarch64 personality
+    CHECK(functionHasConstantInt(*Loader, 0x40000u)); // ADDR_NO_RANDOMIZE
+    CHECK(M->getFunction("personality") == nullptr);
     CHECK(countNamedInstructions(*Probe,
                                  "morok.antihook.mprotect.mprotect.none") >=
           1u);

@@ -801,6 +801,12 @@ bool linuxPersonalitySyscall(const Triple &TT, std::uint32_t &Personality) {
     case Triple::aarch64:
         Personality = 92;
         return true;
+    case Triple::arm:
+    case Triple::armeb:
+    case Triple::thumb:
+    case Triple::thumbeb:
+        Personality = 136;
+        return true;
     default:
         return false;
     }
@@ -8032,6 +8038,185 @@ Function *linuxGotPltProbe(Module &M, const Triple &TT) {
 
     IRBuilder<> RB(retBB);
     emitRetDiff(RB, diff);
+    return fn;
+}
+
+Function *linuxAuxvLoaderStateProbe(Module &M, const Triple &TT) {
+    std::uint32_t personalityNr = 0;
+    if (!linuxPersonalitySyscall(TT, personalityNr))
+        return nullptr;
+
+    const unsigned ptrBits = intPtrTy(M)->getBitWidth();
+    const bool elf64 = ptrBits == 64;
+    const bool elf32 = ptrBits == 32 && linuxArm32Arch(TT);
+    if (!elf64 && !elf32)
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.antihook.loader.auxv"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    Type *elfAddrTy = elf64 ? static_cast<Type *>(ip) : i32;
+    const std::uint64_t phEntMin = elf64 ? 56ULL : 32ULL;
+    const std::uint64_t pVaddrOffset = elf64 ? 16ULL : 8ULL;
+
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.antihook.loader.auxv", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *phLoopBB = BasicBlock::Create(ctx, "ph.loop", fn);
+    auto *phBodyBB = BasicBlock::Create(ctx, "ph.body", fn);
+    auto *phNextBB = BasicBlock::Create(ctx, "ph.next", fn);
+    auto *phDoneBB = BasicBlock::Create(ctx, "ph.done", fn);
+    auto *entryLoadBB = BasicBlock::Create(ctx, "entry.load", fn);
+    auto *packBB = BasicBlock::Create(ctx, "pack", fn);
+
+    IRBuilder<> B(entry);
+    AllocaInst *baseSlot =
+        B.CreateAlloca(ip, nullptr, "morok.antihook.loader.base");
+    B.CreateStore(ConstantInt::get(ip, 0), baseSlot)->setVolatile(true);
+
+    FunctionCallee getauxval =
+        M.getOrInsertFunction("getauxval", FunctionType::get(ip, {ip}, false));
+    Value *atPhdr = B.CreateCall(getauxval, {ConstantInt::get(ip, 3)},
+                                 "morok.antihook.loader.atphdr");
+    Value *phEnt = B.CreateCall(getauxval, {ConstantInt::get(ip, 4)},
+                                "morok.antihook.loader.phent");
+    Value *phNum = B.CreateCall(getauxval, {ConstantInt::get(ip, 5)},
+                                "morok.antihook.loader.phnum");
+    Value *atEntry = B.CreateCall(getauxval, {ConstantInt::get(ip, 9)},
+                                  "morok.antihook.loader.atentry");
+    Value *validPhdr = B.CreateAnd(
+        B.CreateICmpNE(atPhdr, ConstantInt::get(ip, 0)),
+        B.CreateAnd(B.CreateICmpUGE(phEnt, ConstantInt::get(ip, phEntMin)),
+                    B.CreateICmpUGT(phNum, ConstantInt::get(ip, 0))),
+        "morok.antihook.loader.phdr.valid");
+    B.CreateCondBr(validPhdr, phLoopBB, phDoneBB);
+
+    IRBuilder<> PLB(phLoopBB);
+    auto *phIdx = PLB.CreatePHI(ip, 2, "morok.antihook.loader.ph.idx");
+    phIdx->addIncoming(ConstantInt::get(ip, 0), entry);
+    Value *phInRange =
+        PLB.CreateAnd(PLB.CreateICmpULT(phIdx, phNum),
+                      PLB.CreateICmpULT(phIdx, ConstantInt::get(ip, 128)),
+                      "morok.antihook.loader.ph.range");
+    PLB.CreateCondBr(phInRange, phBodyBB, phDoneBB);
+
+    IRBuilder<> PBB(phBodyBB);
+    Value *phPtr = PBB.CreateIntToPtr(
+        PBB.CreateAdd(atPhdr, PBB.CreateMul(phIdx, phEnt)), ptr,
+        "morok.antihook.loader.ph.ptr");
+    Value *pType =
+        loadAt(PBB, M, i32, phPtr, 0ULL, "morok.antihook.loader.ph.type");
+    Value *pVaddrRaw = loadAt(PBB, M, elfAddrTy, phPtr, pVaddrOffset,
+                              "morok.antihook.loader.ph.vaddr");
+    Value *pVaddr = pVaddrRaw;
+    if (pVaddr->getType() != ip)
+        pVaddr = PBB.CreateZExt(pVaddr, ip,
+                                "morok.antihook.loader.ph.vaddr.w");
+    Value *baseOld =
+        PBB.CreateLoad(ip, baseSlot, "morok.antihook.loader.base.old");
+    Value *baseNew = PBB.CreateSelect(
+        PBB.CreateICmpEQ(pType, ConstantInt::get(i32, 6)),
+        PBB.CreateSub(atPhdr, pVaddr), baseOld,
+        "morok.antihook.loader.base.new");
+    PBB.CreateStore(baseNew, baseSlot)->setVolatile(true);
+    PBB.CreateBr(phNextBB);
+
+    IRBuilder<> PNB(phNextBB);
+    Value *phNext = PNB.CreateAdd(phIdx, ConstantInt::get(ip, 1),
+                                  "morok.antihook.loader.ph.next");
+    PNB.CreateBr(phLoopBB);
+    phIdx->addIncoming(phNext, phNextBB);
+
+    IRBuilder<> DB(phDoneBB);
+    Value *base =
+        DB.CreateLoad(ip, baseSlot, "morok.antihook.loader.base.final");
+    base->setName("morok.antihook.loader.base.final");
+    Value *entryReady = DB.CreateAnd(
+        DB.CreateICmpNE(base, ConstantInt::get(ip, 0)),
+        DB.CreateICmpNE(atEntry, ConstantInt::get(ip, 0)),
+        "morok.antihook.loader.entry.ready");
+    DB.CreateCondBr(entryReady, entryLoadBB, packBB);
+
+    IRBuilder<> ELB(entryLoadBB);
+    Value *elfHdr =
+        ELB.CreateIntToPtr(base, ptr, "morok.antihook.loader.elf.header");
+    Value *eEntryRaw =
+        loadAt(ELB, M, elfAddrTy, elfHdr, 24ULL,
+               "morok.antihook.loader.e_entry");
+    Value *eEntry = eEntryRaw;
+    if (eEntry->getType() != ip)
+        eEntry =
+            ELB.CreateZExt(eEntry, ip, "morok.antihook.loader.e_entry.w");
+    Value *bias =
+        ELB.CreateSub(atEntry, eEntry, "morok.antihook.loader.bias");
+    Value *biasByteRaw = ELB.CreateAnd(
+        bias, ConstantInt::get(ip, 0xff),
+        "morok.antihook.loader.bias.byte.raw");
+    Value *biasByte =
+        ELB.CreateZExtOrTrunc(biasByteRaw, i64,
+                              "morok.antihook.loader.bias.byte");
+    Value *biasMismatch = ELB.CreateICmpNE(
+        bias, base, "morok.antihook.loader.bias.mismatch");
+    ELB.CreateBr(packBB);
+
+    IRBuilder<> PB(packBB);
+    auto *biasBytePhi =
+        PB.CreatePHI(i64, 2, "morok.antihook.loader.bias.byte.v");
+    biasBytePhi->addIncoming(ConstantInt::get(i64, 0), phDoneBB);
+    biasBytePhi->addIncoming(biasByte, entryLoadBB);
+    auto *biasMismatchPhi =
+        PB.CreatePHI(i1, 2, "morok.antihook.loader.bias.mismatch.v");
+    biasMismatchPhi->addIncoming(ConstantInt::getFalse(ctx), phDoneBB);
+    biasMismatchPhi->addIncoming(biasMismatch, entryLoadBB);
+    auto *entryReadyPhi =
+        PB.CreatePHI(i1, 2, "morok.antihook.loader.entry.ready.v");
+    entryReadyPhi->addIncoming(ConstantInt::getFalse(ctx), phDoneBB);
+    entryReadyPhi->addIncoming(ConstantInt::getTrue(ctx), entryLoadBB);
+
+    Value *personality =
+        emitLinuxSyscall(PB, M, TT, personalityNr,
+                         {ConstantInt::getAllOnesValue(ip)});
+    personality->setName("morok.antihook.loader.personality");
+    Value *personalityOk = PB.CreateICmpSGE(
+        personality, ConstantInt::getSigned(ip, 0),
+        "morok.antihook.loader.personality.ok");
+    Value *noRandomizeRaw = PB.CreateICmpNE(
+        PB.CreateAnd(personality, ConstantInt::get(ip, 0x40000),
+                     "morok.antihook.loader.personality.flags"),
+        ConstantInt::get(ip, 0),
+        "morok.antihook.loader.personality.norand.raw");
+    Value *noRandomize = PB.CreateAnd(
+        personalityOk, noRandomizeRaw,
+        "morok.antihook.loader.personality.norand");
+    Value *packed = biasBytePhi;
+    auto packBit = [&](Value *Flag, std::uint64_t Shift,
+                       const Twine &Name) -> Value * {
+        Value *word = PB.CreateZExt(Flag, i64, Name + ".word");
+        return PB.CreateShl(word, ConstantInt::get(i64, Shift),
+                            Name + ".bit");
+    };
+    packed = PB.CreateOr(packed, packBit(biasMismatchPhi, 8,
+                                         "morok.antihook.loader.bias.mismatch"),
+                         "morok.antihook.loader.pack.bias");
+    packed = PB.CreateOr(packed, packBit(noRandomize, 9,
+                                         "morok.antihook.loader.personality"),
+                         "morok.antihook.loader.pack.personality");
+    packed = PB.CreateOr(packed, packBit(entryReadyPhi, 10,
+                                         "morok.antihook.loader.entry.ready"),
+                         "morok.antihook.loader.pack.entry");
+    packed = PB.CreateOr(packed, packBit(personalityOk, 11,
+                                         "morok.antihook.loader.personality.ok"),
+                         "morok.antihook.loader.pack");
+    PB.CreateRet(packed);
     return fn;
 }
 
@@ -28221,6 +28406,35 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         foldState(B, state, diff, 0xF93A8B7C62D514E1ULL, "morok.antihook.got");
         foldEnforcedFlag(B, state, changed, 0xB17D4E23C9A5806FULL,
                          "morok.antihook.got.changed");
+    }
+    if (Function *loader = linuxAuxvLoaderStateProbe(M, tt)) {
+        Value *sample =
+            B.CreateCall(loader, {}, "morok.antihook.loader.state");
+        Value *biasByte =
+            B.CreateAnd(sample, ConstantInt::get(B.getInt64Ty(), 0xff),
+                        "morok.antihook.loader.bias.byte");
+        Value *biasMismatch = B.CreateICmpNE(
+            B.CreateAnd(sample, ConstantInt::get(B.getInt64Ty(), 1ULL << 8),
+                        "morok.antihook.loader.bias.mismatch.bits"),
+            ConstantInt::get(B.getInt64Ty(), 0),
+            "morok.corroborate.loader.bias.mismatch");
+        Value *noRandomize = B.CreateICmpNE(
+            B.CreateAnd(sample, ConstantInt::get(B.getInt64Ty(), 1ULL << 9),
+                        "morok.antihook.loader.personality.bits"),
+            ConstantInt::get(B.getInt64Ty(), 0),
+            "morok.corroborate.loader.no_randomize");
+        addSoftGateSignal(B, gate, biasMismatch, 1, 0x25E7C1A94B60D83FULL,
+                          "morok.gate.loader.bias");
+        addSoftGateSignal(B, gate, noRandomize, 1, 0xA9C43E70D15B682FULL,
+                          "morok.gate.loader.personality");
+        foldState(B, state, sample, 0xE8B32D7164C90A5FULL,
+                  "morok.antihook.loader");
+        foldState(B, state, biasByte, 0x6D10B4F2875C93A1ULL,
+                  "morok.antihook.loader.bias.byte");
+        foldFlag(B, state, biasMismatch, 0x4E7A21C9D03685BFULL,
+                 "morok.antihook.loader.bias.mismatch");
+        foldFlag(B, state, noRandomize, 0xD35F9072AC18B46EULL,
+                 "morok.antihook.loader.no_randomize");
     }
     if (Function *fixups = darwinFixupProbe(M, tt)) {
         Value *diff = B.CreateCall(fixups, {}, "morok.antihook.fixup.diff");
