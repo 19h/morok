@@ -503,6 +503,13 @@ void foldEnforcedFlag(IRBuilderBase &B, GlobalVariable *State, Value *Flag,
     sealFold(B, Flag, Salt ^ 0xA5B0E176D83429CFULL);
 }
 
+Value *packedI32Flag(IRBuilderBase &B, Value *Packed, std::uint32_t Mask,
+                     const Twine &BitsName, const Twine &Name) {
+    auto *ty = cast<IntegerType>(Packed->getType());
+    Value *bits = B.CreateAnd(Packed, ConstantInt::get(ty, Mask), BitsName);
+    return B.CreateICmpNE(bits, ConstantInt::get(ty, 0), Name);
+}
+
 Value *constIp(Module &M, std::uint64_t V) {
     return ConstantInt::get(intPtrTy(M), V);
 }
@@ -1918,6 +1925,21 @@ void finishI64Ret(BasicBlock *BB, std::uint64_t Value) {
     B.CreateRet(ConstantInt::get(Type::getInt64Ty(BB->getContext()), Value));
 }
 
+struct StatusHexFieldIR {
+    Value *found = nullptr;
+    Value *value = nullptr;
+};
+
+struct StatusDecimalFieldIR {
+    Value *found = nullptr;
+    Value *value = nullptr;
+};
+
+StatusDecimalFieldIR parseProcStatusDecimalField(
+    IRBuilder<> &B, Module &M, AllocaInst *Buf, Value *N,
+    std::initializer_list<unsigned char> Prefix, std::uint64_t MaxBytes,
+    const Twine &Name);
+
 Function *linuxStatusTracerCheck(Module &M, ir::IRRandom &rng,
                                  const Triple &TT) {
     if (Function *existing = M.getFunction("morok.antidbg.linux.status"))
@@ -2010,9 +2032,30 @@ Function *linuxStatField4Check(Module &M, ir::IRRandom &rng, const Triple &TT) {
     if (Function *existing = M.getFunction("morok.antidbg.linux.stat4"))
         return existing;
 
+    std::uint32_t getppidNr = 0;
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        getppidNr = 110;
+        break;
+    case Triple::aarch64:
+        getppidNr = 173;
+        break;
+    case Triple::x86:
+    case Triple::arm:
+    case Triple::armeb:
+    case Triple::thumb:
+    case Triple::thumbeb:
+        getppidNr = 64;
+        break;
+    default:
+        return nullptr;
+    }
+
     LLVMContext &ctx = M.getContext();
+    auto *i1 = Type::getInt1Ty(ctx);
     auto *i8 = Type::getInt8Ty(ctx);
     auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
     auto *ip = intPtrTy(M);
 
     auto *fn = Function::Create(FunctionType::get(i32, false),
@@ -2020,80 +2063,532 @@ Function *linuxStatField4Check(Module &M, ir::IRRandom &rng, const Triple &TT) {
                                 "morok.antidbg.linux.stat4", &M);
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
     IRBuilder<> B(entry);
-    ReadFileIR rf =
+    ReadFileIR stat =
         emitReadSmallFile(B, M, fn, "/proc/self/stat", 1024, rng, TT);
+    IRBuilder<> SB(stat.afterRead);
+    ReadFileIR status =
+        emitReadSmallFile(SB, M, fn, "/proc/self/status", 1024, rng, TT);
 
-    auto *findBB = BasicBlock::Create(ctx, "find.close", fn);
-    auto *findCharBB = BasicBlock::Create(ctx, "find.char", fn);
-    auto *findNextBB = BasicBlock::Create(ctx, "find.next", fn);
-    auto *digitBB = BasicBlock::Create(ctx, "digit", fn);
-    auto *digitCharBB = BasicBlock::Create(ctx, "digit.char", fn);
-    auto *digitStopBB = BasicBlock::Create(ctx, "digit.stop", fn);
-    auto *digitNextBB = BasicBlock::Create(ctx, "digit.next", fn);
-    auto *ret1 = BasicBlock::Create(ctx, "ret1", fn);
+    auto *parseBB = BasicBlock::Create(ctx, "parse", fn);
+    IRBuilder<> RB(status.afterRead);
+    Value *statReadOk =
+        RB.CreateICmpSGT(stat.n, ConstantInt::get(ip, 8),
+                         "morok.antidbg.stat.read.ok");
+    Value *statusReadOk =
+        RB.CreateICmpSGT(status.n, ConstantInt::get(ip, 16),
+                         "morok.antidbg.status.read.ok");
+    RB.CreateCondBr(RB.CreateAnd(statReadOk, statusReadOk,
+                                 "morok.antidbg.stat.reads.ok"),
+                    parseBB, status.ret0);
 
-    IRBuilder<> RB(rf.afterRead);
-    Value *hasAny = RB.CreateICmpSGT(rf.n, ConstantInt::get(ip, 4));
-    Value *lastIdx = RB.CreateSub(rf.n, ConstantInt::get(ip, 1));
-    RB.CreateCondBr(hasAny, findBB, rf.ret0);
+    struct DecimalRangeIR {
+        Value *found = nullptr;
+        Value *value = nullptr;
+    };
+    struct HashRangeIR {
+        Value *found = nullptr;
+        Value *hash = nullptr;
+        Value *length = nullptr;
+    };
 
-    IRBuilder<> FB(findBB);
-    auto *idx = FB.CreatePHI(ip, 2, "morok.antidbg.stat.idx");
-    idx->addIncoming(lastIdx, rf.afterRead);
-    Value *valid = FB.CreateICmpSGE(idx, ConstantInt::get(ip, 0));
-    FB.CreateCondBr(valid, findCharBB, rf.ret0);
+    auto hashRange = [&](IRBuilder<> &IB, AllocaInst *Buf, ArrayType *BufTy,
+                         Value *Limit, Value *Start, Value *End,
+                         const Twine &Name) -> HashRangeIR {
+        Function *parent = IB.GetInsertBlock()->getParent();
+        auto *foundSlot = IB.CreateAlloca(i1, nullptr, Name + ".found.slot");
+        auto *hashSlot = IB.CreateAlloca(i64, nullptr, Name + ".hash.slot");
+        auto *lenSlot = IB.CreateAlloca(i64, nullptr, Name + ".len.slot");
+        auto *posSlot = IB.CreateAlloca(ip, nullptr, Name + ".pos.slot");
+        IB.CreateStore(ConstantInt::getFalse(ctx), foundSlot)->setVolatile(true);
+        IB.CreateStore(ConstantInt::get(i64, 0xcbf29ce484222325ULL), hashSlot)
+            ->setVolatile(true);
+        IB.CreateStore(ConstantInt::get(i64, 0), lenSlot)->setVolatile(true);
+        IB.CreateStore(Start, posSlot)->setVolatile(true);
+        auto *loopBB = BasicBlock::Create(ctx, (Name + ".loop").str(), parent);
+        auto *bodyBB = BasicBlock::Create(ctx, (Name + ".body").str(), parent);
+        auto *doneBB = BasicBlock::Create(ctx, (Name + ".done").str(), parent);
+        Value *nonEmpty = IB.CreateICmpULT(Start, End, Name + ".nonempty");
+        IB.CreateCondBr(nonEmpty, loopBB, doneBB);
 
-    IRBuilder<> FCB(findCharBB);
-    Value *ptr = arrayBytePtr(FCB, rf.bufTy, rf.buf, idx);
-    Value *ch = FCB.CreateLoad(i8, ptr);
-    Value *ppidStart = FCB.CreateAdd(idx, ConstantInt::get(ip, 4));
-    FCB.CreateCondBr(FCB.CreateICmpEQ(ch, ConstantInt::get(i8, ')')), digitBB,
-                     findNextBB);
+        IRBuilder<> LB(loopBB);
+        auto *pos = LB.CreateLoad(ip, posSlot, Name + ".pos");
+        pos->setVolatile(true);
+        Value *inRange =
+            LB.CreateAnd(LB.CreateICmpULT(pos, End, Name + ".before.end"),
+                         LB.CreateICmpULT(pos, Limit, Name + ".in.buf"),
+                         Name + ".range");
+        LB.CreateCondBr(inRange, bodyBB, doneBB);
 
-    IRBuilder<> FNB(findNextBB);
-    Value *idxPrev = FNB.CreateSub(idx, ConstantInt::get(ip, 1));
-    FNB.CreateBr(findBB);
-    idx->addIncoming(idxPrev, findNextBB);
+        IRBuilder<> HB(bodyBB);
+        Value *ch =
+            HB.CreateLoad(i8, arrayBytePtr(HB, BufTy, Buf, pos), Name + ".ch");
+        Value *oldHash = HB.CreateLoad(i64, hashSlot, Name + ".hash.old");
+        cast<LoadInst>(oldHash)->setVolatile(true);
+        Value *mixed = HB.CreateMul(
+            HB.CreateXor(oldHash, HB.CreateZExt(ch, i64), Name + ".hash.xor"),
+            ConstantInt::get(i64, 0x100000001b3ULL), Name + ".hash.next");
+        HB.CreateStore(mixed, hashSlot)->setVolatile(true);
+        Value *oldLen = HB.CreateLoad(i64, lenSlot, Name + ".len.old");
+        cast<LoadInst>(oldLen)->setVolatile(true);
+        HB.CreateStore(HB.CreateAdd(oldLen, ConstantInt::get(i64, 1),
+                                    Name + ".len.next"),
+                       lenSlot)
+            ->setVolatile(true);
+        HB.CreateStore(ConstantInt::getTrue(ctx), foundSlot)->setVolatile(true);
+        HB.CreateStore(HB.CreateAdd(pos, ConstantInt::get(ip, 1),
+                                    Name + ".pos.next"),
+                       posSlot)
+            ->setVolatile(true);
+        HB.CreateBr(loopBB);
 
-    IRBuilder<> DB(digitBB);
-    auto *digitIdx = DB.CreatePHI(ip, 2, "morok.antidbg.stat4");
-    digitIdx->addIncoming(ppidStart, findCharBB);
-    Value *digitInRange = DB.CreateICmpULT(digitIdx, rf.n);
-    DB.CreateCondBr(digitInRange, digitCharBB, rf.ret0);
+        IB.SetInsertPoint(doneBB);
+        HashRangeIR out;
+        out.found = IB.CreateLoad(i1, foundSlot, Name + ".found");
+        cast<LoadInst>(out.found)->setVolatile(true);
+        out.hash = IB.CreateLoad(i64, hashSlot, Name + ".hash");
+        cast<LoadInst>(out.hash)->setVolatile(true);
+        out.length = IB.CreateLoad(i64, lenSlot, Name + ".len");
+        cast<LoadInst>(out.length)->setVolatile(true);
+        return out;
+    };
 
-    IRBuilder<> DCB(digitCharBB);
-    Value *dptr = arrayBytePtr(DCB, rf.bufTy, rf.buf, digitIdx);
-    Value *dch = DCB.CreateLoad(i8, dptr);
-    Value *geOne = DCB.CreateICmpUGE(
-        dch, ConstantInt::get(i8, static_cast<unsigned>('1')));
-    Value *leNine = DCB.CreateICmpULE(
-        dch, ConstantInt::get(i8, static_cast<unsigned>('9')));
-    DCB.CreateCondBr(DCB.CreateAnd(geOne, leNine), ret1, digitStopBB);
+    auto parseDecimalRange = [&](IRBuilder<> &IB, AllocaInst *Buf,
+                                 ArrayType *BufTy, Value *Limit, Value *Start,
+                                 const Twine &Name) -> DecimalRangeIR {
+        Function *parent = IB.GetInsertBlock()->getParent();
+        auto *foundSlot = IB.CreateAlloca(i1, nullptr, Name + ".found.slot");
+        auto *valueSlot = IB.CreateAlloca(i64, nullptr, Name + ".value.slot");
+        auto *posSlot = IB.CreateAlloca(ip, nullptr, Name + ".pos.slot");
+        IB.CreateStore(ConstantInt::getFalse(ctx), foundSlot)->setVolatile(true);
+        IB.CreateStore(ConstantInt::get(i64, 0), valueSlot)->setVolatile(true);
+        IB.CreateStore(Start, posSlot)->setVolatile(true);
+        auto *loopBB = BasicBlock::Create(ctx, (Name + ".loop").str(), parent);
+        auto *bodyBB = BasicBlock::Create(ctx, (Name + ".body").str(), parent);
+        auto *doneBB = BasicBlock::Create(ctx, (Name + ".done").str(), parent);
+        IB.CreateCondBr(IB.CreateICmpULT(Start, Limit, Name + ".start.in.buf"),
+                        loopBB, doneBB);
 
-    IRBuilder<> DSB(digitStopBB);
-    Value *isSpace = DSB.CreateICmpEQ(dch, ConstantInt::get(i8, ' '));
-    Value *isNl = DSB.CreateICmpEQ(dch, ConstantInt::get(i8, '\n'));
-    DSB.CreateCondBr(DSB.CreateOr(isSpace, isNl), rf.ret0, digitNextBB);
+        IRBuilder<> LB(loopBB);
+        auto *pos = LB.CreateLoad(ip, posSlot, Name + ".pos");
+        pos->setVolatile(true);
+        LB.CreateCondBr(LB.CreateICmpULT(pos, Limit, Name + ".pos.in.buf"),
+                        bodyBB, doneBB);
 
-    IRBuilder<> DXB(digitNextBB);
-    Value *digitNext = DXB.CreateAdd(digitIdx, ConstantInt::get(ip, 1));
-    DXB.CreateBr(digitBB);
-    digitIdx->addIncoming(digitNext, digitNextBB);
+        IRBuilder<> DB(bodyBB);
+        Value *ch =
+            DB.CreateLoad(i8, arrayBytePtr(DB, BufTy, Buf, pos), Name + ".ch");
+        Value *digit = DB.CreateAnd(
+            DB.CreateICmpUGE(ch, ConstantInt::get(i8, '0'), Name + ".ge0"),
+            DB.CreateICmpULE(ch, ConstantInt::get(i8, '9'), Name + ".le9"),
+            Name + ".digit");
+        Value *old = DB.CreateLoad(i64, valueSlot, Name + ".old");
+        cast<LoadInst>(old)->setVolatile(true);
+        Value *digitValue =
+            DB.CreateSub(DB.CreateZExt(ch, i64, Name + ".zext"),
+                         ConstantInt::get(i64, '0'), Name + ".digit.value");
+        Value *next =
+            DB.CreateAdd(DB.CreateMul(old, ConstantInt::get(i64, 10),
+                                      Name + ".scale"),
+                         digitValue, Name + ".next");
+        auto *nextBB = BasicBlock::Create(ctx, (Name + ".next").str(), parent);
+        DB.CreateCondBr(digit, nextBB, doneBB);
 
-    finishI32Ret(rf.ret0, 0);
-    finishI32Ret(ret1, 1);
+        IRBuilder<> NB(nextBB);
+        NB.CreateStore(next, valueSlot)->setVolatile(true);
+        NB.CreateStore(ConstantInt::getTrue(ctx), foundSlot)->setVolatile(true);
+        NB.CreateStore(NB.CreateAdd(pos, ConstantInt::get(ip, 1),
+                                    Name + ".pos.next"),
+                       posSlot)
+            ->setVolatile(true);
+        NB.CreateBr(loopBB);
+
+        IB.SetInsertPoint(doneBB);
+        DecimalRangeIR out;
+        out.found = IB.CreateLoad(i1, foundSlot, Name + ".found");
+        cast<LoadInst>(out.found)->setVolatile(true);
+        out.value = IB.CreateLoad(i64, valueSlot, Name + ".value");
+        cast<LoadInst>(out.value)->setVolatile(true);
+        return out;
+    };
+
+    auto parseStatusName = [&](IRBuilder<> &IB, Value *Limit) -> HashRangeIR {
+        Function *parent = IB.GetInsertBlock()->getParent();
+        constexpr std::array<unsigned char, 5> prefix = {'N', 'a', 'm', 'e',
+                                                         ':'};
+        auto *foundSlot =
+            IB.CreateAlloca(i1, nullptr, "morok.antidbg.status.name.found.slot");
+        auto *hashSlot =
+            IB.CreateAlloca(i64, nullptr, "morok.antidbg.status.name.hash.slot");
+        auto *lenSlot =
+            IB.CreateAlloca(i64, nullptr, "morok.antidbg.status.name.len.slot");
+        auto *startSlot =
+            IB.CreateAlloca(ip, nullptr, "morok.antidbg.status.name.start.slot");
+        auto *idxSlot =
+            IB.CreateAlloca(ip, nullptr, "morok.antidbg.status.name.idx.slot");
+        IB.CreateStore(ConstantInt::getFalse(ctx), foundSlot)->setVolatile(true);
+        IB.CreateStore(ConstantInt::get(i64, 0), hashSlot)->setVolatile(true);
+        IB.CreateStore(ConstantInt::get(i64, 0), lenSlot)->setVolatile(true);
+        IB.CreateStore(ConstantInt::get(ip, 0), startSlot)->setVolatile(true);
+        IB.CreateStore(ConstantInt::get(ip, 0), idxSlot)->setVolatile(true);
+        auto *scanBB =
+            BasicBlock::Create(ctx, "morok.antidbg.status.name.scan", parent);
+        auto *matchBB =
+            BasicBlock::Create(ctx, "morok.antidbg.status.name.match", parent);
+        auto *nextBB =
+            BasicBlock::Create(ctx, "morok.antidbg.status.name.next", parent);
+        auto *skipBB =
+            BasicBlock::Create(ctx, "morok.antidbg.status.name.skip", parent);
+        auto *hashPrepBB =
+            BasicBlock::Create(ctx, "morok.antidbg.status.name.hash.prep",
+                               parent);
+        auto *doneBB =
+            BasicBlock::Create(ctx, "morok.antidbg.status.name.result", parent);
+        IB.CreateBr(scanBB);
+
+        IRBuilder<> SCB(scanBB);
+        auto *idx = SCB.CreateLoad(ip, idxSlot, "morok.antidbg.status.name.idx");
+        idx->setVolatile(true);
+        Value *prefixEnd = SCB.CreateAdd(idx, ConstantInt::get(ip, prefix.size()),
+                                         "morok.antidbg.status.name.end");
+        SCB.CreateCondBr(SCB.CreateICmpULE(prefixEnd, Limit,
+                                           "morok.antidbg.status.name.in.buf"),
+                         matchBB, doneBB);
+
+        IRBuilder<> MB(matchBB);
+        Value *match = ConstantInt::getTrue(ctx);
+        for (std::uint64_t j = 0; j < prefix.size(); ++j) {
+            Value *ch = loadAt(MB, M, i8, status.buf,
+                               MB.CreateAdd(idx, ConstantInt::get(ip, j)),
+                               "morok.antidbg.status.name.prefix.ch");
+            match = MB.CreateAnd(
+                match, MB.CreateICmpEQ(ch, ConstantInt::get(i8, prefix[j])),
+                "morok.antidbg.status.name.prefix.match");
+        }
+        Value *rawStart =
+            MB.CreateAdd(idx, ConstantInt::get(ip, prefix.size()),
+                         "morok.antidbg.status.name.raw.start");
+        MB.CreateCondBr(match, skipBB, nextBB);
+
+        IRBuilder<> NB(nextBB);
+        NB.CreateStore(NB.CreateAdd(idx, ConstantInt::get(ip, 1),
+                                    "morok.antidbg.status.name.idx.next"),
+                       idxSlot)
+            ->setVolatile(true);
+        NB.CreateBr(scanBB);
+
+        IRBuilder<> SKB(skipBB);
+        auto *skipPos = SKB.CreatePHI(ip, 2, "morok.antidbg.status.name.skip.pos");
+        skipPos->addIncoming(rawStart, matchBB);
+        Value *skipInRange = SKB.CreateICmpULT(
+            skipPos, Limit, "morok.antidbg.status.name.skip.in.buf");
+        Value *skipCh = loadAt(SKB, M, i8, status.buf, skipPos,
+                               "morok.antidbg.status.name.skip.ch");
+        Value *skipWs = SKB.CreateOr(
+            SKB.CreateICmpEQ(skipCh, ConstantInt::get(i8, ' '),
+                             "morok.antidbg.status.name.skip.space"),
+            SKB.CreateICmpEQ(skipCh, ConstantInt::get(i8, '\t'),
+                             "morok.antidbg.status.name.skip.tab"),
+            "morok.antidbg.status.name.skip.ws");
+        auto *skipNextBB = BasicBlock::Create(
+            ctx, "morok.antidbg.status.name.skip.next", parent);
+        SKB.CreateCondBr(SKB.CreateAnd(skipInRange, skipWs,
+                                       "morok.antidbg.status.name.skip.more"),
+                         skipNextBB, hashPrepBB);
+
+        IRBuilder<> SNB(skipNextBB);
+        Value *skipNext = SNB.CreateAdd(skipPos, ConstantInt::get(ip, 1),
+                                        "morok.antidbg.status.name.skip.next");
+        SNB.CreateBr(skipBB);
+        skipPos->addIncoming(skipNext, skipNextBB);
+
+        IRBuilder<> HPB(hashPrepBB);
+        HPB.CreateStore(ConstantInt::getTrue(ctx), foundSlot)->setVolatile(true);
+        HPB.CreateStore(skipPos, startSlot)->setVolatile(true);
+        auto *endSlot =
+            HPB.CreateAlloca(ip, nullptr, "morok.antidbg.status.name.end.slot");
+        HPB.CreateStore(skipPos, endSlot)->setVolatile(true);
+        auto *endLoopBB = BasicBlock::Create(
+            ctx, "morok.antidbg.status.name.end.loop", parent);
+        auto *endBodyBB = BasicBlock::Create(
+            ctx, "morok.antidbg.status.name.end.body", parent);
+        auto *hashBB =
+            BasicBlock::Create(ctx, "morok.antidbg.status.name.hash", parent);
+        HPB.CreateBr(endLoopBB);
+
+        IRBuilder<> ELB(endLoopBB);
+        auto *endPos =
+            ELB.CreateLoad(ip, endSlot, "morok.antidbg.status.name.end.pos");
+        endPos->setVolatile(true);
+        ELB.CreateCondBr(ELB.CreateICmpULT(endPos, Limit,
+                                           "morok.antidbg.status.name.end.range"),
+                         endBodyBB, hashBB);
+
+        IRBuilder<> EBB(endBodyBB);
+        Value *endCh = loadAt(EBB, M, i8, status.buf, endPos,
+                              "morok.antidbg.status.name.end.ch");
+        Value *isNl = EBB.CreateICmpEQ(endCh, ConstantInt::get(i8, '\n'),
+                                       "morok.antidbg.status.name.end.nl");
+        auto *endNextBB = BasicBlock::Create(
+            ctx, "morok.antidbg.status.name.end.next", parent);
+        EBB.CreateCondBr(isNl, hashBB, endNextBB);
+
+        IRBuilder<> ENB(endNextBB);
+        ENB.CreateStore(ENB.CreateAdd(endPos, ConstantInt::get(ip, 1),
+                                      "morok.antidbg.status.name.end.next"),
+                        endSlot)
+            ->setVolatile(true);
+        ENB.CreateBr(endLoopBB);
+
+        IRBuilder<> HB(hashBB);
+        auto *start = HB.CreateLoad(ip, startSlot,
+                                    "morok.antidbg.status.name.start");
+        start->setVolatile(true);
+        auto *end = HB.CreateLoad(ip, endSlot, "morok.antidbg.status.name.end.v");
+        end->setVolatile(true);
+        HashRangeIR out =
+            hashRange(HB, status.buf, status.bufTy, Limit, start, end,
+                      "morok.antidbg.status.name");
+        Value *hasName =
+            HB.CreateAnd(out.found,
+                         HB.CreateICmpNE(out.length, ConstantInt::get(i64, 0),
+                                         "morok.antidbg.status.name.nonempty"),
+                         "morok.antidbg.status.name.found");
+        HB.CreateStore(hasName, foundSlot)->setVolatile(true);
+        HB.CreateStore(out.hash, hashSlot)->setVolatile(true);
+        HB.CreateStore(out.length, lenSlot)->setVolatile(true);
+        HB.CreateBr(doneBB);
+
+        IRBuilder<> DB(doneBB);
+        HashRangeIR result;
+        result.found = DB.CreateLoad(i1, foundSlot,
+                                     "morok.antidbg.status.name.found.value");
+        cast<LoadInst>(result.found)->setVolatile(true);
+        result.hash =
+            DB.CreateLoad(i64, hashSlot, "morok.antidbg.status.name.hash.value");
+        cast<LoadInst>(result.hash)->setVolatile(true);
+        result.length =
+            DB.CreateLoad(i64, lenSlot, "morok.antidbg.status.name.len.value");
+        cast<LoadInst>(result.length)->setVolatile(true);
+        IB.SetInsertPoint(doneBB);
+        return result;
+    };
+
+    IRBuilder<> PB(parseBB);
+    Value *statLimit = PB.CreateSelect(
+        PB.CreateICmpULT(stat.n, ConstantInt::get(ip, 1024),
+                         "morok.antidbg.stat.limit.raw"),
+        stat.n, ConstantInt::get(ip, 1024), "morok.antidbg.stat.limit");
+    Value *statusLimit = PB.CreateSelect(
+        PB.CreateICmpULT(status.n, ConstantInt::get(ip, 1024),
+                         "morok.antidbg.status.limit.raw"),
+        status.n, ConstantInt::get(ip, 1024), "morok.antidbg.status.limit");
+
+    auto *openSlot = PB.CreateAlloca(ip, nullptr, "morok.antidbg.stat.open.slot");
+    auto *scanSlot = PB.CreateAlloca(ip, nullptr, "morok.antidbg.stat.idx.slot");
+    PB.CreateStore(ConstantInt::get(ip, 0), openSlot)->setVolatile(true);
+    PB.CreateStore(ConstantInt::get(ip, 0), scanSlot)->setVolatile(true);
+    auto *openLoopBB = BasicBlock::Create(ctx, "morok.antidbg.stat.open.loop", fn);
+    auto *openBodyBB = BasicBlock::Create(ctx, "morok.antidbg.stat.open.body", fn);
+    auto *openNextBB = BasicBlock::Create(ctx, "morok.antidbg.stat.open.next", fn);
+    auto *openDoneBB = BasicBlock::Create(ctx, "morok.antidbg.stat.open.done", fn);
+    PB.CreateBr(openLoopBB);
+
+    IRBuilder<> OLB(openLoopBB);
+    auto *openIdx = OLB.CreateLoad(ip, scanSlot, "morok.antidbg.stat.open.idx");
+    openIdx->setVolatile(true);
+    OLB.CreateCondBr(OLB.CreateICmpULT(openIdx, statLimit,
+                                       "morok.antidbg.stat.open.range"),
+                     openBodyBB, openDoneBB);
+
+    IRBuilder<> OBB(openBodyBB);
+    Value *openCh = loadAt(OBB, M, i8, stat.buf, openIdx,
+                           "morok.antidbg.stat.open.ch");
+    OBB.CreateCondBr(OBB.CreateICmpEQ(openCh, ConstantInt::get(i8, '('),
+                                      "morok.antidbg.stat.open.hit"),
+                     openDoneBB, openNextBB);
+
+    IRBuilder<> ONB(openNextBB);
+    ONB.CreateStore(ONB.CreateAdd(openIdx, ConstantInt::get(ip, 1),
+                                  "morok.antidbg.stat.open.next"),
+                    scanSlot)
+        ->setVolatile(true);
+    ONB.CreateBr(openLoopBB);
+
+    IRBuilder<> ODB(openDoneBB);
+    Value *openHit =
+        ODB.CreateICmpULT(openIdx, statLimit, "morok.antidbg.stat.open.found");
+    ODB.CreateStore(ODB.CreateSelect(openHit, openIdx, ConstantInt::get(ip, 0)),
+                    openSlot)
+        ->setVolatile(true);
+
+    auto *closeSlot =
+        ODB.CreateAlloca(ip, nullptr, "morok.antidbg.stat.close.slot");
+    auto *revSlot =
+        ODB.CreateAlloca(ip, nullptr, "morok.antidbg.stat.close.idx.slot");
+    Value *lastIdx = ODB.CreateSub(statLimit, ConstantInt::get(ip, 1),
+                                   "morok.antidbg.stat.last.idx");
+    ODB.CreateStore(ConstantInt::get(ip, 0), closeSlot)->setVolatile(true);
+    ODB.CreateStore(lastIdx, revSlot)->setVolatile(true);
+    auto *closeLoopBB =
+        BasicBlock::Create(ctx, "morok.antidbg.stat.close.loop", fn);
+    auto *closeBodyBB =
+        BasicBlock::Create(ctx, "morok.antidbg.stat.close.body", fn);
+    auto *closeNextBB =
+        BasicBlock::Create(ctx, "morok.antidbg.stat.close.next", fn);
+    auto *closeDoneBB =
+        BasicBlock::Create(ctx, "morok.antidbg.stat.close.done", fn);
+    ODB.CreateCondBr(openHit, closeLoopBB, closeDoneBB);
+
+    IRBuilder<> CLB(closeLoopBB);
+    auto *closeIdx =
+        CLB.CreateLoad(ip, revSlot, "morok.antidbg.stat.close.idx");
+    closeIdx->setVolatile(true);
+    Value *afterOpen =
+        CLB.CreateICmpUGT(closeIdx, openIdx, "morok.antidbg.stat.close.after.open");
+    CLB.CreateCondBr(afterOpen, closeBodyBB, closeDoneBB);
+
+    IRBuilder<> CBB(closeBodyBB);
+    Value *closeCh = loadAt(CBB, M, i8, stat.buf, closeIdx,
+                            "morok.antidbg.stat.close.ch");
+    CBB.CreateCondBr(CBB.CreateICmpEQ(closeCh, ConstantInt::get(i8, ')'),
+                                      "morok.antidbg.stat.close.hit"),
+                     closeDoneBB, closeNextBB);
+
+    IRBuilder<> CNB(closeNextBB);
+    CNB.CreateStore(CNB.CreateSub(closeIdx, ConstantInt::get(ip, 1),
+                                  "morok.antidbg.stat.close.prev"),
+                    revSlot)
+        ->setVolatile(true);
+    CNB.CreateBr(closeLoopBB);
+
+    IRBuilder<> CDB(closeDoneBB);
+    auto *closeIdxFinal =
+        CDB.CreateLoad(ip, revSlot, "morok.antidbg.stat.close.idx.final");
+    closeIdxFinal->setVolatile(true);
+    auto *openForClose =
+        CDB.CreateLoad(ip, openSlot, "morok.antidbg.stat.open.for.close");
+    openForClose->setVolatile(true);
+    Value *closeAfterOpen =
+        CDB.CreateICmpUGT(closeIdxFinal, openForClose,
+                          "morok.antidbg.stat.close.after.open.final");
+    Value *closeHit =
+        CDB.CreateAnd(openHit, closeAfterOpen, "morok.antidbg.stat.close.found");
+    CDB.CreateStore(CDB.CreateSelect(closeHit, closeIdxFinal,
+                                     ConstantInt::get(ip, 0)),
+                    closeSlot)
+        ->setVolatile(true);
+
+    auto *openFinal =
+        CDB.CreateLoad(ip, openSlot, "morok.antidbg.stat.open.final");
+    openFinal->setVolatile(true);
+    auto *closeFinal =
+        CDB.CreateLoad(ip, closeSlot, "morok.antidbg.stat.close.final");
+    closeFinal->setVolatile(true);
+    Value *stateIdx = CDB.CreateAdd(closeFinal, ConstantInt::get(ip, 2),
+                                    "morok.antidbg.stat.state.idx");
+    Value *ppidStart = CDB.CreateAdd(closeFinal, ConstantInt::get(ip, 4),
+                                     "morok.antidbg.stat.ppid.start");
+    Value *fieldsReady =
+        CDB.CreateAnd(closeHit,
+                      CDB.CreateICmpULT(ppidStart, statLimit,
+                                        "morok.antidbg.stat.fields.in.buf"),
+                      "morok.antidbg.stat.fields.ready");
+    Value *safeStateIdx =
+        CDB.CreateSelect(fieldsReady, stateIdx, ConstantInt::get(ip, 0),
+                         "morok.antidbg.stat.state.safe.idx");
+    Value *stateCh = loadAt(CDB, M, i8, stat.buf, safeStateIdx,
+                            "morok.antidbg.stat.state.ch");
+    Value *stateStop = CDB.CreateAnd(
+        fieldsReady,
+        CDB.CreateOr(CDB.CreateICmpEQ(stateCh, ConstantInt::get(i8, 'T'),
+                                      "morok.antidbg.stat.state.T"),
+                     CDB.CreateICmpEQ(stateCh, ConstantInt::get(i8, 't'),
+                                      "morok.antidbg.stat.state.t")),
+        "morok.antidbg.stat.state.stop");
+    DecimalRangeIR statPpid =
+        parseDecimalRange(CDB, stat.buf, stat.bufTy, statLimit, ppidStart,
+                          "morok.antidbg.stat.ppid");
+    Value *commStart = CDB.CreateAdd(openFinal, ConstantInt::get(ip, 1),
+                                     "morok.antidbg.stat.comm.start");
+    HashRangeIR statComm = hashRange(CDB, stat.buf, stat.bufTy, statLimit,
+                                     commStart, closeFinal,
+                                     "morok.antidbg.stat.comm");
+    HashRangeIR statusName = parseStatusName(CDB, statusLimit);
+    StatusDecimalFieldIR tracer = parseProcStatusDecimalField(
+        CDB, M, status.buf, status.n,
+        {'T', 'r', 'a', 'c', 'e', 'r', 'P', 'i', 'd', ':'}, 1024,
+        "morok.antidbg.stat.tracer");
+
+    Value *rawPpid = emitLinuxSyscall(CDB, M, TT, getppidNr, {});
+    rawPpid->setName("morok.antidbg.stat.getppid");
+    Value *rawPpidOk =
+        CDB.CreateICmpSGE(rawPpid, ConstantInt::getSigned(ip, 0),
+                          "morok.antidbg.stat.getppid.ok");
+    Value *rawPpid64 =
+        CDB.CreateZExtOrTrunc(rawPpid, i64, "morok.antidbg.stat.getppid.w");
+    Value *ppidReady =
+        CDB.CreateAnd(statPpid.found, rawPpidOk,
+                      "morok.antidbg.stat.ppid.ready");
+    Value *ppidMismatch = CDB.CreateAnd(
+        ppidReady,
+        CDB.CreateICmpNE(statPpid.value, rawPpid64,
+                         "morok.antidbg.stat.ppid.delta"),
+        "morok.antidbg.stat.ppid.mismatch");
+    Value *nameReady =
+        CDB.CreateAnd(statComm.found, statusName.found,
+                      "morok.antidbg.stat.name.ready");
+    Value *nameMismatchRaw = CDB.CreateOr(
+        CDB.CreateICmpNE(statComm.length, statusName.length,
+                         "morok.antidbg.stat.name.len.delta"),
+        CDB.CreateICmpNE(statComm.hash, statusName.hash,
+                         "morok.antidbg.stat.name.hash.delta"),
+        "morok.antidbg.stat.name.delta");
+    Value *nameMismatch =
+        CDB.CreateAnd(nameReady, nameMismatchRaw,
+                      "morok.antidbg.stat.name.mismatch");
+    Value *tracerPresent = CDB.CreateAnd(
+        tracer.found,
+        CDB.CreateICmpNE(tracer.value, ConstantInt::get(i64, 0),
+                         "morok.antidbg.stat.tracer.present.raw"),
+        "morok.antidbg.stat.tracer.present");
+    Value *tracedStopped =
+        CDB.CreateAnd(tracerPresent, stateStop,
+                      "morok.antidbg.stat.tracer.state");
+    Value *anomaly = CDB.CreateOr(
+        ppidMismatch, CDB.CreateOr(nameMismatch, tracedStopped,
+                                   "morok.antidbg.stat.coherence.bits"),
+        "morok.antidbg.stat.coherence.anomaly");
+    Value *packed = CDB.CreateZExt(stateStop, i32,
+                                   "morok.antidbg.stat.state.stop.bit");
+    packed = CDB.CreateOr(
+        packed,
+        CDB.CreateShl(CDB.CreateZExt(ppidMismatch, i32),
+                      ConstantInt::get(i32, 1),
+                      "morok.antidbg.stat.ppid.mismatch.bit"),
+        "morok.antidbg.stat.pack.ppid");
+    packed = CDB.CreateOr(
+        packed,
+        CDB.CreateShl(CDB.CreateZExt(nameMismatch, i32),
+                      ConstantInt::get(i32, 2),
+                      "morok.antidbg.stat.name.mismatch.bit"),
+        "morok.antidbg.stat.pack.name");
+    packed = CDB.CreateOr(
+        packed,
+        CDB.CreateShl(CDB.CreateZExt(tracedStopped, i32),
+                      ConstantInt::get(i32, 3),
+                      "morok.antidbg.stat.tracer.state.bit"),
+        "morok.antidbg.stat.pack.tracer");
+    packed = CDB.CreateOr(
+        packed,
+        CDB.CreateShl(CDB.CreateZExt(anomaly, i32), ConstantInt::get(i32, 8),
+                      "morok.antidbg.stat.coherence.bit"),
+        "morok.antidbg.stat.pack");
+    CDB.CreateRet(packed);
+
+    finishI32Ret(stat.ret0, 0);
+    finishI32Ret(status.ret0, 0);
     return fn;
 }
-
-struct StatusHexFieldIR {
-    Value *found = nullptr;
-    Value *value = nullptr;
-};
-
-struct StatusDecimalFieldIR {
-    Value *found = nullptr;
-    Value *value = nullptr;
-};
 
 StatusDecimalFieldIR parseProcStatusDecimalField(
     IRBuilder<> &B, Module &M, AllocaInst *Buf, Value *N,
@@ -2956,6 +3451,11 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
              0x64C2D0B6D8F44A2DULL, "morok.antidbg.watch.status");
     foldState(BB, State, stat4, 0x8CB92BA72F3D8DD7ULL,
               "morok.antidbg.watch.stat4");
+    Value *statCoherence = packedI32Flag(
+        BB, stat4, 1u << 8, "morok.antidbg.watch.stat.coherence.bits",
+        "morok.antidbg.watch.stat.coherence.anomaly");
+    foldEnforcedFlag(BB, State, statCoherence, 0x7F541C8E92AB6D03ULL,
+                     "morok.antidbg.watch.stat.coherence");
     if (SignalMaskFn) {
         Value *sigmask = BB.CreateCall(SignalMaskFn->getFunctionType(),
                                        SignalMaskFn, {},
@@ -5160,6 +5660,11 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
     foldFlag(B, State, statusTraced, 0xA4756E49F2D31219ULL,
              "morok.antidbg.status");
     foldState(B, State, stat4, 0xDA942042E4DD58B5ULL, "morok.antidbg.stat4");
+    Value *statCoherence = packedI32Flag(
+        B, stat4, 1u << 8, "morok.antidbg.stat.coherence.bits",
+        "morok.antidbg.stat.coherence.anomaly");
+    foldEnforcedFlag(B, State, statCoherence, 0x91C0B7F52A6E3D49ULL,
+                     "morok.antidbg.stat.coherence");
     emitLinuxPersonalityAslrTelemetry(B, M, State, TT);
     emitLinuxSigtrapCoherence(
         B, M, State, statusTraced, ConstantInt::get(B.getInt64Ty(), rng.next()),
@@ -13878,6 +14383,11 @@ Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
                  "morok.antidbg.probe.status");
         foldState(B, State, stat4, 0x84379D6FA21708C9ULL,
                   "morok.antidbg.probe.stat4");
+        Value *statCoherence = packedI32Flag(
+            B, stat4, 1u << 8, "morok.antidbg.probe.stat.coherence.bits",
+            "morok.antidbg.probe.stat.coherence.anomaly");
+        foldEnforcedFlag(B, State, statCoherence, 0x3B6D81E5F0C24A97ULL,
+                         "morok.antidbg.probe.stat.coherence");
         emitLinuxSigtrapCoherence(B, M, State, statusTraced, tag, rng, TT,
                                   "morok.antidbg.probe.sigtrap");
         if (Function *faultCf =

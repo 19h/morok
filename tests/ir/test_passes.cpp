@@ -18163,6 +18163,7 @@ entry:
     CHECK(M->getFunction("morok.antidbg.linux.status") != nullptr);
     CHECK(M->getFunction("morok.antidbg.linux.stat4") != nullptr);
     Function *Memfd = M->getFunction("morok.antidbg.memfd");
+    Function *Stat = M->getFunction("morok.antidbg.linux.stat4");
     Function *Sigmask = M->getFunction("morok.antidbg.linux.sigmask");
     Function *PtraceStop = M->getFunction("morok.antidbg.linux.ptrace_stop");
     Function *Watch = M->getFunction("morok.antidbg.linux.watch");
@@ -18182,6 +18183,7 @@ entry:
     Function *Parent = M->getFunction("morok.antidbg.parent");
     Function *Rr = M->getFunction("morok.antidbg.rr");
     REQUIRE(Memfd != nullptr);
+    REQUIRE(Stat != nullptr);
     REQUIRE(Sigmask != nullptr);
     REQUIRE(PtraceStop != nullptr);
     CHECK(Watch != nullptr);
@@ -18229,7 +18231,7 @@ entry:
     CHECK(hasInlineAsmCall(*PtraceStop));
     CHECK(hasInlineAsmCall(*AntiDbg));
     CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.status")));
-    CHECK(hasInlineAsmCall(*M->getFunction("morok.antidbg.linux.stat4")));
+    CHECK(hasInlineAsmCall(*Stat));
     CHECK(hasInlineAsmCall(*Watch));
     CHECK(hasInlineAsmCall(*FaultCf));
     CHECK(hasInlineAsmCall(*Sigtrap));
@@ -18237,6 +18239,24 @@ entry:
     CHECK(hasInlineAsmCall(*Rr));
     checkNoSealEnforcement(*Parent);
     checkNoSealEnforcement(*Rr);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.state.stop") >= 1u);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.ppid.value") >= 1u);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.getppid") >= 1u);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.ppid.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.comm.hash") >= 1u);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.status.name.found") >=
+          1u);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.name.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.tracer.present") >=
+          1u);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.tracer.state") >=
+          1u);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.coherence.anomaly") >=
+          1u);
+    CHECK(countNamedInstructions(*Stat, "morok.seal.fold.anti_debug") == 0u);
+    CHECK(functionHasConstantInt(*Stat, 110u)); // getppid
     CHECK(countNamedInstructions(*Memfd, "morok.antidbg.memfd.readlink") >= 1u);
     CHECK(hasNamedIcmpWithConstant(*Memfd, "morok.antidbg.memfd.prefix.enough",
                                    7u));
@@ -18290,6 +18310,11 @@ entry:
         *Watch, "morok.antidbg.watch.sigmask.cgt.diverged");
     REQUIRE(SigmaskCgt != nullptr);
     CHECK(valueFeedsNamedInstruction(SigmaskCgt,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *WatchStatCoherence =
+        findNamedInstruction(*Watch, "morok.antidbg.watch.stat.coherence.anomaly");
+    REQUIRE(WatchStatCoherence != nullptr);
+    CHECK(valueFeedsNamedInstruction(WatchStatCoherence,
                                      "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Sigmask,
                                  "morok.antidbg.sigmask.proc.blk.found") >=
@@ -18518,6 +18543,16 @@ entry:
     REQUIRE(ProbeSigtrapCoherence != nullptr);
     CHECK(valueFeedsNamedInstruction(ProbeSigtrapCoherence,
                                      "morok.seal.fold.anti_debug"));
+    Instruction *StatCoherence =
+        findNamedInstruction(*AntiDbg, "morok.antidbg.stat.coherence.anomaly");
+    REQUIRE(StatCoherence != nullptr);
+    CHECK(valueFeedsNamedInstruction(StatCoherence,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *ProbeStatCoherence = findNamedInstruction(
+        *HotProbe, "morok.antidbg.probe.stat.coherence.anomaly");
+    REQUIRE(ProbeStatCoherence != nullptr);
+    CHECK(valueFeedsNamedInstruction(ProbeStatCoherence,
+                                     "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*AntiDbg,
                                  "morok.antidbg.personality.raw") >= 1u);
     CHECK(countNamedInstructions(
@@ -18697,6 +18732,7 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "ltrace"));
     CHECK_FALSE(hasReadableByteString(*M, "gcore"));
     CHECK_FALSE(hasReadableByteString(*M, "TracerPid"));
+    CHECK_FALSE(hasReadableByteString(*M, "Name:"));
     CHECK_FALSE(hasReadableByteString(*M, "ptrace_stop"));
     CHECK_FALSE(hasReadableByteString(*M, "do_signal_stop"));
     CHECK_FALSE(hasReadableByteString(*M, "SigBlk"));
@@ -18808,6 +18844,8 @@ define i32 @main() { ret i32 0 }
 
     Function *Ctor = M->getFunction("morok.antidbg");
     REQUIRE(Ctor != nullptr);
+    Function *Stat = M->getFunction("morok.antidbg.linux.stat4");
+    REQUIRE(Stat != nullptr);
     Function *Sigmask = M->getFunction("morok.antidbg.linux.sigmask");
     REQUIRE(Sigmask != nullptr);
     Function *PtraceStop = M->getFunction("morok.antidbg.linux.ptrace_stop");
@@ -18846,6 +18884,13 @@ define i32 @main() { ret i32 0 }
           1u);
     CHECK(countNamedInstructions(
               *Parent, "morok.antidbg.parent.status.ppid.value") >= 1u);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.ppid.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.name.mismatch") >=
+          1u);
+    CHECK(countNamedInstructions(*Stat, "morok.antidbg.stat.coherence.anomaly") >=
+          1u);
+    CHECK(functionHasConstantInt(*Stat, 173u));   // getppid
     CHECK(functionHasConstantInt(*Parent, 173u)); // getppid
     CHECK(functionHasConstantInt(*Parent, 56u));  // openat
     CHECK(functionHasConstantInt(*Parent, 78u));  // readlinkat
@@ -18987,6 +19032,8 @@ define i32 @main() { ret i32 0 }
 
     Function *Ctor = M->getFunction("morok.antidbg");
     REQUIRE(Ctor != nullptr);
+    Function *Stat = M->getFunction("morok.antidbg.linux.stat4");
+    REQUIRE(Stat != nullptr);
     Function *Parent = M->getFunction("morok.antidbg.parent");
     REQUIRE(Parent != nullptr);
     CHECK(M->getFunction("morok.antidbg.rr") == nullptr);
@@ -18999,6 +19046,7 @@ define i32 @main() { ret i32 0 }
           1u);
     CHECK(countNamedInstructions(
               *Parent, "morok.antidbg.parent.status.ppid.value") >= 1u);
+    CHECK(functionHasConstantInt(*Stat, 64u));    // getppid
     CHECK(functionHasConstantInt(*Parent, 64u));  // getppid
     CHECK(functionHasConstantInt(*Parent, 322u)); // openat
     CHECK(functionHasConstantInt(*Parent, 332u)); // readlinkat
