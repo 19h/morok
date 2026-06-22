@@ -10255,12 +10255,20 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
     Value *mapLibPin = bufferHasLiteral(
         MB, M, maps.buf, maps.n, {0x6c, 0x69, 0x62, 0x70, 0x69, 0x6e}, 8192,
         "morok.antihook.dbi.maps.libpin");
+    // "hluda" — a Frida fork that renames the "frida"/"gum" artifacts to
+    // "hluda" specifically to evade the "frida" substring match above; its
+    // renamed agent/server still maps a uniquely-named module, absent on a
+    // clean run (zero-on-clean), so it is safe to enforce (#163).
+    Value *mapHluda = bufferHasLiteral(
+        MB, M, maps.buf, maps.n, {0x68, 0x6c, 0x75, 0x64, 0x61}, 8192,
+        "morok.antihook.dbi.maps.hluda");
     Value *mapSig = MB.CreateOr(
         MB.CreateOr(MB.CreateOr(mapSig0, mapSig1), mapSig2),
-        MB.CreateOr(MB.CreateOr(mapDyn, mapQbdi),
-                    MB.CreateOr(MB.CreateOr(mapVgPreload, mapValgrind),
-                                MB.CreateOr(mapQemu,
-                                            MB.CreateOr(mapPin, mapLibPin)))),
+        MB.CreateOr(
+            MB.CreateOr(mapDyn, mapQbdi),
+            MB.CreateOr(MB.CreateOr(mapVgPreload, mapValgrind),
+                        MB.CreateOr(MB.CreateOr(mapQemu, mapHluda),
+                                    MB.CreateOr(mapPin, mapLibPin)))),
         "morok.antihook.dbi.maps.sig");
     incrementDiff(MB, diff, mapSig, "morok.antihook.dbi.maps");
     Value *mapJitCache = bufferHasLiteral(

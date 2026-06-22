@@ -16621,6 +16621,9 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.maps.libpin") >=
           1u);
+    // #163: the hluda Frida-fork signature must be scanned and OR-folded into
+    // the enforced maps verdict alongside the other instrumentation tools.
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.maps.hluda") >= 1u);
     CHECK(countNamedInstructions(*Dbi,
                                  "morok.antihook.dbi.jit.maps.jitcache") >=
           1u);
