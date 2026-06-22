@@ -61,6 +61,11 @@ HIGH_VALUE_MARKERS = (
     b"PLACEHOLDER_CIPHERTEXT",
     b"UNSEALED_MANIFEST",
 )
+OUTPUT_LABEL_MARKERS = (
+    b"Password:",
+    b"Act Key:",
+    b"Hash:",
+)
 PLAINTEXT_SENTINEL_MARKERS = (
     b"MOROK_MAGIC",
     b"MOROK_SENTINEL",
@@ -226,6 +231,14 @@ class Auditor:
                     "plaintext-high-value-marker",
                     path,
                     f"release artifact contains plaintext marker {marker!r}",
+                )
+                break
+        for marker in OUTPUT_LABEL_MARKERS:
+            if marker in data:
+                self.emit_finding(
+                    "plaintext-output-label",
+                    path,
+                    f"release artifact contains plaintext output label {marker!r}",
                 )
                 break
         for marker in PLAINTEXT_SENTINEL_MARKERS:

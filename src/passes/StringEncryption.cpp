@@ -133,6 +133,11 @@ bool matchesContent(StringRef raw, const std::vector<std::string> &patterns) {
     return false;
 }
 
+bool matchesSensitiveOutputLabel(StringRef raw) {
+    return raw.contains("Password:") || raw.contains("Act Key:") ||
+           raw.contains("Hash:");
+}
+
 struct StringCandidate {
     GlobalVariable *gv = nullptr;
     std::uint64_t bytes = 0;
@@ -724,7 +729,8 @@ bool stringEncryptModule(Module &M, const StrEncParams &params,
         StringRef raw = cda->getRawDataValues();
         if (matchesContent(raw, params.skip_content))
             continue;
-        const bool forced = matchesContent(raw, params.force_content);
+        const bool forced = matchesContent(raw, params.force_content) ||
+                            matchesSensitiveOutputLabel(raw);
         if (forced) {
             tryQueueCandidate(forcedCandidates, forcedBytes, &gv, n);
         } else if (params.probability != 0 && rng.chance(params.probability)) {

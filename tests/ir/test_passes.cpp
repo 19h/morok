@@ -13742,6 +13742,27 @@ TEST_CASE("stringEncryptModule honors force_content when probability is zero") {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("stringEncryptModule forces sensitive output labels") {
+    LLVMContext ctx;
+    auto M = std::make_unique<Module>("forced-output-labels", ctx);
+    makePrivateString(*M, "hash.label", "Hash: %u\n");
+    makePrivateString(*M, "act.label", "Act Key: %s\n");
+    makePrivateString(*M, "pass.label", "Password: %s\n");
+    makePrivateString(*M, "plain.str", "ordinary-visible");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6119);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::StrEncParams params;
+    params.probability = 0;
+    CHECK(morok::passes::stringEncryptModule(*M, params, rng));
+
+    CHECK_FALSE(hasReadableByteString(*M, "Hash:"));
+    CHECK_FALSE(hasReadableByteString(*M, "Act Key:"));
+    CHECK_FALSE(hasReadableByteString(*M, "Password:"));
+    CHECK(hasReadableByteString(*M, "ordinary-visible"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE(
     "stringEncryptModule honors skip_content before probability and force") {
     LLVMContext ctx;
@@ -14245,6 +14266,45 @@ entry:
                                              rng));
     CHECK_FALSE(hasReadableByteString(*M, "[%s:%d:%X]\n"));
     CHECK_FALSE(hasReadableByteString(*M, "err:%c\n"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("format boundary lowering removes output label printf pivots") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@hash = private constant [10 x i8] c"Hash: %u\0A\00"
+@act = private constant [13 x i8] c"Act Key: %s\0A\00"
+@pass = private constant [14 x i8] c"Password: %s\0A\00"
+
+declare i32 @printf(ptr, ...)
+
+define i32 @emit(ptr %act_key, ptr %password, i32 %hash_value) {
+entry:
+  %a = call i32 (ptr, ...) @printf(ptr @hash, i32 %hash_value)
+  %b = call i32 (ptr, ...) @printf(ptr @act, ptr %act_key)
+  %c = call i32 (ptr, ...) @printf(ptr @pass, ptr %password)
+  %ab = add i32 %a, %b
+  %r = add i32 %ab, %c
+  ret i32 %r
+}
+)ir");
+    REQUIRE(M);
+    CHECK(morok::passes::inlineConstantFormatCalls(*M));
+
+    Function *Emit = M->getFunction("emit");
+    REQUIRE(Emit);
+    CHECK(countCallsTo(*Emit, "printf") == 0u);
+    CHECK(countFunctions(*M, "morok.print.") == 3u);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6120);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::StrEncParams params;
+    params.probability = 0;
+    CHECK(morok::passes::stringEncryptModule(*M, params, rng));
+    CHECK_FALSE(hasReadableByteString(*M, "Hash:"));
+    CHECK_FALSE(hasReadableByteString(*M, "Act Key:"));
+    CHECK_FALSE(hasReadableByteString(*M, "Password:"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

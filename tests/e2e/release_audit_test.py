@@ -325,6 +325,18 @@ def main(argv: list[str]) -> int:
             run(tool, sentinel, "--require-sealed-manifest"),
             "plaintext-sentinel-marker",
         )
+
+        output_label = tmp / "output-label"
+        output_label.mkdir()
+        output_app = output_label / "app"
+        write_synthetic_elf(output_app, sealed=True)
+        data = bytearray(output_app.read_bytes())
+        data[0x700 : 0x700 + len(b"Password:")] = b"Password:"
+        output_app.write_bytes(data)
+        require_fail(
+            run(tool, output_label, "--require-sealed-manifest"),
+            "plaintext-output-label",
+        )
     return 0
 
 
