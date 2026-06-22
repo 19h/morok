@@ -469,6 +469,23 @@ bool defineLinuxCollector(Module &M, Function *Feed, Function *Finish,
     return true;
 }
 
+bool defineFinishOnlyCollector(Module &M, Function *Finish, ir::IRRandom &Rng) {
+    if (!Finish || M.getFunction(kCtorName))
+        return false;
+    auto *Fn = Function::Create(
+        FunctionType::get(Type::getVoidTy(M.getContext()), false),
+        GlobalValue::InternalLinkage, kCtorName, &M);
+    Fn->setDSOLocal(true);
+    Fn->addFnAttr(Attribute::NoUnwind);
+    BasicBlock *Entry = BasicBlock::Create(M.getContext(), "entry", Fn);
+    IRBuilder<> B(Entry);
+    B.CreateCall(Finish->getFunctionType(), Finish,
+                 {ConstantInt::get(B.getInt64Ty(), Rng.next())});
+    B.CreateRetVoid();
+    appendToGlobalCtors(M, Fn, 0);
+    return true;
+}
+
 } // namespace
 
 bool envBindingKdfModule(Module &M, const EnvBindingKdfParams &Params,
@@ -494,12 +511,18 @@ bool envBindingKdfModule(Module &M, const EnvBindingKdfParams &Params,
                             Params.bind_to_runtime_seal,
                             Params.virtualize_helpers);
 
+    bool Collected = false;
     if (Params.mode != "feed_api" && supportsLinuxCollector(M)) {
         Function *Feed = M.getFunction(kFeedName);
         Function *Finish = M.getFunction(kFinishName);
-        if (Feed && Finish)
-            Changed |= defineLinuxCollector(M, Feed, Finish, Rng);
+        if (Feed && Finish) {
+            Collected = defineLinuxCollector(M, Feed, Finish, Rng);
+            Changed |= Collected;
+        }
     }
+    if (Params.bind_to_runtime_seal && !Collected)
+        Changed |= defineFinishOnlyCollector(M, M.getFunction(kFinishName),
+                                             Rng);
     return Changed;
 }
 

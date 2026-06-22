@@ -10319,6 +10319,71 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("envBindingKdfModule finish-only fallback dirties missing identity") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-apple-darwin"
+define i32 @main() {
+entry:
+  ret i32 0
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(146003);
+    morok::ir::IRRandom rng(engine);
+
+    morok::passes::EnvBindingKdfParams params;
+    params.expected_digest = "0x1122334455667788";
+    CHECK(morok::passes::envBindingKdfModule(*M, params, rng));
+
+    GlobalVariable *Seal = M->getGlobalVariable(
+        "morok.seal.root.env_binding", /*AllowInternal=*/true);
+    REQUIRE(Seal != nullptr);
+    Function *Feed = M->getFunction("morok.envbind.feed");
+    Function *Finish = M->getFunction("morok.envbind.finish");
+    Function *Ctor = M->getFunction("morok.envbind.collect");
+    REQUIRE(Feed != nullptr);
+    REQUIRE(Finish != nullptr);
+    REQUIRE(Ctor != nullptr);
+    CHECK(countCallsTo(*Ctor, "morok.envbind.feed") == 0u);
+    CHECK(countCallsTo(*Ctor, "morok.envbind.finish") == 1u);
+    CHECK(M->getGlobalVariable("llvm.global_ctors", true) != nullptr);
+    CHECK(countNamedInstructions(*Finish,
+                                 "morok.envbind.finish.missing.nonzero") == 1u);
+    CHECK(countNamedInstructions(*Finish, "morok.envbind.finish.seal.next") ==
+          1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("envBindingKdfModule feed API fail-closes when seal-bound") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() {
+entry:
+  ret i32 0
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(146004);
+    morok::ir::IRRandom rng(engine);
+
+    morok::passes::EnvBindingKdfParams params;
+    params.mode = "feed_api";
+    CHECK(morok::passes::envBindingKdfModule(*M, params, rng));
+
+    GlobalVariable *Seal = M->getGlobalVariable(
+        "morok.seal.root.env_binding", /*AllowInternal=*/true);
+    REQUIRE(Seal != nullptr);
+    Function *Ctor = M->getFunction("morok.envbind.collect");
+    Function *Finish = M->getFunction("morok.envbind.finish");
+    REQUIRE(Ctor != nullptr);
+    REQUIRE(Finish != nullptr);
+    CHECK(countCallsTo(*Ctor, "morok.envbind.feed") == 0u);
+    CHECK(countCallsTo(*Ctor, "morok.envbind.finish") == 1u);
+    CHECK(countNamedInstructions(*Finish, "morok.envbind.finish.seal.next") ==
+          1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("envBindingKdfModule honors feed API mode and seal opt-out") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
