@@ -13474,6 +13474,296 @@ Value *bufferHasLinuxAnonymousExecMap(IRBuilder<> &B, Module &M,
     return out;
 }
 
+Value *bufferHasLinuxRxMemoryLiteral(IRBuilder<> &B, Module &M, AllocaInst *Buf,
+                                     Value *N,
+                                     std::initializer_list<unsigned char> Literal,
+                                     std::uint64_t MaxBytes,
+                                     std::uint64_t MaxRegionBytes,
+                                     std::uint64_t MaxRegions,
+                                     const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    Function *fn = B.GetInsertBlock()->getParent();
+    auto *i1 = Type::getInt1Ty(ctx);
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    if (Literal.size() == 0 || MaxRegionBytes < Literal.size() ||
+        MaxRegions == 0)
+        return ConstantInt::getFalse(ctx);
+
+    std::vector<unsigned char> bytes(Literal.begin(), Literal.end());
+    auto *foundSlot = B.CreateAlloca(i1, nullptr, Name + ".found");
+    auto *idxSlot = B.CreateAlloca(ip, nullptr, Name + ".idx.slot");
+    auto *rangeSlot = B.CreateAlloca(ip, nullptr, Name + ".range.slot");
+    auto *lineSlot = B.CreateAlloca(ip, nullptr, Name + ".line.slot");
+    auto *posSlot = B.CreateAlloca(ip, nullptr, Name + ".pos.slot");
+    auto *startSlot = B.CreateAlloca(ip, nullptr, Name + ".start.slot");
+    auto *endSlot = B.CreateAlloca(ip, nullptr, Name + ".end.slot");
+    auto *dashSlot = B.CreateAlloca(i1, nullptr, Name + ".dash.slot");
+    B.CreateStore(ConstantInt::getFalse(ctx), foundSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 1), idxSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(ip, 0), rangeSlot)->setVolatile(true);
+
+    auto *mapLoopBB = BasicBlock::Create(ctx, (Name + ".map.loop").str(), fn);
+    auto *mapBodyBB = BasicBlock::Create(ctx, (Name + ".map.body").str(), fn);
+    auto *lineLoopBB = BasicBlock::Create(ctx, (Name + ".line.loop").str(), fn);
+    auto *lineBodyBB = BasicBlock::Create(ctx, (Name + ".line.body").str(), fn);
+    auto *lineStepBB = BasicBlock::Create(ctx, (Name + ".line.step").str(), fn);
+    auto *parseInitBB =
+        BasicBlock::Create(ctx, (Name + ".parse.init").str(), fn);
+    auto *parseLoopBB =
+        BasicBlock::Create(ctx, (Name + ".parse.loop").str(), fn);
+    auto *parseBodyBB =
+        BasicBlock::Create(ctx, (Name + ".parse.body").str(), fn);
+    auto *scanGateBB =
+        BasicBlock::Create(ctx, (Name + ".scan.gate").str(), fn);
+    auto *memLoopBB = BasicBlock::Create(ctx, (Name + ".mem.loop").str(), fn);
+    auto *memBodyBB = BasicBlock::Create(ctx, (Name + ".mem.body").str(), fn);
+    auto *memHitBB = BasicBlock::Create(ctx, (Name + ".mem.hit").str(), fn);
+    auto *memNextBB = BasicBlock::Create(ctx, (Name + ".mem.next").str(), fn);
+    auto *mapNextBB = BasicBlock::Create(ctx, (Name + ".map.next").str(), fn);
+    auto *doneBB = BasicBlock::Create(ctx, (Name + ".done").str(), fn);
+    B.CreateBr(mapLoopBB);
+
+    IRBuilder<> MLB(mapLoopBB);
+    auto *found = MLB.CreateLoad(i1, foundSlot, Name + ".found.v");
+    found->setVolatile(true);
+    auto *idx = MLB.CreateLoad(ip, idxSlot, Name + ".idx");
+    idx->setVolatile(true);
+    auto *ranges = MLB.CreateLoad(ip, rangeSlot, Name + ".ranges");
+    ranges->setVolatile(true);
+    Value *end = MLB.CreateAdd(idx, ConstantInt::get(ip, 5), Name + ".end");
+    Value *withinRead = MLB.CreateICmpSLE(end, N, Name + ".within.read");
+    Value *withinBuf = MLB.CreateICmpULE(end, ConstantInt::get(ip, MaxBytes),
+                                         Name + ".within.buf");
+    Value *rangeBudget =
+        MLB.CreateICmpULT(ranges, ConstantInt::get(ip, MaxRegions),
+                          Name + ".range.budget");
+    MLB.CreateCondBr(MLB.CreateAnd(MLB.CreateAnd(withinRead, withinBuf),
+                                   MLB.CreateAnd(rangeBudget,
+                                                 MLB.CreateNot(found))),
+                     mapBodyBB, doneBB);
+
+    IRBuilder<> MBB(mapBodyBB);
+    auto isMapChar = [&](Value *V, char C) {
+        return MBB.CreateICmpEQ(
+            V, ConstantInt::get(i8, static_cast<unsigned char>(C)));
+    };
+    Value *prev = loadAt(MBB, M, i8, Buf,
+                         MBB.CreateSub(idx, ConstantInt::get(ip, 1)),
+                         Name + ".prev");
+    Value *p0 = loadAt(MBB, M, i8, Buf, idx, Name + ".perm0");
+    Value *p1 = loadAt(MBB, M, i8, Buf,
+                       MBB.CreateAdd(idx, ConstantInt::get(ip, 1)),
+                       Name + ".perm1");
+    Value *p2 = loadAt(MBB, M, i8, Buf,
+                       MBB.CreateAdd(idx, ConstantInt::get(ip, 2)),
+                       Name + ".perm2");
+    Value *p3 = loadAt(MBB, M, i8, Buf,
+                       MBB.CreateAdd(idx, ConstantInt::get(ip, 3)),
+                       Name + ".perm3");
+    Value *after = loadAt(MBB, M, i8, Buf,
+                          MBB.CreateAdd(idx, ConstantInt::get(ip, 4)),
+                          Name + ".after");
+    Value *permWindow = MBB.CreateAnd(
+        MBB.CreateAnd(isMapChar(prev, ' '), isMapChar(after, ' ')),
+        MBB.CreateAnd(
+            MBB.CreateAnd(MBB.CreateOr(isMapChar(p0, 'r'), isMapChar(p0, '-')),
+                          MBB.CreateOr(isMapChar(p1, 'w'), isMapChar(p1, '-'))),
+            MBB.CreateAnd(MBB.CreateOr(isMapChar(p2, 'x'), isMapChar(p2, '-')),
+                          MBB.CreateOr(isMapChar(p3, 'p'), isMapChar(p3, 's')))),
+        Name + ".perms");
+    Value *readExec = MBB.CreateAnd(
+        permWindow, MBB.CreateAnd(isMapChar(p0, 'r'), isMapChar(p2, 'x')),
+        Name + ".rx");
+    MBB.CreateStore(idx, lineSlot)->setVolatile(true);
+    MBB.CreateCondBr(readExec, lineLoopBB, mapNextBB);
+
+    IRBuilder<> LLB(lineLoopBB);
+    auto *line = LLB.CreateLoad(ip, lineSlot, Name + ".line");
+    line->setVolatile(true);
+    Value *canStepBack = LLB.CreateAnd(
+        LLB.CreateICmpUGT(line, ConstantInt::get(ip, 0), Name + ".line.gt0"),
+        LLB.CreateICmpULT(LLB.CreateSub(idx, line, Name + ".line.back"),
+                          ConstantInt::get(ip, 48), Name + ".line.cap"),
+        Name + ".line.keep");
+    LLB.CreateCondBr(canStepBack, lineBodyBB, parseInitBB);
+
+    IRBuilder<> LBB(lineBodyBB);
+    Value *prevIdx =
+        LBB.CreateSub(line, ConstantInt::get(ip, 1), Name + ".line.prev.idx");
+    Value *lineCh = loadAt(LBB, M, i8, Buf, prevIdx, Name + ".line.ch");
+    LBB.CreateCondBr(LBB.CreateICmpEQ(lineCh, ConstantInt::get(i8, '\n'),
+                                      Name + ".line.nl"),
+                     parseInitBB, lineStepBB);
+
+    IRBuilder<> LSB(lineStepBB);
+    LSB.CreateStore(prevIdx, lineSlot)->setVolatile(true);
+    LSB.CreateBr(lineLoopBB);
+
+    IRBuilder<> PIB(parseInitBB);
+    auto *lineStart = PIB.CreateLoad(ip, lineSlot, Name + ".line.start");
+    lineStart->setVolatile(true);
+    PIB.CreateStore(lineStart, posSlot)->setVolatile(true);
+    PIB.CreateStore(ConstantInt::get(ip, 0), startSlot)->setVolatile(true);
+    PIB.CreateStore(ConstantInt::get(ip, 0), endSlot)->setVolatile(true);
+    PIB.CreateStore(ConstantInt::getFalse(ctx), dashSlot)->setVolatile(true);
+    PIB.CreateBr(parseLoopBB);
+
+    IRBuilder<> PLB(parseLoopBB);
+    auto *pos = PLB.CreateLoad(ip, posSlot, Name + ".pos");
+    pos->setVolatile(true);
+    Value *addrEnd = PLB.CreateSub(idx, ConstantInt::get(ip, 1),
+                                   Name + ".addr.end");
+    Value *parseLive =
+        PLB.CreateAnd(PLB.CreateICmpULT(pos, addrEnd, Name + ".pos.live"),
+                      PLB.CreateICmpULT(pos, ConstantInt::get(ip, MaxBytes),
+                                        Name + ".pos.in.buf"),
+                      Name + ".parse.live");
+    PLB.CreateCondBr(parseLive, parseBodyBB, scanGateBB);
+
+    IRBuilder<> PBB(parseBodyBB);
+    Value *ch = loadAt(PBB, M, i8, Buf, pos, Name + ".addr.ch");
+    Value *dec = PBB.CreateAnd(
+        PBB.CreateICmpUGE(ch, ConstantInt::get(i8, '0'), Name + ".dec.lo"),
+        PBB.CreateICmpULE(ch, ConstantInt::get(i8, '9'), Name + ".dec.hi"),
+        Name + ".dec");
+    Value *lower = PBB.CreateAnd(
+        PBB.CreateICmpUGE(ch, ConstantInt::get(i8, 'a'), Name + ".lower.lo"),
+        PBB.CreateICmpULE(ch, ConstantInt::get(i8, 'f'), Name + ".lower.hi"),
+        Name + ".lower");
+    Value *upper = PBB.CreateAnd(
+        PBB.CreateICmpUGE(ch, ConstantInt::get(i8, 'A'), Name + ".upper.lo"),
+        PBB.CreateICmpULE(ch, ConstantInt::get(i8, 'F'), Name + ".upper.hi"),
+        Name + ".upper");
+    Value *isHex =
+        PBB.CreateOr(dec, PBB.CreateOr(lower, upper), Name + ".is.hex");
+    Value *decDigit =
+        PBB.CreateSub(PBB.CreateZExt(ch, ip), ConstantInt::get(ip, '0'),
+                      Name + ".digit.dec");
+    Value *lowerDigit =
+        PBB.CreateAdd(PBB.CreateSub(PBB.CreateZExt(ch, ip),
+                                    ConstantInt::get(ip, 'a')),
+                      ConstantInt::get(ip, 10), Name + ".digit.lower");
+    Value *upperDigit =
+        PBB.CreateAdd(PBB.CreateSub(PBB.CreateZExt(ch, ip),
+                                    ConstantInt::get(ip, 'A')),
+                      ConstantInt::get(ip, 10), Name + ".digit.upper");
+    Value *digit = PBB.CreateSelect(
+        dec, decDigit,
+        PBB.CreateSelect(lower, lowerDigit, upperDigit, Name + ".digit.alpha"),
+        Name + ".digit");
+    auto *dash = PBB.CreateLoad(i1, dashSlot, Name + ".dash");
+    dash->setVolatile(true);
+    auto *start = PBB.CreateLoad(ip, startSlot, Name + ".start.old");
+    start->setVolatile(true);
+    auto *rangeEnd = PBB.CreateLoad(ip, endSlot, Name + ".end.old");
+    rangeEnd->setVolatile(true);
+    Value *dashChar =
+        PBB.CreateICmpEQ(ch, ConstantInt::get(i8, '-'), Name + ".dash.char");
+    Value *startNext = PBB.CreateSelect(
+        PBB.CreateAnd(isHex, PBB.CreateNot(dash), Name + ".start.hex"),
+        PBB.CreateOr(PBB.CreateShl(start, ConstantInt::get(ip, 4),
+                                   Name + ".start.shift"),
+                     digit, Name + ".start.add"),
+        start, Name + ".start.next");
+    Value *endNext = PBB.CreateSelect(
+        PBB.CreateAnd(isHex, dash, Name + ".end.hex"),
+        PBB.CreateOr(PBB.CreateShl(rangeEnd, ConstantInt::get(ip, 4),
+                                   Name + ".end.shift"),
+                     digit, Name + ".end.add"),
+        rangeEnd, Name + ".end.next");
+    PBB.CreateStore(startNext, startSlot)->setVolatile(true);
+    PBB.CreateStore(endNext, endSlot)->setVolatile(true);
+    PBB.CreateStore(PBB.CreateOr(dash, dashChar, Name + ".dash.next"),
+                    dashSlot)
+        ->setVolatile(true);
+    PBB.CreateStore(PBB.CreateAdd(pos, ConstantInt::get(ip, 1),
+                                  Name + ".pos.next"),
+                    posSlot)
+        ->setVolatile(true);
+    PBB.CreateBr(parseLoopBB);
+
+    IRBuilder<> SGB(scanGateBB);
+    auto *memStart = SGB.CreateLoad(ip, startSlot, Name + ".mem.start");
+    memStart->setVolatile(true);
+    auto *memEnd = SGB.CreateLoad(ip, endSlot, Name + ".mem.end");
+    memEnd->setVolatile(true);
+    auto *rangeUsed = SGB.CreateLoad(ip, rangeSlot, Name + ".range.used");
+    rangeUsed->setVolatile(true);
+    Value *rangeBytes = SGB.CreateSub(memEnd, memStart, Name + ".range.bytes");
+    Value *rangeReady = SGB.CreateAnd(
+        SGB.CreateICmpUGT(memEnd, memStart, Name + ".range.ordered"),
+        SGB.CreateAnd(SGB.CreateICmpUGE(rangeBytes,
+                                        ConstantInt::get(ip, bytes.size()),
+                                        Name + ".range.min"),
+                      SGB.CreateICmpULT(rangeUsed,
+                                        ConstantInt::get(ip, MaxRegions),
+                                        Name + ".range.left")),
+        Name + ".range.ready");
+    Value *scanLimit = SGB.CreateSelect(
+        SGB.CreateICmpUGT(rangeBytes, ConstantInt::get(ip, MaxRegionBytes),
+                          Name + ".range.clamp"),
+        ConstantInt::get(ip, MaxRegionBytes), rangeBytes,
+        Name + ".scan.limit");
+    SGB.CreateStore(SGB.CreateAdd(rangeUsed, ConstantInt::get(ip, 1),
+                                  Name + ".range.next"),
+                    rangeSlot)
+        ->setVolatile(true);
+    SGB.CreateCondBr(rangeReady, memLoopBB, mapNextBB);
+
+    IRBuilder<> ML(memLoopBB);
+    auto *off = ML.CreatePHI(ip, 2, Name + ".mem.off");
+    off->addIncoming(ConstantInt::get(ip, 0), scanGateBB);
+    auto *memFound = ML.CreateLoad(i1, foundSlot, Name + ".mem.found");
+    memFound->setVolatile(true);
+    Value *needleEnd =
+        ML.CreateAdd(off, ConstantInt::get(ip, bytes.size()), Name + ".mem.end");
+    Value *memLive =
+        ML.CreateAnd(ML.CreateICmpULE(needleEnd, scanLimit, Name + ".mem.live"),
+                     ML.CreateNot(memFound), Name + ".mem.keep");
+    ML.CreateCondBr(memLive, memBodyBB, mapNextBB);
+
+    IRBuilder<> MBY(memBodyBB);
+    Value *match = ConstantInt::getTrue(ctx);
+    for (std::uint64_t j = 0; j < bytes.size(); ++j) {
+        Value *addr = MBY.CreateAdd(
+            memStart,
+            MBY.CreateAdd(off, ConstantInt::get(ip, j), Name + ".byte.off"),
+            Name + ".byte.addr");
+        Value *memPtr = MBY.CreateIntToPtr(addr, ptr, Name + ".byte.ptr");
+        auto *memByte = MBY.CreateLoad(i8, memPtr, Name + ".byte");
+        memByte->setVolatile(true);
+        memByte->setAlignment(Align(1));
+        match = MBY.CreateAnd(
+            match, MBY.CreateICmpEQ(memByte, ConstantInt::get(i8, bytes[j])),
+            Name + ".match");
+    }
+    MBY.CreateCondBr(match, memHitBB, memNextBB);
+
+    IRBuilder<> MHB(memHitBB);
+    MHB.CreateStore(ConstantInt::getTrue(ctx), foundSlot)->setVolatile(true);
+    MHB.CreateBr(doneBB);
+
+    IRBuilder<> MNB(memNextBB);
+    Value *nextOff =
+        MNB.CreateAdd(off, ConstantInt::get(ip, 1), Name + ".mem.off.next");
+    MNB.CreateBr(memLoopBB);
+    off->addIncoming(nextOff, memNextBB);
+
+    IRBuilder<> MNB2(mapNextBB);
+    MNB2.CreateStore(MNB2.CreateAdd(idx, ConstantInt::get(ip, 1),
+                                    Name + ".idx.next"),
+                     idxSlot)
+        ->setVolatile(true);
+    MNB2.CreateBr(mapLoopBB);
+
+    B.SetInsertPoint(doneBB);
+    auto *out = B.CreateLoad(i1, foundSlot, Name + ".out");
+    out->setVolatile(true);
+    return out;
+}
+
 bool linuxDbiParentSyscalls(const Triple &TT, std::uint32_t &Getppid,
                             std::uint32_t &Readlinkat) {
     switch (TT.getArch()) {
@@ -14192,8 +14482,11 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
     AllocaInst *diff = B.CreateAlloca(i64, nullptr, "morok.antihook.dbi.diff");
     AllocaInst *jitDiff =
         B.CreateAlloca(i64, nullptr, "morok.antihook.dbi.jit.diff");
+    AllocaInst *pinDiff =
+        B.CreateAlloca(i64, nullptr, "morok.antihook.dbi.pin.diff");
     B.CreateStore(ConstantInt::get(i64, 0), diff)->setVolatile(true);
     B.CreateStore(ConstantInt::get(i64, 0), jitDiff)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, 0), pinDiff)->setVolatile(true);
     ReadFileIR maps =
         emitReadSmallFile(B, M, fn, "/proc/self/maps", 8192, rng, TT);
 
@@ -14239,6 +14532,23 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
     Value *mapLibPin = bufferHasLiteral(
         MB, M, maps.buf, maps.n, {0x6c, 0x69, 0x62, 0x70, 0x69, 0x6e}, 8192,
         "morok.antihook.dbi.maps.libpin");
+    Value *mapPinVm = bufferHasLiteral(
+        MB, M, maps.buf, maps.n,
+        {0x70, 0x69, 0x6e, 0x76, 0x6d, 0x2e, 0x73, 0x6f}, 8192,
+        "morok.antihook.dbi.pin.maps.pinvm");
+    Value *mapPinCharmve = bufferHasLiteral(
+        MB, M, maps.buf, maps.n,
+        {0x2e, 0x63, 0x68, 0x61, 0x72, 0x6d, 0x76, 0x65}, 8192,
+        "morok.antihook.dbi.pin.maps.charmve");
+    Value *mapPinClie = bufferHasLiteral(
+        MB, M, maps.buf, maps.n,
+        {0x2e, 0x70, 0x69, 0x6e, 0x63, 0x6c, 0x69, 0x65}, 8192,
+        "morok.antihook.dbi.pin.maps.pinclie");
+    Value *mapPinEncoder = bufferHasLinuxRxMemoryLiteral(
+        MB, M, maps.buf, maps.n,
+        {0x49, 0x6e, 0x74, 0x65, 0x6c, 0x28, 0x52, 0x29, 0x20, 0x58,
+         0x38, 0x36, 0x20, 0x45, 0x6e, 0x63, 0x6f, 0x64, 0x65, 0x72},
+        8192, 65536, 8, "morok.antihook.dbi.pin.rx.encoder");
     // "hluda-" — a Frida fork that renames the "frida"/"gum" artifacts to
     // "hluda" specifically to evade the "frida" substring match above. Anchored
     // to the trailing '-' of its module convention (hluda-agent / hluda-gadget
@@ -14253,13 +14563,20 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
         "morok.antihook.dbi.maps.hluda");
     Value *mapSig = MB.CreateOr(
         MB.CreateOr(MB.CreateOr(mapSig0, mapSig1), mapSig2),
-        MB.CreateOr(
-            MB.CreateOr(mapDyn, mapQbdi),
-            MB.CreateOr(MB.CreateOr(mapVgPreload, mapValgrind),
-                        MB.CreateOr(MB.CreateOr(mapQemu, mapHluda),
-                                    MB.CreateOr(mapPin, mapLibPin)))),
+        MB.CreateOr(MB.CreateOr(mapDyn, mapQbdi),
+                    MB.CreateOr(MB.CreateOr(mapVgPreload, mapValgrind),
+                                MB.CreateOr(mapQemu, mapHluda))),
         "morok.antihook.dbi.maps.sig");
     incrementDiff(MB, diff, mapSig, "morok.antihook.dbi.maps");
+    Value *mapPinStock = MB.CreateOr(
+        MB.CreateOr(mapPin, mapLibPin, "morok.antihook.dbi.pin.maps.libs"),
+        MB.CreateOr(MB.CreateOr(mapPinVm, mapPinEncoder,
+                                "morok.antihook.dbi.pin.maps.vm.rx"),
+                    MB.CreateOr(mapPinCharmve, mapPinClie,
+                                "morok.antihook.dbi.pin.maps.sections"),
+                    "morok.antihook.dbi.pin.maps.vm.sections"),
+        "morok.antihook.dbi.pin.maps.stock");
+    incrementDiff(MB, pinDiff, mapPinStock, "morok.antihook.dbi.pin.maps");
     Value *mapJitCache = bufferHasLiteral(
         MB, M, maps.buf, maps.n,
         {0x6a, 0x69, 0x74, 0x2d, 0x63, 0x61, 0x63, 0x68, 0x65}, 8192,
@@ -14332,6 +14649,17 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
         {rtldDefault,
          ir::emitCloakedSymbol(TB, M, "QBDI_addCodeRangeCB", rng)},
         "morok.antihook.dbi.dlsym.qbdi");
+    Value *pinSetDebug = TB.CreateCall(
+        dlsym,
+        {rtldDefault, ir::emitCloakedSymbol(TB, M, "PIN_SetDebugMode", rng)},
+        "morok.antihook.dbi.pin.dlsym.set_debug");
+    Value *pinCommitHash = TB.CreateCall(
+        dlsym,
+        {rtldDefault, ir::emitCloakedSymbol(TB, M, "PinCommitHashC", rng)},
+        "morok.antihook.dbi.pin.dlsym.commit_hash");
+    Value *pinTls = TB.CreateCall(
+        dlsym, {rtldDefault, ir::emitCloakedSymbol(TB, M, "__pin_tls", rng)},
+        "morok.antihook.dbi.pin.dlsym.tls");
     Value *symbolSig = TB.CreateOr(
         TB.CreateICmpNE(drAppStart, ConstantPointerNull::get(ptr),
                         "morok.antihook.dbi.dlsym.dr.hit"),
@@ -14339,6 +14667,17 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
                         "morok.antihook.dbi.dlsym.qbdi.hit"),
         "morok.antihook.dbi.dlsym.sig");
     incrementDiff(TB, diff, symbolSig, "morok.antihook.dbi.dlsym");
+    Value *pinSymbolSig = TB.CreateOr(
+        TB.CreateICmpNE(pinSetDebug, ConstantPointerNull::get(ptr),
+                        "morok.antihook.dbi.pin.dlsym.set_debug.hit"),
+        TB.CreateOr(TB.CreateICmpNE(pinCommitHash,
+                                    ConstantPointerNull::get(ptr),
+                                    "morok.antihook.dbi.pin.dlsym.commit_hash.hit"),
+                    TB.CreateICmpNE(pinTls, ConstantPointerNull::get(ptr),
+                                    "morok.antihook.dbi.pin.dlsym.tls.hit"),
+                    "morok.antihook.dbi.pin.dlsym.commit.tls"),
+        "morok.antihook.dbi.pin.dlsym.sig");
+    incrementDiff(TB, pinDiff, pinSymbolSig, "morok.antihook.dbi.pin.dlsym");
 
     Value *vgMagic = emitValgrindRunningRequest(TB, M);
     Value *vgHit =
@@ -14382,8 +14721,17 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
             CB, M, comm.buf, comm.n,
             {0x76, 0x61, 0x6c, 0x67, 0x72, 0x69, 0x6e, 0x64}, 128,
             "morok.antihook.dbi.parent.comm.valgrind");
+        Value *commPin = bufferHasLiteral(
+            CB, M, comm.buf, comm.n, {0x70, 0x69, 0x6e, 0x0a}, 128,
+            "morok.antihook.dbi.parent.comm.pin");
+        Value *commPinBin = bufferHasLiteral(
+            CB, M, comm.buf, comm.n,
+            {0x70, 0x69, 0x6e, 0x62, 0x69, 0x6e}, 128,
+            "morok.antihook.dbi.parent.comm.pinbin");
         incrementDiff(CB, diff, CB.CreateOr(commQemu, commValgrind),
                       "morok.antihook.dbi.parent.comm");
+        incrementDiff(CB, pinDiff, CB.CreateOr(commPin, commPinBin),
+                      "morok.antihook.dbi.pin.parent.comm");
         CB.CreateBr(afterCommBB);
 
         IRBuilder<> PCB(afterCommBB);
@@ -14414,8 +14762,17 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
             PCB, M, exeBuf, exeN,
             {0x76, 0x61, 0x6c, 0x67, 0x72, 0x69, 0x6e, 0x64}, 256,
             "morok.antihook.dbi.parent.exe.valgrind");
+        Value *exePin = bufferBasenameEqualsLiteral(
+            PCB, M, exeBuf, exeN, {0x70, 0x69, 0x6e}, 256,
+            "morok.antihook.dbi.parent.exe.pin");
+        Value *exePinBin = bufferBasenameEqualsLiteral(
+            PCB, M, exeBuf, exeN,
+            {0x70, 0x69, 0x6e, 0x62, 0x69, 0x6e}, 256,
+            "morok.antihook.dbi.parent.exe.pinbin");
         incrementDiff(PCB, diff, PCB.CreateOr(exeQemu, exeValgrind),
                       "morok.antihook.dbi.parent.exe");
+        incrementDiff(PCB, pinDiff, PCB.CreateOr(exePin, exePinBin),
+                      "morok.antihook.dbi.pin.parent.exe");
         PCB.CreateBr(afterParentBB);
     } else {
         TB.CreateBr(afterParentBB);
@@ -14445,11 +14802,22 @@ Function *linuxDbiSignatureProbe(Module &M, ir::IRRandom &rng,
     auto *soft =
         RB.CreateLoad(i64, jitDiff, "morok.antihook.dbi.jit.diff.soft");
     soft->setVolatile(true);
+    auto *pin =
+        RB.CreateLoad(i64, pinDiff, "morok.antihook.dbi.pin.diff.hard");
+    pin->setVolatile(true);
+    Value *pinConfirmed =
+        RB.CreateICmpUGE(pin, ConstantInt::get(i64, 2),
+                         "morok.antihook.dbi.pin.confirmed");
+    Value *hardWithPin =
+        RB.CreateAdd(hard, RB.CreateZExt(pinConfirmed, i64),
+                     "morok.antihook.dbi.diff.hard.pin");
+    Value *softWithPin =
+        RB.CreateAdd(soft, pin, "morok.antihook.dbi.jit.pin.soft");
     Value *packedHard =
-        RB.CreateAnd(hard, ConstantInt::get(i64, 0xffffffffULL),
+        RB.CreateAnd(hardWithPin, ConstantInt::get(i64, 0xffffffffULL),
                      "morok.antihook.dbi.diff.pack.hard");
     Value *packedSoft = RB.CreateShl(
-        RB.CreateAnd(soft, ConstantInt::get(i64, 0xffffffffULL),
+        RB.CreateAnd(softWithPin, ConstantInt::get(i64, 0xffffffffULL),
                      "morok.antihook.dbi.jit.diff.pack.soft"),
         ConstantInt::get(i64, 32), "morok.antihook.dbi.jit.diff.shift");
     RB.CreateRet(RB.CreateOr(packedHard, packedSoft,

@@ -17216,6 +17216,22 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.maps.libpin") >=
           1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.pin.maps.pinvm") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.pin.maps.charmve") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.pin.maps.pinclie") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.pin.rx.encoder") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.pin.rx.encoder.rx") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.pin.rx.encoder.scan.limit") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.pin.rx.encoder.byte") >= 1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.pin.maps") >= 1u);
     // #163: the hluda Frida-fork signature must be scanned and OR-folded into
     // the enforced maps verdict alongside the other instrumentation tools.
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.maps.hluda") >= 1u);
@@ -17260,6 +17276,14 @@ entry:
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.port.sig0") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.dlsym.dr") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.dlsym.qbdi") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.pin.dlsym.set_debug") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.pin.dlsym.commit_hash") >= 1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.pin.dlsym.tls") >=
+          1u);
+    CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.pin.dlsym.sig") >=
+          1u);
     CHECK(countNamedInstructions(*Dbi,
                                  "morok.antihook.dbi.valgrind.magic") >= 1u);
     CHECK(countNamedInstructions(*Dbi,
@@ -17270,11 +17294,30 @@ entry:
     CHECK(countNamedInstructions(
               *Dbi, "morok.antihook.dbi.parent.comm.valgrind") >= 1u);
     CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.parent.comm.pin") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.parent.comm.pinbin") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.pin.parent.comm") >= 1u);
+    CHECK(countNamedInstructions(
               *Dbi, "morok.antihook.dbi.parent.exe.readlink") >= 1u);
     CHECK(countNamedInstructions(*Dbi,
                                  "morok.antihook.dbi.parent.exe.qemu") >= 1u);
     CHECK(countNamedInstructions(
               *Dbi, "morok.antihook.dbi.parent.exe.valgrind") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.parent.exe.pin") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.parent.exe.pinbin") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.pin.parent.exe") >= 1u);
+    CHECK(countNamedInstructions(*Dbi,
+                                 "morok.antihook.dbi.pin.confirmed") >= 1u);
+    Instruction *PinConfirmed =
+        findNamedInstruction(*Dbi, "morok.antihook.dbi.pin.confirmed");
+    REQUIRE(PinConfirmed != nullptr);
+    CHECK(valueFeedsNamedInstruction(PinConfirmed,
+                                     "morok.antihook.dbi.diff.ret"));
     Instruction *DbiChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.dbi.changed");
     REQUIRE(DbiChanged != nullptr);
@@ -17527,6 +17570,9 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "qemu-"));
     CHECK_FALSE(hasReadableByteString(*M, "pinbin"));
     CHECK_FALSE(hasReadableByteString(*M, "libpin"));
+    CHECK_FALSE(hasReadableByteString(*M, "pinvm.so"));
+    CHECK_FALSE(hasReadableByteString(*M, ".charmve"));
+    CHECK_FALSE(hasReadableByteString(*M, ".pinclie"));
     CHECK_FALSE(hasReadableByteString(*M, "jit-cache"));
     CHECK_FALSE(hasReadableByteString(*M, "code-cache"));
     CHECK_FALSE(hasReadableByteString(*M, "tcg-"));
@@ -17534,6 +17580,10 @@ entry:
     CHECK_FALSE(hasReadableByteString(*M, "TCGTCGTCGTCG"));
     CHECK_FALSE(hasReadableByteString(*M, "dr_app_start"));
     CHECK_FALSE(hasReadableByteString(*M, "QBDI_addCodeRangeCB"));
+    CHECK_FALSE(hasReadableByteString(*M, "PIN_SetDebugMode"));
+    CHECK_FALSE(hasReadableByteString(*M, "PinCommitHashC"));
+    CHECK_FALSE(hasReadableByteString(*M, "__pin_tls"));
+    CHECK_FALSE(hasReadableByteString(*M, "Intel(R) X86 Encoder"));
     CHECK_FALSE(hasReadableByteString(*M, "ASAN_OPTIONS"));
     CHECK_FALSE(hasReadableByteString(*M, "MSHookFunction"));
     CHECK_FALSE(verifyModule(*M, &errs()));
