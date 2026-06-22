@@ -265,13 +265,46 @@ void checkSealEnforcement(Module &M, Function &F) {
     CHECK(countNamedInstructions(F, "morok.seal.fold.anti_debug.next") >= 1u);
 }
 
-void checkDarwinCsopsTaskAllowSignals(Function &F) {
+void checkDarwinCsopsTaskAllowSignals(Function &F,
+                                      bool DistributionSigned = false) {
     CHECK(countNamedInstructions(F, "morok.antidbg.csops.gta.bits") >= 1u);
     CHECK(countNamedInstructions(F, "morok.antidbg.csops.gta.missing") >= 1u);
     Instruction *Absent =
         findNamedInstruction(F, "morok.antidbg.csops.gta.absent.debugged");
     REQUIRE(Absent != nullptr);
     CHECK(valueFeedsNamedInstruction(Absent, "morok.seal.fold.anti_debug"));
+
+    CHECK(countNamedInstructions(F, "morok.antidbg.csops.sigclass.adhoc.bits") >=
+          1u);
+    CHECK(countNamedInstructions(F, "morok.antidbg.csops.sigclass.dev.bits") >=
+          1u);
+    CHECK(countNamedInstructions(F,
+                                 "morok.antidbg.csops.sigclass.platform.bits") >=
+          1u);
+    Instruction *Actual =
+        findNamedInstruction(F, "morok.antidbg.csops.sigclass.actual");
+    Instruction *Delta =
+        findNamedInstruction(F, "morok.antidbg.csops.sigclass.delta");
+    Instruction *EffectiveDelta = findNamedInstruction(
+        F, "morok.antidbg.csops.sigclass.delta.effective");
+    Instruction *Drift =
+        findNamedInstruction(F, "morok.antidbg.csops.sigclass.drift");
+    REQUIRE(Actual != nullptr);
+    REQUIRE(Delta != nullptr);
+    REQUIRE(EffectiveDelta != nullptr);
+    REQUIRE(Drift != nullptr);
+    CHECK(valueFeedsNamedInstruction(Actual,
+                                     "morok.antidbg.csops.sigclass.delta"));
+    CHECK(valueFeedsNamedInstruction(Delta,
+                                     "morok.antidbg.csops.sigclass.drift"));
+    CHECK(valueFeedsNamedInstruction(Drift, "morok.seal.fold.anti_debug"));
+
+    const std::uint64_t ForbiddenMask = DistributionSigned ? 0x7u : 0x4u;
+    bool UsesExpectedMask = false;
+    for (Value *Op : Delta->operands())
+        if (auto *CI = dyn_cast<ConstantInt>(Op))
+            UsesExpectedMask |= CI->getZExtValue() == ForbiddenMask;
+    CHECK(UsesExpectedMask);
 }
 
 void checkDarwinCsopsExceptionCoherence(Function &F) {
@@ -18557,6 +18590,7 @@ entry:
         M->getFunction("morok.antidbg.darwin.get_task_allow");
     REQUIRE(Ctor != nullptr);
     REQUIRE(GetTaskAllow != nullptr);
+    checkDarwinCsopsTaskAllowSignals(*Ctor, /*DistributionSigned=*/true);
     CHECK(M->getFunction("SecTaskCreateFromSelf") == nullptr);
     CHECK(M->getFunction("SecTaskCopyValueForEntitlement") == nullptr);
     CHECK_FALSE(hasReadableByteString(*M,

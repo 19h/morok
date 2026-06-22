@@ -3186,7 +3186,7 @@ void emitLinuxWatcherStart(IRBuilder<> &B, Module &M, Function *WatchFn) {
 }
 
 Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
-                         const Triple &TT);
+                         const Triple &TT, bool DistributionSigned);
 Function *windowsTextChecksumProbe(Module &M, GlobalVariable *State,
                                    ir::IRRandom &rng, const Triple &TT);
 Function *windowsHardwareBreakpointProbe(Module &M, GlobalVariable *State,
@@ -3511,7 +3511,8 @@ struct DarwinCsopsSignals {
 
 DarwinCsopsSignals emitDarwinCsopsCheck(IRBuilder<> &B, Module &M,
                                         GlobalVariable *State,
-                                        const Triple &TT) {
+                                        const Triple &TT,
+                                        bool DistributionSigned) {
     LLVMContext &ctx = M.getContext();
     auto *i32 = Type::getInt32Ty(ctx);
     auto *ip = intPtrTy(M);
@@ -3529,6 +3530,38 @@ DarwinCsopsSignals emitDarwinCsopsCheck(IRBuilder<> &B, Module &M,
     Value *dbgFlag = B.CreateAnd(ok, debugged);
     foldFlag(B, State, dbgFlag, 0xF1D88C6C72195307ULL, "morok.antidbg.csops");
     sealFold(B, dbgFlag, 0xF1D88C6C72195307ULL);
+
+    auto classBit = [&](std::uint32_t flag, std::uint32_t bit,
+                        const Twine &Name) -> Value * {
+        Value *bits = B.CreateAnd(flags, ConstantInt::get(i32, flag),
+                                  Name + ".bits");
+        Value *set = B.CreateICmpNE(bits, ConstantInt::get(i32, 0), Name);
+        return B.CreateSelect(set, ConstantInt::get(i32, bit),
+                              ConstantInt::get(i32, 0), Name + ".word");
+    };
+    Value *adhocClass =
+        classBit(0x00000002U, 0x1U, "morok.antidbg.csops.sigclass.adhoc");
+    Value *devClass =
+        classBit(0x00002000U, 0x2U, "morok.antidbg.csops.sigclass.dev");
+    Value *platformClass =
+        classBit(0x04000000U, 0x4U, "morok.antidbg.csops.sigclass.platform");
+    Value *sigClass = B.CreateOr(
+        B.CreateOr(adhocClass, devClass, "morok.antidbg.csops.sigclass.local"),
+        platformClass, "morok.antidbg.csops.sigclass.actual");
+    const std::uint32_t expectedMask = DistributionSigned ? 0x0U : 0x3U;
+    const std::uint32_t forbiddenMask = 0x7U & ~expectedMask;
+    Value *classDelta =
+        B.CreateAnd(sigClass, ConstantInt::get(i32, forbiddenMask),
+                    "morok.antidbg.csops.sigclass.delta");
+    Value *effectiveDelta = B.CreateSelect(
+        ok, classDelta, ConstantInt::get(i32, 0),
+        "morok.antidbg.csops.sigclass.delta.effective");
+    Value *classDrift =
+        B.CreateICmpNE(effectiveDelta, ConstantInt::get(i32, 0),
+                       "morok.antidbg.csops.sigclass.drift");
+    foldState(B, State, effectiveDelta, 0xA76C5D9021B4E38FULL,
+              "morok.antidbg.csops.sigclass");
+    sealFold(B, classDrift, 0xA76C5D9021B4E38FULL);
 
     Value *taskAllowBits =
         B.CreateAnd(flags, ConstantInt::get(i32, 0x4),
@@ -4107,7 +4140,8 @@ void emitDarwinAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
              B.CreateICmpNE(ptraceRc, ConstantInt::get(ptraceRc->getType(), 0)),
              0x9C2F71A6E5B30D4FULL);
     emitDarwinSysctlCheck(B, M, State, TT);
-    DarwinCsopsSignals csops = emitDarwinCsopsCheck(B, M, State, TT);
+    DarwinCsopsSignals csops =
+        emitDarwinCsopsCheck(B, M, State, TT, DistributionSigned);
     Value *exceptionPorts = emitDarwinExceptionPortProbe(B, M, State, TT);
     if (csops.debuggedWithoutTaskAllow && exceptionPorts) {
         Value *coherent =
@@ -10937,7 +10971,7 @@ void emitProloguePatternChecks(IRBuilder<> &B, Module &M, const Triple &TT,
 }
 
 Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
-                         const Triple &TT) {
+                         const Triple &TT, bool DistributionSigned) {
     if (Function *existing = M.getFunction("morok.antidbg.probe"))
         return existing;
 
@@ -10971,7 +11005,7 @@ Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
             B.CreateCall(faultCf->getFunctionType(), faultCf, {tag});
     } else if (TT.isOSDarwin()) {
         emitDarwinSysctlCheck(B, M, State, TT);
-        emitDarwinCsopsCheck(B, M, State, TT);
+        emitDarwinCsopsCheck(B, M, State, TT, DistributionSigned);
     } else if (TT.isOSWindows()) {
         if (Function *dr = windowsHardwareBreakpointProbe(M, State, rng, TT))
             B.CreateCall(dr->getFunctionType(), dr, {tag});
@@ -24728,7 +24762,7 @@ bool antiDebuggingModule(Module &M, ir::IRRandom &rng, bool AllowSelfTrace,
         emitWindowsAntiDebug(M, ctor, state, rng, tt);
     else
         IRBuilder<>(&ctor->getEntryBlock()).CreateRetVoid();
-    Function *probe = antiDebugProbe(M, state, rng, tt);
+    Function *probe = antiDebugProbe(M, state, rng, tt, DistributionSigned);
     insertAntiDebugCallsiteProbes(M, probe, rng);
     appendToGlobalCtors(M, ctor, 0);
     registerWindowsTlsCallbacks(M, ctor, "antidbg", rng);
