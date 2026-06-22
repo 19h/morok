@@ -17629,6 +17629,87 @@ Function *windowsPatchRemoteBreakinHelper(Module &M) {
     return fn;
 }
 
+GlobalVariable *windowsInvalidHandleExceptionSeen(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.win.attach.invalid.exception.seen",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, i32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i32, 0),
+        "morok.win.attach.invalid.exception.seen");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+Function *windowsInvalidHandleExceptionHandler(Module &M) {
+    if (Function *existing =
+            M.getFunction("morok.win.attach.invalid.exception.handler"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i32, {ptr}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.win.attach.invalid.exception.handler",
+                                &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    Argument *exceptionPointers = fn->getArg(0);
+    exceptionPointers->setName("morok.win.attach.invalid.exception.ptrs");
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *readBB = BasicBlock::Create(ctx, "read", fn);
+    auto *inspectBB = BasicBlock::Create(ctx, "inspect", fn);
+    auto *hitBB = BasicBlock::Create(ctx, "hit", fn);
+    auto *searchBB = BasicBlock::Create(ctx, "search", fn);
+
+    IRBuilder<> B(entry);
+    B.CreateCondBr(B.CreateICmpNE(exceptionPointers,
+                                  ConstantPointerNull::get(ptr),
+                                  "morok.win.attach.invalid.exception.args"),
+                   readBB, searchBB);
+
+    IRBuilder<> RB(readBB);
+    Value *record =
+        loadAt(RB, M, ptr, exceptionPointers, 0ULL,
+               "morok.win.attach.invalid.exception.record");
+    RB.CreateCondBr(RB.CreateICmpNE(record, ConstantPointerNull::get(ptr),
+                                    "morok.win.attach.invalid.exception.record.ready"),
+                    inspectBB, searchBB);
+
+    IRBuilder<> IB(inspectBB);
+    Value *code =
+        loadAt(IB, M, i32, record, 0ULL,
+               "morok.win.attach.invalid.exception.code");
+    IB.CreateCondBr(
+        IB.CreateICmpEQ(code, ConstantInt::get(i32, 0xC0000008ULL),
+                        "morok.win.attach.invalid.exception.code.match"),
+        hitBB, searchBB);
+
+    IRBuilder<> HB(hitBB);
+    Value *recordBits =
+        HB.CreatePtrToInt(record, ip,
+                          "morok.win.attach.invalid.exception.record.bits");
+    Value *marker = HB.CreateOr(
+        HB.CreateXor(code,
+                     HB.CreateTrunc(recordBits, i32,
+                                    "morok.win.attach.invalid.exception.record.low"),
+                     "morok.win.attach.invalid.exception.code.record"),
+        ConstantInt::get(i32, 1),
+        "morok.win.attach.invalid.exception.marker");
+    HB.CreateStore(marker, windowsInvalidHandleExceptionSeen(M))
+        ->setVolatile(true);
+    HB.CreateRet(ConstantInt::getSigned(i32, -1));
+
+    IRBuilder<> SB(searchBB);
+    SB.CreateRet(ConstantInt::get(i32, 0));
+    return fn;
+}
+
 Function *windowsInvalidHandleProbeHelper(Module &M) {
     if (Function *existing = M.getFunction("morok.win.attach.invalid"))
         return existing;
@@ -17638,7 +17719,7 @@ Function *windowsInvalidHandleProbeHelper(Module &M) {
     auto *i64 = Type::getInt64Ty(ctx);
     auto *ip = intPtrTy(M);
     auto *ptr = PointerType::getUnqual(ctx);
-    auto *fn = Function::Create(FunctionType::get(i64, {ip, ip}, false),
+    auto *fn = Function::Create(FunctionType::get(i64, {ip, ip, ip, ip}, false),
                                 GlobalValue::PrivateLinkage,
                                 "morok.win.attach.invalid", &M);
     fn->addFnAttr(Attribute::NoInline);
@@ -17647,19 +17728,52 @@ Function *windowsInvalidHandleProbeHelper(Module &M) {
     ntClose->setName("ntclose");
     Argument *closeHandle = fn->getArg(1);
     closeHandle->setName("closehandle");
+    Argument *rtlAdd = fn->getArg(2);
+    rtlAdd->setName("rtladdveh");
+    Argument *rtlRemove = fn->getArg(3);
+    rtlRemove->setName("rtlremoveveh");
+    Function *vehHandler = windowsInvalidHandleExceptionHandler(M);
+    GlobalVariable *exceptionSeen = windowsInvalidHandleExceptionSeen(M);
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *registerBB = BasicBlock::Create(ctx, "register", fn);
+    auto *ntGateBB = BasicBlock::Create(ctx, "nt.gate", fn);
     auto *ntBB = BasicBlock::Create(ctx, "ntclose", fn);
     auto *closeGateBB = BasicBlock::Create(ctx, "close.gate", fn);
     auto *closeBB = BasicBlock::Create(ctx, "closehandle", fn);
+    auto *removeGateBB = BasicBlock::Create(ctx, "remove.gate", fn);
+    auto *removeBB = BasicBlock::Create(ctx, "remove", fn);
     auto *retBB = BasicBlock::Create(ctx, "ret", fn);
 
     IRBuilder<> B(entry);
     AllocaInst *mix = B.CreateAlloca(i64, nullptr, "morok.win.attach.mix");
+    AllocaInst *vehHandle =
+        B.CreateAlloca(ptr, nullptr, "morok.win.attach.invalid.veh.slot");
     B.CreateStore(ConstantInt::get(i64, 0), mix)->setVolatile(true);
-    B.CreateCondBr(B.CreateICmpNE(ntClose, ConstantInt::get(ip, 0),
-                                  "morok.win.attach.ntclose.ready"),
-                   ntBB, closeGateBB);
+    B.CreateStore(ConstantPointerNull::get(ptr), vehHandle)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i32, 0), exceptionSeen)->setVolatile(true);
+    Value *vehReady = B.CreateAnd(
+        B.CreateICmpNE(rtlAdd, ConstantInt::get(ip, 0),
+                       "morok.win.attach.invalid.rtladd.ready"),
+        B.CreateICmpNE(rtlRemove, ConstantInt::get(ip, 0),
+                       "morok.win.attach.invalid.rtlremove.ready"),
+        "morok.win.attach.invalid.veh.ready");
+    B.CreateCondBr(vehReady, registerBB, ntGateBB);
+
+    IRBuilder<> VB(registerBB);
+    auto *addTy = FunctionType::get(ptr, {i32, ptr}, false);
+    Value *handle = VB.CreateCall(
+        addTy, VB.CreateIntToPtr(rtlAdd, ptr,
+                                 "morok.win.attach.invalid.rtladd.ptr"),
+        {ConstantInt::get(i32, 1), vehHandler},
+        "morok.win.attach.invalid.veh.handle");
+    VB.CreateStore(handle, vehHandle)->setVolatile(true);
+    VB.CreateBr(ntGateBB);
+
+    IRBuilder<> NG(ntGateBB);
+    NG.CreateCondBr(NG.CreateICmpNE(ntClose, ConstantInt::get(ip, 0),
+                                    "morok.win.attach.ntclose.ready"),
+                    ntBB, closeGateBB);
 
     IRBuilder<> NB(ntBB);
     auto *closeTy = FunctionType::get(i32, {ptr}, false);
@@ -17673,7 +17787,7 @@ Function *windowsInvalidHandleProbeHelper(Module &M) {
     IRBuilder<> GB(closeGateBB);
     GB.CreateCondBr(GB.CreateICmpNE(closeHandle, ConstantInt::get(ip, 0),
                                     "morok.win.attach.closehandle.ready"),
-                    closeBB, retBB);
+                    closeBB, removeGateBB);
 
     IRBuilder<> CB(closeBB);
     Value *oldMix =
@@ -17689,7 +17803,36 @@ Function *windowsInvalidHandleProbeHelper(Module &M) {
                              ConstantInt::get(i64, 32)),
         "morok.win.attach.invalid.next");
     CB.CreateStore(nextMix, mix)->setVolatile(true);
-    CB.CreateBr(retBB);
+    CB.CreateBr(removeGateBB);
+
+    IRBuilder<> RGB(removeGateBB);
+    Value *oldHandle =
+        RGB.CreateLoad(ptr, vehHandle, "morok.win.attach.invalid.veh.handle.v");
+    cast<LoadInst>(oldHandle)->setVolatile(true);
+    Value *removeReady = RGB.CreateAnd(
+        RGB.CreateICmpNE(oldHandle, ConstantPointerNull::get(ptr),
+                         "morok.win.attach.invalid.veh.handle.present"),
+        RGB.CreateICmpNE(rtlRemove, ConstantInt::get(ip, 0),
+                         "morok.win.attach.invalid.remove.ready"),
+        "morok.win.attach.invalid.remove.needed");
+    RGB.CreateCondBr(removeReady, removeBB, retBB);
+
+    IRBuilder<> RMB(removeBB);
+    auto *removeTy = FunctionType::get(i32, {ptr}, false);
+    Value *removeStatus = RMB.CreateCall(
+        removeTy,
+        RMB.CreateIntToPtr(rtlRemove, ptr,
+                           "morok.win.attach.invalid.rtlremove.ptr"),
+        {oldHandle}, "morok.win.attach.invalid.remove.status");
+    Value *preRemoveMix =
+        RMB.CreateLoad(i64, mix, "morok.win.attach.invalid.remove.old");
+    cast<LoadInst>(preRemoveMix)->setVolatile(true);
+    RMB.CreateStore(
+           RMB.CreateXor(preRemoveMix, RMB.CreateZExt(removeStatus, i64),
+                         "morok.win.attach.invalid.remove.next"),
+           mix)
+        ->setVolatile(true);
+    RMB.CreateBr(retBB);
 
     IRBuilder<> RB(retBB);
     Value *out = RB.CreateLoad(i64, mix, "morok.win.attach.invalid.result");
@@ -17766,10 +17909,13 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
     Function *patchRet = windowsPatchRetHelper(M);
     Function *patchRemote = windowsPatchRemoteBreakinHelper(M);
     Function *invalidProbe = windowsInvalidHandleProbeHelper(M);
+    GlobalVariable *invalidExceptionSeen =
+        windowsInvalidHandleExceptionSeen(M);
     Function *uefFilter = windowsUnhandledExceptionFilter(M);
     GlobalVariable *uefReached = windowsUefReachedFlag(M);
     if (!pebReader || !moduleByHash || !resolver || !patchRet ||
-        !patchRemote || !invalidProbe || !uefFilter || !uefReached)
+        !patchRemote || !invalidProbe || !invalidExceptionSeen || !uefFilter ||
+        !uefReached)
         return nullptr;
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
@@ -17813,6 +17959,17 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
     Value *ntClose = RB.CreateCall(
         resolver, {ntdll, ConstantInt::get(i64, fnv1aName("NtClose"))},
         "morok.win.attach.ntclose");
+    Value *rtlAddVeh = RB.CreateCall(
+        resolver,
+        {ntdll, ConstantInt::get(i64,
+                                 fnv1aName("RtlAddVectoredExceptionHandler"))},
+        "morok.win.attach.invalid.rtladd");
+    Value *rtlRemoveVeh = RB.CreateCall(
+        resolver,
+        {ntdll,
+         ConstantInt::get(i64,
+                          fnv1aName("RtlRemoveVectoredExceptionHandler"))},
+        "morok.win.attach.invalid.rtlremove");
     Value *kernelbaseExitProcess = RB.CreateCall(
         resolver,
         {kernelbase, ConstantInt::get(i64, fnv1aName("ExitProcess"))},
@@ -17865,6 +18022,10 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
               "morok.win.attach.remote.breakin.mix");
     foldState(RB, State, dbgBreak, rng.next(),
               "morok.win.attach.dbg.breakpoint.mix");
+    foldState(RB, State, rtlAddVeh, rng.next(),
+              "morok.win.attach.invalid.rtladd.mix");
+    foldState(RB, State, rtlRemoveVeh, rng.next(),
+              "morok.win.attach.invalid.rtlremove.mix");
     foldState(RB, State, setUef, rng.next(), "morok.win.attach.uef.set.mix");
     foldState(RB, State, raiseException, rng.next(),
               "morok.win.attach.uef.raise.mix");
@@ -17873,14 +18034,40 @@ Function *windowsAntiAttachProbe(Module &M, GlobalVariable *State,
         "morok.win.attach.patch.remote.status");
     Value *breakStatus = RB.CreateCall(
         patchRet, {dbgBreak, ntProtect}, "morok.win.attach.patch.ret.status");
-    Value *invalid = RB.CreateCall(
-        invalidProbe, {ntClose, closeHandle}, "morok.win.attach.invalid.mix");
+    Value *invalid = RB.CreateCall(invalidProbe,
+                                   {ntClose, closeHandle, rtlAddVeh,
+                                    rtlRemoveVeh},
+                                   "morok.win.attach.invalid.mix");
+    Value *invalidExceptionValue =
+        RB.CreateLoad(i32, invalidExceptionSeen,
+                      "morok.win.attach.invalid.exception.value");
+    cast<LoadInst>(invalidExceptionValue)->setVolatile(true);
+    Value *invalidVehReady = RB.CreateAnd(
+        RB.CreateICmpNE(rtlAddVeh, ConstantInt::get(ip, 0),
+                        "morok.win.attach.invalid.rtladd.present"),
+        RB.CreateICmpNE(rtlRemoveVeh, ConstantInt::get(ip, 0),
+                        "morok.win.attach.invalid.rtlremove.present"),
+        "morok.win.attach.invalid.veh.apis");
+    Value *invalidExceptionDelivered = RB.CreateAnd(
+        invalidVehReady,
+        RB.CreateICmpNE(invalidExceptionValue, ConstantInt::get(i32, 0),
+                        "morok.win.attach.invalid.exception.seen"),
+        "morok.win.attach.invalid.exception.delivered");
     foldState(RB, State, remoteStatus, rng.next(),
               "morok.win.attach.patch.remote.status.mix");
     foldState(RB, State, breakStatus, rng.next(),
               "morok.win.attach.patch.ret.status.mix");
     foldState(RB, State, invalid, rng.next(),
               "morok.win.attach.invalid.mix.state");
+    foldState(RB, State, invalidExceptionValue, rng.next(),
+              "morok.win.attach.invalid.exception.mix");
+    foldFlag(RB, State,
+             RB.CreateNot(invalidVehReady,
+                          "morok.win.attach.invalid.veh.missing"),
+             0xA4257913CB0F6E12ULL, "morok.win.attach.invalid.veh.missing");
+    foldEnforcedFlag(RB, State, invalidExceptionDelivered,
+                     0x9EAF28C416D3705BULL,
+                     "morok.win.attach.invalid.exception");
     Value *patchFailed = RB.CreateOr(
         RB.CreateICmpSLT(remoteStatus, ConstantInt::get(i32, 0),
                          "morok.win.attach.patch.remote.failed"),

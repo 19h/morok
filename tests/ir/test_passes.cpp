@@ -18444,6 +18444,8 @@ define i32 @main() { ret i32 0 }
     Function *PatchRet = M->getFunction("morok.win.attach.patch.ret");
     Function *PatchRemote = M->getFunction("morok.win.attach.patch.remote");
     Function *Invalid = M->getFunction("morok.win.attach.invalid");
+    Function *InvalidVeh =
+        M->getFunction("morok.win.attach.invalid.exception.handler");
     Function *Uef = M->getFunction("morok.win.attach.uef.filter");
     Function *Resolve = M->getFunction("morok.win.pe.resolve");
     REQUIRE(Ctor != nullptr);
@@ -18451,9 +18453,12 @@ define i32 @main() { ret i32 0 }
     REQUIRE(PatchRet != nullptr);
     REQUIRE(PatchRemote != nullptr);
     REQUIRE(Invalid != nullptr);
+    REQUIRE(InvalidVeh != nullptr);
     REQUIRE(Uef != nullptr);
     REQUIRE(Resolve != nullptr);
     CHECK(M->getGlobalVariable("morok.win.state", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.win.attach.invalid.exception.seen",
+                               true) != nullptr);
     CHECK(M->getGlobalVariable("morok.win.attach.uef.reached", true) !=
           nullptr);
     checkSealEnforcement(*M, *Probe);
@@ -18462,6 +18467,8 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("ExitProcess") == nullptr);
     CHECK(M->getFunction("CloseHandle") == nullptr);
     CHECK(M->getFunction("NtClose") == nullptr);
+    CHECK(M->getFunction("RtlAddVectoredExceptionHandler") == nullptr);
+    CHECK(M->getFunction("RtlRemoveVectoredExceptionHandler") == nullptr);
     CHECK(M->getFunction("SetUnhandledExceptionFilter") == nullptr);
     CHECK(M->getFunction("RaiseException") == nullptr);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.remote.breakin") >=
@@ -18478,6 +18485,10 @@ define i32 @main() { ret i32 0 }
               *Probe, "morok.win.attach.kernelbase.closehandle") >= 1u);
     CHECK(countNamedInstructions(
               *Probe, "morok.win.attach.kernel32.closehandle") >= 1u);
+    CHECK(countNamedInstructions(*Probe, "morok.win.attach.invalid.rtladd") >=
+          1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.invalid.rtlremove") >= 1u);
     CHECK(countNamedInstructions(*Probe,
                                  "morok.win.attach.kernelbase.setuef") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.kernel32.setuef") >=
@@ -18488,6 +18499,9 @@ define i32 @main() { ret i32 0 }
               *Probe, "morok.win.attach.kernel32.raiseexception") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.exitprocess") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.closehandle") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.invalid.exception.delivered") >=
+          1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.uef.set") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.uef.raise") >= 1u);
     CHECK(countNamedInstructions(*Probe, "morok.win.attach.uef.previous") >=
@@ -18509,6 +18523,20 @@ define i32 @main() { ret i32 0 }
                                  "morok.win.attach.ntclose.invalid") >= 1u);
     CHECK(countNamedInstructions(*Invalid,
                                  "morok.win.attach.closehandle.invalid") >= 1u);
+    CHECK(countNamedInstructions(*Invalid,
+                                 "morok.win.attach.invalid.veh.handle") >= 1u);
+    CHECK(countNamedInstructions(*Invalid,
+                                 "morok.win.attach.invalid.remove.status") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *InvalidVeh, "morok.win.attach.invalid.exception.code") >= 1u);
+    CHECK(countNamedInstructions(
+              *InvalidVeh, "morok.win.attach.invalid.exception.marker") >= 1u);
+    Instruction *InvalidDelivered = findNamedInstruction(
+        *Probe, "morok.win.attach.invalid.exception.delivered");
+    REQUIRE(InvalidDelivered != nullptr);
+    CHECK(valueFeedsNamedInstruction(InvalidDelivered,
+                                     "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*PatchRet,
                                  "morok.win.attach.patch.ret.protect") >= 1u);
     CHECK(countNamedInstructions(

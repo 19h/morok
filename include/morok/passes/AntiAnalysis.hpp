@@ -91,8 +91,9 @@ bool windowsThreadHideModule(llvm::Module &M, morok::ir::IRRandom &rng);
 /// Inject Windows x86_64 anti-attach patching.  The emitted startup probe
 /// resolves ntdll/kernel32 by PEB.Ldr and export hash, patches
 /// DbgUiRemoteBreakin to tail-jump ExitProcess, patches DbgBreakPoint to ret,
-/// samples invalid-handle CloseHandle/NtClose behavior, and checks
-/// UnhandledExceptionFilter routing.  Returns true if code was added.
+/// samples invalid-handle CloseHandle/NtClose behavior and debugger-only
+/// invalid-handle exception delivery, and checks UnhandledExceptionFilter
+/// routing.  Returns true if code was added.
 bool windowsAntiAttachModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
 /// Inject Windows x86_64 kernel-debugger probes.  The emitted startup probe
