@@ -46,13 +46,13 @@ bool stringEncryptModule(llvm::Module &M, const StrEncParams &params,
 bool bindStringSeedToSeal(llvm::Module &M, morok::ir::IRRandom &rng);
 
 /// Replace supported constant-format `snprintf`/`sprintf`, `printf`/`fprintf`,
-/// simple `sscanf("%d"/"%u")`, and `sscanf("%31s %255[^\n]")` calls with
-/// generated per-site helpers.  The printer grammar is intentionally narrow
-/// (`%s`, `%c`, simple integer decimal/hex, `%%`, and literals).  This removes
-/// recoverable format constants (e.g. "%s@%s$%s&%s") and clean libc
-/// formatting/parsing boundaries that in-process hooks use to read
-/// canonicalized secrets.  Unsupported printf/scanf features are intentionally
-/// left untouched.
+/// simple `sscanf`/glibc alias integer parses, and
+/// `sscanf("%31s %255[^\n]")` calls with generated per-site helpers.  The
+/// printer grammar is intentionally narrow (`%s`, `%c`, simple integer
+/// decimal/hex, `%%`, and literals).  This removes recoverable format constants
+/// (e.g. "%s@%s$%s&%s") and clean libc formatting/parsing boundaries that
+/// in-process hooks use to read canonicalized secrets.  Unsupported
+/// printf/scanf features are intentionally left untouched.
 bool inlineConstantFormatCalls(llvm::Module &M);
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-strenc`).

@@ -14040,6 +14040,46 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("format boundary lowering removes glibc sscanf aliases") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+@fmt = private constant [3 x i8] c"%d\00"
+
+declare i32 @__isoc99_sscanf(ptr, ptr, ...)
+declare i32 @__isoc23_sscanf(ptr, ptr, ...)
+
+define i32 @parse99(ptr %line, ptr %out) {
+entry:
+  %n = call i32 (ptr, ptr, ...) @__isoc99_sscanf(ptr %line, ptr @fmt, ptr %out)
+  ret i32 %n
+}
+
+define i32 @parse23(ptr %line, ptr %out) {
+entry:
+  %n = call i32 (ptr, ptr, ...) @__isoc23_sscanf(ptr %line, ptr @fmt, ptr %out)
+  ret i32 %n
+}
+)ir");
+    REQUIRE(M);
+    CHECK(morok::passes::inlineConstantFormatCalls(*M));
+
+    Function *Parse99 = M->getFunction("parse99");
+    Function *Parse23 = M->getFunction("parse23");
+    REQUIRE(Parse99);
+    REQUIRE(Parse23);
+    CHECK(countCallsTo(*Parse99, "__isoc99_sscanf") == 0u);
+    CHECK(countCallsTo(*Parse23, "__isoc23_sscanf") == 0u);
+    CHECK(countFunctions(*M, "morok.scan.") == 1u);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(6109);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::stringEncryptModule(*M, morok::passes::StrEncParams{},
+                                             rng));
+    CHECK_FALSE(hasReadableByteString(*M, "%d"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("format boundary lowering removes assembler sscanf parsing") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

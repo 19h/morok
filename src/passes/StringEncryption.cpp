@@ -1052,24 +1052,21 @@ bool bindStringSeedToSeal(Module &M, ir::IRRandom &rng) {
 }
 
 bool inlineConstantFormatCalls(Module &M) {
-    Function *Snprintf = M.getFunction("snprintf");
-    Function *Sprintf = M.getFunction("sprintf");
-    Function *Printf = M.getFunction("printf");
-    Function *Fprintf = M.getFunction("fprintf");
-    Function *Sscanf = M.getFunction("sscanf");
-    if (Snprintf && !Snprintf->isDeclaration())
-        Snprintf = nullptr;
-    if (Sprintf && !Sprintf->isDeclaration())
-        Sprintf = nullptr;
-    if (Printf && !Printf->isDeclaration())
-        Printf = nullptr;
-    if (Fprintf && !Fprintf->isDeclaration())
-        Fprintf = nullptr;
-    if (Sscanf && !Sscanf->isDeclaration())
-        Sscanf = nullptr;
-    if ((!Snprintf || !Snprintf->isDeclaration()) &&
-        (!Sprintf || !Sprintf->isDeclaration()) && !Printf && !Fprintf &&
-        !Sscanf)
+    auto Decl = [&](StringRef Name) -> Function * {
+        Function *F = M.getFunction(Name);
+        return (F && F->isDeclaration()) ? F : nullptr;
+    };
+
+    Function *Snprintf = Decl("snprintf");
+    Function *Sprintf = Decl("sprintf");
+    Function *Printf = Decl("printf");
+    Function *Fprintf = Decl("fprintf");
+    SmallVector<Function *, 3> SscanfFns;
+    StringRef SscanfNames[] = {"sscanf", "__isoc99_sscanf", "__isoc23_sscanf"};
+    for (StringRef Name : SscanfNames)
+        if (Function *F = Decl(Name))
+            SscanfFns.push_back(F);
+    if (!Snprintf && !Sprintf && !Printf && !Fprintf && SscanfFns.empty())
         return false;
 
     LLVMContext &Ctx = M.getContext();
@@ -1882,7 +1879,7 @@ bool inlineConstantFormatCalls(Module &M) {
             if (auto *CI = dyn_cast<CallInst>(U))
                 if (CI->getCalledFunction() == Fprintf && CI->arg_size() >= 2)
                     Calls.push_back({CI, BoundaryKind::Fprintf});
-    if (Sscanf)
+    for (Function *Sscanf : SscanfFns)
         for (User *U : Sscanf->users())
             if (auto *CI = dyn_cast<CallInst>(U))
                 if (CI->getCalledFunction() == Sscanf && CI->arg_size() >= 3)
