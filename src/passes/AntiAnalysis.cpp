@@ -3450,8 +3450,14 @@ void emitDarwinSysctlCheck(IRBuilder<> &B, Module &M, GlobalVariable *State,
     sealFold(B, dbgParent, 0x53A1D7F0C46B82E9ULL);
 }
 
-void emitDarwinCsopsCheck(IRBuilder<> &B, Module &M, GlobalVariable *State,
-                          const Triple &TT) {
+struct DarwinCsopsSignals {
+    Value *debugged = nullptr;
+    Value *debuggedWithoutTaskAllow = nullptr;
+};
+
+DarwinCsopsSignals emitDarwinCsopsCheck(IRBuilder<> &B, Module &M,
+                                        GlobalVariable *State,
+                                        const Triple &TT) {
     LLVMContext &ctx = M.getContext();
     auto *i32 = Type::getInt32Ty(ctx);
     auto *ip = intPtrTy(M);
@@ -3469,12 +3475,28 @@ void emitDarwinCsopsCheck(IRBuilder<> &B, Module &M, GlobalVariable *State,
     Value *dbgFlag = B.CreateAnd(ok, debugged);
     foldFlag(B, State, dbgFlag, 0xF1D88C6C72195307ULL, "morok.antidbg.csops");
     sealFold(B, dbgFlag, 0xF1D88C6C72195307ULL);
+
+    Value *taskAllowBits =
+        B.CreateAnd(flags, ConstantInt::get(i32, 0x4),
+                    "morok.antidbg.csops.gta.bits");
+    Value *taskAllowed =
+        B.CreateICmpNE(taskAllowBits, ConstantInt::get(i32, 0),
+                       "morok.antidbg.csops.gta");
+    Value *missingTaskAllow =
+        B.CreateNot(taskAllowed, "morok.antidbg.csops.gta.missing");
+    Value *debuggedWithoutTaskAllow =
+        B.CreateAnd(dbgFlag, missingTaskAllow,
+                    "morok.antidbg.csops.gta.absent.debugged");
+    foldFlag(B, State, debuggedWithoutTaskAllow, 0x4B6E8A13D927C5F1ULL,
+             "morok.antidbg.csops.gta.absent");
+    sealFold(B, debuggedWithoutTaskAllow, 0x4B6E8A13D927C5F1ULL);
+    return {dbgFlag, debuggedWithoutTaskAllow};
 }
 
-void emitDarwinExceptionPortProbe(IRBuilder<> &B, Module &M,
-                                  GlobalVariable *State, const Triple &TT) {
+Value *emitDarwinExceptionPortProbe(IRBuilder<> &B, Module &M,
+                                    GlobalVariable *State, const Triple &TT) {
     if (TT.getArch() != Triple::x86_64 && TT.getArch() != Triple::aarch64)
-        return;
+        return nullptr;
 
     LLVMContext &ctx = M.getContext();
     auto *i32 = Type::getInt32Ty(ctx);
@@ -3548,6 +3570,7 @@ void emitDarwinExceptionPortProbe(IRBuilder<> &B, Module &M,
     foldFlag(B, State, tripped, 0xC90B5A4E67281D3FULL,
              "morok.antidbg.exc_ports");
     sealFold(B, tripped, 0xC90B5A4E67281D3FULL);
+    return tripped;
 }
 
 void emitDarwinDyldCensus(IRBuilder<> &B, Module &M, GlobalVariable *State,
@@ -3831,8 +3854,16 @@ void emitDarwinAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
              B.CreateICmpNE(ptraceRc, ConstantInt::get(ptraceRc->getType(), 0)),
              0x9C2F71A6E5B30D4FULL);
     emitDarwinSysctlCheck(B, M, State, TT);
-    emitDarwinCsopsCheck(B, M, State, TT);
-    emitDarwinExceptionPortProbe(B, M, State, TT);
+    DarwinCsopsSignals csops = emitDarwinCsopsCheck(B, M, State, TT);
+    Value *exceptionPorts = emitDarwinExceptionPortProbe(B, M, State, TT);
+    if (csops.debuggedWithoutTaskAllow && exceptionPorts) {
+        Value *coherent =
+            B.CreateAnd(csops.debuggedWithoutTaskAllow, exceptionPorts,
+                        "morok.antidbg.csops.exc.gta.absent.debugged");
+        foldFlag(B, State, coherent, 0xD13C7A5E92604B8FULL,
+                 "morok.antidbg.csops.exc.gta.absent");
+        sealFold(B, coherent, 0xD13C7A5E92604B8FULL);
+    }
     emitDarwinDyldCensus(B, M, State, rng);
     emitDarwinImageCensus(B, M, State);
     if (StartLiveWatchers) {

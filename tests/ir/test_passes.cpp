@@ -265,6 +265,22 @@ void checkSealEnforcement(Module &M, Function &F) {
     CHECK(countNamedInstructions(F, "morok.seal.fold.anti_debug.next") >= 1u);
 }
 
+void checkDarwinCsopsTaskAllowSignals(Function &F) {
+    CHECK(countNamedInstructions(F, "morok.antidbg.csops.gta.bits") >= 1u);
+    CHECK(countNamedInstructions(F, "morok.antidbg.csops.gta.missing") >= 1u);
+    Instruction *Absent =
+        findNamedInstruction(F, "morok.antidbg.csops.gta.absent.debugged");
+    REQUIRE(Absent != nullptr);
+    CHECK(valueFeedsNamedInstruction(Absent, "morok.seal.fold.anti_debug"));
+}
+
+void checkDarwinCsopsExceptionCoherence(Function &F) {
+    Instruction *Coherent =
+        findNamedInstruction(F, "morok.antidbg.csops.exc.gta.absent.debugged");
+    REQUIRE(Coherent != nullptr);
+    CHECK(valueFeedsNamedInstruction(Coherent, "morok.seal.fold.anti_debug"));
+}
+
 void checkGateScoring(Function &F) {
     CHECK(countNamedInstructions(F, "morok.gate.hard.score") >= 1u);
     CHECK(countNamedInstructions(F, "morok.gate.soft.score") >= 1u);
@@ -18328,6 +18344,9 @@ entry:
     CHECK(countNamedInstructions(*Ctor,
                                  "morok.antidbg.exc.handler.nonnull") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.antidbg.exc.any") >= 1u);
+    checkDarwinCsopsTaskAllowSignals(*Ctor);
+    checkDarwinCsopsTaskAllowSignals(*Probe);
+    checkDarwinCsopsExceptionCoherence(*Ctor);
     CHECK(functionHasConstantInt(*Ctor, 0x7FE));
     CHECK(M->getFunction("task_threads") != nullptr);
     CHECK(M->getFunction("thread_get_state") != nullptr);
@@ -18341,6 +18360,7 @@ entry:
     CHECK(M->getFunction("pthread_detach") != nullptr);
     CHECK(M->getFunction("sleep") != nullptr);
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_INSERT_LIBRARIES"));
+    CHECK_FALSE(hasReadableByteString(*M, "get-task-allow"));
     auto [cloakStores, opaqueCloakStores] =
         countStoresToBaseWithOpaqueSource(*M, "morok.cloak.buf");
     CHECK(cloakStores >= 8u);
@@ -18515,6 +18535,9 @@ entry:
                                  "morok.antidbg.exc.handler.nonnull") >= 1u);
     CHECK(countNamedInstructions(*M->getFunction("morok.antidbg"),
                                  "morok.antidbg.exc.any") >= 1u);
+    checkDarwinCsopsTaskAllowSignals(*M->getFunction("morok.antidbg"));
+    checkDarwinCsopsTaskAllowSignals(*M->getFunction("morok.antidbg.probe"));
+    checkDarwinCsopsExceptionCoherence(*M->getFunction("morok.antidbg"));
     CHECK(functionHasConstantInt(*M->getFunction("morok.antidbg"), 0x7FE));
     // M3: the loaded-image census enumerates dyld images to flag foreign
     // dylibs.
@@ -18546,6 +18569,7 @@ entry:
     CHECK(countGlobals(*M, "morok.cloak.c") >= 8u);
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_INSERT_LIBRARIES"));
     CHECK_FALSE(hasReadableByteString(*M, "DYLD_PRINT"));
+    CHECK_FALSE(hasReadableByteString(*M, "get-task-allow"));
     auto [cloakStores, opaqueCloakStores] =
         countStoresToBaseWithOpaqueSource(*M, "morok.cloak.buf");
     CHECK(cloakStores >= 8u);
