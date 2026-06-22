@@ -234,15 +234,6 @@ int __isoc99_sscanf(const char *input, const char *fmt, ...) {
     va_end(ap);
     return r;
 }
-
-int __isoc23_sscanf(const char *input, const char *fmt, ...) {
-    COUNT_IF_TARGET(c_sscanf);
-    va_list ap;
-    va_start(ap, fmt);
-    int r = vsscanf(input, fmt, ap);
-    va_end(ap);
-    return r;
-}
 #endif
 
 #if defined(__APPLE__)
