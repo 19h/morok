@@ -19128,6 +19128,8 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getFunction("CreateProcessW") == nullptr);
     CHECK(M->getFunction("GetCurrentProcessId") == nullptr);
     CHECK(M->getFunction("DebugActiveProcess") == nullptr);
+    CHECK(M->getFunction("DebugActiveProcessStop") == nullptr);
+    CHECK(M->getFunction("DebugSetProcessKillOnExit") == nullptr);
     CHECK(M->getFunction("WaitForDebugEvent") == nullptr);
     CHECK(M->getFunction("ContinueDebugEvent") == nullptr);
     CHECK(M->getFunction("WaitForSingleObject") == nullptr);
@@ -19216,6 +19218,15 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(
               *Probe, "morok.win.attach.selfdbg.kernel32.debugactive") >= 1u);
     CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernelbase.debugstop") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernel32.debugstop") >= 1u);
+    CHECK(countNamedInstructions(
+              *Probe, "morok.win.attach.selfdbg.kernelbase.kex") >= 1u);
+    CHECK(countNamedInstructions(*Probe,
+                                 "morok.win.attach.selfdbg.kernel32.kex") >=
+          1u);
+    CHECK(countNamedInstructions(
               *Probe, "morok.win.attach.selfdbg.kernelbase.waitdebug") >= 1u);
     CHECK(countNamedInstructions(
               *Probe, "morok.win.attach.selfdbg.kernel32.waitdebug") >= 1u);
@@ -19255,8 +19266,29 @@ define i32 @main() { ret i32 0 }
               *SelfDbg, "morok.win.attach.selfdbg.child.debugactive") >= 1u);
     CHECK(countNamedInstructions(*SelfDbg,
                                  "morok.win.attach.selfdbg.child.wait") >= 1u);
+    CHECK_FALSE(namedInstructionUsesConstant(
+        *SelfDbg, "morok.win.attach.selfdbg.child.wait", 0xFFFFFFFFu));
     CHECK(countNamedInstructions(
               *SelfDbg, "morok.win.attach.selfdbg.child.continue") >= 1u);
+    CHECK(countNamedInstructions(
+              *SelfDbg, "morok.win.attach.selfdbg.child.event.code") >= 1u);
+    CHECK(hasNamedIcmpWithConstant(
+        *SelfDbg, "morok.win.attach.selfdbg.child.event.exception", 1u));
+    CHECK(hasNamedIcmpWithConstant(
+        *SelfDbg, "morok.win.attach.selfdbg.child.event.exit.process", 5u));
+    CHECK(namedInstructionUsesConstant(
+        *SelfDbg, "morok.win.attach.selfdbg.child.continue.status",
+        0x80010001u));
+    CHECK(namedInstructionUsesConstant(
+        *SelfDbg, "morok.win.attach.selfdbg.child.continue.status",
+        0x00010002u));
+    CHECK(countNamedInstructions(
+              *SelfDbg, "morok.win.attach.selfdbg.child.debugstop") >= 1u);
+    CHECK(countNamedInstructions(*SelfDbg,
+                                 "morok.win.attach.selfdbg.child.kex.false") >=
+          1u);
+    CHECK(namedInstructionUsesConstant(
+        *SelfDbg, "morok.win.attach.selfdbg.child.pump.expired", 64u));
     CHECK(countNamedInstructions(
               *SelfDbg, "morok.win.attach.selfdbg.createprocess") >= 1u);
     CHECK(countNamedInstructions(
