@@ -41,10 +41,20 @@ namespace {
 constexpr char kPartAttr[] = "morok-fission-part";
 constexpr std::uint32_t kHardMaxSplits = 64;
 
+bool callReturnsTwice(CallBase &CB) {
+    if (CB.hasFnAttr(Attribute::ReturnsTwice))
+        return true;
+    if (Function *Callee = CB.getCalledFunction())
+        return Callee->hasFnAttribute(Attribute::ReturnsTwice);
+    return false;
+}
+
 bool functionEligible(Function &F) {
     if (F.isDeclaration() || F.getName().starts_with("morok.") ||
         F.hasFnAttribute(Attribute::Naked) || F.hasFnAttribute(kPartAttr) ||
         F.hasPersonalityFn() || F.isVarArg())
+        return false;
+    if (F.callsFunctionThatReturnsTwice())
         return false;
     // Computed-goto / blockaddress functions are fragile to outline (moving a
     // referenced block invalidates its address); skip the whole function.
@@ -53,6 +63,10 @@ bool functionEligible(Function &F) {
             return false;
         if (isa<IndirectBrInst>(BB.getTerminator()))
             return false;
+        for (Instruction &I : BB)
+            if (auto *CB = dyn_cast<CallBase>(&I))
+                if (callReturnsTwice(*CB))
+                    return false;
     }
     return true;
 }
@@ -63,15 +77,23 @@ bool regionBlockSafe(BasicBlock &BB) {
     for (Instruction &I : BB) {
         if (isa<AllocaInst>(&I))
             return false; // CodeExtractor runs with AllowAlloca = false
-        if (auto *CI = dyn_cast<CallInst>(&I))
-            if (CI->isMustTailCall())
+        if (I.getType()->isTokenTy())
+            return false; // CodeExtractor cannot thread token values safely.
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+            if (callReturnsTwice(*CB))
                 return false;
+            if (auto *CI = dyn_cast<CallInst>(&I))
+                if (CI->isMustTailCall())
+                    return false;
+        }
         if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
             switch (II->getIntrinsicID()) {
             case Intrinsic::vastart:
             case Intrinsic::vaend:
             case Intrinsic::vacopy:
             case Intrinsic::eh_typeid_for:
+            case Intrinsic::eh_sjlj_setjmp:
+            case Intrinsic::eh_sjlj_longjmp:
                 return false;
             default:
                 break;

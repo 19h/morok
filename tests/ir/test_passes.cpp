@@ -689,6 +689,56 @@ exit:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("functionFission skips functions that call returns_twice") {
+    LLVMContext ctx;
+    const char *ir = R"ir(
+declare i32 @rt(ptr) #0
+
+define i32 @with_setjmp(ptr %buf, i32 %n) {
+entry:
+  %sj = call i32 @rt(ptr %buf)
+  %c = icmp sgt i32 %n, 0
+  br i1 %c, label %pos, label %neg
+pos:
+  %a = add i32 %n, 1
+  %c2 = icmp sgt i32 %a, 10
+  br i1 %c2, label %big, label %small
+big:
+  %b = mul i32 %a, 2
+  br label %join
+small:
+  %s = sub i32 %a, 1
+  br label %join
+join:
+  %p = phi i32 [ %b, %big ], [ %s, %small ]
+  br label %exit
+neg:
+  %d = sub i32 0, %n
+  br label %exit
+exit:
+  %r = phi i32 [ %p, %join ], [ %d, %neg ]
+  %mix = add i32 %r, %sj
+  ret i32 %mix
+}
+
+attributes #0 = { returns_twice }
+)ir";
+    auto M = parse(ctx, ir);
+    REQUIRE(M);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0xF1551012);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::FunctionFissionParams params;
+    params.min_region_blocks = 2;
+    CHECK_FALSE(morok::passes::functionFissionModule(*M, params, rng));
+    CHECK(countFunctions(*M, "morok.fission") == 0u);
+
+    Function *F = M->getFunction("with_setjmp");
+    REQUIRE(F);
+    CHECK(countCallsTo(*F, "rt") == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("returnlessDispatch turns tail-position returns into indirect tails") {
     LLVMContext ctx;
     const char *ir = R"ir(
