@@ -4599,6 +4599,47 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("coherentDecoysFunction skips Linux x86 small integer returns") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+
+define i32 @score_i32(i32 %x) {
+entry:
+  %y = xor i32 %x, 7
+  ret i32 %y
+}
+
+define i64 @score_i64(i64 %x) {
+entry:
+  %y = xor i64 %x, 7
+  ret i64 %y
+}
+)ir");
+    Function *SmallF = M->getFunction("score_i32");
+    Function *WideF = M->getFunction("score_i64");
+    REQUIRE(SmallF);
+    REQUIRE(WideF);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(1314);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK_FALSE(morok::passes::coherentDecoysFunction(
+        *SmallF, {/*probability=*/100, /*max_blocks=*/4, /*depth=*/4}, rng));
+    CHECK(morok::passes::coherentDecoysFunction(
+        *WideF, {/*probability=*/100, /*max_blocks=*/4, /*depth=*/4}, rng));
+
+    for (BasicBlock &BB : *SmallF)
+        CHECK_FALSE(BB.getName().starts_with("morok.decoy.alt"));
+
+    bool hasWideAlt = false;
+    for (BasicBlock &BB : *WideF)
+        if (BB.getName().starts_with("morok.decoy.alt"))
+            if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+                hasWideAlt |= RI->getReturnValue()->getType()->isIntegerTy(64);
+    CHECK(hasWideAlt);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("coherentDecoysFunction adds floating scalar return alternatives") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(

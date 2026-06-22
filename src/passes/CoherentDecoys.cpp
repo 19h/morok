@@ -26,6 +26,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #include <algorithm>
@@ -69,6 +70,14 @@ bool isGeneratedBlock(const BasicBlock &BB) {
     return BB.getName().starts_with("morok.decoy");
 }
 
+bool isLinuxX86_64Target(const Function &F) {
+    const Module *M = F.getParent();
+    if (!M)
+        return false;
+    const Triple TT(M->getTargetTriple());
+    return TT.getArch() == Triple::x86_64 && TT.isOSLinux();
+}
+
 bool eligibleReturn(ReturnInst &RI) {
     if (ir::isMustTailReturn(RI))
         return false;
@@ -80,6 +89,14 @@ bool eligibleReturn(ReturnInst &RI) {
         return IT->getBitWidth() > 0;
     return Ty->isHalfTy() || Ty->isBFloatTy() || Ty->isFloatTy() ||
            Ty->isDoubleTy();
+}
+
+bool smallIntegerReturn(ReturnInst &RI) {
+    Value *Ret = RI.getReturnValue();
+    if (!Ret)
+        return false;
+    auto *IT = dyn_cast<IntegerType>(Ret->getType());
+    return IT && IT->getBitWidth() <= 32;
 }
 
 bool isSupportedFp(Type *Ty) {
@@ -97,11 +114,17 @@ IntegerType *integerCarrierForFp(Type *Ty) {
     return nullptr;
 }
 
-std::vector<ReturnInst *> collectReturns(Function &F) {
+std::vector<ReturnInst *> collectReturns(Function &F,
+                                         bool SkipSmallIntegerReturns) {
     std::vector<ReturnInst *> Returns;
     for (Instruction &I : instructions(F)) {
         auto *RI = dyn_cast<ReturnInst>(&I);
         if (!RI || isGeneratedBlock(*RI->getParent()) || !eligibleReturn(*RI))
+            continue;
+        // LLVM 23's Linux x86_64 backend can abort while printing optimized
+        // dead-arm i32 decoy mixes (IMUL32rri with an invalid killed source).
+        // Keep coherent decoys for wider integer/floating returns on the target.
+        if (SkipSmallIntegerReturns && smallIntegerReturn(*RI))
             continue;
         Returns.push_back(RI);
     }
@@ -356,7 +379,8 @@ bool coherentDecoysFunction(Function &F, const CoherentDecoyParams &params,
         params.probability == 0 || params.max_blocks == 0)
         return false;
 
-    std::vector<ReturnInst *> Returns = collectReturns(F);
+    std::vector<ReturnInst *> Returns =
+        collectReturns(F, isLinuxX86_64Target(F));
     shuffleReturns(Returns, rng);
     if (Returns.empty())
         return false;
