@@ -11227,11 +11227,15 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.expected") == 12u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.word.diff") ==
           12u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.word.bad") == 12u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.bad.any") == 12u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.weighted.diff") ==
-          12u);
+          0u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.combined.diff") ==
-          12u);
+          0u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.seal.next") == 4u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.seal.next") ==
+          12u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.antidbg.next") == 4u);
 
     std::size_t repairDiffs = 0;
@@ -11240,7 +11244,9 @@ entry:
             continue;
         ++repairDiffs;
         CHECK(valueFeedsNamedInstruction(&I,
-                                         "morok.tracer.repair.weighted.diff"));
+                                         "morok.tracer.repair.word.bad"));
+        CHECK(valueFeedsNamedInstruction(&I, "morok.tracer.repair.seal"));
+        CHECK(valueFeedsNamedInstruction(&I, "morok.tracer.antidbg.trip"));
     }
     CHECK(repairDiffs == 12u);
     CHECK_FALSE(verifyModule(*M, &errs()));

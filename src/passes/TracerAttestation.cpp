@@ -393,7 +393,9 @@ void emitShareRound(Module &M, Function &Ctor, IRBuilder<> &B,
                          "morok.tracer.expected");
     Value *WordDiff =
         FoldB.CreateXor(Loaded, Expected, "morok.tracer.word.diff");
-    Value *CombinedDiff = WordDiff;
+    Value *Mismatch = FoldB.CreateICmpNE(
+        WordDiff, ConstantInt::get(I64, 0), "morok.tracer.word.bad");
+    std::array<Value *, kRepairSites> RepairDiffs{};
     if (EnableRepair) {
         for (std::uint32_t I = 0; I < kRepairSites; ++I) {
             auto *RepairLoaded =
@@ -413,30 +415,34 @@ void emitShareRound(Module &M, Function &Ctor, IRBuilder<> &B,
             Value *RepairDiff =
                 FoldB.CreateXor(RepairLoaded, ExpectedRepair,
                                 "morok.tracer.repair.word.diff");
-            Value *Weighted = FoldB.CreateMul(
-                RepairDiff,
-                ConstantInt::get(I64, (0xD1B54A32D192ED03ULL +
-                                       I * 0x9E3779B97F4A7C15ULL) |
-                                          1ULL),
-                "morok.tracer.repair.weighted.diff");
-            CombinedDiff =
-                FoldB.CreateXor(CombinedDiff, Weighted,
-                                "morok.tracer.repair.combined.diff");
+            RepairDiffs[I] = RepairDiff;
+            Value *RepairBad = FoldB.CreateICmpNE(
+                RepairDiff, ConstantInt::get(I64, 0),
+                "morok.tracer.repair.word.bad");
+            Mismatch = FoldB.CreateOr(Mismatch, RepairBad,
+                                      "morok.tracer.repair.bad.any");
         }
     }
-    Value *Mismatch = FoldB.CreateICmpNE(
-        CombinedDiff, ConstantInt::get(I64, 0), "morok.tracer.word.bad");
     // Zero-on-clean (#97): fold the DIFF between delivered and expected words
     // into the tracer seal, NOT raw delivered words. On a clean attach the child
-    // pokes exactly the expected non-zero words, so the combined diff is zero
-    // and foldWord leaves the tracer channel at its S0 baseline. Tamper makes
-    // the diff non-zero, the seal diverges, and seal-dependent code fails
-    // closed.
+    // pokes exactly the expected non-zero words, so every diff is zero and
+    // foldWord leaves the tracer channel at its S0 baseline. Tamper makes any
+    // per-site diff non-zero, the seal diverges, and seal-dependent code fails
+    // closed. Keep repair diffs independent: a chosen repair word must not be
+    // able to cancel the primary share diff before the seal observes it.
     // The bind_to_runtime_seal opt-out must also leave any pre-existing seal
     // channels alone, because another pass may have created them already.
     if (BindToRuntimeSeal) {
         runtime_seal::foldWord(FoldB, runtime_seal::kTracerChannel,
-                               CombinedDiff, FoldSalt, "morok.tracer.seal");
+                               WordDiff, FoldSalt, "morok.tracer.seal");
+        if (EnableRepair) {
+            for (std::uint32_t I = 0; I < kRepairSites; ++I)
+                runtime_seal::foldWord(
+                    FoldB, runtime_seal::kTracerChannel, RepairDiffs[I],
+                    FoldSalt ^ (0xD1B54A32D192ED03ULL +
+                                I * 0x9E3779B97F4A7C15ULL),
+                    "morok.tracer.repair.seal");
+        }
         runtime_seal::foldFlag(FoldB, runtime_seal::kAntiDebugChannel, Mismatch,
                                FoldSalt ^ 0x8A6F0E4D27D5C139ULL,
                                "morok.tracer.antidbg");
