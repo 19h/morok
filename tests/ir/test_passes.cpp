@@ -17208,6 +17208,13 @@ entry:
     REQUIRE(LinuxStub != nullptr);
     CHECK(valueFeedsNamedInstruction(LinuxStub,
                                      "morok.seal.fold.anti_debug"));
+    Instruction *LinuxStubFf25 =
+        findNamedInstruction(*Ctor, "morok.antihook.stub.getpid.ff25");
+    REQUIRE(LinuxStubFf25 != nullptr);
+    CHECK(valueFeedsNamedInstruction(LinuxStubFf25,
+                                     "morok.antihook.stub.getpid.hit"));
+    CHECK(valueFeedsNamedInstruction(LinuxStubFf25,
+                                     "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Clean, "morok.antihook.mac.mem.mix") >= 1u);
     CHECK(countNamedInstructions(*Clean, "morok.antihook.mac.file.mix") >= 1u);
     CHECK(countNamedInstructions(*Clean, "morok.negative.text.int3") >= 1u);
@@ -18730,6 +18737,13 @@ entry:
         findNamedInstruction(*Ctor, "morok.antihook.stub.getpid.hit");
     REQUIRE(DarwinStub != nullptr);
     CHECK(valueFeedsNamedInstruction(DarwinStub,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *DarwinStubFf25 =
+        findNamedInstruction(*Ctor, "morok.antihook.stub.getpid.ff25");
+    REQUIRE(DarwinStubFf25 != nullptr);
+    CHECK(valueFeedsNamedInstruction(DarwinStubFf25,
+                                     "morok.antihook.stub.getpid.hit"));
+    CHECK(valueFeedsNamedInstruction(DarwinStubFf25,
                                      "morok.seal.fold.anti_debug"));
     CHECK(M->getFunction("_NSGetExecutablePath") != nullptr);
     CHECK(M->getFunction("_dyld_image_count") != nullptr);

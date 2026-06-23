@@ -8371,6 +8371,9 @@ Value *emitX86ImportStubPattern(IRBuilder<> &B, Module &M, Value *Target,
 
     Value *relJmp = B.CreateICmpEQ(b0, ConstantInt::get(i8, 0xE9),
                                    Name + ".e9");
+    Value *ripJmp = B.CreateAnd(B.CreateICmpEQ(b0, ConstantInt::get(i8, 0xFF)),
+                                B.CreateICmpEQ(b1, ConstantInt::get(i8, 0x25)),
+                                Name + ".ff25");
     Value *pushRet = B.CreateAnd(B.CreateICmpEQ(b0, ConstantInt::get(i8, 0x68)),
                                  B.CreateICmpEQ(b5, ConstantInt::get(i8, 0xC3)),
                                  Name + ".pushret");
@@ -8381,8 +8384,9 @@ Value *emitX86ImportStubPattern(IRBuilder<> &B, Module &M, Value *Target,
         B.CreateICmpEQ(b0, ConstantInt::get(i8, 0x0F)),
         byteInRange(B, b1, 0x80, 0x8F, Name + ".jcc32"), Name + ".0fjcc");
 
-    return B.CreateOr(B.CreateOr(relJmp, B.CreateOr(pushRet, shortJmp)),
-                      B.CreateOr(shortJcc, nearJcc), Name + ".hit");
+    return B.CreateOr(
+        B.CreateOr(B.CreateOr(relJmp, ripJmp), B.CreateOr(pushRet, shortJmp)),
+        B.CreateOr(shortJcc, nearJcc), Name + ".hit");
 }
 
 Value *wordMaskEq(IRBuilder<> &B, Value *Word, std::uint32_t Mask,
