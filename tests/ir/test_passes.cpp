@@ -20476,6 +20476,11 @@ entry:
                                            "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Ctor, "morok.imgcensus.library.apple") >=
           1u);
+    // #265: the unconditional 8-byte read at name+8 (which OOB-read short image
+    // names and crashed the ctor) must be gone, replaced by per-byte /Apple/
+    // reads guarded so they never dereference past a short name.
+    CHECK(countNamedInstructions(*Ctor, "morok.imgcensus.path.second8") == 0u);
+    CHECK(countNamedInstructions(*Ctor, "morok.imgcensus.apple.byte") >= 1u);
     CHECK(countNamedInstructions(
               *Ctor, "morok.antidbg.csops.audit.task_info.direct.rc") >= 1u);
     CHECK(functionHasConstantInt(*Ctor, 0x020000AAU));

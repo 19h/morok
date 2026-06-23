@@ -6385,12 +6385,14 @@ void emitDarwinImageCensus(IRBuilder<> &B, Module &M, GlobalVariable *State) {
     PHINode *i = LB.CreatePHI(i32, 2, "morok.imgcensus.i");
     i->addIncoming(ConstantInt::get(i32, 1), pre);
     Value *name = LB.CreateCall(imgName, {i}, "morok.imgcensus.name");
-    // dyld image paths are long, so these reads stay in bounds within the
-    // contiguous load-command string table.  The second read keeps
-    // /Library/<non-Apple> foreign while allowing Rosetta's /Library/Apple/.
+    // first8 reads the leading 8 bytes. The /Library/Apple/ discriminator
+    // (name[8..14]) is read ONE BYTE AT A TIME below, each only after the prior
+    // bytes matched "/Apple/" (and were thus non-NUL, proving the string extends
+    // that far); otherwise the read falls back to the already-in-bounds name+0.
+    // This keeps Rosetta's /Library/Apple/ allowance while never dereferencing
+    // name+8..15 past a short (<16-byte) relative/@rpath/injected image name,
+    // whose unconditional 8-byte read crashed the always-on Darwin ctor (#265).
     Value *first8 = LB.CreateAlignedLoad(i64, name, Align(1));
-    Value *second8 =
-        loadAt(LB, M, i64, name, 8ULL, "morok.imgcensus.path.second8");
     Value *isUsrLib = // "/usr/lib"
         LB.CreateICmpEQ(first8, ConstantInt::get(i64, 0x62696c2f7273752fULL));
     Value *isSystem = // "/System/"
@@ -6398,14 +6400,22 @@ void emitDarwinImageCensus(IRBuilder<> &B, Module &M, GlobalVariable *State) {
     Value *isLibrary = // "/Library"
         LB.CreateICmpEQ(first8, ConstantInt::get(i64, 0x7972617262694C2FULL),
                         "morok.imgcensus.library.prefix");
-    Value *isApple = // "/Apple/"
-        LB.CreateICmpEQ(
-            LB.CreateAnd(second8, ConstantInt::get(i64, 0x00FFFFFFFFFFFFFFULL),
-                         "morok.imgcensus.apple.masked"),
-            ConstantInt::get(i64, 0x2F656C7070412FULL),
-            "morok.imgcensus.apple.prefix");
-    Value *isLibraryApple =
-        LB.CreateAnd(isLibrary, isApple, "morok.imgcensus.library.apple");
+    auto *imgI8 = Type::getInt8Ty(M.getContext());
+    const unsigned char kAppleBytes[7] = {'/', 'A', 'p', 'p', 'l', 'e', '/'};
+    Value *isLibraryApple = isLibrary;
+    for (unsigned k = 0; k < 7; ++k) {
+        Value *byteAddr = LB.CreateSelect(
+            isLibraryApple,
+            gepI8(LB, M, name, constIp(M, 8 + k), "morok.imgcensus.apple.gep"),
+            name, "morok.imgcensus.apple.ptr");
+        Value *byte =
+            loadUnaligned(LB, imgI8, byteAddr, "morok.imgcensus.apple.byte");
+        isLibraryApple = LB.CreateAnd(
+            isLibraryApple,
+            LB.CreateICmpEQ(byte, ConstantInt::get(imgI8, kAppleBytes[k]),
+                            "morok.imgcensus.apple.eq"),
+            "morok.imgcensus.library.apple");
+    }
     Value *foreign = LB.CreateNot(
         LB.CreateOr(LB.CreateOr(isUsrLib, isSystem),
                     isLibraryApple, "morok.imgcensus.system.prefixes"));
