@@ -54,6 +54,7 @@ llvm::FunctionCallee mprotectDecl(llvm::Module &M);
 // module flag that the emit helpers below honor; dropped before the final binary.
 void setDirectSyscallPolicy(llvm::Module &M, llvm::StringRef Policy);
 
+unsigned directSyscallPolicy(const llvm::Module &M);
 bool useDirectLinuxSyscalls(const llvm::Module &M, const llvm::Triple &TT);
 bool lookupLinuxCoreSyscalls(const llvm::Triple &TT,
                              LinuxCoreSyscalls &Out);

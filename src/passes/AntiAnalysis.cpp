@@ -4366,6 +4366,8 @@ Function *linuxSeccompSigsysHandler(Module &M) {
 Function *linuxRtSigreturnRestorer(Module &M, const Triple &TT) {
     if (Function *existing = M.getFunction("morok.antidbg.seccomp.sigreturn"))
         return existing;
+    if (runtime::directSyscallPolicy(M) == 2u)
+        return nullptr;
     if (TT.getArch() != Triple::x86_64 && TT.getArch() != Triple::x86)
         return nullptr;
 
@@ -4901,6 +4903,8 @@ Function *linuxSigtrapRoutingProbe(Module &M, ir::IRRandom &rng,
     LinuxRawSigactionLayout rawLayout;
     if (!linuxRawSigactionLayout(TT, rawLayout))
         return nullptr;
+    if (runtime::directSyscallPolicy(M) == 2u && rawLayout.needsRestorer)
+        return nullptr;
     LinuxSigtrapRoutingContextLayout contextLayout;
     if (!linuxSigtrapRoutingContextLayout(TT, contextLayout))
         return nullptr;
@@ -5196,6 +5200,8 @@ Function *linuxIntentionalFaultFlowProbe(Module &M, GlobalVariable *State,
     LinuxFaultFlowLayout faultLayout;
     if (!linuxRawSigactionLayout(TT, rawLayout) ||
         !linuxFaultFlowLayout(TT, faultLayout))
+        return nullptr;
+    if (runtime::directSyscallPolicy(M) == 2u && rawLayout.needsRestorer)
         return nullptr;
     std::uint32_t rtSigactionNr = 0;
     std::uint32_t sigaltstackNr = 0;
@@ -5595,6 +5601,8 @@ void emitLinuxSeccompTracerOracle(IRBuilder<> &B, Module &M,
         return;
     LinuxRawSigactionLayout layout;
     if (!linuxRawSigactionLayout(TT, layout))
+        return;
+    if (runtime::directSyscallPolicy(M) == 2u && layout.needsRestorer)
         return;
 
     runtime_seal::getChannel(M, runtime_seal::kAntiDebugChannel, rng);
@@ -7442,6 +7450,9 @@ Value *emitLinuxStaticRawSyscall(IRBuilder<> &B, Module &M, const Triple &TT,
                                  std::uint32_t Number,
                                  std::initializer_list<Value *> Args,
                                  const Twine &Name) {
+    if (runtime::directSyscallPolicy(M) == 2u)
+        return runtime::emitLinuxSyscall(B, M, TT, Number, Args, Name);
+
     auto *ip = intPtrTy(M);
     std::array<Value *, 6> sysArgs = {
         ConstantInt::get(ip, 0), ConstantInt::get(ip, 0),

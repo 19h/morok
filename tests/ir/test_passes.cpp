@@ -19933,6 +19933,39 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("antiDebuggingModule honors direct_syscalls=never for Linux raw "
+          "syscall emitters") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() {
+entry:
+  ret i32 0
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(88271);
+    morok::ir::IRRandom rng(engine);
+
+    morok::runtime::setDirectSyscallPolicy(*M, "never");
+    CHECK(morok::passes::antiDebuggingModule(*M, rng));
+
+    Function *AntiDbg = M->getFunction("morok.antidbg");
+    REQUIRE(AntiDbg != nullptr);
+    CHECK(M->getFunction("syscall") != nullptr);
+    CHECK(countNamedInstructions(*AntiDbg,
+                                 "morok.antidbg.personality.raw.wrap") >= 1u);
+    CHECK(countNamedInstructions(*M, "morok.linux.rawsys.nr.dec") == 0u);
+    for (Function &F : *M) {
+        if (F.isDeclaration())
+            continue;
+        CAPTURE(F.getName().str());
+        CHECK(countInlineAsmBodies(F, "syscall") == 0u);
+    }
+    CHECK(M->getFunction("morok.antidbg.seccomp.sigreturn") == nullptr);
+    CHECK(M->getFunction("personality") == nullptr);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE(
     "antiDebuggingModule emits i386 Linux SIGTRAP routing with raw int80") {
     LLVMContext ctx;
