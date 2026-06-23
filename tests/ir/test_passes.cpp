@@ -17378,6 +17378,21 @@ entry:
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.qemu.brand") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.cpuid.leaf0.delta") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.hvleaf.delta") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.leaf.variance") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.latency") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.identity.latency") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox,
+              "morok.antihook.sandbox.coherence.cpuid.no.identity") >= 1u);
+    CHECK(functionHasConstantInt(*Sandbox, 0x40000000u));
+    CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.brand.available") >=
           1u);
     CHECK(countNamedInstructions(*Sandbox,
@@ -18388,6 +18403,21 @@ entry:
                                  "morok.antihook.sandbox.tcg.vendor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.qemu.brand") >= 1u);
+    CHECK(countNamedInstructions(*Sandbox,
+                                 "morok.antihook.sandbox.cpuid.leaf0.delta") >=
+          1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.hvleaf.delta") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.leaf.variance") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.latency") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.identity.latency") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox,
+              "morok.antihook.sandbox.coherence.cpuid.no.identity") >= 1u);
+    CHECK(functionHasConstantInt(*Sandbox, 0x40000000u));
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.tcg.tb.cold") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
@@ -22001,7 +22031,7 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getGlobalVariable("morok.timing.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.seal.score.anti_debug.weight", true) !=
           nullptr);
-    CHECK(M->getGlobalVariable("morok.antianalysis.poison", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.antianalysis.poison", true) == nullptr);
     checkNoSealEnforcement(*Oracle);
     CHECK(M->getFunction("morok.timing") != nullptr);
     CHECK(M->getFunction("clock_gettime") != nullptr);
@@ -22045,8 +22075,8 @@ define i32 @main() { ret i32 0 }
     REQUIRE(ExitRatio != nullptr);
     CHECK_FALSE(valueFeedsNamedInstruction(ExitRatio,
                                            "morok.seal.fold.anti_debug"));
-    CHECK(valueFeedsNamedInstruction(ExitRatio,
-                                     "morok.timing.cpuid.exit.ratio.poison"));
+    CHECK_FALSE(valueFeedsNamedInstruction(
+        ExitRatio, "morok.timing.cpuid.exit.ratio.poison"));
     CHECK(countInlineAsmBodies(*Oracle, "cpuid") >= 7u);
     // The x86 timestamp read lives in a CPUID-gated helper (rdtscp + rdtsc
     // fallback); the probe calls it rather than inlining the asm.

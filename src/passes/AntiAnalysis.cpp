@@ -12576,6 +12576,130 @@ Value *emitSandboxSmcLatency(IRBuilder<> &B, Module &M, const Triple &TT,
     return observed;
 }
 
+Value *emitSandboxCpuidExitLatency(IRBuilder<> &B, Module &M,
+                                   AllocaInst *Score, AllocaInst *Coherence,
+                                   Value *IdentityEvidence) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    SmallVector<Value *, 8> nakedSamples;
+    SmallVector<Value *, 8> leaf0Samples;
+    SmallVector<Value *, 8> hvLeafSamples;
+    SmallVector<Value *, 8> varianceSamples;
+    nakedSamples.reserve(7);
+    leaf0Samples.reserve(7);
+    hvLeafSamples.reserve(7);
+    varianceSamples.reserve(7);
+
+    for (unsigned sample = 0; sample < 7; ++sample) {
+        Value *nakedStart = emitRdtscp(B, M);
+        Value *nakedEnd = emitRdtscp(B, M);
+        Value *nakedDelta =
+            B.CreateSub(nakedEnd, nakedStart,
+                        "morok.antihook.sandbox.cpuid.naked.delta");
+        nakedSamples.push_back(nakedDelta);
+
+        Value *leaf0Start = emitRdtscp(B, M);
+        (void)emitCpuid(B, M, ConstantInt::get(i32, 0),
+                        ConstantInt::get(i32, sample & 1u));
+        Value *leaf0End = emitRdtscp(B, M);
+        Value *leaf0Delta =
+            B.CreateSub(leaf0End, leaf0Start,
+                        "morok.antihook.sandbox.cpuid.leaf0.delta");
+        leaf0Samples.push_back(leaf0Delta);
+
+        Value *hvStart = emitRdtscp(B, M);
+        (void)emitCpuid(B, M, ConstantInt::get(i32, 0x40000000u),
+                        ConstantInt::get(i32, sample & 1u));
+        Value *hvEnd = emitRdtscp(B, M);
+        Value *hvDelta =
+            B.CreateSub(hvEnd, hvStart,
+                        "morok.antihook.sandbox.cpuid.hvleaf.delta");
+        hvLeafSamples.push_back(hvDelta);
+
+        Value *hvSlower =
+            B.CreateICmpUGT(hvDelta, leaf0Delta,
+                            "morok.antihook.sandbox.cpuid.hvleaf.gt");
+        Value *variance = B.CreateSelect(
+            hvSlower,
+            B.CreateSub(hvDelta, leaf0Delta,
+                        "morok.antihook.sandbox.cpuid.hvleaf.minus.leaf0"),
+            B.CreateSub(leaf0Delta, hvDelta,
+                        "morok.antihook.sandbox.cpuid.leaf0.minus.hvleaf"),
+            "morok.antihook.sandbox.cpuid.leaf.variance");
+        varianceSamples.push_back(variance);
+    }
+
+    auto sortSamples = [&](SmallVector<Value *, 8> samples,
+                           const Twine &prefix) {
+        for (unsigned i = 0; i < samples.size(); ++i) {
+            for (unsigned j = i + 1; j < samples.size(); ++j) {
+                Value *swap = B.CreateICmpUGT(samples[i], samples[j],
+                                             prefix + ".gt");
+                Value *lo = B.CreateSelect(swap, samples[j], samples[i],
+                                           prefix + ".lo");
+                Value *hi = B.CreateSelect(swap, samples[i], samples[j],
+                                           prefix + ".hi");
+                samples[i] = lo;
+                samples[j] = hi;
+            }
+        }
+        return samples;
+    };
+
+    SmallVector<Value *, 8> sortedNaked =
+        sortSamples(nakedSamples, "morok.antihook.sandbox.cpuid.naked.sort");
+    SmallVector<Value *, 8> sortedLeaf0 =
+        sortSamples(leaf0Samples, "morok.antihook.sandbox.cpuid.leaf0.sort");
+    SmallVector<Value *, 8> sortedHv = sortSamples(
+        hvLeafSamples, "morok.antihook.sandbox.cpuid.hvleaf.sort");
+    SmallVector<Value *, 8> sortedVariance = sortSamples(
+        varianceSamples, "morok.antihook.sandbox.cpuid.variance.sort");
+
+    Value *nakedMedian = sortedNaked[3];
+    Value *leaf0Median = sortedLeaf0[3];
+    Value *hvMedian = sortedHv[3];
+    Value *varianceMedian = sortedVariance[3];
+    nakedMedian->setName("morok.antihook.sandbox.cpuid.naked.median");
+    leaf0Median->setName("morok.antihook.sandbox.cpuid.leaf0.median");
+    hvMedian->setName("morok.antihook.sandbox.cpuid.hvleaf.median");
+    varianceMedian->setName("morok.antihook.sandbox.cpuid.variance.median");
+
+    Value *baseline = B.CreateSelect(
+        B.CreateICmpEQ(nakedMedian, ConstantInt::get(i64, 0),
+                       "morok.antihook.sandbox.cpuid.naked.zero"),
+        ConstantInt::get(i64, 1), nakedMedian,
+        "morok.antihook.sandbox.cpuid.naked.baseline");
+    Value *varianceSlow = B.CreateICmpUGT(
+        varianceMedian,
+        B.CreateMul(baseline, ConstantInt::get(i64, 8),
+                    "morok.antihook.sandbox.cpuid.variance.scaled"),
+        "morok.antihook.sandbox.cpuid.variance.slow");
+    Value *hvLeafSlow = B.CreateICmpUGT(
+        hvMedian,
+        B.CreateAdd(leaf0Median,
+                    B.CreateMul(baseline, ConstantInt::get(i64, 16),
+                                "morok.antihook.sandbox.cpuid.leaf0.slack"),
+                    "morok.antihook.sandbox.cpuid.leaf0.threshold"),
+        "morok.antihook.sandbox.cpuid.hvleaf.slow");
+    Value *latency = B.CreateAnd(varianceSlow, hvLeafSlow,
+                                 "morok.antihook.sandbox.cpuid.latency");
+    Value *composite =
+        B.CreateAnd(latency, IdentityEvidence,
+                    "morok.antihook.sandbox.cpuid.identity.latency");
+    incrementWeightedGate(B, Score, composite, 2, 0xA20D61F3B49C875EULL,
+                          "morok.antihook.sandbox.cpuid.identity.latency");
+    Value *latencyWithoutIdentity = B.CreateAnd(
+        latency,
+        B.CreateNot(IdentityEvidence,
+                    "morok.antihook.sandbox.cpuid.identity.absent"),
+        "morok.antihook.sandbox.coherence.cpuid.no.identity");
+    incrementWeightedGate(B, Coherence, latencyWithoutIdentity, 1,
+                          0xE36C1084F59A27BDULL,
+                          "morok.antihook.sandbox.coherence.cpuid.no.identity");
+    return latency;
+}
+
 Function *sandboxHeuristicProbe(Module &M, const Triple &TT) {
     const bool X86 =
         TT.getArch() == Triple::x86 || TT.getArch() == Triple::x86_64;
@@ -12666,6 +12790,8 @@ Function *sandboxHeuristicProbe(Module &M, const Triple &TT) {
             B.CreateOr(B.CreateOr(hypervisor, vmwareVendor),
                        B.CreateOr(tcgVendor, qemuBrand),
                        "morok.antihook.sandbox.identity.evidence");
+        (void)emitSandboxCpuidExitLatency(B, M, score, coherence,
+                                          identityEvidence);
         Value *hvWithoutLeaf =
             B.CreateAnd(hypervisor,
                         B.CreateNot(hvVendor,
@@ -17273,8 +17399,6 @@ Function *timingOracleProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
                  "morok.timing.cpuid.min.ratio");
         foldFlag(B, State, exitRatio, 0xB90F2E6C41A57D38ULL,
                  "morok.timing.cpuid.exit.ratio");
-        foldPoisonFlag(B, exitRatio, 0x4E3B71D0A6C9582FULL,
-                       "morok.timing.cpuid.exit.ratio");
     }
 
     foldState(B, State, mix, 0x275C92B4EF31D68BULL, "morok.timing.mix");
