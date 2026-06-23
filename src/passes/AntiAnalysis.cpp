@@ -15086,6 +15086,7 @@ Value *bufferHasLinuxRxMemoryLiteral(IRBuilder<> &B, Module &M, AllocaInst *Buf,
     auto *lineLoopBB = BasicBlock::Create(ctx, (Name + ".line.loop").str(), fn);
     auto *lineBodyBB = BasicBlock::Create(ctx, (Name + ".line.body").str(), fn);
     auto *lineStepBB = BasicBlock::Create(ctx, (Name + ".line.step").str(), fn);
+    auto *lineCapBB = BasicBlock::Create(ctx, (Name + ".line.cap.bb").str(), fn);
     auto *parseInitBB =
         BasicBlock::Create(ctx, (Name + ".parse.init").str(), fn);
     auto *parseLoopBB =
@@ -15164,7 +15165,20 @@ Value *bufferHasLinuxRxMemoryLiteral(IRBuilder<> &B, Module &M, AllocaInst *Buf,
         LLB.CreateICmpULT(LLB.CreateSub(idx, line, Name + ".line.back"),
                           ConstantInt::get(ip, 48), Name + ".line.cap"),
         Name + ".line.keep");
-    LLB.CreateCondBr(canStepBack, lineBodyBB, parseInitBB);
+    LLB.CreateCondBr(canStepBack, lineBodyBB, lineCapBB);
+
+    // #259: the backtrack stopped without stepping further (line == 0 reached,
+    // or the 48-byte cap was hit). Accept ONLY the true buffer start (line == 0).
+    // A cap hit with line > 0 means the r-xp permission window sits deep inside a
+    // maps line with no preceding newline within the cap — i.e. inside
+    // attacker-controlled pathname text — so reject the candidate instead of
+    // parsing a forged hex-range from it (which would then inttoptr + volatile-
+    // load an arbitrary/NULL address and crash the scan on a clean run).
+    IRBuilder<> LCB(lineCapBB);
+    LCB.CreateCondBr(
+        LCB.CreateICmpEQ(line, ConstantInt::get(ip, 0),
+                         Name + ".line.buf.start"),
+        parseInitBB, mapNextBB);
 
     IRBuilder<> LBB(lineBodyBB);
     Value *prevIdx =
@@ -15270,7 +15284,14 @@ Value *bufferHasLinuxRxMemoryLiteral(IRBuilder<> &B, Module &M, AllocaInst *Buf,
     rangeUsed->setVolatile(true);
     Value *rangeBytes = SGB.CreateSub(memEnd, memStart, Name + ".range.bytes");
     Value *rangeReady = SGB.CreateAnd(
-        SGB.CreateICmpUGT(memEnd, memStart, Name + ".range.ordered"),
+        SGB.CreateAnd(
+            SGB.CreateICmpUGT(memEnd, memStart, Name + ".range.ordered"),
+            // #259: reject a parsed start in the null/low page so a forged
+            // 0000...-... range cannot steer the inttoptr load to NULL even if a
+            // candidate slipped past the line-boundary anchor (defense in depth).
+            SGB.CreateICmpUGE(memStart, ConstantInt::get(ip, 0x1000),
+                              Name + ".range.above.null"),
+            Name + ".range.ordered.bounded"),
         SGB.CreateAnd(SGB.CreateICmpUGE(rangeBytes,
                                         ConstantInt::get(ip, bytes.size()),
                                         Name + ".range.min"),

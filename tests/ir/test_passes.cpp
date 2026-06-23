@@ -17590,6 +17590,16 @@ entry:
           1u);
     CHECK(countNamedInstructions(
               *Dbi, "morok.antihook.dbi.pin.rx.encoder.scan.limit") >= 1u);
+    // #259: the scanner must anchor to real maps line boundaries (accept a line
+    // start only at a true '\n' or the buffer start, rejecting an r-xp window
+    // reached only via the 48-byte backtrack cap — i.e. deep in attacker-
+    // controlled pathname text) and bound the parsed start above the null page
+    // before the inttoptr load, so a forged hex-range cannot crash the scan.
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.pin.rx.encoder.line.buf.start") >= 1u);
+    CHECK(countNamedInstructions(
+              *Dbi, "morok.antihook.dbi.pin.rx.encoder.range.above.null") >=
+          1u);
     CHECK(countNamedInstructions(
               *Dbi, "morok.antihook.dbi.pin.rx.encoder.byte") >= 1u);
     CHECK(countNamedInstructions(*Dbi, "morok.antihook.dbi.pin.maps") >= 1u);
