@@ -17197,6 +17197,36 @@ bool linuxSchedulerStepSyscalls(const Triple &TT, std::uint32_t &PerfOpen,
         Close = 57;
         Ioctl = 29;
         return true;
+    case Triple::x86:
+        PerfOpen = 336;
+        Read = 3;
+        Close = 6;
+        Ioctl = 54;
+        return true;
+    default:
+        return false;
+    }
+}
+
+struct LinuxPmuMmapSyscalls {
+    std::uint32_t mmap = 0;
+    std::uint32_t munmap = 0;
+};
+
+bool linuxPmuMmapSyscalls(const Triple &TT, LinuxPmuMmapSyscalls &Out) {
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        Out.mmap = 9;
+        Out.munmap = 11;
+        return true;
+    case Triple::aarch64:
+        Out.mmap = 222;
+        Out.munmap = 215;
+        return true;
+    case Triple::x86:
+        Out.mmap = 192; // mmap2(addr, len, prot, flags, fd, pgoffset)
+        Out.munmap = 91;
+        return true;
     default:
         return false;
     }
@@ -17235,6 +17265,26 @@ LoadInst *loadI64AtOffset(IRBuilder<> &B, Module &M, Value *Base,
                             Name);
     li->setVolatile(true);
     li->setAlignment(Align(8));
+    return li;
+}
+
+LoadInst *loadI32AtOffset(IRBuilder<> &B, Module &M, Value *Base,
+                          std::uint64_t Offset, const Twine &Name) {
+    auto *li = B.CreateLoad(Type::getInt32Ty(M.getContext()),
+                            gepI8Offset(B, M, Base, Offset, Name + ".ptr"),
+                            Name);
+    li->setVolatile(true);
+    li->setAlignment(Align(4));
+    return li;
+}
+
+LoadInst *loadI16AtOffset(IRBuilder<> &B, Module &M, Value *Base,
+                          std::uint64_t Offset, const Twine &Name) {
+    auto *li = B.CreateLoad(Type::getInt16Ty(M.getContext()),
+                            gepI8Offset(B, M, Base, Offset, Name + ".ptr"),
+                            Name);
+    li->setVolatile(true);
+    li->setAlignment(Align(2));
     return li;
 }
 
@@ -17280,6 +17330,76 @@ Value *emitLinuxPerfContextSwitchOpen(IRBuilder<> &B, Module &M,
     return emitLinuxPerfOpen(B, M, TT, /*Type=*/1, /*Config=*/3,
                              /*AttrFlags=*/0, /*OpenFlags=*/0,
                              "morok.step.perf.open", Ready);
+}
+
+Value *linuxPerfOpenErrnoMatches(IRBuilder<> &B, Module &M, const Triple &TT,
+                                 Value *Rc,
+                                 std::initializer_list<int> Errnos,
+                                 const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *ip = intPtrTy(M);
+    Value *match = ConstantInt::getFalse(ctx);
+    if (useDirectLinuxSyscalls(M, TT)) {
+        for (int err : Errnos) {
+            Value *eq = B.CreateICmpEQ(Rc, ConstantInt::getSigned(ip, -err),
+                                       Name + ".raw");
+            match = B.CreateOr(match, eq, Name + ".raw.any");
+        }
+        return B.CreateOr(match, ConstantInt::getFalse(ctx), Name);
+    }
+
+    Value *failed = B.CreateICmpEQ(Rc, ConstantInt::getSigned(ip, -1),
+                                   Name + ".failed");
+    Value *errnoPtr = B.CreateCall(linuxErrnoLocationDecl(M), {}, Name + ".ptr");
+    auto *errnoVal = B.CreateLoad(i32, errnoPtr, Name + ".value");
+    errnoVal->setVolatile(true);
+    for (int err : Errnos) {
+        Value *eq = B.CreateICmpEQ(errnoVal, ConstantInt::getSigned(i32, err),
+                                   Name + ".errno");
+        match = B.CreateOr(match, eq, Name + ".errno.any");
+    }
+    return B.CreateAnd(failed, match, Name);
+}
+
+Value *emitLinuxPerfMetadataMmap(IRBuilder<> &B, Module &M, const Triple &TT,
+                                 Value *Fd, Value *&Ready,
+                                 const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *ip = intPtrTy(M);
+    LinuxPmuMmapSyscalls sys;
+    if (!linuxPmuMmapSyscalls(TT, sys)) {
+        Ready = ConstantInt::getFalse(ctx);
+        return ConstantInt::getSigned(ip, -1);
+    }
+
+    constexpr std::uint64_t kPerfMmapPage = 4096;
+    constexpr std::uint64_t kProtRead = 1;
+    constexpr std::uint64_t kMapShared = 1;
+    Value *addr = emitLinuxSyscall(
+        B, M, TT, sys.mmap,
+        {ConstantInt::get(ip, 0), ConstantInt::get(ip, kPerfMmapPage),
+         ConstantInt::get(ip, kProtRead), ConstantInt::get(ip, kMapShared), Fd,
+         ConstantInt::get(ip, 0)});
+    addr->setName(Name);
+    Ready = B.CreateAnd(
+        B.CreateICmpNE(addr, ConstantInt::get(ip, 0), Name + ".nonzero"),
+        B.CreateICmpULT(addr, ConstantInt::getSigned(ip, -4095),
+                        Name + ".not.err"),
+        Name + ".ready");
+    return addr;
+}
+
+void emitLinuxPerfMetadataMunmap(IRBuilder<> &B, Module &M, const Triple &TT,
+                                 Value *Addr) {
+    LinuxPmuMmapSyscalls sys;
+    if (!linuxPmuMmapSyscalls(TT, sys))
+        return;
+    auto *ip = intPtrTy(M);
+    Value *rc =
+        emitLinuxSyscall(B, M, TT, sys.munmap,
+                         {Addr, ConstantInt::get(ip, 4096)});
+    rc->setName("morok.step.pmu.munmap");
 }
 
 SchedulerCounterSample emitLinuxPerfRead(IRBuilder<> &B, Module &M,
@@ -17969,11 +18089,241 @@ void emitSchedulerStepSpan(IRBuilder<> &B, AllocaInst *Acc,
                             rng.next() ^ (0xD1B54A32D192ED03ULL * (part + 1)));
 }
 
+bool schedulerStepTargetSupported(Module &M, const Triple &TT) {
+    const unsigned wordBits = intPtrTy(M)->getBitWidth();
+    if (TT.isOSLinux()) {
+        if (TT.getArch() == Triple::x86)
+            return wordBits == 32;
+        return wordBits == 64;
+    }
+    return wordBits == 64 && (TT.isOSDarwin() || TT.isOSWindows());
+}
+
+Value *emitLinuxUserPmuCounterRead(IRBuilder<> &B, Module &M, const Triple &TT,
+                                   Value *Index, const Twine &Name) {
+    LLVMContext &ctx = M.getContext();
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    if (TT.getArch() == Triple::x86 || TT.getArch() == Triple::x86_64) {
+        auto *pairTy = StructType::get(ctx, {i32, i32});
+        auto *asmTy = FunctionType::get(pairTy, {i32}, false);
+        InlineAsm *rdpmc =
+            InlineAsm::get(asmTy, "rdpmc",
+                           "={eax},={edx},{ecx},~{dirflag},~{fpsr},~{flags}",
+                           /*hasSideEffects=*/true);
+        Value *pair = B.CreateCall(
+            asmTy, rdpmc, {B.CreateZExtOrTrunc(Index, i32)}, Name + ".rdpmc");
+        Value *lo = B.CreateExtractValue(pair, {0}, Name + ".lo");
+        Value *hi = B.CreateExtractValue(pair, {1}, Name + ".hi");
+        return B.CreateOr(B.CreateZExt(lo, i64),
+                          B.CreateShl(B.CreateZExt(hi, i64),
+                                      ConstantInt::get(i64, 32),
+                                      Name + ".hi.shift"),
+                          Name);
+    }
+    if (TT.getArch() == Triple::aarch64) {
+        auto *asmTy = FunctionType::get(i64, false);
+        InlineAsm *pmccntr =
+            InlineAsm::get(asmTy, "mrs $0, PMCCNTR_EL0", "=r,~{memory}",
+                           /*hasSideEffects=*/true);
+        return B.CreateCall(asmTy, pmccntr, {}, Name + ".pmccntr");
+    }
+    return ConstantInt::get(i64, 0);
+}
+
+Function *linuxPmuAccessProbe(Module &M, GlobalVariable *State,
+                              ir::IRRandom &rng, const Triple &TT) {
+    if (!TT.isOSLinux())
+        return nullptr;
+    if (Function *existing = M.getFunction("morok.step.pmu.oracle"))
+        return existing;
+    const bool supportedArch =
+        TT.getArch() == Triple::x86 || TT.getArch() == Triple::x86_64 ||
+        TT.getArch() == Triple::aarch64;
+    if (!supportedArch)
+        return nullptr;
+    if (!schedulerStepTargetSupported(M, TT))
+        return nullptr;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i16 = Type::getInt16Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.step.pmu.oracle", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *mmapBB = BasicBlock::Create(ctx, "mmap", fn);
+    auto *capBB = BasicBlock::Create(ctx, "cap", fn);
+    auto *enableBB = BasicBlock::Create(ctx, "enable", fn);
+    auto *unreadyBB = BasicBlock::Create(ctx, "unready", fn);
+    auto *sampleBB = BasicBlock::Create(ctx, "sample", fn);
+    auto *cleanupBB = BasicBlock::Create(ctx, "cleanup", fn);
+    auto *closeBB = BasicBlock::Create(ctx, "close", fn);
+    auto *retBB = BasicBlock::Create(ctx, "ret", fn);
+
+    IRBuilder<> B(entry);
+    auto *mixSlot = B.CreateAlloca(i64, nullptr, "morok.step.pmu.mix.slot");
+    auto *acc = B.CreateAlloca(i64, nullptr, "morok.step.pmu.span.acc");
+    B.CreateStore(ConstantInt::get(i64, rng.next()), mixSlot)->setVolatile(true);
+    B.CreateStore(ConstantInt::get(i64, rng.next()), acc)->setVolatile(true);
+
+    constexpr std::uint64_t kPerfFlagFdCloexec = 8;
+    constexpr std::uint64_t kPerfAttrDisabledExcludeKernelHv =
+        (1ULL << 0) | (1ULL << 5) | (1ULL << 6);
+    Value *hwReady = nullptr;
+    Value *fd = emitLinuxPerfOpen(
+        B, M, TT, /*Type=*/0, /*Config=*/0,
+        kPerfAttrDisabledExcludeKernelHv, kPerfFlagFdCloexec,
+        "morok.step.pmu.open", hwReady);
+    Value *denied = linuxPerfOpenErrnoMatches(
+        B, M, TT, fd, {1, 13}, "morok.step.pmu.open.denied");
+    Value *easyFp = linuxPerfOpenErrnoMatches(
+        B, M, TT, fd, {2, 16, 95}, "morok.step.pmu.open.easyfp");
+    foldFlag(B, State, denied, 0xB42D79E18C5036AFULL,
+             "morok.step.pmu.open.denied");
+    foldFlag(B, State, easyFp, 0x6F03C58A21D7E94BULL,
+             "morok.step.pmu.open.easyfp");
+    B.CreateCondBr(hwReady, mmapBB, retBB);
+
+    IRBuilder<> MB(mmapBB);
+    Value *mapReady = nullptr;
+    Value *mapAddr =
+        emitLinuxPerfMetadataMmap(MB, M, TT, fd, mapReady,
+                                  "morok.step.pmu.mmap");
+    MB.CreateCondBr(mapReady, capBB, closeBB);
+
+    IRBuilder<> CB(capBB);
+    Value *page = CB.CreateIntToPtr(mapAddr, ptr, "morok.step.pmu.page");
+    Value *caps = loadI64AtOffset(CB, M, page, 40,
+                                  "morok.step.pmu.capabilities");
+    Value *capUserRdpmc =
+        CB.CreateICmpNE(CB.CreateAnd(CB.CreateLShr(caps,
+                                                   ConstantInt::get(i64, 2),
+                                                   "morok.step.pmu.cap.shift"),
+                                     ConstantInt::get(i64, 1),
+                                     "morok.step.pmu.cap.bit"),
+                       ConstantInt::get(i64, 0),
+                       "morok.step.pmu.cap_user_rdpmc");
+    Value *widthRaw =
+        loadI16AtOffset(CB, M, page, 48, "morok.step.pmu.pmc_width");
+    Value *width = CB.CreateZExt(widthRaw, i32, "morok.step.pmu.pmc_width.w");
+    Value *widthOk =
+        CB.CreateAnd(CB.CreateICmpNE(widthRaw, ConstantInt::get(i16, 0),
+                                     "morok.step.pmu.pmc_width.nonzero"),
+                     CB.CreateICmpULE(width, ConstantInt::get(i32, 64),
+                                      "morok.step.pmu.pmc_width.sane"),
+                     "morok.step.pmu.pmc_width.ok");
+    Value *capReady = CB.CreateAnd(capUserRdpmc, widthOk,
+                                   "morok.step.pmu.cap.ready");
+    foldState(CB, State, caps, 0x9D41E630C5A78B2FULL,
+              "morok.step.pmu.capabilities");
+    foldState(CB, State, width, 0x348F0A6C91D257BEULL,
+              "morok.step.pmu.pmc_width");
+    foldFlag(CB, State, CB.CreateNot(capUserRdpmc,
+                                     "morok.step.pmu.cap_user_rdpmc.missing"),
+             0xC6E5A9703B18D42FULL, "morok.step.pmu.cap_user_rdpmc.missing");
+    foldFlag(CB, State, CB.CreateNot(widthOk, "morok.step.pmu.pmc_width.bad"),
+             0x817C2D40E9A65F3BULL, "morok.step.pmu.pmc_width.bad");
+    CB.CreateCondBr(capReady, enableBB, cleanupBB);
+
+    IRBuilder<> EB(enableBB);
+    constexpr std::uint64_t kPerfEventIocEnable = 0x2400;
+    constexpr std::uint64_t kPerfEventIocDisable = 0x2401;
+    constexpr std::uint64_t kPerfEventIocReset = 0x2403;
+    Value *resetRc =
+        emitLinuxPerfIoctl(EB, M, TT, fd, kPerfEventIocReset,
+                           "morok.step.pmu.reset");
+    Value *enableRc =
+        emitLinuxPerfIoctl(EB, M, TT, fd, kPerfEventIocEnable,
+                           "morok.step.pmu.enable");
+    Value *indexRaw =
+        loadI32AtOffset(EB, M, page, 12, "morok.step.pmu.index");
+    Value *indexOk = EB.CreateICmpNE(indexRaw, ConstantInt::get(i32, 0),
+                                     "morok.step.pmu.index.nonzero");
+    Value *flowOk = EB.CreateAnd(
+        EB.CreateICmpEQ(resetRc, ConstantInt::get(ip, 0),
+                        "morok.step.pmu.reset.ok"),
+        EB.CreateAnd(EB.CreateICmpEQ(enableRc, ConstantInt::get(ip, 0),
+                                     "morok.step.pmu.enable.ok"),
+                     indexOk, "morok.step.pmu.enabled.index"),
+        "morok.step.pmu.flow.ok");
+    foldState(EB, State, indexRaw, 0x5AF0D36B82C41E97ULL,
+              "morok.step.pmu.index");
+    foldFlag(EB, State, EB.CreateNot(indexOk, "morok.step.pmu.index.missing"),
+             0x24E8B3F06195CD7AULL, "morok.step.pmu.index.missing");
+    EB.CreateCondBr(flowOk, sampleBB, unreadyBB);
+
+    IRBuilder<> UB(unreadyBB);
+    emitLinuxPerfIoctl(UB, M, TT, fd, kPerfEventIocDisable,
+                       "morok.step.pmu.disable.unready");
+    UB.CreateBr(cleanupBB);
+
+    IRBuilder<> SB(sampleBB);
+    Value *counterIndex =
+        SB.CreateSub(indexRaw, ConstantInt::get(i32, 1),
+                     "morok.step.pmu.counter.index");
+    Value *before =
+        emitLinuxUserPmuCounterRead(SB, M, TT, counterIndex,
+                                    "morok.step.pmu.before");
+    emitSchedulerStepSpan(SB, acc, rng);
+    Value *after =
+        emitLinuxUserPmuCounterRead(SB, M, TT, counterIndex,
+                                    "morok.step.pmu.after");
+    Value *disableRc =
+        emitLinuxPerfIoctl(SB, M, TT, fd, kPerfEventIocDisable,
+                           "morok.step.pmu.disable");
+    Value *delta = SB.CreateSub(after, before, "morok.step.pmu.delta");
+    Value *disableBad =
+        SB.CreateICmpNE(disableRc, ConstantInt::get(ip, 0),
+                        "morok.step.pmu.disable.bad");
+    Value *deltaStalled =
+        SB.CreateICmpEQ(delta, ConstantInt::get(i64, 0),
+                        "morok.step.pmu.delta.stalled");
+    auto *oldMix = SB.CreateLoad(i64, mixSlot, "morok.step.pmu.mix.old");
+    oldMix->setVolatile(true);
+    Value *nextMix = SB.CreateXor(
+        SB.CreateMul(oldMix, ConstantInt::get(i64, rng.next() | 1ULL),
+                     "morok.step.pmu.mix.mul"),
+        SB.CreateAdd(delta, SB.CreateZExt(width, i64),
+                     "morok.step.pmu.mix.delta"),
+        "morok.step.pmu.mix");
+    SB.CreateStore(nextMix, mixSlot)->setVolatile(true);
+    foldState(SB, State, before, 0xE5A134C7906B2D8FULL,
+              "morok.step.pmu.before");
+    foldState(SB, State, after, 0x7B6D20E94A31C85FULL,
+              "morok.step.pmu.after");
+    foldState(SB, State, delta, 0xD0C7A4815E9B632FULL,
+              "morok.step.pmu.delta");
+    foldFlag(SB, State, disableBad, 0x96C418A7E35D02BFULL,
+             "morok.step.pmu.disable.bad");
+    foldEnforcedFlag(SB, State, deltaStalled, 0x43E8B0D61A9C752FULL,
+                     "morok.step.pmu.delta.stalled");
+    SB.CreateBr(cleanupBB);
+
+    IRBuilder<> XB(cleanupBB);
+    emitLinuxPerfMetadataMunmap(XB, M, TT, mapAddr);
+    XB.CreateBr(closeBB);
+
+    IRBuilder<> FB(closeBB);
+    emitLinuxPerfClose(FB, M, TT, fd);
+    FB.CreateBr(retBB);
+
+    IRBuilder<> RB(retBB);
+    auto *mix = RB.CreateLoad(i64, mixSlot, "morok.step.pmu.mix.final");
+    mix->setVolatile(true);
+    RB.CreateRet(mix);
+    return fn;
+}
+
 Function *schedulerStepOracleProbe(Module &M, GlobalVariable *State,
                                    ir::IRRandom &rng, const Triple &TT) {
-    if (intPtrTy(M)->getBitWidth() != 64)
-        return nullptr;
-    if (!TT.isOSLinux() && !TT.isOSDarwin() && !TT.isOSWindows())
+    if (!schedulerStepTargetSupported(M, TT))
         return nullptr;
     if (Function *existing = M.getFunction("morok.step.oracle"))
         return existing;
@@ -18004,6 +18354,15 @@ Function *schedulerStepOracleProbe(Module &M, GlobalVariable *State,
         constexpr std::uint64_t kPerfEventIocEnable = 0x2400;
         constexpr std::uint64_t kPerfEventIocDisable = 0x2401;
         constexpr std::uint64_t kPerfEventIocReset = 0x2403;
+
+        if (Function *pmu = linuxPmuAccessProbe(M, State, rng, TT)) {
+            Value *pmuMix = B.CreateCall(pmu->getFunctionType(), pmu, {},
+                                         "morok.step.pmu.result");
+            mix = B.CreateXor(
+                B.CreateMul(mix, ConstantInt::get(i64, rng.next() | 1ULL),
+                            "morok.step.pmu.outer.mul"),
+                pmuMix, "morok.step.pmu.outer.mix");
+        }
 
         LinuxPerfParanoidSample paranoid = emitLinuxPerfParanoidRead(
             B, M, rng, TT, "morok.step.perf.paranoid");
@@ -32598,8 +32957,7 @@ bool timingOracleModule(Module &M, ir::IRRandom &rng) {
 
 bool schedulerStepOracleModule(Module &M, ir::IRRandom &rng) {
     const Triple tt(M.getTargetTriple());
-    if (intPtrTy(M)->getBitWidth() != 64 ||
-        (!tt.isOSLinux() && !tt.isOSDarwin() && !tt.isOSWindows()))
+    if (!schedulerStepTargetSupported(M, tt))
         return false;
     antiDebugSeal(M, rng);
     GlobalVariable *state = schedulerStepOracleState(M, rng);

@@ -22092,16 +22092,23 @@ define i32 @main() { ret i32 0 }
 
     Function *Ctor = M->getFunction("morok.step");
     Function *Oracle = M->getFunction("morok.step.oracle");
+    Function *Pmu = M->getFunction("morok.step.pmu.oracle");
     REQUIRE(Ctor != nullptr);
     REQUIRE(Oracle != nullptr);
+    REQUIRE(Pmu != nullptr);
     CHECK(M->getGlobalVariable("morok.step.state", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.seal.score.anti_debug.weight", true) ==
           nullptr);
     checkNoSealEnforcement(*Oracle);
+    checkSealEnforcement(*M, *Pmu);
     CHECK(M->getFunction("getrusage") != nullptr);
     CHECK(M->getFunction("syscall") == nullptr);
+    CHECK(M->getFunction("__errno_location") == nullptr);
     CHECK(hasInlineAsmCall(*Oracle));
+    CHECK(countCallsTo(*Oracle, "morok.step.pmu.oracle") == 1u);
     CHECK_FALSE(functionHasConstantInt(*Oracle,
+                                       298u)); // perf_event_open syscall NR
+    CHECK_FALSE(functionHasConstantInt(*Pmu,
                                        298u)); // perf_event_open syscall NR
     CHECK(
         functionHasConstantInt(*Oracle, 3u)); // PERF_COUNT_SW_CONTEXT_SWITCHES
@@ -22109,6 +22116,31 @@ define i32 @main() { ret i32 0 }
     CHECK(functionHasConstantInt(*Oracle, 0x2401u)); // PERF_EVENT_IOC_DISABLE
     CHECK(functionHasConstantInt(*Oracle, 0x2403u)); // PERF_EVENT_IOC_RESET
     CHECK(functionHasConstantInt(*Oracle, 0x61u)); // disabled+exclude flags
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.open.ready") >= 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.open.denied") >= 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.open.easyfp") >= 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.mmap.ready") >= 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.cap_user_rdpmc") >= 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.pmc_width") >= 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.index") >= 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.delta") >= 1u);
+    CHECK(countInlineAsmBodies(*Pmu, "rdpmc") >= 2u);
+    CHECK(countInlineAsmBodies(*Pmu, "PMCCNTR_EL0") == 0u);
+    Instruction *PmuDenied =
+        findNamedInstruction(*Pmu, "morok.step.pmu.open.denied");
+    Instruction *PmuEasyFp =
+        findNamedInstruction(*Pmu, "morok.step.pmu.open.easyfp");
+    Instruction *PmuStalled =
+        findNamedInstruction(*Pmu, "morok.step.pmu.delta.stalled");
+    REQUIRE(PmuDenied != nullptr);
+    REQUIRE(PmuEasyFp != nullptr);
+    REQUIRE(PmuStalled != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(PmuDenied,
+                                           "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(PmuEasyFp,
+                                           "morok.seal.fold.anti_debug"));
+    CHECK(valueFeedsNamedInstruction(PmuStalled,
+                                     "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Oracle, "morok.step.perf.open.ready") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.step.perf.hw.open.ready") >=
           1u);
@@ -22131,6 +22163,62 @@ define i32 @main() { ret i32 0 }
           1u);
     CHECK_FALSE(
         hasReadableByteString(*M, "/proc/sys/kernel/perf_event_paranoid"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("schedulerStepOracleModule emits Linux aarch64 PMCCNTR sampling") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "aarch64-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(88411);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::schedulerStepOracleModule(*M, rng));
+
+    Function *Oracle = M->getFunction("morok.step.oracle");
+    Function *Pmu = M->getFunction("morok.step.pmu.oracle");
+    REQUIRE(Oracle != nullptr);
+    REQUIRE(Pmu != nullptr);
+    CHECK(M->getFunction("syscall") == nullptr);
+    CHECK(countCallsTo(*Oracle, "morok.step.pmu.oracle") == 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.cap_user_rdpmc") >= 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.pmc_width") >= 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.delta.stalled") >= 1u);
+    CHECK(countInlineAsmBodies(*Pmu, "PMCCNTR_EL0") >= 2u);
+    CHECK(countInlineAsmBodies(*Pmu, "rdpmc") == 0u);
+    CHECK_FALSE(functionHasConstantInt(*Pmu,
+                                       241u)); // perf_event_open syscall NR
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("schedulerStepOracleModule emits Linux i386 RDPMC sampling") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target datalayout = "e-m:e-p:32:32-i64:64-f80:128-n8:16:32-S128"
+target triple = "i386-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(88412);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::schedulerStepOracleModule(*M, rng));
+
+    Function *Oracle = M->getFunction("morok.step.oracle");
+    Function *Pmu = M->getFunction("morok.step.pmu.oracle");
+    REQUIRE(Oracle != nullptr);
+    REQUIRE(Pmu != nullptr);
+    CHECK(M->getFunction("syscall") != nullptr);
+    CHECK(M->getFunction("__errno_location") != nullptr);
+    CHECK(countCallsTo(*Oracle, "morok.step.pmu.oracle") == 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.open.denied") >= 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.open.easyfp") >= 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.mmap.ready") >= 1u);
+    CHECK(countNamedInstructions(*Pmu, "morok.step.pmu.delta.stalled") >= 1u);
+    CHECK(countInlineAsmBodies(*Pmu, "rdpmc") >= 2u);
+    CHECK(functionHasConstantInt(*Pmu,
+                                 336u)); // fallback syscall wrapper path
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -22186,7 +22274,7 @@ TEST_CASE("schedulerStepOracleModule skips unsupported pointer widths") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
 target datalayout = "e-m:e-p:32:32-i64:64-f80:128-n8:16:32-S128"
-target triple = "i386-unknown-linux-gnu"
+target triple = "x86_64-unknown-linux-gnu"
 define i32 @main() { ret i32 0 }
 )ir");
     auto engine = morok::core::Xoshiro256pp::fromSeed(8844);
