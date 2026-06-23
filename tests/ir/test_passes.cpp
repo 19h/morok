@@ -17295,8 +17295,18 @@ entry:
           1u);
     CHECK(countNamedInstructions(
               *Diverge, "morok.antihook.diverge.mmap.fixed.rc") >= 1u);
+    // #252: the inverted dead verdict (nonneg && rc!=requested, never true
+    // under MAP_FIXED) is gone; the live signal flags rc==0 (null page mapped)
+    // and feeds the divergence diff.
     CHECK(countNamedInstructions(
-              *Diverge, "morok.antihook.diverge.mmap.fixed.mismatch") >= 1u);
+              *Diverge, "morok.antihook.diverge.mmap.fixed.mismatch") == 0u);
+    {
+        Instruction *MmapReq = findNamedInstruction(
+            *Diverge, "morok.antihook.diverge.mmap.fixed.requested");
+        REQUIRE(MmapReq != nullptr);
+        CHECK(valueFeedsNamedInstruction(
+            MmapReq, "morok.antihook.diverge.mmap.fixed.next"));
+    }
     CHECK(countNamedInstructions(
               *Diverge, "morok.antihook.diverge.mmap.fixed.unmap") >= 1u);
     Instruction *DivergeChanged =
@@ -18235,8 +18245,18 @@ entry:
               *Diverge, "morok.antihook.diverge.fcntl.badcmd.expected") >= 1u);
     CHECK(countNamedInstructions(
               *Diverge, "morok.antihook.diverge.mmap.fixed.rc") >= 1u);
+    // #252: the inverted dead verdict (nonneg && rc!=requested, never true
+    // under MAP_FIXED) is gone; the live signal flags rc==0 (null page mapped)
+    // and feeds the divergence diff.
     CHECK(countNamedInstructions(
-              *Diverge, "morok.antihook.diverge.mmap.fixed.mismatch") >= 1u);
+              *Diverge, "morok.antihook.diverge.mmap.fixed.mismatch") == 0u);
+    {
+        Instruction *MmapReq = findNamedInstruction(
+            *Diverge, "morok.antihook.diverge.mmap.fixed.requested");
+        REQUIRE(MmapReq != nullptr);
+        CHECK(valueFeedsNamedInstruction(
+            MmapReq, "morok.antihook.diverge.mmap.fixed.next"));
+    }
     Instruction *Changed =
         findNamedInstruction(*Ctor, "morok.corroborate.mprotect.changed");
     REQUIRE(Changed != nullptr);

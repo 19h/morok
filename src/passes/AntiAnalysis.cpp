@@ -12375,16 +12375,19 @@ void emitLinuxMmapFixedDivergence(IRBuilder<> &B, Module &M, Function *Fn,
          ConstantInt::get(i32, 0x02U | 0x10U | 0x20U),
          ConstantInt::getSigned(i32, -1), ConstantInt::get(ip, 0)});
     rc->setName("morok.antihook.diverge.mmap.fixed.rc");
+    // #252: a successful null-page MAP_FIXED *is* the divergence. A real
+    // hardened kernel refuses mmap(NULL, ..., MAP_FIXED) (mmap_min_addr > 0) and
+    // returns -errno; an emulator/DBI or an mmap_min_addr=0 host allows it and,
+    // because MAP_FIXED always returns the requested address, yields rc == 0.
+    // The previous verdict (nonNegative && rc != requested) could therefore
+    // NEVER be true under MAP_FIXED, so the enforced signal was dead and the
+    // null-page allowance was a free bypass. Flag on rc == 0 (null page mapped);
+    // the success path below unmaps it so the probe stays side-effect free.
     Value *mappedRequested =
         B.CreateICmpEQ(rc, addr,
                        "morok.antihook.diverge.mmap.fixed.requested");
-    Value *nonNegative =
-        B.CreateICmpSGE(rc, ConstantInt::getSigned(ip, 0),
-                        "morok.antihook.diverge.mmap.fixed.nonneg");
-    Value *wrongSuccess =
-        B.CreateAnd(nonNegative, B.CreateNot(mappedRequested),
-                    "morok.antihook.diverge.mmap.fixed.mismatch");
-    incrementDiff(B, Diff, wrongSuccess, "morok.antihook.diverge.mmap.fixed");
+    incrementDiff(B, Diff, mappedRequested,
+                  "morok.antihook.diverge.mmap.fixed");
 
     auto *unmapBB =
         BasicBlock::Create(ctx, "morok.antihook.diverge.mmap.unmap", Fn);
