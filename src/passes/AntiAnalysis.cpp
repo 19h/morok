@@ -14784,6 +14784,21 @@ Value *bufferHasLinuxAnonymousExecMap(IRBuilder<> &B, Module &M,
     Value *seenNewline = ConstantInt::getFalse(ctx);
     Value *inToken = ConstantInt::getFalse(ctx);
     Value *fieldCount = ConstantInt::get(i8, 0);
+    Value *pathPos = ConstantInt::get(i8, 0);
+    Value *anonPrefixOk = ConstantInt::getTrue(ctx);
+    Value *anonPrefixHit = ConstantInt::getFalse(ctx);
+    Value *anonShmemPrefixOk = ConstantInt::getTrue(ctx);
+    Value *anonShmemPrefixHit = ConstantInt::getFalse(ctx);
+    Value *vdsoPrefixOk = ConstantInt::getTrue(ctx);
+    Value *vdsoPrefixHit = ConstantInt::getFalse(ctx);
+    Value *vsyscallPrefixOk = ConstantInt::getTrue(ctx);
+    Value *vsyscallPrefixHit = ConstantInt::getFalse(ctx);
+    Value *heapPrefixOk = ConstantInt::getTrue(ctx);
+    Value *heapPrefixHit = ConstantInt::getFalse(ctx);
+    Value *stackPrefixOk = ConstantInt::getTrue(ctx);
+    Value *stackPrefixHit = ConstantInt::getFalse(ctx);
+    Value *stackTidPrefixOk = ConstantInt::getTrue(ctx);
+    Value *stackTidPrefixHit = ConstantInt::getFalse(ctx);
     // /proc/self/maps pathnames start after offset/dev/inode. Bracketed
     // kernel pseudo-maps like [vdso] are named mappings, not anonymous JIT
     // scratch pages.
@@ -14814,6 +14829,59 @@ Value *bufferHasLinuxAnonymousExecMap(IRBuilder<> &B, Module &M,
                         Name + ".path.bracket");
         seenPathNonSpace =
             MB.CreateOr(seenPathNonSpace, pathChar, Name + ".path.any");
+        auto updatePrefix = [&](Value *&prefixOk, Value *&prefixHit,
+                                std::initializer_list<unsigned char> literal,
+                                const Twine &label) {
+            Value *expected = ConstantInt::get(i8, 0);
+            std::uint64_t pos = 0;
+            for (unsigned char byte : literal) {
+                Value *atPos = MB.CreateICmpEQ(
+                    pathPos, ConstantInt::get(i8, pos), label + ".pos");
+                expected = MB.CreateSelect(atPos, ConstantInt::get(i8, byte),
+                                           expected, label + ".expected");
+                ++pos;
+            }
+            Value *within =
+                MB.CreateICmpULT(pathPos, ConstantInt::get(i8, literal.size()),
+                                 label + ".within");
+            Value *check = MB.CreateAnd(pathChar, within, label + ".check");
+            Value *byteOk = MB.CreateICmpEQ(ch, expected, label + ".byte");
+            Value *matchNext = MB.CreateAnd(prefixOk, byteOk, label + ".match");
+            Value *last = MB.CreateICmpEQ(
+                pathPos, ConstantInt::get(i8, literal.size() - 1),
+                label + ".last");
+            Value *hitNow = MB.CreateAnd(
+                pathChar,
+                MB.CreateAnd(last, matchNext, label + ".hit.ready"),
+                label + ".hit.now");
+            prefixHit = MB.CreateOr(prefixHit, hitNow, label + ".hit");
+            prefixOk =
+                MB.CreateSelect(check, matchNext, prefixOk, label + ".ok");
+        };
+        updatePrefix(anonPrefixOk, anonPrefixHit,
+                     {'[', 'a', 'n', 'o', 'n', ':'},
+                     Name + ".path.anon.prefix");
+        updatePrefix(anonShmemPrefixOk, anonShmemPrefixHit,
+                     {'[', 'a', 'n', 'o', 'n', '_', 's', 'h', 'm', 'e', 'm',
+                      ':'},
+                     Name + ".path.anon_shmem.prefix");
+        updatePrefix(vdsoPrefixOk, vdsoPrefixHit,
+                     {'[', 'v', 'd', 's', 'o', ']'},
+                     Name + ".path.pseudo.vdso");
+        updatePrefix(vsyscallPrefixOk, vsyscallPrefixHit,
+                     {'[', 'v', 's', 'y', 's', 'c', 'a', 'l', 'l', ']'},
+                     Name + ".path.pseudo.vsyscall");
+        updatePrefix(heapPrefixOk, heapPrefixHit,
+                     {'[', 'h', 'e', 'a', 'p', ']'},
+                     Name + ".path.pseudo.heap");
+        updatePrefix(stackPrefixOk, stackPrefixHit,
+                     {'[', 's', 't', 'a', 'c', 'k', ']'},
+                     Name + ".path.pseudo.stack");
+        updatePrefix(stackTidPrefixOk, stackTidPrefixHit,
+                     {'[', 's', 't', 'a', 'c', 'k', ':'},
+                     Name + ".path.pseudo.stack_tid");
+        pathPos = MB.CreateAdd(pathPos, MB.CreateZExt(pathChar, i8),
+                               Name + ".path.pos");
         Value *tokenEnd = MB.CreateAnd(
             MB.CreateAnd(beforeNl, inToken, Name + ".path.token.live"),
             terminator, Name + ".path.token.end");
@@ -14830,11 +14898,23 @@ Value *bufferHasLinuxAnonymousExecMap(IRBuilder<> &B, Module &M,
         seenNewline =
             MB.CreateOr(seenNewline, isNl, Name + ".path.nl");
     }
-    Value *pathClear = MB.CreateAnd(
-        MB.CreateAnd(MB.CreateNot(seenSlash), MB.CreateNot(seenBracket),
+    Value *namedAnon =
+        MB.CreateOr(anonPrefixHit, anonShmemPrefixHit, Name + ".path.named_anon");
+    Value *kernelPseudo = MB.CreateOr(
+        MB.CreateOr(vdsoPrefixHit, vsyscallPrefixHit, Name + ".path.pseudo.0"),
+        MB.CreateOr(MB.CreateOr(heapPrefixHit, stackPrefixHit,
+                                Name + ".path.pseudo.1"),
+                    stackTidPrefixHit, Name + ".path.pseudo.2"),
+        Name + ".path.pseudo.kernel");
+    Value *plainAnon = MB.CreateAnd(
+        MB.CreateAnd(MB.CreateNot(seenSlash), MB.CreateNot(kernelPseudo),
                      Name + ".path.pseudo.clear"),
         MB.CreateNot(seenPathNonSpace, Name + ".path.empty"),
-        Name + ".path.clear");
+        Name + ".path.plain.clear");
+    Value *namedAnonClear = MB.CreateAnd(namedAnon, MB.CreateNot(kernelPseudo),
+                                         Name + ".path.named_anon.clear");
+    Value *pathClear =
+        MB.CreateOr(plainAnon, namedAnonClear, Name + ".path.clear");
     Value *anonExec = MB.CreateAnd(
         permWindow,
         MB.CreateAnd(MB.CreateAnd(isChar(p2, 'x'), isChar(p3, 'p')),
