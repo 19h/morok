@@ -21859,6 +21859,26 @@ define i32 @main() { ret i32 0 }
         *SelfDbg, "morok.win.attach.selfdbg.child.event.exception", 1u));
     CHECK(hasNamedIcmpWithConstant(
         *SelfDbg, "morok.win.attach.selfdbg.child.event.exit.process", 5u));
+    CHECK(hasNamedIcmpWithConstant(
+        *SelfDbg,
+        "morok.win.attach.selfdbg.child.event.exception.breakpoint",
+        0x80000003u));
+    CHECK(countNamedInstructions(
+              *SelfDbg,
+              "morok.win.attach.selfdbg.child.event.exception.first_chance") >=
+          1u);
+    Instruction *InitialBreakpoint = findNamedInstruction(
+        *SelfDbg, "morok.win.attach.selfdbg.child.event.initial.breakpoint");
+    REQUIRE(InitialBreakpoint != nullptr);
+    CHECK(valueFeedsNamedInstruction(
+        InitialBreakpoint, "morok.win.attach.selfdbg.child.continue.status"));
+    Instruction *ForwardException = findNamedInstruction(
+        *SelfDbg, "morok.win.attach.selfdbg.child.event.exception.forward");
+    REQUIRE(ForwardException != nullptr);
+    CHECK(valueFeedsNamedInstruction(
+        ForwardException, "morok.win.attach.selfdbg.child.continue.status"));
+    CHECK(countNamedInstructions(
+              *SelfDbg, "morok.win.attach.selfdbg.child.break.seen") >= 1u);
     CHECK(namedInstructionUsesConstant(
         *SelfDbg, "morok.win.attach.selfdbg.child.continue.status",
         0x80010001u));
@@ -21866,12 +21886,15 @@ define i32 @main() { ret i32 0 }
         *SelfDbg, "morok.win.attach.selfdbg.child.continue.status",
         0x00010002u));
     CHECK(countNamedInstructions(
-              *SelfDbg, "morok.win.attach.selfdbg.child.debugstop") >= 1u);
+              *SelfDbg, "morok.win.attach.selfdbg.child.debugstop") == 0u);
     CHECK(countNamedInstructions(*SelfDbg,
                                  "morok.win.attach.selfdbg.child.kex.false") >=
           1u);
-    CHECK(namedInstructionUsesConstant(
-        *SelfDbg, "morok.win.attach.selfdbg.child.pump.expired", 64u));
+    CHECK(countNamedInstructions(
+              *SelfDbg, "morok.win.attach.selfdbg.child.pump.expired") == 0u);
+    CHECK(countNamedInstructions(*SelfDbg,
+                                 "morok.win.attach.selfdbg.child.pump.idx") ==
+          0u);
     CHECK(countNamedInstructions(
               *SelfDbg, "morok.win.attach.selfdbg.createprocess") >= 1u);
     CHECK(countNamedInstructions(

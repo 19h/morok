@@ -29160,7 +29160,6 @@ Function *windowsSelfDebugAttachHelper(
     constexpr std::uint32_t kProcessInfoBytes = 32;
     constexpr std::uint32_t kDebugEventBytes = 192;
     constexpr std::uint32_t kAttachPolls = 80;
-    constexpr std::uint32_t kChildPumpTicks = 64;
     constexpr std::uint32_t kDebugPollTimeoutMs = 1;
 
     SmallVector<Type *, 14> argTys(14, ip);
@@ -29213,7 +29212,6 @@ Function *windowsSelfDebugAttachHelper(
     auto *childPumpBB = BasicBlock::Create(ctx, "child.pump", fn);
     auto *childContinueBB = BasicBlock::Create(ctx, "child.continue", fn);
     auto *childPumpNextBB = BasicBlock::Create(ctx, "child.pump.next", fn);
-    auto *childStopBB = BasicBlock::Create(ctx, "child.stop", fn);
     auto *childExitBB = BasicBlock::Create(ctx, "child.exit", fn);
     auto *parentGateBB = BasicBlock::Create(ctx, "parent.gate", fn);
     auto *parentBuildBB = BasicBlock::Create(ctx, "parent.build", fn);
@@ -29254,6 +29252,8 @@ Function *windowsSelfDebugAttachHelper(
         B.CreateAlloca(ptr, nullptr, "morok.win.attach.selfdbg.child.thread");
     AllocaInst *childDead =
         B.CreateAlloca(i1, nullptr, "morok.win.attach.selfdbg.child.dead.slot");
+    AllocaInst *childBreakSeen = B.CreateAlloca(
+        i1, nullptr, "morok.win.attach.selfdbg.child.break.seen.slot");
     B.CreateStore(ConstantInt::get(i64, 0), result)->setVolatile(true);
     B.CreateStore(ConstantPointerNull::get(ptr), dbgObject)->setVolatile(true);
     B.CreateStore(ConstantPointerNull::get(ptr), childProcess)
@@ -29261,6 +29261,8 @@ Function *windowsSelfDebugAttachHelper(
     B.CreateStore(ConstantPointerNull::get(ptr), childThread)
         ->setVolatile(true);
     B.CreateStore(ConstantInt::getFalse(ctx), childDead)->setVolatile(true);
+    B.CreateStore(ConstantInt::getFalse(ctx), childBreakSeen)
+        ->setVolatile(true);
 
     auto orResult = [&](IRBuilder<> &IB, Value *Word, const Twine &Name) {
         Value *old = IB.CreateLoad(i64, result, Name + ".old");
@@ -29410,11 +29412,8 @@ Function *windowsSelfDebugAttachHelper(
     Value *childPumpApisReady = ChG.CreateAnd(
         ChG.CreateICmpNE(waitDebug, ConstantInt::get(ip, 0),
                          "morok.win.attach.selfdbg.wait.ready"),
-        ChG.CreateAnd(ChG.CreateICmpNE(continueDebug, ConstantInt::get(ip, 0),
-                                       "morok.win.attach.selfdbg.continue.ready"),
-                      ChG.CreateICmpNE(debugStop, ConstantInt::get(ip, 0),
-                                       "morok.win.attach.selfdbg.debugstop.ready"),
-                      "morok.win.attach.selfdbg.pump.ready"),
+        ChG.CreateICmpNE(continueDebug, ConstantInt::get(ip, 0),
+                         "morok.win.attach.selfdbg.continue.ready"),
         "morok.win.attach.selfdbg.pump.apis.ready");
     Value *childApisReady = ChG.CreateAnd(
         ChG.CreateICmpNE(debugActive, ConstantInt::get(ip, 0),
@@ -29429,6 +29428,8 @@ Function *windowsSelfDebugAttachHelper(
         ChA.CreateIntToPtr(debugActive, ptr,
                            "morok.win.attach.selfdbg.debugactive.ptr"),
         {parentPid}, "morok.win.attach.selfdbg.child.debugactive");
+    ChA.CreateStore(ConstantInt::getFalse(ctx), childBreakSeen)
+        ->setVolatile(true);
     ChA.CreateCondBr(ChA.CreateICmpNE(attachOk, ConstantInt::get(i32, 0),
                                       "morok.win.attach.selfdbg.child.attached"),
                      childKillExitGateBB, childExitBB);
@@ -29453,10 +29454,6 @@ Function *windowsSelfDebugAttachHelper(
     ChKC.CreateBr(childPumpBB);
 
     IRBuilder<> ChP(childPumpBB);
-    PHINode *pumpIdx =
-        ChP.CreatePHI(i32, 3, "morok.win.attach.selfdbg.child.pump.idx");
-    pumpIdx->addIncoming(ConstantInt::get(i32, 0), childKillExitGateBB);
-    pumpIdx->addIncoming(ConstantInt::get(i32, 0), childKillExitCallBB);
     ChP.CreateMemSet(debugEvent, ConstantInt::get(i8, 0),
                      ConstantInt::get(ip, kDebugEventBytes), MaybeAlign(1));
     auto *waitDebugTy = FunctionType::get(i32, {ptr, i32}, false);
@@ -29487,10 +29484,44 @@ Function *windowsSelfDebugAttachHelper(
     Value *isExitProcess = ChC.CreateICmpEQ(
         eventCode, ConstantInt::get(i32, 5),
         "morok.win.attach.selfdbg.child.event.exit.process");
+    Value *exceptionCode =
+        loadAt(ChC, M, i32, debugEvent, 16ULL,
+               "morok.win.attach.selfdbg.child.event.exception.code");
+    Value *firstChance =
+        loadAt(ChC, M, i32, debugEvent, 168ULL,
+               "morok.win.attach.selfdbg.child.event.exception.first_chance");
+    Value *firstChanceSet = ChC.CreateICmpNE(
+        firstChance, ConstantInt::get(i32, 0),
+        "morok.win.attach.selfdbg.child.event.exception.first_chance.set");
+    Value *isBreakpoint = ChC.CreateICmpEQ(
+        exceptionCode, ConstantInt::get(i32, 0x80000003u),
+        "morok.win.attach.selfdbg.child.event.exception.breakpoint");
+    Value *breakSeen =
+        ChC.CreateLoad(i1, childBreakSeen,
+                       "morok.win.attach.selfdbg.child.break.seen");
+    cast<LoadInst>(breakSeen)->setVolatile(true);
+    Value *breakpointEvent = ChC.CreateAnd(
+        isException, isBreakpoint,
+        "morok.win.attach.selfdbg.child.event.breakpoint");
+    Value *initialBreakpoint = ChC.CreateAnd(
+        ChC.CreateAnd(isException, firstChanceSet,
+                      "morok.win.attach.selfdbg.child.event.first_chance.exception"),
+        ChC.CreateAnd(isBreakpoint, ChC.CreateNot(breakSeen),
+                      "morok.win.attach.selfdbg.child.event.breakpoint.first"),
+        "morok.win.attach.selfdbg.child.event.initial.breakpoint");
+    Value *forwardException = ChC.CreateAnd(
+        isException,
+        ChC.CreateNot(initialBreakpoint,
+                      "morok.win.attach.selfdbg.child.event.initial.not"),
+        "morok.win.attach.selfdbg.child.event.exception.forward");
     Value *continueStatus = ChC.CreateSelect(
-        isException, ConstantInt::get(i32, 0x80010001u),
+        forwardException, ConstantInt::get(i32, 0x80010001u),
         ConstantInt::get(i32, 0x00010002u),
         "morok.win.attach.selfdbg.child.continue.status");
+    ChC.CreateStore(ChC.CreateOr(breakSeen, breakpointEvent,
+                                 "morok.win.attach.selfdbg.child.break.seen.next"),
+                    childBreakSeen)
+        ->setVolatile(true);
     Value *cont = ChC.CreateCall(
         continueDebugTy,
         ChC.CreateIntToPtr(continueDebug, ptr,
@@ -29499,30 +29530,10 @@ Function *windowsSelfDebugAttachHelper(
         "morok.win.attach.selfdbg.child.continue");
     orResult(ChC, ChC.CreateZExt(cont, i64),
              "morok.win.attach.selfdbg.child.continue.mix");
-    ChC.CreateCondBr(isExitProcess, childStopBB, childPumpNextBB);
+    ChC.CreateCondBr(isExitProcess, childExitBB, childPumpNextBB);
 
     IRBuilder<> ChN(childPumpNextBB);
-    Value *nextPumpIdx =
-        ChN.CreateAdd(pumpIdx, ConstantInt::get(i32, 1),
-                      "morok.win.attach.selfdbg.child.pump.next");
-    Value *pumpExpired = ChN.CreateICmpUGE(
-        nextPumpIdx, ConstantInt::get(i32, kChildPumpTicks),
-        "morok.win.attach.selfdbg.child.pump.expired");
-    ChN.CreateCondBr(pumpExpired, childStopBB, childPumpBB);
-    pumpIdx->addIncoming(nextPumpIdx, childPumpNextBB);
-
-    IRBuilder<> ChS(childStopBB);
-    auto *debugStopTy = FunctionType::get(i32, {i32}, false);
-    Value *stopStatus = ChS.CreateCall(
-        debugStopTy,
-        ChS.CreateIntToPtr(debugStop, ptr,
-                           "morok.win.attach.selfdbg.debugstop.ptr"),
-        {parentPid}, "morok.win.attach.selfdbg.child.debugstop");
-    orResult(ChS,
-             ChS.CreateShl(ChS.CreateZExt(stopStatus, i64),
-                           ConstantInt::get(i64, 24)),
-             "morok.win.attach.selfdbg.child.debugstop.mix");
-    ChS.CreateBr(childExitBB);
+    ChN.CreateBr(childPumpBB);
 
     IRBuilder<> ChE(childExitBB);
     auto *exitTy = FunctionType::get(Type::getVoidTy(ctx), {i32}, false);
@@ -29554,11 +29565,8 @@ Function *windowsSelfDebugAttachHelper(
             "morok.win.attach.selfdbg.pid.apis"),
         "morok.win.attach.selfdbg.parent.ready");
     Value *parentDebugApisReady = PG.CreateAnd(
-        PG.CreateAnd(PG.CreateICmpNE(debugActive, ConstantInt::get(ip, 0),
-                                     "morok.win.attach.selfdbg.parent.debugactive.ready"),
-                     PG.CreateICmpNE(debugStop, ConstantInt::get(ip, 0),
-                                     "morok.win.attach.selfdbg.parent.debugstop.ready"),
-                     "morok.win.attach.selfdbg.parent.debug.attach.apis"),
+        PG.CreateICmpNE(debugActive, ConstantInt::get(ip, 0),
+                        "morok.win.attach.selfdbg.parent.debugactive.ready"),
         PG.CreateAnd(PG.CreateICmpNE(waitDebug, ConstantInt::get(ip, 0),
                                      "morok.win.attach.selfdbg.parent.wait.ready"),
                      PG.CreateICmpNE(continueDebug, ConstantInt::get(ip, 0),
