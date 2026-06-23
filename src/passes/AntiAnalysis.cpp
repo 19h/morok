@@ -14040,22 +14040,12 @@ Value *emitFsGsBaseRead(IRBuilder<> &B, bool Gs, const Twine &Name) {
     return B.CreateCall(asmTy, IA, {}, Name);
 }
 
-Value *emitWindowsGsSelfRead(IRBuilder<> &B, const Twine &Name) {
-    auto *i64 = B.getInt64Ty();
-    auto *asmTy = FunctionType::get(i64, false);
-    InlineAsm *IA =
-        InlineAsm::get(asmTy, "movq %gs:0x30, $0",
-                       "=r,~{memory},~{dirflag},~{fpsr},~{flags}",
-                       /*hasSideEffects=*/true);
-    return B.CreateCall(asmTy, IA, {}, Name);
-}
-
 Function *fsGsBaseGapProbe(Module &M, const Triple &TT) {
     if (TT.getArch() != Triple::x86_64)
         return nullptr;
-    if (!TT.isOSLinux() && !TT.isOSWindows())
+    if (!TT.isOSLinux())
         return nullptr;
-    if (TT.isOSLinux() && !useDirectLinuxSyscalls(M, TT))
+    if (!useDirectLinuxSyscalls(M, TT))
         return nullptr;
     if (Function *existing = M.getFunction("morok.antihook.fsgs.x86"))
         return existing;
@@ -14087,29 +14077,6 @@ Function *fsGsBaseGapProbe(Module &M, const Triple &TT) {
         B.CreateAnd(ebx7, ConstantInt::get(i32, 1),
                     "morok.antihook.fsgs.cpuid.fsgsbase"),
         ConstantInt::get(i32, 0), "morok.antihook.fsgs.supported");
-
-    if (TT.isOSWindows()) {
-        B.CreateCondBr(supported, probeBB, doneBB);
-        IRBuilder<> WB(probeBB);
-        Value *gsBase = emitFsGsBaseRead(WB, /*Gs=*/true,
-                                         "morok.antihook.fsgs.win.rdgsbase");
-        Value *gsSelf =
-            emitWindowsGsSelfRead(WB, "morok.antihook.fsgs.win.gs.self");
-        Value *ready =
-            WB.CreateICmpNE(gsSelf, ConstantInt::get(i64, 0),
-                            "morok.antihook.fsgs.win.gs.ready");
-        Value *mismatch = WB.CreateAnd(
-            ready,
-            WB.CreateICmpNE(gsBase, gsSelf,
-                            "morok.antihook.fsgs.win.gs.base.diff"),
-            "morok.antihook.fsgs.win.gs.mismatch");
-        incrementDiff(WB, diff, mismatch, "morok.antihook.fsgs.win.gs");
-        WB.CreateBr(doneBB);
-
-        IRBuilder<> DB(doneBB);
-        emitRetDiff(DB, diff);
-        return fn;
-    }
 
     auto *installBB =
         BasicBlock::Create(ctx, "morok.antihook.fsgs.sig.install", fn);

@@ -18886,8 +18886,14 @@ entry:
     REQUIRE(FirmwareCoherence != nullptr);
     Function *Emu = M->getFunction("morok.antihook.emu.x86");
     REQUIRE(Emu != nullptr);
-    Function *FsGs = M->getFunction("morok.antihook.fsgs.x86");
-    REQUIRE(FsGs != nullptr);
+    CHECK(M->getFunction("morok.antihook.fsgs.x86") == nullptr);
+    CHECK(M->getFunction("morok.antihook.fsgs.sig.handler") == nullptr);
+    CHECK(M->getGlobalVariable("morok.antihook.fsgs.sig.mask", true) ==
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.antihook.fsgs.old.ill.action", true) ==
+          nullptr);
+    CHECK(countNamedInstructions(*M, "morok.antihook.fsgs.win.rdgsbase") ==
+          0u);
     Function *Fpu = M->getFunction("morok.antihook.fpu.x86");
     REQUIRE(Fpu != nullptr);
     Function *Smc = M->getFunction("morok.antihook.dbi.smc");
@@ -19001,30 +19007,16 @@ entry:
           1u);
     CHECK(countNamedInstructions(*Emu,
                                  "morok.antihook.emu.cpuid.baseline") >= 1u);
-    CHECK(hasInlineAsmCall(*FsGs));
-    CHECK(countNamedInstructions(*FsGs, "morok.antihook.fsgs.supported") >=
-          1u);
-    CHECK(countNamedInstructions(*FsGs, "morok.antihook.fsgs.win.rdgsbase") >=
-          1u);
-    CHECK(countNamedInstructions(*FsGs, "morok.antihook.fsgs.win.gs.self") >=
-          1u);
-    CHECK(countNamedInstructions(*FsGs, "morok.antihook.fsgs.win.gs.ready") >=
-          1u);
-    CHECK(countNamedInstructions(*FsGs, "morok.antihook.fsgs.win.gs.mismatch") >=
-          1u);
     Instruction *EmuChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.emu.changed");
     REQUIRE(EmuChanged != nullptr);
     CHECK(valueFeedsNamedInstruction(EmuChanged,
                                      "morok.seal.fold.anti_debug"));
-    Instruction *FsGsChanged =
-        findNamedInstruction(*Ctor, "morok.corroborate.fsgs.changed");
-    REQUIRE(FsGsChanged != nullptr);
-    CHECK_FALSE(valueFeedsNamedInstruction(FsGsChanged,
-                                           "morok.seal.fold.anti_debug"));
-    CHECK(countNamedInstructions(*Ctor, "morok.gate.fsgs.soft") >= 1u);
-    CHECK(countNamedInstructions(*Ctor, "morok.antihook.fsgs.changed.score") >=
-          1u);
+    CHECK(findNamedInstruction(*Ctor, "morok.corroborate.fsgs.changed") ==
+          nullptr);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.fsgs.soft") == 0u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antihook.fsgs.changed.score") ==
+          0u);
     checkFpuSimdProbe(*Fpu, *Ctor);
     Instruction *WinRaRangeChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.ra.range.changed");
