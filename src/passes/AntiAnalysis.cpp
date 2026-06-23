@@ -4465,41 +4465,82 @@ Function *linuxFaultFlowHandler(Module &M, GlobalVariable *State,
     return fn;
 }
 
-GlobalVariable *linuxSigtrapRoutingSentinel(Module &M) {
+GlobalVariable *linuxSigtrapRoutingBusy(Module &M) {
     if (auto *existing =
-            M.getGlobalVariable("morok.antidbg.sigtrap.sentinel",
+            M.getGlobalVariable("morok.antidbg.sigtrap.busy",
                                 /*AllowInternal=*/true))
         return existing;
-    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *i32 = Type::getInt32Ty(M.getContext());
     auto *gv = new GlobalVariable(
-        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
-        ConstantInt::get(i64, 0), "morok.antidbg.sigtrap.sentinel");
+        M, i32, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantInt::get(i32, 0), "morok.antidbg.sigtrap.busy");
     gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-    gv->setAlignment(Align(8));
+    gv->setAlignment(Align(4));
+    gv->setDSOLocal(true);
     return gv;
 }
 
-GlobalVariable *linuxSigtrapRoutingToken(Module &M) {
+GlobalVariable *linuxSigtrapRoutingContext(Module &M) {
     if (auto *existing =
-            M.getGlobalVariable("morok.antidbg.sigtrap.token",
+            M.getGlobalVariable("morok.antidbg.sigtrap.context",
                                 /*AllowInternal=*/true))
         return existing;
-    auto *i64 = Type::getInt64Ty(M.getContext());
+    auto *ptr = PointerType::getUnqual(M.getContext());
     auto *gv = new GlobalVariable(
-        M, i64, /*isConstant=*/false, GlobalValue::PrivateLinkage,
-        ConstantInt::get(i64, 0), "morok.antidbg.sigtrap.token");
+        M, ptr, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantPointerNull::get(ptr), "morok.antidbg.sigtrap.context");
     gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
     gv->setAlignment(Align(8));
+    gv->setDSOLocal(true);
     return gv;
 }
 
-Function *linuxSigtrapRoutingHandler(Module &M) {
+GlobalVariable *linuxSigtrapRoutingOldAction(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.antidbg.sigtrap.old_action",
+                                /*AllowInternal=*/true))
+        return existing;
+    auto *ptr = PointerType::getUnqual(M.getContext());
+    auto *gv = new GlobalVariable(
+        M, ptr, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+        ConstantPointerNull::get(ptr), "morok.antidbg.sigtrap.old_action");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    gv->setAlignment(Align(8));
+    gv->setDSOLocal(true);
+    return gv;
+}
+
+struct LinuxSigtrapRoutingContextLayout {
+    std::uint64_t pcSlotOffset = 0;
+};
+
+bool linuxSigtrapRoutingContextLayout(const Triple &TT,
+                                      LinuxSigtrapRoutingContextLayout &L) {
+    if (!TT.isOSLinux())
+        return false;
+    switch (TT.getArch()) {
+    case Triple::x86_64:
+        L.pcSlotOffset = 168; // ucontext_t.uc_mcontext.gregs[REG_RIP]
+        return true;
+    case Triple::x86:
+        L.pcSlotOffset = 76; // ucontext_t.uc_mcontext.gregs[REG_EIP]
+        return true;
+    default:
+        return false;
+    }
+}
+
+Function *linuxSigtrapRoutingHandler(Module &M,
+                                     const LinuxRawSigactionLayout &RawLayout,
+                                     const LinuxSigtrapRoutingContextLayout
+                                         &ContextLayout) {
     if (Function *existing = M.getFunction("morok.antidbg.sigtrap.handler"))
         return existing;
 
     LLVMContext &ctx = M.getContext();
     auto *i32 = Type::getInt32Ty(ctx);
     auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
     auto *ptr = PointerType::getUnqual(ctx);
     auto *fn = Function::Create(
         FunctionType::get(Type::getVoidTy(ctx), {i32, ptr, ptr}, false),
@@ -4508,28 +4549,108 @@ Function *linuxSigtrapRoutingHandler(Module &M) {
     fn->setDSOLocal(true);
     Argument *sig = fn->getArg(0);
     sig->setName("sig");
-    fn->getArg(1)->setName("info");
-    fn->getArg(2)->setName("uctx");
+    Argument *info = fn->getArg(1);
+    info->setName("info");
+    Argument *uctx = fn->getArg(2);
+    uctx->setName("uctx");
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
+    auto *inspectBB = BasicBlock::Create(ctx, "inspect", fn);
     auto *storeBB = BasicBlock::Create(ctx, "store", fn);
+    auto *chainBB = BasicBlock::Create(ctx, "chain", fn);
+    auto *chainInspectBB = BasicBlock::Create(ctx, "chain.inspect", fn);
+    auto *chainSiginfoBB = BasicBlock::Create(ctx, "chain.siginfo", fn);
+    auto *chainOneArgBB = BasicBlock::Create(ctx, "chain.onearg", fn);
     auto *retBB = BasicBlock::Create(ctx, "ret", fn);
 
     IRBuilder<> B(entry);
     Value *sigOk =
         B.CreateICmpEQ(sig, ConstantInt::getSigned(i32, 5),
                        "morok.antidbg.sigtrap.sig.match");
-    B.CreateCondBr(sigOk, storeBB, retBB);
+    Value *contextPtr =
+        B.CreateLoad(ptr, linuxSigtrapRoutingContext(M),
+                     "morok.antidbg.sigtrap.context.v");
+    cast<LoadInst>(contextPtr)->setVolatile(true);
+    cast<LoadInst>(contextPtr)->setAlignment(Align(8));
+    Value *ctxOk = B.CreateICmpNE(contextPtr, ConstantPointerNull::get(ptr),
+                                  "morok.antidbg.sigtrap.context.ready");
+    Value *uctxOk = B.CreateICmpNE(uctx, ConstantPointerNull::get(ptr),
+                                   "morok.antidbg.sigtrap.uctx.ready");
+    B.CreateCondBr(B.CreateAnd(sigOk, B.CreateAnd(ctxOk, uctxOk),
+                               "morok.antidbg.sigtrap.inspect.ready"),
+                   inspectBB, chainBB);
+
+    IRBuilder<> IB(inspectBB);
+    Value *pc = loadAt(IB, M, ip, uctx, ContextLayout.pcSlotOffset,
+                       "morok.antidbg.sigtrap.pc");
+    Value *expected =
+        loadAt(IB, M, ip, contextPtr, 16ULL,
+               "morok.antidbg.sigtrap.expected.v");
+    Value *armed =
+        IB.CreateICmpNE(expected, ConstantInt::get(ip, 0),
+                        "morok.antidbg.sigtrap.armed");
+    Value *pcMatch = IB.CreateICmpEQ(pc, expected,
+                                     "morok.antidbg.sigtrap.pc.match");
+    IB.CreateCondBr(IB.CreateAnd(armed, pcMatch,
+                                 "morok.antidbg.sigtrap.ours"),
+                    storeBB, chainBB);
 
     IRBuilder<> SB(storeBB);
-    Value *token =
-        SB.CreateLoad(i64, linuxSigtrapRoutingToken(M),
-                      "morok.antidbg.sigtrap.token.v");
-    cast<LoadInst>(token)->setVolatile(true);
-    auto *sentinel = SB.CreateStore(token, linuxSigtrapRoutingSentinel(M));
-    sentinel->setVolatile(true);
-    sentinel->setAlignment(Align(8));
+    Value *token = loadAt(SB, M, i64, contextPtr, 0ULL,
+                          "morok.antidbg.sigtrap.token.v");
+    storeAt(SB, M, contextPtr, 8ULL, token,
+            "morok.antidbg.sigtrap.sentinel.store");
     SB.CreateBr(retBB);
+
+    IRBuilder<> CB(chainBB);
+    Value *oldActionPtr =
+        CB.CreateLoad(ptr, linuxSigtrapRoutingOldAction(M),
+                      "morok.antidbg.sigtrap.old_action.v");
+    cast<LoadInst>(oldActionPtr)->setVolatile(true);
+    cast<LoadInst>(oldActionPtr)->setAlignment(Align(8));
+    CB.CreateCondBr(CB.CreateAnd(sigOk,
+                                 CB.CreateICmpNE(
+                                     oldActionPtr,
+                                     ConstantPointerNull::get(ptr),
+                                     "morok.antidbg.sigtrap.old_action.ready"),
+                                 "morok.antidbg.sigtrap.chain.ready"),
+                    chainInspectBB, retBB);
+
+    IRBuilder<> CIB(chainInspectBB);
+    Value *oldHandler =
+        loadAt(CIB, M, ptr, oldActionPtr, 0ULL,
+               "morok.antidbg.sigtrap.old.handler");
+    Value *oldHandlerInt =
+        CIB.CreatePtrToInt(oldHandler, ip,
+                           "morok.antidbg.sigtrap.old.handler.ip");
+    Value *callable =
+        CIB.CreateICmpUGT(oldHandlerInt, ConstantInt::get(ip, 1),
+                          "morok.antidbg.sigtrap.old.callable");
+    Value *oldFlags =
+        loadAt(CIB, M, ip, oldActionPtr, RawLayout.flagsOffset,
+               "morok.antidbg.sigtrap.old.flags");
+    Value *oldSiginfo =
+        CIB.CreateICmpNE(CIB.CreateAnd(oldFlags, ConstantInt::get(ip, 4),
+                                       "morok.antidbg.sigtrap.old.sa_siginfo"),
+                         ConstantInt::get(ip, 0),
+                         "morok.antidbg.sigtrap.old.siginfo");
+    auto *chainDispatchBB =
+        BasicBlock::Create(ctx, "chain.dispatch", fn, chainSiginfoBB);
+    CIB.CreateCondBr(callable, chainDispatchBB, retBB);
+
+    IRBuilder<> CDB(chainDispatchBB);
+    CDB.CreateCondBr(oldSiginfo, chainSiginfoBB, chainOneArgBB);
+
+    IRBuilder<> CSB(chainSiginfoBB);
+    CSB.CreateCall(FunctionType::get(Type::getVoidTy(ctx), {i32, ptr, ptr},
+                                     false),
+                   oldHandler, {sig, info, uctx});
+    CSB.CreateBr(retBB);
+
+    IRBuilder<> COB(chainOneArgBB);
+    COB.CreateCall(FunctionType::get(Type::getVoidTy(ctx), {i32}, false),
+                   oldHandler, {sig});
+    COB.CreateBr(retBB);
 
     IRBuilder<> RB(retBB);
     RB.CreateRetVoid();
@@ -4567,12 +4688,23 @@ void emitLinuxFaultFlowStimulus(IRBuilder<> &B, const Triple &TT) {
     B.CreateCall(asmTy, IA);
 }
 
-void emitLinuxInt3Stimulus(IRBuilder<> &B) {
-    auto *asmTy = FunctionType::get(Type::getVoidTy(B.getContext()), false);
-    InlineAsm *IA = InlineAsm::get(
-        asmTy, ".byte 0xcc", "~{memory},~{dirflag},~{fpsr},~{flags}",
-        /*hasSideEffects=*/true);
-    B.CreateCall(asmTy, IA);
+void emitLinuxInt3Stimulus(IRBuilder<> &B, const Triple &TT,
+                           Value *ExpectedSlot) {
+    auto *ptr = PointerType::getUnqual(B.getContext());
+    auto *asmTy = FunctionType::get(Type::getVoidTy(B.getContext()), {ptr},
+                                    false);
+    const bool x64 = TT.getArch() == Triple::x86_64;
+    StringRef asmText =
+        x64 ? StringRef("movq $0, %r10\nleaq 1f(%rip), %rax\nmovq %rax, "
+                        "(%r10)\n.byte 0xcc\n1:")
+            : StringRef("movl $0, %ecx\ncalll 0f\n0:\npopl %eax\naddl "
+                        "$$(1f-0b), %eax\nmovl %eax, (%ecx)\n.byte 0xcc\n1:");
+    StringRef constraints =
+        x64 ? StringRef("r,~{rax},~{r10},~{memory},~{dirflag},~{fpsr},~{flags}")
+            : StringRef("r,~{eax},~{ecx},~{memory},~{dirflag},~{fpsr},~{flags}");
+    InlineAsm *IA = InlineAsm::get(asmTy, asmText, constraints,
+                                   /*hasSideEffects=*/true);
+    B.CreateCall(asmTy, IA, {ExpectedSlot});
 }
 
 bool linuxSigtrapRoutingSyscall(const Triple &TT, std::uint32_t &RtSigaction) {
@@ -4627,6 +4759,9 @@ Function *linuxSigtrapRoutingProbe(Module &M, ir::IRRandom &rng,
     LinuxRawSigactionLayout rawLayout;
     if (!linuxRawSigactionLayout(TT, rawLayout))
         return nullptr;
+    LinuxSigtrapRoutingContextLayout contextLayout;
+    if (!linuxSigtrapRoutingContextLayout(TT, contextLayout))
+        return nullptr;
     std::uint32_t rtSigactionNr = 0;
     if (!linuxSigtrapRoutingSyscall(TT, rtSigactionNr))
         return nullptr;
@@ -4648,7 +4783,7 @@ Function *linuxSigtrapRoutingProbe(Module &M, ir::IRRandom &rng,
     Argument *tag = fn->getArg(0);
     tag->setName("tag");
 
-    Function *handler = linuxSigtrapRoutingHandler(M);
+    Function *handler = linuxSigtrapRoutingHandler(M, rawLayout, contextLayout);
     Function *restorer = rawLayout.needsRestorer
                              ? linuxRtSigreturnRestorer(M, TT)
                              : nullptr;
@@ -4657,8 +4792,12 @@ Function *linuxSigtrapRoutingProbe(Module &M, ir::IRRandom &rng,
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
     auto *enabledBB = BasicBlock::Create(ctx, "enabled", fn);
+    auto *installBB = BasicBlock::Create(ctx, "install", fn);
     auto *armedBB = BasicBlock::Create(ctx, "armed", fn);
     auto *restoreBB = BasicBlock::Create(ctx, "restore", fn);
+    auto *restoreOldBB = BasicBlock::Create(ctx, "restore.old", fn);
+    auto *releaseBitsBB = BasicBlock::Create(ctx, "release.bits", fn);
+    auto *release0BB = BasicBlock::Create(ctx, "release0", fn);
     auto *retInstalledBB = BasicBlock::Create(ctx, "ret.installed", fn);
     auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
 
@@ -4670,16 +4809,49 @@ Function *linuxSigtrapRoutingProbe(Module &M, ir::IRRandom &rng,
     cast<LoadInst>(enabled)->setAlignment(Align(1));
     GB.CreateCondBr(enabled, enabledBB, ret0BB);
 
-    IRBuilder<> B(enabledBB);
+    IRBuilder<> EB(enabledBB);
+    AtomicRMWInst *claim = EB.CreateAtomicRMW(
+        AtomicRMWInst::Xchg, linuxSigtrapRoutingBusy(M),
+        ConstantInt::get(i32, 1), Align(4), AtomicOrdering::AcquireRelease);
+    claim->setVolatile(true);
+    claim->setName("morok.antidbg.sigtrap.busy.claim");
+    Value *acquired =
+        EB.CreateICmpEQ(claim, ConstantInt::get(i32, 0),
+                        "morok.antidbg.sigtrap.busy.acquired");
+    EB.CreateCondBr(acquired, installBB, ret0BB);
+
+    IRBuilder<> B(installBB);
     auto *actionTy = ArrayType::get(i8, rawLayout.actionSize);
+    auto *ctxTy = ArrayType::get(i8, 24);
     AllocaInst *action =
         B.CreateAlloca(actionTy, nullptr, "morok.antidbg.sigtrap.sa");
     AllocaInst *oldAction =
         B.CreateAlloca(actionTy, nullptr, "morok.antidbg.sigtrap.old.sa");
+    AllocaInst *curAction =
+        B.CreateAlloca(actionTy, nullptr, "morok.antidbg.sigtrap.cur.sa");
+    AllocaInst *routingCtx =
+        B.CreateAlloca(ctxTy, nullptr, "morok.antidbg.sigtrap.ctx");
     action->setAlignment(Align(8));
     oldAction->setAlignment(Align(8));
+    curAction->setAlignment(Align(8));
+    routingCtx->setAlignment(Align(8));
+    storeAt(B, M, routingCtx, 0ULL, ConstantInt::get(i64, 0),
+            "morok.antidbg.sigtrap.ctx.token.clear");
+    storeAt(B, M, routingCtx, 8ULL, ConstantInt::get(i64, 0),
+            "morok.antidbg.sigtrap.ctx.sentinel.clear");
+    storeAt(B, M, routingCtx, 16ULL, ConstantInt::get(ip, 0),
+            "morok.antidbg.sigtrap.ctx.expected.clear");
     zeroRawSigaction(B, M, oldAction, rawLayout,
                      "morok.antidbg.sigtrap.old.sa");
+    zeroRawSigaction(B, M, curAction, rawLayout,
+                     "morok.antidbg.sigtrap.cur.sa");
+    auto *contextStore = B.CreateStore(routingCtx, linuxSigtrapRoutingContext(M));
+    contextStore->setVolatile(true);
+    contextStore->setAlignment(Align(8));
+    auto *oldActionStore =
+        B.CreateStore(oldAction, linuxSigtrapRoutingOldAction(M));
+    oldActionStore->setVolatile(true);
+    oldActionStore->setAlignment(Align(8));
     storeRawSiginfoAction(B, M, action, handler, rawLayout, 0,
                           "morok.antidbg.sigtrap.sa");
     if (rawLayout.needsRestorer)
@@ -4695,7 +4867,7 @@ Function *linuxSigtrapRoutingProbe(Module &M, ir::IRRandom &rng,
     Value *installed =
         B.CreateICmpEQ(sigactionRc, ConstantInt::get(ip, 0),
                        "morok.antidbg.sigtrap.rt_sigaction.ok");
-    B.CreateCondBr(installed, armedBB, ret0BB);
+    B.CreateCondBr(installed, armedBB, release0BB);
 
     IRBuilder<> AB(armedBB);
     const std::uint64_t tokenMul = rng.next() | 1ULL;
@@ -4708,18 +4880,16 @@ Function *linuxSigtrapRoutingProbe(Module &M, ir::IRRandom &rng,
     Value *token =
         AB.CreateOr(tokenBase, ConstantInt::get(i64, 1),
                     "morok.antidbg.sigtrap.token.expected");
-    auto *clearSentinel =
-        AB.CreateStore(ConstantInt::get(i64, 0), linuxSigtrapRoutingSentinel(M));
-    clearSentinel->setVolatile(true);
-    clearSentinel->setAlignment(Align(8));
-    auto *storeToken = AB.CreateStore(token, linuxSigtrapRoutingToken(M));
-    storeToken->setVolatile(true);
-    storeToken->setAlignment(Align(8));
-    emitLinuxInt3Stimulus(AB);
-    Value *sentinel =
-        AB.CreateLoad(i64, linuxSigtrapRoutingSentinel(M),
-                      "morok.antidbg.sigtrap.sentinel.v");
-    cast<LoadInst>(sentinel)->setVolatile(true);
+    storeAt(AB, M, routingCtx, 8ULL, ConstantInt::get(i64, 0),
+            "morok.antidbg.sigtrap.sentinel.clear");
+    storeAt(AB, M, routingCtx, 0ULL, token,
+            "morok.antidbg.sigtrap.token.store");
+    Value *expectedSlot =
+        gepI8(AB, M, routingCtx, constIp(M, 16),
+              "morok.antidbg.sigtrap.expected.slot");
+    emitLinuxInt3Stimulus(AB, TT, expectedSlot);
+    Value *sentinel = loadAt(AB, M, i64, routingCtx, 8ULL,
+                             "morok.antidbg.sigtrap.sentinel.v");
     Value *fired =
         AB.CreateICmpEQ(sentinel, token,
                         "morok.antidbg.sigtrap.handler.fired");
@@ -4729,23 +4899,66 @@ Function *linuxSigtrapRoutingProbe(Module &M, ir::IRRandom &rng,
                      "morok.antidbg.sigtrap.fired.bit");
     Value *bits = AB.CreateOr(firedBit, ConstantInt::get(i32, 1),
                               "morok.antidbg.sigtrap.result.bits");
+    storeAt(AB, M, routingCtx, 16ULL, ConstantInt::get(ip, 0),
+            "morok.antidbg.sigtrap.expected.clear");
     AB.CreateBr(restoreBB);
 
     IRBuilder<> RB(restoreBB);
-    Value *restoreRc = emitLinuxSigtrapRoutingSyscall(
+    Value *currentRc = emitLinuxSigtrapRoutingSyscall(
         RB, M, TT, rtSigactionNr,
+        {ConstantInt::getSigned(ip, 5), ConstantPointerNull::get(ptr),
+         curAction, ConstantInt::get(ip, rawLayout.sigsetSize)},
+        "morok.antidbg.sigtrap.rt_sigaction.current");
+    currentRc->setName("morok.antidbg.sigtrap.rt_sigaction.current");
+    Value *currentOk =
+        RB.CreateICmpEQ(currentRc, ConstantInt::get(ip, 0),
+                        "morok.antidbg.sigtrap.rt_sigaction.current.ok");
+    Value *currentHandler =
+        loadAt(RB, M, ptr, curAction, 0ULL,
+               "morok.antidbg.sigtrap.current.handler");
+    Value *currentIsOurs =
+        RB.CreateICmpEQ(currentHandler, handler,
+                        "morok.antidbg.sigtrap.current.handler.ours");
+    RB.CreateCondBr(RB.CreateAnd(currentOk, currentIsOurs,
+                                 "morok.antidbg.sigtrap.restore.allowed"),
+                    restoreOldBB, releaseBitsBB);
+
+    IRBuilder<> ROB(restoreOldBB);
+    Value *restoreRc = emitLinuxSigtrapRoutingSyscall(
+        ROB, M, TT, rtSigactionNr,
         {ConstantInt::getSigned(ip, 5), oldAction,
          ConstantPointerNull::get(ptr),
          ConstantInt::get(ip, rawLayout.sigsetSize)},
         "morok.antidbg.sigtrap.rt_sigaction.restore");
     restoreRc->setName("morok.antidbg.sigtrap.rt_sigaction.restore");
-    RB.CreateBr(retInstalledBB);
+    ROB.CreateBr(releaseBitsBB);
+
+    auto clearRoutingGlobals = [&](IRBuilder<> &Builder) {
+        auto *contextClear = Builder.CreateStore(ConstantPointerNull::get(ptr),
+                                                 linuxSigtrapRoutingContext(M));
+        contextClear->setVolatile(true);
+        contextClear->setAlignment(Align(8));
+        auto *oldActionClear = Builder.CreateStore(
+            ConstantPointerNull::get(ptr), linuxSigtrapRoutingOldAction(M));
+        oldActionClear->setVolatile(true);
+        oldActionClear->setAlignment(Align(8));
+        auto *releaseBusy = Builder.CreateStore(ConstantInt::get(i32, 0),
+                                                linuxSigtrapRoutingBusy(M));
+        releaseBusy->setVolatile(true);
+        releaseBusy->setAtomic(AtomicOrdering::Release);
+        releaseBusy->setAlignment(Align(4));
+    };
+
+    IRBuilder<> RBB(releaseBitsBB);
+    clearRoutingGlobals(RBB);
+    RBB.CreateBr(retInstalledBB);
+
+    IRBuilder<> R0B(release0BB);
+    clearRoutingGlobals(R0B);
+    R0B.CreateBr(ret0BB);
 
     IRBuilder<> RIB(retInstalledBB);
-    PHINode *retBits =
-        RIB.CreatePHI(i32, 1, "morok.antidbg.sigtrap.return.bits");
-    retBits->addIncoming(bits, restoreBB);
-    RIB.CreateRet(retBits);
+    RIB.CreateRet(bits);
 
     IRBuilder<> R0(ret0BB);
     R0.CreateRet(ConstantInt::get(i32, 0));
@@ -16704,8 +16917,6 @@ Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
             foldEnforcedFlag(B, State, statCoherence, 0x3B6D81E5F0C24A97ULL,
                              "morok.antidbg.probe.stat.coherence");
         }
-        emitLinuxSigtrapCoherence(B, M, State, statusTraced, tag, rng, TT,
-                                  "morok.antidbg.probe.sigtrap");
         if (Function *faultCf =
                 linuxIntentionalFaultFlowProbe(M, State, rng, TT))
             B.CreateCall(faultCf->getFunctionType(), faultCf, {tag});

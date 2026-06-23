@@ -771,6 +771,36 @@ bool pointerReferencesGlobal(Value *V, const GlobalValue *GV) {
     return false;
 }
 
+bool hasVolatileAtomicXchgTo(Function &F, GlobalVariable *GV,
+                             AtomicOrdering Ordering, Align Alignment) {
+    for (Instruction &I : instructions(F)) {
+        auto *RMW = dyn_cast<AtomicRMWInst>(&I);
+        if (!RMW)
+            continue;
+        if (RMW->isVolatile() && RMW->getOperation() == AtomicRMWInst::Xchg &&
+            RMW->getOrdering() == Ordering && RMW->getAlign() == Alignment &&
+            pointerReferencesGlobal(RMW->getPointerOperand(), GV))
+            return true;
+    }
+    return false;
+}
+
+std::size_t countVolatileAtomicStoresTo(Function &F, GlobalVariable *GV,
+                                        AtomicOrdering Ordering,
+                                        Align Alignment) {
+    std::size_t n = 0;
+    for (Instruction &I : instructions(F)) {
+        auto *SI = dyn_cast<StoreInst>(&I);
+        if (!SI)
+            continue;
+        if (SI->isVolatile() && SI->isAtomic() &&
+            SI->getOrdering() == Ordering && SI->getAlign() == Alignment &&
+            pointerReferencesGlobal(SI->getPointerOperand(), GV))
+            ++n;
+    }
+    return n;
+}
+
 bool valueDependsOnGlobalPrefix(Value *V, StringRef globalPrefix) {
     SmallVector<Value *, 32> Work;
     SmallPtrSet<Value *, 32> Seen;
@@ -19140,10 +19170,15 @@ entry:
     CHECK(M->getGlobalVariable("morok.antidbg.faultcf.sentinel", true) !=
           nullptr);
     CHECK(M->getGlobalVariable("morok.antidbg.faultcf.token", true) != nullptr);
-    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.sentinel", true) !=
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.sentinel", true) ==
           nullptr);
-    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.token", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.token", true) == nullptr);
     CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.enabled", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.busy", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.context", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.old_action", true) !=
           nullptr);
     CHECK(M->getGlobalVariable("morok.antidbg.faultcf.enabled", true) !=
           nullptr);
@@ -19469,11 +19504,9 @@ entry:
     REQUIRE(SigtrapMissing != nullptr);
     CHECK_FALSE(valueFeedsNamedInstruction(SigtrapMissing,
                                            "morok.seal.fold.anti_debug"));
-    Instruction *ProbeSigtrapCoherence = findNamedInstruction(
-        *HotProbe, "morok.antidbg.probe.sigtrap.coherence");
-    REQUIRE(ProbeSigtrapCoherence != nullptr);
-    CHECK(valueFeedsNamedInstruction(ProbeSigtrapCoherence,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK(findNamedInstruction(*HotProbe,
+                               "morok.antidbg.probe.sigtrap.coherence") ==
+          nullptr);
     Instruction *StatCoherence =
         findNamedInstruction(*AntiDbg, "morok.antidbg.stat.coherence.anomaly");
     REQUIRE(StatCoherence != nullptr);
@@ -19593,16 +19626,49 @@ entry:
     CHECK(countNamedInstructions(*Sigtrap,
                                  "morok.antidbg.sigtrap.enabled.load") >= 1u);
     CHECK(countNamedInstructions(*Sigtrap,
+                                 "morok.antidbg.sigtrap.busy.claim") >= 1u);
+    CHECK(countNamedInstructions(*Sigtrap,
+                                 "morok.antidbg.sigtrap.busy.acquired") >= 1u);
+    CHECK(countNamedInstructions(*Sigtrap,
                                  "morok.antidbg.sigtrap.rt_sigaction") >= 1u);
     CHECK(countNamedInstructions(
+              *Sigtrap, "morok.antidbg.sigtrap.rt_sigaction.current") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sigtrap, "morok.antidbg.sigtrap.current.handler.ours") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sigtrap, "morok.antidbg.sigtrap.restore.allowed") >= 1u);
+    CHECK(countNamedInstructions(
               *Sigtrap, "morok.antidbg.sigtrap.rt_sigaction.restore") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sigtrap, "morok.antidbg.sigtrap.expected.slot") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sigtrap, "morok.antidbg.sigtrap.sentinel.v") >= 1u);
     CHECK(countNamedInstructions(*Sigtrap,
                                  "morok.antidbg.sigtrap.handler.fired") >=
           1u);
+    GlobalVariable *SigtrapBusy =
+        M->getGlobalVariable("morok.antidbg.sigtrap.busy", true);
+    REQUIRE(SigtrapBusy != nullptr);
+    CHECK(hasVolatileAtomicXchgTo(*Sigtrap, SigtrapBusy,
+                                  AtomicOrdering::AcquireRelease, Align(4)));
+    CHECK(countVolatileAtomicStoresTo(*Sigtrap, SigtrapBusy,
+                                      AtomicOrdering::Release, Align(4)) >= 2u);
     CHECK(countNamedInstructions(
               *SigtrapHandler, "morok.antidbg.sigtrap.sig.match") >= 1u);
     CHECK(countNamedInstructions(*SigtrapHandler,
+                                 "morok.antidbg.sigtrap.context.v") >= 1u);
+    CHECK(countNamedInstructions(*SigtrapHandler,
+                                 "morok.antidbg.sigtrap.pc") >= 1u);
+    CHECK(countNamedInstructions(*SigtrapHandler,
+                                 "morok.antidbg.sigtrap.expected.v") >= 1u);
+    CHECK(countNamedInstructions(*SigtrapHandler,
+                                 "morok.antidbg.sigtrap.pc.match") >= 1u);
+    CHECK(countNamedInstructions(*SigtrapHandler,
                                  "morok.antidbg.sigtrap.token.v") >= 1u);
+    CHECK(countNamedInstructions(*SigtrapHandler,
+                                 "morok.antidbg.sigtrap.old.handler") >= 1u);
+    CHECK(countNamedInstructions(*SigtrapHandler,
+                                 "morok.antidbg.sigtrap.old.siginfo") >= 1u);
     CHECK(countNamedInstructions(*HotProbe,
                                  "morok.antidbg.probe.status") >= 1u);
     CHECK(countNamedInstructions(*AntiDbg,
@@ -19624,7 +19690,7 @@ entry:
     CHECK(countNamedInstructions(*HotProbe,
                                  "morok.antidbg.probe.status.score") >= 1u);
     CHECK(countCallsTo(*AntiDbg, "morok.antidbg.sigtrap") == 1u);
-    CHECK(countCallsTo(*HotProbe, "morok.antidbg.sigtrap") == 1u);
+    CHECK(countCallsTo(*HotProbe, "morok.antidbg.sigtrap") == 0u);
     CHECK(functionHasConstantInt(*AntiDbg, 13u));       // rt_sigaction syscall
     CHECK(functionHasConstantInt(*AntiDbg, 31u));       // SIGSYS
     CHECK(functionHasConstantInt(*AntiDbg, 0x00030000)); // SECCOMP_RET_TRAP
@@ -19712,6 +19778,16 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Sigreturn != nullptr);
     REQUIRE(HotProbe != nullptr);
 
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.sentinel", true) ==
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.token", true) == nullptr);
+    GlobalVariable *SigtrapBusy =
+        M->getGlobalVariable("morok.antidbg.sigtrap.busy", true);
+    REQUIRE(SigtrapBusy != nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.context", true) !=
+          nullptr);
+    CHECK(M->getGlobalVariable("morok.antidbg.sigtrap.old_action", true) !=
+          nullptr);
     CHECK(maxStaticAllocaArrayElements(*Sigtrap,
                                        "morok.antidbg.sigtrap.sa") == 20u);
     CHECK(hasInlineAsmCall(*Sigtrap));
@@ -19723,12 +19799,34 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Sigtrap,
                                  "morok.antidbg.sigtrap.enabled.load") >= 1u);
     CHECK(countNamedInstructions(*Sigtrap,
+                                 "morok.antidbg.sigtrap.busy.claim") >= 1u);
+    CHECK(hasVolatileAtomicXchgTo(*Sigtrap, SigtrapBusy,
+                                  AtomicOrdering::AcquireRelease, Align(4)));
+    CHECK(countVolatileAtomicStoresTo(*Sigtrap, SigtrapBusy,
+                                      AtomicOrdering::Release, Align(4)) >= 2u);
+    CHECK(countNamedInstructions(*Sigtrap,
                                  "morok.antidbg.sigtrap.rt_sigaction") >= 1u);
     CHECK(countNamedInstructions(
+              *Sigtrap, "morok.antidbg.sigtrap.rt_sigaction.current") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sigtrap, "morok.antidbg.sigtrap.restore.allowed") >= 1u);
+    CHECK(countNamedInstructions(
               *Sigtrap, "morok.antidbg.sigtrap.rt_sigaction.restore") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sigtrap, "morok.antidbg.sigtrap.expected.slot") >= 1u);
     CHECK(functionHasConstantInt(*Sigtrap, 174u)); // i386 rt_sigaction
     CHECK(countNamedInstructions(
               *SigtrapHandler, "morok.antidbg.sigtrap.sig.match") >= 1u);
+    CHECK(countNamedInstructions(*SigtrapHandler,
+                                 "morok.antidbg.sigtrap.context.v") >= 1u);
+    CHECK(countNamedInstructions(*SigtrapHandler,
+                                 "morok.antidbg.sigtrap.pc") >= 1u);
+    CHECK(countNamedInstructions(*SigtrapHandler,
+                                 "morok.antidbg.sigtrap.expected.v") >= 1u);
+    CHECK(countNamedInstructions(*SigtrapHandler,
+                                 "morok.antidbg.sigtrap.pc.match") >= 1u);
+    CHECK(countNamedInstructions(*SigtrapHandler,
+                                 "morok.antidbg.sigtrap.old.handler") >= 1u);
     CHECK(countNamedInstructions(*Ctor,
                                  "morok.antidbg.harden.dumpable") >= 1u);
     CHECK(countNamedInstructions(*Ctor,
@@ -19745,7 +19843,7 @@ define i32 @main() { ret i32 0 }
     CHECK(valueFeedsNamedInstruction(SigtrapCoherence,
                                      "morok.seal.fold.anti_debug"));
     CHECK(countCallsTo(*Ctor, "morok.antidbg.sigtrap") == 1u);
-    CHECK(countCallsTo(*HotProbe, "morok.antidbg.sigtrap") == 1u);
+    CHECK(countCallsTo(*HotProbe, "morok.antidbg.sigtrap") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
