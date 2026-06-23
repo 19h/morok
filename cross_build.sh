@@ -500,8 +500,12 @@ audit_bundle() {
     allowlist=(--allowlist "$AUDIT_ALLOWLIST")
   fi
   echo ">> auditing release bundle $OUT_DIR"
-  "$PYTHON" "$AUDIT_TOOL" "$OUT_DIR" --release --require-sealed-manifest \
-    --provenance "$provenance" "${allowlist[@]}" ||
+  local audit_cmd=("$PYTHON" "$AUDIT_TOOL" "$OUT_DIR" --release
+                   --require-sealed-manifest --provenance "$provenance")
+  if [ "${#allowlist[@]}" -gt 0 ]; then
+    audit_cmd+=("${allowlist[@]}")
+  fi
+  "${audit_cmd[@]}" ||
     die "release audit failed for $OUT_DIR"
 }
 
@@ -548,9 +552,17 @@ build_linux() {
 
   local out="$OUT_DIR/$STEM-linux-$arch$static_suffix"
   echo ">> linux $LINUX_TARGET -> $out"
-  "$COMPILER" "--target=$LINUX_TARGET" "${sysroot_arg[@]}" \
-    "-B$tool_bin" "-B$gcc_lib_dir" "-B$crt_dir" "-L$gcc_lib_dir" \
-    -D_GNU_SOURCE "${static_flag[@]}" "${morok_cfg[@]}" "${COMMON[@]}" -o "$out"
+  local linux_cmd=("$COMPILER" "--target=$LINUX_TARGET")
+  if [ "${#sysroot_arg[@]}" -gt 0 ]; then
+    linux_cmd+=("${sysroot_arg[@]}")
+  fi
+  linux_cmd+=("-B$tool_bin" "-B$gcc_lib_dir" "-B$crt_dir" "-L$gcc_lib_dir"
+              -D_GNU_SOURCE)
+  if [ "${#static_flag[@]}" -gt 0 ]; then
+    linux_cmd+=("${static_flag[@]}")
+  fi
+  linux_cmd+=("${morok_cfg[@]}" "${COMMON[@]}" -o "$out")
+  "${linux_cmd[@]}"
   strip_linux "$out"
   seal_binary "$out"
   OUTPUTS+=("$out")
@@ -614,10 +626,17 @@ build_macos() {
 
     local out="$OUT_DIR/$STEM-macos-$suffix"
     echo ">> macos $suffix -> $out"
-    "$COMPILER" "${target_args[@]}" -isysroot "$sdk" \
-      -mmacosx-version-min="$MACOS_MIN" "${MOROK_CONFIG[@]}" "${seal_strict[@]}" \
-      "${COMMON[@]}" \
-      -o "$out"
+    local macos_cmd=("$COMPILER")
+    if [ "${#target_args[@]}" -gt 0 ]; then
+      macos_cmd+=("${target_args[@]}")
+    fi
+    macos_cmd+=(-isysroot "$sdk" -mmacosx-version-min="$MACOS_MIN"
+                "${MOROK_CONFIG[@]}")
+    if [ "${#seal_strict[@]}" -gt 0 ]; then
+      macos_cmd+=("${seal_strict[@]}")
+    fi
+    macos_cmd+=("${COMMON[@]}" -o "$out")
+    "${macos_cmd[@]}"
     strip_macos "$out"
     seal_binary "$out"
     OUTPUTS+=("$out")
