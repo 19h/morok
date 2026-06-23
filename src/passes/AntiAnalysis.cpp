@@ -3560,6 +3560,38 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
                             ConstantInt::get(i64, 0),
                             "morok.antidbg.watch.stopcoh.coherent");
         sealFold(BB, coherent, 0xD5A127BC904E63F8ULL);
+        // #269: also ENFORCE the no-tracer mismatch bits 5 (wchanNoTracer) and
+        // 6 (statNoTracer). These are exactly the bypass the bits were added to
+        // catch: an analyst who suppresses TracerPid/status leaves bit 0
+        // (coherent, which requires `traced`) false, yet a real ptrace stop
+        // still leaves wchan/stat stop evidence and trips 5/6. They are
+        // zero-on-clean — wchanNoTracer = wchanStop && !traced and statNoTracer
+        // = stopLike && !traced are both false on a legit untraced run (a
+        // process reading its own /proc is RUNNING, never ptrace-stopped) — so
+        // seal-folding them makes the suppression still corrupt the run.
+        Value *wchanNoTracer = BB.CreateICmpNE(
+            BB.CreateAnd(ptraceStop, ConstantInt::get(i64, 1u << 5),
+                         "morok.antidbg.watch.stopcoh.wchan.notracer.bit"),
+            ConstantInt::get(i64, 0),
+            "morok.antidbg.watch.stopcoh.wchan.notracer");
+        Value *statNoTracer = BB.CreateICmpNE(
+            BB.CreateAnd(ptraceStop, ConstantInt::get(i64, 1u << 6),
+                         "morok.antidbg.watch.stopcoh.stat.notracer.bit"),
+            ConstantInt::get(i64, 0),
+            "morok.antidbg.watch.stopcoh.stat.notracer");
+        sealFold(BB, wchanNoTracer, 0x3E9C7A15B82D04F6ULL);
+        sealFold(BB, statNoTracer, 0x91B4D6E0273FA85CULL);
+        // Bit 4 (wchan/stat delta) can transiently trip on a clean run via a
+        // sampling race between the two /proc reads, so it is NOT strictly
+        // zero-on-clean: route it through the accumulating soft-score (which
+        // only commits after independent evidence corroborates), not the seal.
+        Value *wchanStatDelta = BB.CreateICmpNE(
+            BB.CreateAnd(ptraceStop, ConstantInt::get(i64, 1u << 4),
+                         "morok.antidbg.watch.stopcoh.delta.bit"),
+            ConstantInt::get(i64, 0),
+            "morok.antidbg.watch.stopcoh.delta");
+        foldSoftScore(BB, wchanStatDelta, 0x5D71A8C3E9402B6FULL,
+                      "morok.antidbg.watch.stopcoh.delta");
     }
     if (watchBuddy) {
         BB.CreateBr(buddyCheckBB);

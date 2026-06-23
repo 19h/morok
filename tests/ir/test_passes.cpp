@@ -19338,6 +19338,26 @@ entry:
     REQUIRE(PtraceStopCoherent != nullptr);
     CHECK(valueFeedsNamedInstruction(PtraceStopCoherent,
                                      "morok.seal.fold.anti_debug"));
+    // #269: the no-tracer mismatch bits (5 wchanNoTracer, 6 statNoTracer) are
+    // zero-on-clean and must ALSO be enforced into the consumed seal, so that
+    // suppressing TracerPid/status (which makes bit-0 coherent false) still
+    // corrupts a traced run. Bit 4 (wchan/stat delta) is racy on a clean run,
+    // so it must NOT reach the hard seal (soft-score only).
+    Instruction *WchanNoTracer = findNamedInstruction(
+        *Watch, "morok.antidbg.watch.stopcoh.wchan.notracer");
+    REQUIRE(WchanNoTracer != nullptr);
+    CHECK(valueFeedsNamedInstruction(WchanNoTracer,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *StatNoTracer = findNamedInstruction(
+        *Watch, "morok.antidbg.watch.stopcoh.stat.notracer");
+    REQUIRE(StatNoTracer != nullptr);
+    CHECK(valueFeedsNamedInstruction(StatNoTracer,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *WchanStatDelta = findNamedInstruction(
+        *Watch, "morok.antidbg.watch.stopcoh.delta");
+    REQUIRE(WchanStatDelta != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(WchanStatDelta,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(
               *PtraceStop, "morok.antidbg.ptrace_stop.kernel.uname") >= 1u);
     CHECK(countNamedInstructions(
