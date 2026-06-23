@@ -396,6 +396,20 @@ bool lookupLinuxCoreSyscalls(const Triple &TT, LinuxCoreSyscalls &Out) {
         Out.read = 3;
         Out.close = 6;
         return true;
+    case Triple::x86:
+        // i386/i686 (32-bit) syscall numbers. Emission is handled by the
+        // int $0x80 path in emitLinuxStaticRawSyscall. Without this case the
+        // lookup returned false, emitLinuxPrctlDirect folded every prctl to a
+        // constant -ENOSYS, and i386 binaries silently lost their
+        // PR_SET_DUMPABLE / PR_SET_PTRACER / PR_SET_NO_NEW_PRIVS anti-debug
+        // hardening (#262). i386 shares ptrace/prctl/read/close with the legacy
+        // ARM numbers but uses openat=295.
+        Out.ptrace = 26;
+        Out.prctl = 172;
+        Out.openat = 295;
+        Out.read = 3;
+        Out.close = 6;
+        return true;
     default:
         return false;
     }

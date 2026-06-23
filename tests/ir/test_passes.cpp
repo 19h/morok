@@ -19998,6 +19998,31 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("antiDebuggingModule emits real i386 prctl hardening syscalls (#262)") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "i386-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(2620);
+    morok::ir::IRRandom rng(engine);
+
+    // #262: lookupLinuxCoreSyscalls had no Triple::x86 case, so emitLinuxPrctlDirect
+    // folded every i386 prctl to a constant -ENOSYS and silently dropped the
+    // PR_SET_DUMPABLE / PR_GET_DUMPABLE / PR_SET_PTRACER / PR_SET_NO_NEW_PRIVS
+    // anti-debug hardening on 32-bit x86. With i386 prctl=172 wired up, the
+    // int 0x80 path must actually emit the prctl syscall.
+    CHECK(morok::passes::antiDebuggingModule(*M, rng, /*allowSelfTrace=*/false));
+
+    Function *Ctor = M->getFunction("morok.antidbg");
+    REQUIRE(Ctor != nullptr);
+    // The i386 prctl syscall number (172) is emitted as the int 0x80 syscall-NR
+    // argument; before the fix the call was folded to a constant -ENOSYS and 172
+    // never appeared. (x86_64 prctl is 157, so 172 is specific to the i386 path.)
+    CHECK(functionHasConstantInt(*Ctor, 172u)); // i386 prctl syscall NR
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("antiDebuggingModule emits aarch64 Linux seccomp TSYNC arch filter") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
