@@ -92,7 +92,7 @@ morok::passes     New-PM pass implementations plus testable free functions.
 morok_plugin      Loadable New-PM pass plugin, emitted as libMorok.
 ```
 
-Tracked top-level paths:
+Useful repository and developer paths:
 
 ```text
 include/morok/{core,config,ir,runtime,passes,pipeline}/ public headers
@@ -103,6 +103,7 @@ cmake/Morok{LLVM,Test,Warnings}.cmake             build policy modules
 docs/algorithms.md                                pass and scheduler reference
 docs/hardness.md                                  primitive hardness notes
 docs/objections.md                                public claim/objection notes
+docs/insurance.md                                 broader protection catalog
 docs/insurance-tasks.md                           implementable protection checklist
 docs/roadmap.md                                   design backlog and reality notes
 cross_build.sh                                    Linux/macOS cross-build helper
@@ -116,6 +117,7 @@ Optional local paths may exist in a developer tree:
 programs/                                         stress corpus for compile/run sweeps
 crackmes/                                        example protected programs
 issues/                                          local issue triage material
+research/                                        local research notes and technique catalogs
 build*/                                          generated build trees
 ```
 
