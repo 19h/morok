@@ -17273,6 +17273,15 @@ entry:
     CHECK(countNamedInstructions(*Emu,
                                  "morok.antihook.emu.flags.mismatch") >= 1u);
     CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.eflags.masked") >= 1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.eflags.expected") >= 1u);
+    CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.eflags.word") >=
+          1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.eflags.mismatch") >= 1u);
+    CHECK(functionHasConstantInt(*Emu, 0x003F7FD5u));
+    CHECK(countNamedInstructions(*Emu,
                                  "morok.antihook.emu.cmp.flags.mismatch") >=
           1u);
     CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.setcc.mismatch") >=
@@ -18351,6 +18360,15 @@ entry:
               *Diverge, "morok.antihook.diverge.getppid.wrapper") >= 1u);
     CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.flags.mismatch") >=
           1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.eflags.masked") >= 1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.eflags.expected") >= 1u);
+    CHECK(countNamedInstructions(*Emu, "morok.antihook.emu.eflags.word") >=
+          1u);
+    CHECK(countNamedInstructions(*Emu,
+                                 "morok.antihook.emu.eflags.mismatch") >= 1u);
+    CHECK(functionHasConstantInt(*Emu, 0x003F7FD5u));
     CHECK(countNamedInstructions(*Emu,
                                  "morok.antihook.emu.cmp.flags.mismatch") >=
           1u);
@@ -22334,12 +22352,34 @@ define i32 @main() { ret i32 0 }
     CHECK(M->getGlobalVariable("morok.trap.state", true) != nullptr);
     checkSealEnforcement(*M, *Ctor);
     CHECK(M->getGlobalVariable("morok.trap.hits", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.trap.tf.pc.hits", true) != nullptr);
+    CHECK(M->getGlobalVariable("morok.trap.ac.hits", true) != nullptr);
     CHECK(M->getFunction("sigaction") != nullptr);
     CHECK(M->getFunction("signal") == nullptr);
     CHECK(hasInlineAsmCall(*Ctor));
     CHECK(countNamedInstructions(*Ctor, "morok.trap.sigaction.trap") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.trap.sigaction.ill") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.trap.sigaction.bus") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.trap.tf.pc.missing") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.trap.ac.missing") >= 1u);
     CHECK(countNamedInstructions(*Handler, "morok.trap.icebp") >= 1u);
+    CHECK(countNamedInstructions(*Handler, "morok.trap.tf.pc.delta") >= 1u);
+    CHECK(countNamedInstructions(*Handler, "morok.trap.tf.pc.next") >= 1u);
+    CHECK(countNamedInstructions(*Handler, "morok.trap.ac.fault") >= 1u);
+    CHECK(countNamedInstructions(*Handler, "morok.trap.ac.next") >= 1u);
+    CHECK(countNamedInstructions(*Handler, "morok.trap.ac.eflags.clear") >=
+          1u);
+    CHECK(countNamedInstructions(*Handler, "morok.trap.ac.rip.next") >= 1u);
+    Instruction *TfPcMissing =
+        findNamedInstruction(*Ctor, "morok.trap.tf.pc.missing");
+    REQUIRE(TfPcMissing != nullptr);
+    CHECK(valueFeedsNamedInstruction(TfPcMissing,
+                                     "morok.seal.fold.anti_debug"));
+    Instruction *AcMissing =
+        findNamedInstruction(*Ctor, "morok.trap.ac.missing");
+    REQUIRE(AcMissing != nullptr);
+    CHECK(valueFeedsNamedInstruction(AcMissing,
+                                     "morok.seal.fold.anti_debug"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

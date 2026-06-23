@@ -13675,6 +13675,41 @@ Function *emulationDivergenceProbe(Module &M, const Triple &TT) {
                        "morok.antihook.emu.flags.mismatch");
     incrementDiff(B, diff, mismatch, "morok.antihook.emu.flags");
 
+    auto *fullFlagsTy = StructType::get(ctx, {i64, i64});
+    auto *fullFlagsFnTy = FunctionType::get(fullFlagsTy, false);
+    InlineAsm *fullFlagsAsm = InlineAsm::get(
+        fullFlagsFnTy,
+        "pushfq\n\tpopq %rcx\n\txorq %rax, %rax\n\tpushfq\n\tpopq %rax",
+        "={rax},={rcx},~{memory},~{dirflag},~{fpsr},~{flags}",
+        /*hasSideEffects=*/true);
+    Value *fullFlags = B.CreateCall(fullFlagsFnTy, fullFlagsAsm, {},
+                                    "morok.antihook.emu.eflags.full.raw");
+    Value *fullAfter =
+        B.CreateExtractValue(fullFlags, {0}, "morok.antihook.emu.eflags.after");
+    Value *fullBefore = B.CreateExtractValue(
+        fullFlags, {1}, "morok.antihook.emu.eflags.before");
+    constexpr std::uint64_t kFullEflagsMask = 0x003F7FD5ULL;
+    constexpr std::uint64_t kArithmeticFlagMask =
+        (1ull << 0) | (1ull << 2) | (1ull << 4) | (1ull << 6) |
+        (1ull << 7) | (1ull << 11);
+    constexpr std::uint64_t kXorArithmeticFlags = (1ull << 2) | (1ull << 6);
+    Value *fullAfterMasked =
+        B.CreateAnd(fullAfter, ConstantInt::get(i64, kFullEflagsMask),
+                    "morok.antihook.emu.eflags.masked");
+    Value *preservedExpected = B.CreateAnd(
+        fullBefore,
+        ConstantInt::get(i64, kFullEflagsMask & ~kArithmeticFlagMask),
+        "morok.antihook.emu.eflags.preserved");
+    Value *fullExpected = B.CreateOr(
+        preservedExpected, ConstantInt::get(i64, kXorArithmeticFlags),
+        "morok.antihook.emu.eflags.expected");
+    Value *fullWord = B.CreateXor(fullAfterMasked, fullExpected,
+                                  "morok.antihook.emu.eflags.word");
+    Value *fullMismatch =
+        B.CreateICmpNE(fullWord, ConstantInt::get(i64, 0),
+                       "morok.antihook.emu.eflags.mismatch");
+    incrementDiff(B, diff, fullMismatch, "morok.antihook.emu.eflags");
+
     InlineAsm *cmpFlagsAsm = InlineAsm::get(
         flagsTy,
         "xorq %rax, %rax\n\tmovq %rax, %rcx\n\tincq %rcx\n\tcmpq %rcx, "
@@ -19365,6 +19400,32 @@ GlobalVariable *trapHitCounter(Module &M) {
     return gv;
 }
 
+GlobalVariable *trapTfPcCounter(Module &M) {
+    if (auto *existing = M.getGlobalVariable("morok.trap.tf.pc.hits",
+                                             /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i32, 0),
+                                  "morok.trap.tf.pc.hits");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
+GlobalVariable *trapAcCounter(Module &M) {
+    if (auto *existing =
+            M.getGlobalVariable("morok.trap.ac.hits", /*AllowInternal=*/true))
+        return existing;
+    auto *i32 = Type::getInt32Ty(M.getContext());
+    auto *gv = new GlobalVariable(M, i32, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(i32, 0),
+                                  "morok.trap.ac.hits");
+    gv->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    return gv;
+}
+
 GlobalVariable *trapLongInt3Expected(Module &M) {
     if (auto *existing = M.getGlobalVariable("morok.trap.win.cd03.expected",
                                              /*AllowInternal=*/true))
@@ -19427,20 +19488,34 @@ Function *trapSignalHandler(Module &M, GlobalVariable *Counter,
     if (useLinuxX86SiginfoTrapHandler(TT)) {
         auto *ip = intPtrTy(M);
         auto *i8 = Type::getInt8Ty(ctx);
-        auto *checkCtx = BasicBlock::Create(ctx, "morok.trap.ill.ctx", fn);
-        auto *checkByte = BasicBlock::Create(ctx, "morok.trap.ill.byte", fn);
-        auto *advance = BasicBlock::Create(ctx, "morok.trap.ill.advance", fn);
+        auto *checkIllCtx = BasicBlock::Create(ctx, "morok.trap.ill.ctx", fn);
+        auto *checkIllByte =
+            BasicBlock::Create(ctx, "morok.trap.ill.byte", fn);
+        auto *advanceIll =
+            BasicBlock::Create(ctx, "morok.trap.ill.advance", fn);
+        auto *checkTrapCtx = BasicBlock::Create(ctx, "morok.trap.tf.ctx", fn);
+        auto *checkTrapByte =
+            BasicBlock::Create(ctx, "morok.trap.tf.byte", fn);
+        auto *recordTf = BasicBlock::Create(ctx, "morok.trap.tf.record", fn);
+        auto *checkBusCtx = BasicBlock::Create(ctx, "morok.trap.ac.ctx", fn);
+        auto *checkBusByte =
+            BasicBlock::Create(ctx, "morok.trap.ac.byte", fn);
+        auto *recordAc = BasicBlock::Create(ctx, "morok.trap.ac.record", fn);
         auto *done = BasicBlock::Create(ctx, "done", fn);
 
         Value *isIll =
             B.CreateICmpEQ(sig, ConstantInt::get(i32, 4), "morok.trap.ill");
-        B.CreateCondBr(isIll, checkCtx, done);
+        Value *isTrap =
+            B.CreateICmpEQ(sig, ConstantInt::get(i32, 5), "morok.trap.sigtrap");
+        Value *isBus =
+            B.CreateICmpEQ(sig, ConstantInt::get(i32, 7), "morok.trap.sigbus");
+        B.CreateCondBr(isIll, checkIllCtx, checkTrapCtx);
 
-        IRBuilder<> CB(checkCtx);
+        IRBuilder<> CB(checkIllCtx);
         CB.CreateCondBr(CB.CreateICmpNE(uctx, ConstantPointerNull::get(ptr)),
-                        checkByte, done);
+                        checkIllByte, done);
 
-        IRBuilder<> BB(checkByte);
+        IRBuilder<> BB(checkIllByte);
         // Linux x86_64 ucontext_t: uc_mcontext.gregs[REG_RIP] at byte 168.
         // Orb reports ICEBP (0xf1) as SIGILL at the same PC, so advance only
         // when the trapped byte is exactly the ICEBP stimulus.
@@ -19452,11 +19527,105 @@ Function *trapSignalHandler(Module &M, GlobalVariable *Counter,
         BB.CreateCondBr(
             BB.CreateICmpEQ(byte, ConstantInt::get(i8, 0xF1),
                             "morok.trap.icebp"),
-            advance, done);
+            advanceIll, done);
 
-        IRBuilder<> AB(advance);
+        IRBuilder<> AB(advanceIll);
         AB.CreateStore(AB.CreateAdd(rip, ConstantInt::get(ip, 1)), ripSlot);
         AB.CreateBr(done);
+
+        IRBuilder<> TB(checkTrapCtx);
+        TB.CreateCondBr(
+            isTrap, checkTrapByte,
+            checkBusCtx);
+
+        IRBuilder<> PB(checkTrapByte);
+        PB.CreateCondBr(PB.CreateICmpNE(uctx, ConstantPointerNull::get(ptr),
+                                        "morok.trap.tf.ctx.ready"),
+                        recordTf, done);
+
+        IRBuilder<> RB(recordTf);
+        Value *tfRipSlot = gepI8(RB, M, uctx, constIp(M, 168),
+                                 "morok.trap.tf.rip.slot");
+        Value *tfRip = RB.CreateLoad(ip, tfRipSlot, "morok.trap.tf.rip");
+        Value *prev = RB.CreateIntToPtr(
+            RB.CreateSub(tfRip, ConstantInt::get(ip, 1),
+                         "morok.trap.tf.prev.addr"),
+            ptr, "morok.trap.tf.prev.ptr");
+        auto *prevByte = RB.CreateLoad(i8, prev, "morok.trap.tf.prev.byte");
+        prevByte->setVolatile(true);
+        prevByte->setAlignment(Align(1));
+        auto *tfOk = RB.CreateICmpEQ(prevByte, ConstantInt::get(i8, 0x90),
+                                     "morok.trap.tf.pc.delta");
+        auto *oldTf = RB.CreateLoad(i32, trapTfPcCounter(M),
+                                    "morok.trap.tf.pc.old");
+        oldTf->setVolatile(true);
+        Value *tfNext = RB.CreateSelect(
+            tfOk, RB.CreateAdd(oldTf, ConstantInt::get(i32, 1),
+                               "morok.trap.tf.pc.next"),
+            oldTf, "morok.trap.tf.pc.keep");
+        auto *tfStore = RB.CreateStore(
+            tfNext,
+            trapTfPcCounter(M));
+        tfStore->setVolatile(true);
+        RB.CreateBr(done);
+
+        IRBuilder<> BUS(checkBusCtx);
+        BUS.CreateCondBr(BUS.CreateAnd(
+                             isBus,
+                             BUS.CreateICmpNE(uctx,
+                                              ConstantPointerNull::get(ptr)),
+                             "morok.trap.ac.ctx.ready"),
+                         checkBusByte, done);
+
+        IRBuilder<> ADB(checkBusByte);
+        Value *acRipSlot = gepI8(ADB, M, uctx, constIp(M, 168),
+                                 "morok.trap.ac.rip.slot");
+        Value *acRip = ADB.CreateLoad(ip, acRipSlot, "morok.trap.ac.rip");
+        Value *acPc = ADB.CreateIntToPtr(acRip, ptr, "morok.trap.ac.pc");
+        auto *acOp0 = ADB.CreateLoad(i8, acPc, "morok.trap.ac.op0");
+        acOp0->setVolatile(true);
+        acOp0->setAlignment(Align(1));
+        auto *acOp1 = ADB.CreateLoad(
+            i8, gepI8(ADB, M, acPc, constIp(M, 1), "morok.trap.ac.op1.ptr"),
+            "morok.trap.ac.op1");
+        acOp1->setVolatile(true);
+        acOp1->setAlignment(Align(1));
+        auto *acOp2 = ADB.CreateLoad(
+            i8, gepI8(ADB, M, acPc, constIp(M, 2), "morok.trap.ac.op2.ptr"),
+            "morok.trap.ac.op2");
+        acOp2->setVolatile(true);
+        acOp2->setAlignment(Align(1));
+        Value *acFault = ADB.CreateAnd(
+            ADB.CreateAnd(ADB.CreateICmpEQ(acOp0, ConstantInt::get(i8, 0x8b)),
+                          ADB.CreateICmpEQ(acOp1, ConstantInt::get(i8, 0x40))),
+            ADB.CreateICmpEQ(acOp2, ConstantInt::get(i8, 0x01)),
+            "morok.trap.ac.fault");
+        ADB.CreateCondBr(acFault, recordAc, done);
+
+        IRBuilder<> ACB(recordAc);
+        auto *oldAc =
+            ACB.CreateLoad(i32, trapAcCounter(M), "morok.trap.ac.old");
+        oldAc->setVolatile(true);
+        auto *acStore = ACB.CreateStore(
+            ACB.CreateAdd(oldAc, ConstantInt::get(i32, 1),
+                          "morok.trap.ac.next"),
+            trapAcCounter(M));
+        acStore->setVolatile(true);
+        Value *eflSlot = gepI8(ACB, M, uctx, constIp(M, 176),
+                               "morok.trap.ac.eflags.slot");
+        auto *efl = ACB.CreateLoad(ip, eflSlot, "morok.trap.ac.eflags");
+        efl->setAlignment(Align(1));
+        auto *eflStore = ACB.CreateStore(
+            ACB.CreateAnd(efl, ConstantInt::get(ip, ~0x40000ULL),
+                          "morok.trap.ac.eflags.clear"),
+            eflSlot);
+        eflStore->setAlignment(Align(1));
+        auto *ripStore = ACB.CreateStore(
+            ACB.CreateAdd(acRip, ConstantInt::get(ip, 3),
+                          "morok.trap.ac.rip.next"),
+            acRipSlot);
+        ripStore->setAlignment(Align(1));
+        ACB.CreateBr(done);
 
         B.SetInsertPoint(done);
     }
@@ -19541,7 +19710,12 @@ unsigned emitTrapStimuli(IRBuilder<> &B, Module &M, const Triple &TT) {
                           "%rax\npopfq\nnop\npushfq\npopq %rax\nandq "
                           "$$-257, %rax\npushq %rax\npopfq",
                           "~{rax},~{dirflag},~{fpsr},~{flags}");
-        return 3;
+        emitTrapInlineAsm(B,
+                          "movq %rsp, %rax\npushfq\norq $$262144, "
+                          "(%rsp)\npopfq\n.byte 0x8b,0x40,0x01\npushfq\n"
+                          "andq $$-262145, (%rsp)\npopfq",
+                          "~{rax},~{memory},~{dirflag},~{fpsr},~{flags}");
+        return 4;
     }
 
     FunctionCallee raiseFn = raiseDecl(M);
@@ -33120,12 +33294,19 @@ bool trapOracleModule(Module &M, ir::IRRandom &rng) {
 
     IRBuilder<> B(&ctor->getEntryBlock());
     B.CreateStore(ConstantInt::get(i32, 0), counter)->setVolatile(true);
+    if (useLinuxX86SiginfoTrapHandler(tt)) {
+        B.CreateStore(ConstantInt::get(i32, 0), trapTfPcCounter(M))
+            ->setVolatile(true);
+        B.CreateStore(ConstantInt::get(i32, 0), trapAcCounter(M))
+            ->setVolatile(true);
+    }
 
     auto *actionTy = ArrayType::get(i8, layout.sigactionSize);
     AllocaInst *newAction = B.CreateAlloca(actionTy, nullptr, "morok.trap.sa");
     AllocaInst *oldTrapAction =
         B.CreateAlloca(actionTy, nullptr, "morok.trap.old.trap");
     AllocaInst *oldIllAction = nullptr;
+    AllocaInst *oldBusAction = nullptr;
     storeTrapSiginfoAction(B, M, newAction, handler, layout);
     FunctionCallee sigactionFn = sigactionDecl(M);
     B.CreateCall(sigactionFn,
@@ -33133,10 +33314,15 @@ bool trapOracleModule(Module &M, ir::IRRandom &rng) {
                  "morok.trap.sigaction.trap");
     if (useLinuxX86SiginfoTrapHandler(tt)) {
         constexpr int kSigIll = 4;
+        constexpr int kSigBus = 7;
         oldIllAction = B.CreateAlloca(actionTy, nullptr, "morok.trap.old.ill");
+        oldBusAction = B.CreateAlloca(actionTy, nullptr, "morok.trap.old.bus");
         B.CreateCall(sigactionFn,
                      {ConstantInt::get(i32, kSigIll), newAction, oldIllAction},
                      "morok.trap.sigaction.ill");
+        B.CreateCall(sigactionFn,
+                     {ConstantInt::get(i32, kSigBus), newAction, oldBusAction},
+                     "morok.trap.sigaction.bus");
     }
 
     unsigned expected = emitTrapStimuli(B, M, tt);
@@ -33148,12 +33334,38 @@ bool trapOracleModule(Module &M, ir::IRRandom &rng) {
     foldEnforcedFlag(B, state, missing, 0xE2AB41739D08C6F5ULL,
                      "morok.trap.missing");
     if (useLinuxX86SiginfoTrapHandler(tt)) {
+        auto *tfPc = B.CreateLoad(i32, trapTfPcCounter(M),
+                                  "morok.trap.tf.pc.final");
+        tfPc->setVolatile(true);
+        foldState(B, state, tfPc, 0x4B7391D0E62C58AFULL,
+                  "morok.trap.tf.pc");
+        Value *tfPcMissing =
+            B.CreateICmpEQ(tfPc, ConstantInt::get(i32, 0),
+                           "morok.trap.tf.pc.missing");
+        foldEnforcedFlag(B, state, tfPcMissing, 0x95D3E70B24AC681FULL,
+                         "morok.trap.tf.pc.missing");
+        auto *acHits =
+            B.CreateLoad(i32, trapAcCounter(M), "morok.trap.ac.final");
+        acHits->setVolatile(true);
+        foldState(B, state, acHits, 0xD182C5E73A90B64FULL,
+                  "morok.trap.ac");
+        Value *acMissing =
+            B.CreateICmpEQ(acHits, ConstantInt::get(i32, 0),
+                           "morok.trap.ac.missing");
+        foldEnforcedFlag(B, state, acMissing, 0x53A9D7C20E6B184FULL,
+                         "morok.trap.ac.missing");
+    }
+    if (useLinuxX86SiginfoTrapHandler(tt)) {
         constexpr int kSigIll = 4;
+        constexpr int kSigBus = 7;
         B.CreateCall(sigactionFn,
                      {ConstantInt::get(i32, kSigTrap), oldTrapAction,
                       ConstantPointerNull::get(ptr)});
         B.CreateCall(sigactionFn,
                      {ConstantInt::get(i32, kSigIll), oldIllAction,
+                      ConstantPointerNull::get(ptr)});
+        B.CreateCall(sigactionFn,
+                     {ConstantInt::get(i32, kSigBus), oldBusAction,
                       ConstantPointerNull::get(ptr)});
     } else {
         B.CreateCall(sigactionFn,
