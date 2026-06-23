@@ -17377,6 +17377,18 @@ entry:
                                  "morok.antihook.sandbox.tcg.vendor") >= 1u);
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.qemu.brand") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.leaf.identity") >= 1u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor.next") == 0u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.cpuid.vendor.next") == 0u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.vmware.vendor.next") == 0u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.tcg.vendor.next") == 0u);
+    CHECK(countNamedInstructions(
+              *Sandbox, "morok.antihook.sandbox.qemu.brand.next") == 0u);
     CHECK(countNamedInstructions(*Sandbox,
                                  "morok.antihook.sandbox.cpuid.leaf0.delta") >=
           1u);

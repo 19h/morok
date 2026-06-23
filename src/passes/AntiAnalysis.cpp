@@ -12749,8 +12749,6 @@ Function *sandboxHeuristicProbe(Module &M, const Triple &TT) {
                         "morok.antihook.sandbox.cpuid.hypervisor.bit"),
             ConstantInt::get(i32, 0),
             "morok.antihook.sandbox.cpuid.hypervisor");
-        incrementDiff(B, score, hypervisor,
-                      "morok.antihook.sandbox.cpuid.hypervisor");
 
         Value *hvLeaf = emitCpuid(B, M, ConstantInt::get(i32, 0x40000000u),
                                   ConstantInt::get(i32, 0));
@@ -12765,29 +12763,27 @@ Function *sandboxHeuristicProbe(Module &M, const Triple &TT) {
         Value *hvVendor = B.CreateICmpNE(
             hvMax, ConstantInt::get(i32, 0),
             "morok.antihook.sandbox.cpuid.hv.vendor");
-        incrementDiff(B, score, B.CreateAnd(hypervisor, hvVendor),
-                      "morok.antihook.sandbox.cpuid.vendor");
+        Value *hvVendorEvidence =
+            B.CreateAnd(hypervisor, hvVendor,
+                        "morok.antihook.sandbox.cpuid.vendor");
         Value *vmwareVendor = B.CreateAnd(
             B.CreateAnd(B.CreateICmpEQ(hvEbx, ConstantInt::get(i32, 0x61774D56u)),
                         B.CreateICmpEQ(hvEcx,
                                        ConstantInt::get(i32, 0x4D566572u))),
             B.CreateICmpEQ(hvEdx, ConstantInt::get(i32, 0x65726177u)),
             "morok.antihook.sandbox.vmware.vendor");
-        incrementDiff(B, score, vmwareVendor,
-                      "morok.antihook.sandbox.vmware.vendor");
         Value *tcgVendor = B.CreateAnd(
             B.CreateAnd(B.CreateICmpEQ(hvEbx, ConstantInt::get(i32, 0x54474354u)),
                         B.CreateICmpEQ(hvEcx,
                                        ConstantInt::get(i32, 0x43544743u))),
             B.CreateICmpEQ(hvEdx, ConstantInt::get(i32, 0x47435447u)),
             "morok.antihook.sandbox.tcg.vendor");
-        incrementDiff(B, score, tcgVendor,
-                      "morok.antihook.sandbox.tcg.vendor");
         Value *qemuBrand = emitQemuBrandMatch(B, M);
-        incrementDiff(B, score, qemuBrand,
-                      "morok.antihook.sandbox.qemu.brand");
+        Value *leafIdentity =
+            B.CreateOr(hypervisor, hvVendorEvidence,
+                       "morok.antihook.sandbox.cpuid.leaf.identity");
         identityEvidence =
-            B.CreateOr(B.CreateOr(hypervisor, vmwareVendor),
+            B.CreateOr(B.CreateOr(leafIdentity, vmwareVendor),
                        B.CreateOr(tcgVendor, qemuBrand),
                        "morok.antihook.sandbox.identity.evidence");
         (void)emitSandboxCpuidExitLatency(B, M, score, coherence,
