@@ -3473,7 +3473,8 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
                                    "morok.antidbg.watch.ptrace",
                                    0x6FAE31D54B8C9721ULL);
     Value *status = BB.CreateCall(StatusFn);
-    Value *stat4 = BB.CreateCall(StatFn);
+    // #261: StatFn (linuxStatField4Check) is null on unsupported Linux arches.
+    Value *stat4 = StatFn ? BB.CreateCall(StatFn) : nullptr;
     Value *statusTraced =
         BB.CreateICmpNE(status, ConstantInt::get(i32, 0),
                         "morok.antidbg.watch.status.traced");
@@ -3481,13 +3482,15 @@ Function *linuxWatchThread(Module &M, Function *StatusFn, Function *StatFn,
                               0x64C2D0B6D8F44A2DULL,
                               0xB9281F3D4E6C507AULL,
                               "morok.antidbg.watch.status");
-    foldState(BB, State, stat4, 0x8CB92BA72F3D8DD7ULL,
-              "morok.antidbg.watch.stat4");
-    Value *statCoherence = packedI32Flag(
-        BB, stat4, 1u << 8, "morok.antidbg.watch.stat.coherence.bits",
-        "morok.antidbg.watch.stat.coherence.anomaly");
-    foldEnforcedFlag(BB, State, statCoherence, 0x7F541C8E92AB6D03ULL,
-                     "morok.antidbg.watch.stat.coherence");
+    if (stat4) {
+        foldState(BB, State, stat4, 0x8CB92BA72F3D8DD7ULL,
+                  "morok.antidbg.watch.stat4");
+        Value *statCoherence = packedI32Flag(
+            BB, stat4, 1u << 8, "morok.antidbg.watch.stat.coherence.bits",
+            "morok.antidbg.watch.stat.coherence.anomaly");
+        foldEnforcedFlag(BB, State, statCoherence, 0x7F541C8E92AB6D03ULL,
+                         "morok.antidbg.watch.stat.coherence");
+    }
     if (SignalMaskFn) {
         Value *sigmask = BB.CreateCall(SignalMaskFn->getFunctionType(),
                                        SignalMaskFn, {},
@@ -5686,19 +5689,26 @@ void emitLinuxAntiDebug(Module &M, Function *Ctor, GlobalVariable *State,
                                                                  statusFn)
                                  : nullptr;
     Value *status = B.CreateCall(statusFn);
-    Value *stat4 = B.CreateCall(statFn);
+    // #261: linuxStatField4Check returns null on Linux arches without a known
+    // getppid syscall number (riscv64, ppc64le, mips, s390x, loongarch, ...);
+    // guard the call so the pass does not null-deref CreateCall and crash the
+    // compiler on those (legitimate cross-compile) triples.
+    Value *stat4 = statFn ? B.CreateCall(statFn) : nullptr;
     Value *statusTraced =
         B.CreateICmpNE(status, ConstantInt::get(i32, 0),
                        "morok.antidbg.status.traced");
     foldLinuxTracerPidVerdict(B, State, statusTraced, AllowSelfTrace,
                               0xA4756E49F2D31219ULL,
                               0xCB1E4D0A762F3958ULL, "morok.antidbg.status");
-    foldState(B, State, stat4, 0xDA942042E4DD58B5ULL, "morok.antidbg.stat4");
-    Value *statCoherence = packedI32Flag(
-        B, stat4, 1u << 8, "morok.antidbg.stat.coherence.bits",
-        "morok.antidbg.stat.coherence.anomaly");
-    foldEnforcedFlag(B, State, statCoherence, 0x91C0B7F52A6E3D49ULL,
-                     "morok.antidbg.stat.coherence");
+    if (stat4) {
+        foldState(B, State, stat4, 0xDA942042E4DD58B5ULL,
+                  "morok.antidbg.stat4");
+        Value *statCoherence = packedI32Flag(
+            B, stat4, 1u << 8, "morok.antidbg.stat.coherence.bits",
+            "morok.antidbg.stat.coherence.anomaly");
+        foldEnforcedFlag(B, State, statCoherence, 0x91C0B7F52A6E3D49ULL,
+                         "morok.antidbg.stat.coherence");
+    }
     emitLinuxPersonalityAslrTelemetry(B, M, State, TT);
     emitLinuxSigtrapCoherence(
         B, M, State, statusTraced, ConstantInt::get(B.getInt64Ty(), rng.next()),
@@ -16659,7 +16669,8 @@ Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
         Function *statusFn = linuxStatusTracerCheck(M, rng, TT);
         Function *statFn = linuxStatField4Check(M, rng, TT);
         Value *status = B.CreateCall(statusFn);
-        Value *stat4 = B.CreateCall(statFn);
+        // #261: guard the null helper on unsupported Linux arches (see above).
+        Value *stat4 = statFn ? B.CreateCall(statFn) : nullptr;
         Value *statusTraced =
             B.CreateICmpNE(status, ConstantInt::get(i32, 0),
                            "morok.antidbg.probe.status.traced");
@@ -16667,13 +16678,15 @@ Function *antiDebugProbe(Module &M, GlobalVariable *State, ir::IRRandom &rng,
                                   0x3FEC9A6245A7DB13ULL,
                                   0x71D64A930CB25FE8ULL,
                                   "morok.antidbg.probe.status");
-        foldState(B, State, stat4, 0x84379D6FA21708C9ULL,
-                  "morok.antidbg.probe.stat4");
-        Value *statCoherence = packedI32Flag(
-            B, stat4, 1u << 8, "morok.antidbg.probe.stat.coherence.bits",
-            "morok.antidbg.probe.stat.coherence.anomaly");
-        foldEnforcedFlag(B, State, statCoherence, 0x3B6D81E5F0C24A97ULL,
-                         "morok.antidbg.probe.stat.coherence");
+        if (stat4) {
+            foldState(B, State, stat4, 0x84379D6FA21708C9ULL,
+                      "morok.antidbg.probe.stat4");
+            Value *statCoherence = packedI32Flag(
+                B, stat4, 1u << 8, "morok.antidbg.probe.stat.coherence.bits",
+                "morok.antidbg.probe.stat.coherence.anomaly");
+            foldEnforcedFlag(B, State, statCoherence, 0x3B6D81E5F0C24A97ULL,
+                             "morok.antidbg.probe.stat.coherence");
+        }
         emitLinuxSigtrapCoherence(B, M, State, statusTraced, tag, rng, TT,
                                   "morok.antidbg.probe.sigtrap");
         if (Function *faultCf =

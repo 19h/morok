@@ -19732,6 +19732,32 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("antiDebuggingModule does not crash on an unsupported Linux arch "
+          "(riscv64) where the stat4 helper is null (#261)") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "riscv64-unknown-linux-gnu"
+define i32 @main() { ret i32 0 }
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(2610);
+    morok::ir::IRRandom rng(engine);
+
+    // #261: linuxStatField4Check returns null on Linux arches with no known
+    // getppid syscall number (riscv64, ppc64le, mips, s390x, loongarch, ...).
+    // The Linux emitter must guard the call instead of passing a null Function*
+    // straight into CreateCall, which null-dereferenced and crashed the pass
+    // (a compiler-service DoS on untrusted triples / legit cross-compiles).
+    CHECK(morok::passes::antiDebuggingModule(*M, rng, /*allowSelfTrace=*/false));
+
+    // The stat4 helper is never created and no stat4 verdict is folded on this
+    // arch — the sub-probe simply no-ops while the rest of the module is valid.
+    CHECK(M->getFunction("morok.antidbg.linux.stat4") == nullptr);
+    Function *Ctor = M->getFunction("morok.antidbg");
+    REQUIRE(Ctor != nullptr);
+    CHECK(countNamedInstructions(*Ctor, "morok.antidbg.stat4") == 0u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("antiDebuggingModule emits aarch64 Linux seccomp TSYNC arch filter") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
