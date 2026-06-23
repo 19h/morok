@@ -242,6 +242,15 @@ Instruction *findNamedInstruction(Function &F, StringRef name) {
     return nullptr;
 }
 
+bool namedCallHasConstantArg(Function &F, StringRef name, unsigned arg,
+                             std::uint64_t expected) {
+    auto *CI = dyn_cast_or_null<CallInst>(findNamedInstruction(F, name));
+    if (!CI || arg >= CI->arg_size())
+        return false;
+    auto *C = dyn_cast<ConstantInt>(CI->getArgOperand(arg));
+    return C && C->getZExtValue() == expected;
+}
+
 bool instructionHasConstantOperand(Instruction *I, std::uint64_t Expected) {
     if (!I)
         return false;
@@ -17802,6 +17811,10 @@ entry:
     CHECK(countNamedInstructions(*Response, "morok.response.terminate") >= 1u);
     CHECK(countNamedInstructions(*Response,
                                  "morok.response.raw.exit.syscall") >= 1u);
+    CHECK(namedCallHasConstantArg(*Response, "morok.response.raw.exit.syscall",
+                                  0, 231u)); // x86_64 exit_group
+    CHECK_FALSE(namedCallHasConstantArg(
+        *Response, "morok.response.raw.exit.syscall", 0, 60u)); // SYS_exit
     CHECK(countNamedInstructions(*Ctor, "morok.gate.sandbox.soft") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.negative.timing.soft") >=
           1u);
@@ -18053,10 +18066,17 @@ entry:
             *M, rng, /*staticLinkExpected=*/true));
         Function *Probe = M->getFunction("morok.antihook.static.atbase");
         REQUIRE(Probe != nullptr);
+        Function *Response = M->getFunction("morok.gate.response.action");
+        REQUIRE(Response != nullptr);
         CHECK(hasInlineAsmCall(*Probe));
         CHECK(countNamedInstructions(*Probe,
                                      "morok.antihook.static.atbase.trip") >=
               1u);
+        CHECK(namedCallHasConstantArg(*Response,
+                                      "morok.response.raw.exit.syscall", 0,
+                                      94u)); // aarch64 exit_group
+        CHECK_FALSE(namedCallHasConstantArg(
+            *Response, "morok.response.raw.exit.syscall", 0, 93u)); // SYS_exit
         CHECK_FALSE(verifyModule(*M, &errs()));
     }
     {
@@ -18081,10 +18101,17 @@ entry:
         REQUIRE(Loader != nullptr);
         Function *Ctor = M->getFunction("morok.antihook");
         REQUIRE(Ctor != nullptr);
+        Function *Response = M->getFunction("morok.gate.response.action");
+        REQUIRE(Response != nullptr);
         CHECK(hasInlineAsmCall(*Probe));
         CHECK(countNamedInstructions(*Probe,
                                      "morok.antihook.static.atbase.trip") >=
               1u);
+        CHECK(namedCallHasConstantArg(*Response,
+                                      "morok.response.raw.exit.syscall", 0,
+                                      248u)); // ARM EABI exit_group
+        CHECK_FALSE(namedCallHasConstantArg(
+            *Response, "morok.response.raw.exit.syscall", 0, 1u)); // SYS_exit
         CHECK(countCallsTo(*Ctor, "morok.antihook.loader.auxv") == 1u);
         CHECK(namedGepUsesConstantOffset(*Loader,
                                          "morok.antihook.loader.ph.vaddr.ptr",
@@ -18208,6 +18235,8 @@ define i32 @main() { ret i32 0 }
         CHECK(morok::passes::antiHookingModule(*M, rng));
         Function *S = M->getFunction("morok.antihook.sandbox");
         REQUIRE(S);
+        Function *Response = M->getFunction("morok.gate.response.action");
+        REQUIRE(Response != nullptr);
         CHECK(countNamedInstructions(*S, "morok.antihook.sandbox.cpu.count") >=
               1u);
         CHECK(countNamedInstructions(*S, "morok.antihook.sandbox.sleep.req") >=
@@ -18220,6 +18249,11 @@ define i32 @main() { ret i32 0 }
               1u);
         CHECK(countNamedInstructions(*S,
                                      "morok.antihook.sandbox.smc.flush") >= 1u);
+        CHECK(namedCallHasConstantArg(*Response,
+                                      "morok.response.raw.exit.syscall", 0,
+                                      231u)); // x86_64 exit_group
+        CHECK_FALSE(namedCallHasConstantArg(
+            *Response, "morok.response.raw.exit.syscall", 0, 60u)); // SYS_exit
     }
     // 32-bit: the sysconf CPU check still runs, but the wrong-layout timespec
     // timing heuristics are skipped (so the sandbox score can't be corrupted).
@@ -18234,6 +18268,8 @@ define i32 @main() { ret i32 0 }
         CHECK(morok::passes::antiHookingModule(*M, rng));
         Function *S = M->getFunction("morok.antihook.sandbox");
         REQUIRE(S);
+        Function *Response = M->getFunction("morok.gate.response.action");
+        REQUIRE(Response != nullptr);
         CHECK(countNamedInstructions(*S, "morok.antihook.sandbox.cpu.count") >=
               1u);
         CHECK(countNamedInstructions(*S, "morok.antihook.sandbox.sleep.req") ==
@@ -18248,6 +18284,11 @@ define i32 @main() { ret i32 0 }
               0u);
         CHECK(countNamedInstructions(*S,
                                      "morok.antihook.sandbox.smc.flush") == 0u);
+        CHECK(namedCallHasConstantArg(*Response,
+                                      "morok.response.raw.exit.syscall", 0,
+                                      252u)); // i386 exit_group
+        CHECK_FALSE(namedCallHasConstantArg(
+            *Response, "morok.response.raw.exit.syscall", 0, 1u)); // SYS_exit
     }
 }
 

@@ -7100,19 +7100,19 @@ bool responseLinuxExitSyscall(const Triple &TT, std::uint32_t &Exit) {
         return false;
     switch (TT.getArch()) {
     case Triple::x86_64:
-        Exit = 60;
+        Exit = 231;
         return true;
     case Triple::x86:
-        Exit = 1;
+        Exit = 252;
         return true;
     case Triple::aarch64:
-        Exit = 93;
+        Exit = 94;
         return true;
     case Triple::arm:
     case Triple::armeb:
     case Triple::thumb:
     case Triple::thumbeb:
-        Exit = 1;
+        Exit = 248;
         return true;
     default:
         return false;
