@@ -17998,7 +17998,8 @@ entry:
     CHECK(countNamedInstructions(*Ctor,
                                  "morok.gate.loader.personality.soft") >= 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.mprotect.hard") >= 1u);
-    CHECK(countNamedInstructions(*Ctor, "morok.gate.ra.range.hard") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.ra.range.soft") >= 1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.gate.ra.range.hard") == 0u);
     CHECK(countNamedInstructions(*Ctor,
                                  "morok.corroborate.ra.range.changed") >= 1u);
     CHECK(countNamedInstructions(*Ctor,
@@ -18016,7 +18017,11 @@ entry:
         findNamedInstruction(*Ctor, "morok.corroborate.ra.range.changed");
     REQUIRE(RaRangeChanged != nullptr);
     CHECK(valueFeedsNamedInstruction(RaRangeChanged,
-                                     "morok.seal.fold.anti_debug"));
+                                     "morok.gate.ra.range.soft.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(RaRangeChanged,
+                                           "morok.gate.ra.range.hard.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(RaRangeChanged,
+                                           "morok.seal.fold.anti_debug"));
     Instruction *SandboxChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.sandbox.changed");
     REQUIRE(SandboxChanged != nullptr);
@@ -18043,10 +18048,9 @@ entry:
     REQUIRE(PowChanged != nullptr);
     CHECK_FALSE(valueFeedsNamedInstruction(PowChanged,
                                            "morok.seal.fold.anti_debug"));
-    Instruction *PowKdfWord =
-        findNamedInstruction(*Ctor, "morok.antihook.pow.kdf.word");
-    REQUIRE(PowKdfWord != nullptr);
-    CHECK(valueFeedsNamedInstruction(PowKdfWord, "morok.antihook.pow.kdf"));
+    CHECK(findNamedInstruction(*Ctor, "morok.antihook.pow.kdf.word") ==
+          nullptr);
+    CHECK(countNamedInstructions(*Ctor, "morok.antihook.pow.kdf") == 0u);
     CHECK(countCallsTo(*Ctor, "morok.antihook.loader.auxv") == 1u);
     CHECK(countNamedInstructions(*Ctor, "morok.antihook.loader.bias.byte") >=
           1u);

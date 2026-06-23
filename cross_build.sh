@@ -400,18 +400,27 @@ done
 # (which a target may need to override — see build_linux for static links).
 # Source files and link libs are kept separate so build_linux/build_macos can
 # place them correctly relative to --static and other target-specific flags.
-COMMON=(
-  "$OPT_LEVEL" "${STD[@]}"
-  "${EXTRA_CFLAG_ARRAY[@]}"
+COMMON=("$OPT_LEVEL")
+if [ "${#STD[@]}" -gt 0 ]; then
+  COMMON+=("${STD[@]}")
+fi
+if [ "${#EXTRA_CFLAG_ARRAY[@]}" -gt 0 ]; then
+  COMMON+=("${EXTRA_CFLAG_ARRAY[@]}")
+fi
+COMMON+=(
   -fpass-plugin="$PLUGIN"
   -mllvm -morok
   -mllvm "-morok-seed=$SEED"
   "$SRC"
 )
 # Append extra sources after the main source
-COMMON+=("${EXTRA_SRC_ARRAY[@]}")
+if [ "${#EXTRA_SRC_ARRAY[@]}" -gt 0 ]; then
+  COMMON+=("${EXTRA_SRC_ARRAY[@]}")
+fi
 # Append extra link libs at the very end
-COMMON+=("${LIB_ARRAY[@]}")
+if [ "${#LIB_ARRAY[@]}" -gt 0 ]; then
+  COMMON+=("${LIB_ARRAY[@]}")
+fi
 
 OUTPUTS=()
 
