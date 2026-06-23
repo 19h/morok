@@ -17172,6 +17172,8 @@ entry:
     CHECK(globalInitializerReferences(MacTargets, Rx));
     CHECK(globalInitializerReferences(MacTargets, Lazy));
     CHECK(globalInitializerReferences(MacTargets, Needed));
+    CHECK(globalInitializerReferences(MacTargets, GotRecheck));
+    CHECK(globalInitializerReferences(MacTargets, Clean));
     GlobalVariable *SmcGate =
         M->getGlobalVariable("morok.antihook.dbi.smc.gate", true);
     REQUIRE(SmcGate != nullptr);
@@ -18545,6 +18547,7 @@ entry:
     CHECK(globalInitializerReferences(DarwinMacTargets, DylibOrdinal));
     CHECK(globalInitializerReferences(DarwinMacTargets, Expected));
     CHECK(globalInitializerReferences(DarwinMacTargets, ImageText));
+    CHECK(globalInitializerReferences(DarwinMacTargets, Clean));
     CHECK(M->getFunction("morok.antihook.got.plt") == nullptr);
     CHECK(hasInlineAsmCall(*Clean));
     CHECK(hasInlineAsmCall(*Sandbox));

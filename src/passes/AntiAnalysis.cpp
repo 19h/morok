@@ -7910,13 +7910,34 @@ void emitFunctionMacLoop(IRBuilder<> &B, Module &M, Function *Fn,
                          AllocaInst *Diff, GlobalVariable *Targets,
                          std::uint64_t Key, BasicBlock *Done);
 
+Function *declareCleanCopyProbe(Module &M, const Triple &TT) {
+    if (!(TT.isOSLinux() || TT.isOSDarwin()))
+        return nullptr;
+    if (intPtrTy(M)->getBitWidth() != 64)
+        return nullptr;
+
+    StringRef name = TT.isOSLinux() ? "morok.antihook.clean.elf"
+                                    : "morok.antihook.clean.macho";
+    auto *fnTy = FunctionType::get(Type::getInt64Ty(M.getContext()), false);
+    if (Function *existing = M.getFunction(name)) {
+        if (existing->getFunctionType() != fnTy)
+            return nullptr;
+        existing->addFnAttr(Attribute::NoInline);
+        existing->setDSOLocal(true);
+        return existing;
+    }
+
+    auto *fn = Function::Create(fnTy, GlobalValue::PrivateLinkage, name, &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+    return fn;
+}
+
 Function *linuxCleanCopyProbe(Module &M, ir::IRRandom &rng, const Triple &TT) {
     if (!TT.isOSLinux())
         return nullptr;
     if (intPtrTy(M)->getBitWidth() != 64)
         return nullptr;
-    if (Function *existing = M.getFunction("morok.antihook.clean.elf"))
-        return existing;
 
     LLVMContext &ctx = M.getContext();
     auto *i8 = Type::getInt8Ty(ctx);
@@ -7930,11 +7951,11 @@ Function *linuxCleanCopyProbe(Module &M, ir::IRRandom &rng, const Triple &TT) {
                             /*AllowInternal=*/true);
     const std::uint64_t macKey = rng.next();
 
-    auto *fn = Function::Create(FunctionType::get(i64, false),
-                                GlobalValue::PrivateLinkage,
-                                "morok.antihook.clean.elf", &M);
-    fn->addFnAttr(Attribute::NoInline);
-    fn->setDSOLocal(true);
+    Function *fn = declareCleanCopyProbe(M, TT);
+    if (!fn)
+        return nullptr;
+    if (!fn->empty())
+        return fn;
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
     auto *openBB = BasicBlock::Create(ctx, "open", fn);
@@ -8104,8 +8125,6 @@ Function *darwinCleanCopyProbe(Module &M, ir::IRRandom &rng) {
         return nullptr;
     if (intPtrTy(M)->getBitWidth() != 64)
         return nullptr;
-    if (Function *existing = M.getFunction("morok.antihook.clean.macho"))
-        return existing;
 
     LLVMContext &ctx = M.getContext();
     auto *i8 = Type::getInt8Ty(ctx);
@@ -8118,11 +8137,11 @@ Function *darwinCleanCopyProbe(Module &M, ir::IRRandom &rng) {
                             /*AllowInternal=*/true);
     const std::uint64_t macKey = rng.next();
 
-    auto *fn = Function::Create(FunctionType::get(i64, false),
-                                GlobalValue::PrivateLinkage,
-                                "morok.antihook.clean.macho", &M);
-    fn->addFnAttr(Attribute::NoInline);
-    fn->setDSOLocal(true);
+    Function *fn = declareCleanCopyProbe(M, TT);
+    if (!fn)
+        return nullptr;
+    if (!fn->empty())
+        return fn;
 
     auto *entry = BasicBlock::Create(ctx, "entry", fn);
     auto *openBB = BasicBlock::Create(ctx, "open", fn);
@@ -8277,13 +8296,20 @@ bool isPrologueProbeCandidate(Function &F) {
     return true;
 }
 
-void appendPrologueTarget(std::vector<Function *> &Targets, Function *Target) {
-    if (!Target || Target->isDeclaration() || Target->empty())
+void appendReservedPrologueTarget(std::vector<Function *> &Targets,
+                                  Function *Target) {
+    if (!Target)
         return;
     for (Function *existing : Targets)
         if (existing == Target)
             return;
     Targets.push_back(Target);
+}
+
+void appendPrologueTarget(std::vector<Function *> &Targets, Function *Target) {
+    if (!Target || Target->isDeclaration() || Target->empty())
+        return;
+    appendReservedPrologueTarget(Targets, Target);
 }
 
 void appendNamedPrologueTarget(Module &M, std::vector<Function *> &Targets,
@@ -34518,13 +34544,18 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
     Function *gotProbe = linuxGotPltProbe(M, tt);
     Function *fixupProbe = darwinFixupProbe(M, tt);
     appendImportVerifierTargets(M, tt, prologueTargets);
-    functionMacTargetTable(M, prologueTargets);
 
     Function *ctor = makeCtorShell(M, "morok.antihook");
     antiDebugSeal(M, rng);
     GlobalVariable *state = antiHookState(M, rng);
     IRBuilder<> B(&ctor->getEntryBlock());
     GateAccumulator gate = createGateAccumulator(B);
+    Function *gotRecheckProbe =
+        gotProbe ? linuxGotRecheckProbe(M, gotProbe, state) : nullptr;
+    appendPrologueTarget(prologueTargets, gotRecheckProbe);
+    Function *reservedClean = declareCleanCopyProbe(M, tt);
+    appendReservedPrologueTarget(prologueTargets, reservedClean);
+    functionMacTargetTable(M, prologueTargets);
 
     if (Function *clean = cleanCopyProbe(M, rng, tt)) {
         Value *diff = B.CreateCall(clean, {}, "morok.antihook.clean.diff");
@@ -34537,7 +34568,7 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                   "morok.antihook.clean");
         foldFlag(B, state, changed, 0x48C3F3A9127DE40BULL,
                  "morok.antihook.clean.changed");
-        prologueTargets.push_back(clean);
+        appendPrologueTarget(prologueTargets, clean);
     }
     if (gotProbe) {
         Value *diff = B.CreateCall(gotProbe, {}, "morok.antihook.got.diff");
@@ -34878,9 +34909,6 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         }
     }
     insertStackOriginChecks(M, stackCheck, state, prologueTargets, rng);
-    Function *gotRecheckProbe =
-        gotProbe ? linuxGotRecheckProbe(M, gotProbe, state) : nullptr;
-    appendPrologueTarget(prologueTargets, gotRecheckProbe);
     Function *phaseRecheck =
         antiHookRecheckProbe(M, state, gotRecheckProbe, stackCheck, rng);
     emitProloguePatternChecks(B, M, tt, state, prologueTargets, rng);
