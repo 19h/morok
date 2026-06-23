@@ -22446,6 +22446,22 @@ define i32 @main() { ret i32 0 }
     CHECK(countNamedInstructions(*Oracle, "morok.pftlb.mprotect.none") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.pftlb.primary.delta") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.pftlb.pattern.missing") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.ept.read.delta") >= 8u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.ept.exec.delta") >= 8u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.ept.read.median") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.ept.exec.median") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.ept.mprotect.roundtrip") >=
+          1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.ept.ratio") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.ept.variance.floor") >=
+          1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.ept.hypervisor") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.ept.score") >= 1u);
+    Instruction *EptQualified =
+        findNamedInstruction(*Oracle, "morok.pftlb.ept.qualified");
+    REQUIRE(EptQualified != nullptr);
+    CHECK_FALSE(valueFeedsNamedInstruction(EptQualified,
+                                           "morok.seal.fold.anti_debug"));
     checkSealEnforcement(*M, *Oracle);
     CHECK(countNamedInstructions(*Handler, "morok.pftlb.mprotect.page") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -22502,6 +22518,8 @@ define i32 @main() { ret i32 0 }
     CHECK_FALSE(hasInlineAsmCall(*Oracle));
     CHECK(countNamedInstructions(*Handler, "morok.pftlb.pc") >= 1u);
     CHECK(countNamedInstructions(*Oracle, "morok.pftlb.pattern.slow") >= 1u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.ept.exec.delta") == 0u);
+    CHECK(countNamedInstructions(*Oracle, "morok.pftlb.ept.hypervisor") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 

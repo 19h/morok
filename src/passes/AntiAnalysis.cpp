@@ -20107,6 +20107,241 @@ Function *pageFaultTlbSignalHandler(Module &M, GlobalVariable *State,
     return fn;
 }
 
+Function *pageFaultTlbEptExecTarget(Module &M, ir::IRRandom &rng) {
+    if (Function *existing = M.getFunction("morok.pftlb.ept.exec.target"))
+        return existing;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *fn = Function::Create(FunctionType::get(i64, {i64}, false),
+                                GlobalValue::PrivateLinkage,
+                                "morok.pftlb.ept.exec.target", &M);
+    fn->addFnAttr(Attribute::NoInline);
+    fn->setDSOLocal(true);
+
+    Argument *seed = fn->getArg(0);
+    seed->setName("seed");
+
+    BasicBlock *entry = BasicBlock::Create(ctx, "entry", fn);
+    IRBuilder<> B(entry);
+    Value *x = B.CreateXor(seed, ConstantInt::get(i64, rng.next()),
+                           "morok.pftlb.ept.exec.seed");
+    for (unsigned step = 0; step < 6; ++step) {
+        const unsigned lshift = ((step * 11u) + 17u) & 63u;
+        const unsigned rshift = 64u - lshift;
+        Value *rot = B.CreateOr(
+            B.CreateShl(x, ConstantInt::get(i64, lshift),
+                        "morok.pftlb.ept.exec.rotl"),
+            B.CreateLShr(x, ConstantInt::get(i64, rshift),
+                         "morok.pftlb.ept.exec.rotr"),
+            "morok.pftlb.ept.exec.rot");
+        Value *salted = B.CreateAdd(
+            rot, ConstantInt::get(i64, rng.next() ^ (0xA5A5u + step)),
+            "morok.pftlb.ept.exec.salt");
+        x = B.CreateXor(
+            B.CreateMul(salted, ConstantInt::get(i64, rng.next() | 1ULL),
+                        "morok.pftlb.ept.exec.mul"),
+            B.CreateLShr(x, ConstantInt::get(i64, (step % 13u) + 3u),
+                         "morok.pftlb.ept.exec.skew"),
+            "morok.pftlb.ept.exec.mix");
+    }
+    B.CreateRet(x);
+    return fn;
+}
+
+void emitPageFaultTlbEptTelemetry(IRBuilder<> &B, Module &M,
+                                  GlobalVariable *State, ir::IRRandom &rng,
+                                  const Triple &TT, Value *Mapped,
+                                  Value *PageSize, AllocaInst *MixSlot) {
+    if (!isX86Target(TT) || intPtrTy(M)->getBitWidth() != 64)
+        return;
+
+    LLVMContext &ctx = M.getContext();
+    auto *i8 = Type::getInt8Ty(ctx);
+    auto *i32 = Type::getInt32Ty(ctx);
+    auto *i64 = Type::getInt64Ty(ctx);
+    auto *ip = intPtrTy(M);
+    auto *ptr = PointerType::getUnqual(ctx);
+    Function *target = pageFaultTlbEptExecTarget(M, rng);
+    Value *targetBase =
+        B.CreatePtrToInt(target, ip, "morok.pftlb.ept.target.base");
+
+    Value *roundTripStart = emitRdtscp(B, M);
+    Value *noneRc = emitPosixMprotect(B, M, TT, Mapped, PageSize,
+                                      ConstantInt::get(ip, 0));
+    noneRc->setName("morok.pftlb.ept.mprotect.none");
+    Value *rwRc = emitPosixMprotect(B, M, TT, Mapped, PageSize,
+                                    ConstantInt::get(ip, 3));
+    rwRc->setName("morok.pftlb.ept.mprotect.rw");
+    Value *roundTripEnd = emitRdtscp(B, M);
+    Value *roundTripDelta = B.CreateSub(
+        roundTripEnd, roundTripStart, "morok.pftlb.ept.mprotect.roundtrip");
+    Value *roundTripOk = B.CreateAnd(
+        B.CreateICmpEQ(noneRc, ConstantInt::get(i32, 0),
+                       "morok.pftlb.ept.none.ok"),
+        B.CreateICmpEQ(rwRc, ConstantInt::get(i32, 0),
+                       "morok.pftlb.ept.rw.ok"),
+        "morok.pftlb.ept.mprotect.ok");
+
+    SmallVector<Value *, 8> readSamples;
+    SmallVector<Value *, 8> execSamples;
+    readSamples.reserve(8);
+    execSamples.reserve(8);
+    for (unsigned sample = 0; sample < 8; ++sample) {
+        Value *readStart = emitRdtscp(B, M);
+        Value *readAddr =
+            B.CreateAdd(targetBase, ConstantInt::get(ip, sample * 5u),
+                        "morok.pftlb.ept.read.addr");
+        auto *codeByte = B.CreateLoad(
+            i8, B.CreateIntToPtr(readAddr, ptr, "morok.pftlb.ept.read.ptr"),
+            "morok.pftlb.ept.read.byte");
+        codeByte->setVolatile(true);
+        codeByte->setAlignment(Align(1));
+        Value *readEnd = emitRdtscp(B, M);
+        Value *readDelta =
+            B.CreateSub(readEnd, readStart, "morok.pftlb.ept.read.delta");
+        readSamples.push_back(readDelta);
+
+        Value *execStart = emitRdtscp(B, M);
+        Value *execArg =
+            B.CreateXor(execStart,
+                        B.CreateAdd(B.CreateZExt(codeByte, i64),
+                                    ConstantInt::get(i64, rng.next() ^ sample),
+                                    "morok.pftlb.ept.exec.arg.byte"),
+                        "morok.pftlb.ept.exec.arg");
+        Value *execValue = B.CreateCall(target->getFunctionType(), target,
+                                        {execArg},
+                                        "morok.pftlb.ept.exec.value");
+        Value *execEnd = emitRdtscp(B, M);
+        Value *execDelta =
+            B.CreateSub(execEnd, execStart, "morok.pftlb.ept.exec.delta");
+        execSamples.push_back(execDelta);
+
+        auto *oldMix =
+            B.CreateLoad(i64, MixSlot, "morok.pftlb.ept.mix.old");
+        oldMix->setVolatile(true);
+        Value *sampleMix = B.CreateXor(
+            B.CreateMul(
+                B.CreateXor(oldMix, execValue, "morok.pftlb.ept.mix.exec"),
+                ConstantInt::get(i64, rng.next() | 1ULL),
+                "morok.pftlb.ept.mix.mul"),
+            B.CreateAdd(readDelta, execDelta, "morok.pftlb.ept.mix.delta"),
+            "morok.pftlb.ept.mix");
+        B.CreateStore(sampleMix, MixSlot)->setVolatile(true);
+    }
+
+    auto sortSamples = [&](SmallVector<Value *, 8> samples,
+                           const Twine &prefix) {
+        for (unsigned i = 0; i < samples.size(); ++i) {
+            for (unsigned j = i + 1; j < samples.size(); ++j) {
+                Value *swap = B.CreateICmpUGT(samples[i], samples[j],
+                                             prefix + ".gt");
+                Value *lo =
+                    B.CreateSelect(swap, samples[j], samples[i],
+                                   prefix + ".lo");
+                Value *hi =
+                    B.CreateSelect(swap, samples[i], samples[j],
+                                   prefix + ".hi");
+                samples[i] = lo;
+                samples[j] = hi;
+            }
+        }
+        return samples;
+    };
+
+    SmallVector<Value *, 8> sortedRead =
+        sortSamples(readSamples, "morok.pftlb.ept.read.sort");
+    SmallVector<Value *, 8> sortedExec =
+        sortSamples(execSamples, "morok.pftlb.ept.exec.sort");
+    Value *readMedian = B.CreateLShr(
+        B.CreateAdd(sortedRead[3], sortedRead[4],
+                    "morok.pftlb.ept.read.median.sum"),
+        ConstantInt::get(i64, 1), "morok.pftlb.ept.read.median");
+    Value *execMedian = B.CreateLShr(
+        B.CreateAdd(sortedExec[3], sortedExec[4],
+                    "morok.pftlb.ept.exec.median.sum"),
+        ConstantInt::get(i64, 1), "morok.pftlb.ept.exec.median");
+    Value *readSpread =
+        B.CreateSub(sortedRead[7], sortedRead[0],
+                    "morok.pftlb.ept.read.spread");
+    Value *execSpread =
+        B.CreateSub(sortedExec[7], sortedExec[0],
+                    "morok.pftlb.ept.exec.spread");
+    Value *readBase = B.CreateSelect(
+        B.CreateICmpEQ(readMedian, ConstantInt::get(i64, 0),
+                       "morok.pftlb.ept.read.zero"),
+        ConstantInt::get(i64, 1), readMedian,
+        "morok.pftlb.ept.read.baseline");
+    Value *ratioHit = B.CreateICmpUGT(
+        execMedian,
+        B.CreateMul(readBase, ConstantInt::get(i64, 5),
+                    "morok.pftlb.ept.read.scaled"),
+        "morok.pftlb.ept.ratio");
+    Value *varianceFloor = B.CreateAnd(
+        B.CreateICmpULE(readSpread, ConstantInt::get(i64, 1),
+                        "morok.pftlb.ept.read.variance.floor"),
+        B.CreateICmpULE(execSpread, ConstantInt::get(i64, 1),
+                        "morok.pftlb.ept.exec.variance.floor"),
+        "morok.pftlb.ept.variance.floor");
+
+    Value *leaf1 = emitCpuid(B, M, ConstantInt::get(i32, 1),
+                             ConstantInt::get(i32, 0));
+    Value *ecx = cpuidReg(B, leaf1, 2, "morok.pftlb.ept.cpuid.ecx");
+    Value *hypervisorBit =
+        B.CreateAnd(B.CreateLShr(ecx, ConstantInt::get(i32, 31),
+                                 "morok.pftlb.ept.hypervisor.shift"),
+                    ConstantInt::get(i32, 1),
+                    "morok.pftlb.ept.hypervisor.bit");
+    Value *hypervisor =
+        B.CreateICmpNE(hypervisorBit, ConstantInt::get(i32, 0),
+                       "morok.pftlb.ept.hypervisor");
+    Value *signalCount = B.CreateAdd(
+        B.CreateAdd(B.CreateZExt(ratioHit, i32),
+                    B.CreateZExt(varianceFloor, i32),
+                    "morok.pftlb.ept.score.timing"),
+        B.CreateZExt(hypervisor, i32), "morok.pftlb.ept.score");
+    Value *twoOfThree =
+        B.CreateICmpUGE(signalCount, ConstantInt::get(i32, 2),
+                        "morok.pftlb.ept.two.of.three");
+    Value *qualified =
+        B.CreateAnd(hypervisor, twoOfThree, "morok.pftlb.ept.qualified");
+    Value *roundTripFailed =
+        B.CreateNot(roundTripOk, "morok.pftlb.ept.mprotect.failed");
+
+    Value *seed = B.CreateXor(
+        B.CreateMul(readMedian, ConstantInt::get(i64, rng.next() | 1ULL),
+                    "morok.pftlb.ept.seed.read"),
+        B.CreateMul(execMedian, ConstantInt::get(i64, rng.next() | 1ULL),
+                    "morok.pftlb.ept.seed.exec"),
+        "morok.pftlb.ept.seed.timing");
+    seed = B.CreateXor(
+        seed,
+        B.CreateMul(B.CreateAdd(readSpread, execSpread,
+                                "morok.pftlb.ept.seed.spread"),
+                    ConstantInt::get(i64, rng.next() | 1ULL),
+                    "morok.pftlb.ept.seed.spread.mix"),
+        "morok.pftlb.ept.seed");
+    seed = B.CreateXor(seed, roundTripDelta, "morok.pftlb.ept.seed.roundtrip");
+
+    foldState(B, State, seed, 0x84D3A5B91E6C27F0ULL, "morok.pftlb.ept.seed");
+    foldState(B, State, readMedian, 0x2F6E9C41D873A50BULL,
+              "morok.pftlb.ept.read.median");
+    foldState(B, State, execMedian, 0x91A7C2D40F5E6B38ULL,
+              "morok.pftlb.ept.exec.median");
+    foldState(B, State, roundTripDelta, 0xC51E8D72A49B306FULL,
+              "morok.pftlb.ept.mprotect.roundtrip");
+    foldFlag(B, State, roundTripFailed, 0x70E12A9D3C64B85FULL,
+             "morok.pftlb.ept.mprotect.failed");
+    foldFlag(B, State, ratioHit, 0x5E90C3A71B4D286FULL,
+             "morok.pftlb.ept.ratio");
+    foldFlag(B, State, varianceFloor, 0xA43F6D182C95E0B7ULL,
+             "morok.pftlb.ept.variance.floor");
+    foldFlag(B, State, hypervisor, 0xD08C3B5E91A7462FULL,
+             "morok.pftlb.ept.hypervisor");
+    foldFlag(B, State, qualified, 0x3B76E18F42D0A95CULL,
+             "morok.pftlb.ept.qualified");
+}
+
 Function *pageFaultTlbProbe(Module &M, GlobalVariable *State,
                             ir::IRRandom &rng, const Triple &TT) {
     SchroFaultLayout layout;
@@ -20266,6 +20501,8 @@ Function *pageFaultTlbProbe(Module &M, GlobalVariable *State,
     auto *hits =
         AB.CreateLoad(i32, pageFaultTlbHitsGlobal(M), "morok.pftlb.hits.final");
     hits->setVolatile(true);
+    emitPageFaultTlbEptTelemetry(AB, M, State, rng, TT, mapped, pageSize,
+                                 mixSlot);
     auto *mix = AB.CreateLoad(i64, mixSlot, "morok.pftlb.touch.mix.final");
     mix->setVolatile(true);
     Value *primaryDelta =
