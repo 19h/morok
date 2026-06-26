@@ -90,7 +90,7 @@ jobs:
           echo "SCCACHE_CACHE_SIZE=3G" >> "$GITHUB_ENV"
 
       - name: Restore sccache cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        uses: actions/cache/restore@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: ${{ env.SCCACHE_DIR }}
           # Key on the LLVM recipe (composite action) so any recipe change busts
