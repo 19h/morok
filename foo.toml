@@ -193,6 +193,15 @@ identity_policy = "raw"
 bind_to_runtime_seal = true
 virtualize_helpers = true
 
+[passes.env_binding_kdf]
+enabled = true
+mode = "feed_api"
+expected_digest = "0xD15EA5EBA5E60001"
+identity_policy = "ascii_lower_strip_ws"
+min_factors = 8
+bind_to_runtime_seal = false
+virtualize_helpers = true
+
 [passes.tracer_attestation]
 enabled = true
 mode = "linux_ptrace"
@@ -266,18 +275,18 @@ enabled = true
 function_order = true
 block_order = true
 anchor_probability = 100
-max_anchors = 128
+max_anchors = 256
 
 [passes.path_explosion]
 enabled = true
 probability = 100
-max_blocks = 8
+max_blocks = 16
 max_iterations = 64
 
 [passes.execution_trace_keying]
 enabled = true
 probability = 100
-max_blocks = 16
+max_blocks = 32
 
 [passes.dispatcherless_routing]
 enabled = true
@@ -309,14 +318,14 @@ max_sites = 4096
 [passes.function_fission]
 enabled = true
 probability = 100
-max_splits = 12
+max_splits = 32
 min_region_blocks = 2
-max_region_blocks = 48
+max_region_blocks = 64
 
 [passes.nanomites]
 enabled = true
 probability = 100
-max_sites = 64
+max_sites = 128
 
 [passes.chaos_state_machine]
 enabled = true
@@ -375,6 +384,9 @@ enabled = true
 [passes.windows_syscalls]
 enabled = true
 
+[passes.windows_process_modules]
+enabled = true
+
 [passes.platform_runtime]
 enabled = true
 direct_syscalls = "auto"
@@ -382,6 +394,7 @@ windows_mode = "direct_syscall"
 per_build_stubs = true
 minimize_imports = true
 import_table_audit = true
+static_link_expected = false
 
 [passes.windows_unhook]
 enabled = true
