@@ -189,8 +189,22 @@ Value *emitSiteHash(IRBuilder<> &B, Value *H, Value *Salt, const Twine &Name) {
                                 ConstantInt::get(I64, 0xA24BAED4963EE407ULL),
                                 Name + ".salt.mul"),
                     Name + ".add");
-    return B.CreateXor(H, B.CreateLShr(H, ConstantInt::get(I64, 32)),
-                       Name + ".fold1");
+    Value *Folded = B.CreateXor(H, B.CreateLShr(H, ConstantInt::get(I64, 32)),
+                                Name + ".fold1");
+    // Mirror siteHash()'s zero-guard exactly (see siteHash, the `H ? H : …`
+    // tail): a site hash that folds to 0 must map to the same non-zero fallback
+    // at runtime as it does at pass time.  Without this, hashName() substitutes
+    // the fallback while the resolver's runtime hasher yields 0, so the symbol
+    // never matches, resolution returns null, and the redirected call jumps to
+    // address 0 — an unrecoverable SIGSEGV loop under the exception handler.
+    Value *Fallback =
+        B.CreateOr(B.CreateXor(Salt,
+                               ConstantInt::get(I64, 0xC2B2AE3D27D4EB4FULL),
+                               Name + ".z.x"),
+                   ConstantInt::get(I64, 1), Name + ".z");
+    return B.CreateSelect(
+        B.CreateICmpEQ(Folded, ConstantInt::get(I64, 0), Name + ".isz"),
+        Fallback, Folded, Name + ".nz");
 }
 
 std::uint64_t baseHashName(StringRef Name, const Module &M, unsigned Family) {
@@ -759,7 +773,13 @@ Value *runtimeBaseHashName(IRBuilder<> &B, Module &M, Function *Fn, Value *Name,
     Acc->addIncoming(Next, Body);
 
     B.SetInsertPoint(Done);
-    return Acc;
+    // Mirror baseHashName()'s zero-guard exactly (its `H ? H : HK.prime` tail):
+    // an FNV accumulator that lands on 0 must map to HK.prime at runtime too,
+    // otherwise the runtime hash diverges from the pass-time hashName() and the
+    // symbol is never matched (resolution returns null -> SIGSEGV hang).
+    return B.CreateSelect(
+        B.CreateICmpEQ(Acc, ConstantInt::get(I64, 0), "morok.fco.ex.hash.isz"),
+        ConstantInt::get(I64, HK.prime), Acc, "morok.fco.ex.hash.nz");
 }
 
 Value *runtimeHashName(IRBuilder<> &B, Module &M, Function *Fn, Value *Name) {
@@ -2117,6 +2137,14 @@ Function *manualHashResolver(Module &M, const Triple &TT, unsigned Family) {
     return nullptr;
 }
 
+// Length in bytes of the faulting store emitted by emitFault() (below): `movq
+// %rax, (%rax)` encodes as REX.W(0x48) 0x89 0x00 = 3 bytes.  The preceding
+// `xorq %rax, %rax` does not fault, so on entry the saved RIP points at this
+// store; the exception handler advances RIP by exactly this many bytes to
+// resume on the instruction after the fault.  Keep this in lockstep with the
+// asm string in emitFault().
+constexpr std::uint64_t kFaultStoreLen = 3;
+
 Function *exceptionHandler(Module &M, ExceptionRuntime &Rt,
                            FunctionCallee Resolver, bool ManualResolver,
                            int RtldDefaultVal) {
@@ -2187,11 +2215,30 @@ Function *exceptionHandler(Module &M, ExceptionRuntime &Rt,
     RB.CreateStore(ConstantPointerNull::get(Ptr), Rt.out);
     RB.CreateStore(ConstantPointerNull::get(Ptr), Rt.cont);
     RB.CreateStore(ConstantInt::get(I64, 0), Rt.hash);
+    // Resume by advancing the saved RIP PAST the faulting store, rather than
+    // jumping to the recorded `Cont` blockaddress.  emitFault() always emits the
+    // 3-byte `movq %rax, (%rax)` (REX.W 48 / 89 / 00) as the faulting
+    // instruction, and the kernel leaves uc_mcontext.rip pointing at it, so
+    // RIP += kFaultStoreLen lands on whatever the call site emitted next (the
+    // branch into the resolver) along the *actual* execution path.
+    //
+    // The blockaddress form is unsafe: FunctionCallObfuscate runs before
+    // SplitBasicBlocks and BogusControlFlow (see pipeline/Scheduler.cpp), which
+    // clone and split the fault block afterwards.  That can divorce the recorded
+    // continuation from the path actually taken, or drop the block whose address
+    // was taken so the BlockAddress folds to null — the handler would then set
+    // RIP=0 and the thread would fault on address 0 forever (observed as an
+    // infinite SIGSEGV storm hanging fp_piecewise_chaos / syscall_file_ops at
+    // -preset high on x86_64 Linux).  Skipping the fixed-length fault follows the
+    // real instruction stream and is immune to any later CFG transform.
+    auto *IP = M.getDataLayout().getIntPtrType(Ctx);
     Value *RipSlot =
         gepI8(RB, M, UCtx, constIp(M, 168), "morok.fco.ex.rip.slot");
-    RB.CreateStore(RB.CreatePtrToInt(Cont, M.getDataLayout().getIntPtrType(Ctx),
-                                     "morok.fco.ex.rip"),
-                   RipSlot);
+    Value *FaultRip = RB.CreateLoad(IP, RipSlot, "morok.fco.ex.rip.cur");
+    Value *NextRip = RB.CreateAdd(
+        FaultRip, ConstantInt::get(IP, kFaultStoreLen), "morok.fco.ex.rip.next");
+    RB.CreateStore(NextRip, RipSlot);
+    (void)Cont; // retained only as a non-null claim sentinel (see HasRequest)
     RB.CreateBr(Done);
 
     IRBuilder<> DB(Done);
