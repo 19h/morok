@@ -189,6 +189,10 @@ bool eligible(CallInst &CI) {
         return false;
     if (Caller->getName().starts_with("morok."))
         return false;
+    // Direct self-recursion re-enters the same carrier protocol on nested
+    // frames; leave those edges direct and still dispatch the surrounding graph.
+    if (Caller == Callee)
+        return false;
     return true;
 }
 

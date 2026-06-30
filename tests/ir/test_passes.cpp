@@ -14291,6 +14291,62 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("callerKeyedDispatchModule leaves direct self-recursion direct") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "aarch64-unknown-linux-gnu"
+define internal i32 @leaf(i32 %x) {
+entry:
+  %r = add i32 %x, 1
+  ret i32 %r
+}
+
+define internal i32 @rec(i32 %x) {
+entry:
+  %done = icmp eq i32 %x, 0
+  br i1 %done, label %base, label %again
+
+base:
+  ret i32 0
+
+again:
+  %next = sub i32 %x, 1
+  %r = call i32 @rec(i32 %next)
+  %l = call i32 @leaf(i32 %r)
+  ret i32 %l
+}
+
+define i32 @caller(i32 %x) {
+entry:
+  %r = call i32 @rec(i32 %x)
+  ret i32 %r
+}
+)ir");
+    Function *Rec = M->getFunction("rec");
+    Function *Caller = M->getFunction("caller");
+    REQUIRE(Rec);
+    REQUIRE(Caller);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(9521);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::CallerKeyedDispatchParams params;
+    params.probability = 100;
+    params.max_calls = 16;
+    params.region_bytes = 8;
+
+    CHECK(morok::passes::callerKeyedDispatchModule(*M, params, rng));
+
+    Function *Dispatch = M->getFunction("morok.ckd.dispatch");
+    REQUIRE(Dispatch != nullptr);
+    CHECK(countCallsTo(*Rec, "rec") == 1u);
+    CHECK(countCallsTo(*Rec, "leaf") == 0u);
+    CHECK(countCallsThroughOperand(*Rec, Dispatch) == 1u);
+    CHECK(countCallsTo(*Caller, "rec") == 0u);
+    CHECK(countCallsThroughOperand(*Caller, Dispatch) == 1u);
+    CHECK(countGlobals(*M, "morok.ckd.enc") == 2u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 // Regression for #21: caller-keyed dispatch self-sealed at startup.  The
 // constructor recomputed each site's encoded target from the LIVE code bytes
 // whenever the mutable code_size slot read the unsealed sentinel, then stored
