@@ -56,6 +56,7 @@
 #include "morok/passes/SplitBasicBlocks.hpp"
 #include "morok/passes/StackCoalescing.hpp"
 #include "morok/passes/StackDeltaGames.hpp"
+#include "morok/passes/StackRebase.hpp"
 #include "morok/passes/StateOpaquePredicates.hpp"
 #include "morok/passes/StringEncryption.hpp"
 #include "morok/passes/SubThresholdPersistence.hpp"
@@ -621,6 +622,10 @@ PassPluginLibraryInfo getPluginInfo() {
                     }
                     if (name == "morok-stackdelta") {
                         FPM.addPass(passes::StackDeltaGamesPass());
+                        return true;
+                    }
+                    if (name == "morok-stackrebase") {
+                        FPM.addPass(passes::StackRebasePass());
                         return true;
                     }
                     if (name == "morok-ptrlaunder") {

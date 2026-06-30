@@ -68,6 +68,15 @@ struct StackDeltaConfig {
     Opt<std::uint32_t> touches;
 };
 
+struct StackRebaseConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> realign_align;
+    Opt<std::uint32_t> dynamic_size;
+    Opt<std::uint32_t> relocate_probability;
+    Opt<std::uint32_t> alias_amplify;
+    Opt<bool> nonentry_shuffle;
+};
+
 struct PointerLaunderConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> pointer_probability;
@@ -441,6 +450,7 @@ struct PassConfig {
     SplitConfig split;
     StackCoalesceConfig stack_coalesce;
     StackDeltaConfig stack_delta;
+    StackRebaseConfig stack_rebase;
     PointerLaunderConfig pointer_launder;
     TypePunConfig type_pun;
     PhiTangleConfig phi_tangle;

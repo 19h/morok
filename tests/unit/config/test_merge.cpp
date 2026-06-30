@@ -76,6 +76,12 @@ TEST_CASE("merge handles every pass family") {
     src.stack_delta.min_bytes = 19u;
     src.stack_delta.max_extra_bytes = 40u;
     src.stack_delta.touches = 3u;
+    src.stack_rebase.enabled = true;
+    src.stack_rebase.realign_align = 96u;
+    src.stack_rebase.dynamic_size = 192u;
+    src.stack_rebase.relocate_probability = 71u;
+    src.stack_rebase.alias_amplify = 37u;
+    src.stack_rebase.nonentry_shuffle = true;
     src.pointer_launder.enabled = true;
     src.pointer_launder.pointer_probability = 85u;
     src.pointer_launder.integer_probability = 30u;
@@ -292,6 +298,12 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.stack_delta.min_bytes == 19u);
     CHECK(dst.stack_delta.max_extra_bytes == 40u);
     CHECK(dst.stack_delta.touches == 3u);
+    CHECK(dst.stack_rebase.enabled == true);
+    CHECK(dst.stack_rebase.realign_align == 96u);
+    CHECK(dst.stack_rebase.dynamic_size == 192u);
+    CHECK(dst.stack_rebase.relocate_probability == 71u);
+    CHECK(dst.stack_rebase.alias_amplify == 37u);
+    CHECK(dst.stack_rebase.nonentry_shuffle == true);
     CHECK(dst.pointer_launder.enabled == true);
     CHECK(dst.pointer_launder.pointer_probability == 85u);
     CHECK(dst.pointer_launder.integer_probability == 30u);

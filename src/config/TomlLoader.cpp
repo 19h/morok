@@ -109,6 +109,15 @@ void parseStackDelta(const toml::table &t, StackDeltaConfig &c) {
     c.touches = readU32(t["touches"]);
 }
 
+void parseStackRebase(const toml::table &t, StackRebaseConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.realign_align = readU32(t["realign_align"]);
+    c.dynamic_size = readU32(t["dynamic_size"]);
+    c.relocate_probability = readU32(t["relocate_probability"]);
+    c.alias_amplify = readU32(t["alias_amplify"]);
+    c.nonentry_shuffle = readBool(t["nonentry_shuffle"]);
+}
+
 void parsePointerLaunder(const toml::table &t, PointerLaunderConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.pointer_probability = readU32(t["pointer_probability"]);
@@ -490,6 +499,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseStackCoalesce(*t, pc.stack_coalesce);
     if (auto *t = p["stack_delta_games"].as_table())
         parseStackDelta(*t, pc.stack_delta);
+    if (auto *t = p["stack_rebase"].as_table())
+        parseStackRebase(*t, pc.stack_rebase);
     if (auto *t = p["pointer_laundering"].as_table())
         parsePointerLaunder(*t, pc.pointer_launder);
     if (auto *t = p["type_punning"].as_table())

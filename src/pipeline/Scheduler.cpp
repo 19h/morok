@@ -54,6 +54,7 @@
 #include "morok/passes/SplitBasicBlocks.hpp"
 #include "morok/passes/StackCoalescing.hpp"
 #include "morok/passes/StackDeltaGames.hpp"
+#include "morok/passes/StackRebase.hpp"
 #include "morok/passes/StateOpaquePredicates.hpp"
 #include "morok/passes/StringEncryption.hpp"
 #include "morok/passes/SubThresholdPersistence.hpp"
@@ -1025,6 +1026,26 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
                     eff.stack_delta.max_extra_bytes.value_or(64);
                 p.touches = eff.stack_delta.touches.value_or(3);
                 changed |= passes::stackDeltaGamesFunction(F, p, rng);
+            }
+
+            // Persistently pressure the backend into realigned/dynamic stack
+            // frames and escape selected frame addresses before pointer
+            // laundering obscures the emitted GEP/int traffic.
+            if (heavyFunctionOk(F) &&
+                ir::shouldObfuscate(F, "stackrebase",
+                                    eff.stack_rebase.enabled.value_or(false))) {
+                passes::StackRebaseParams p;
+                p.realign_align =
+                    eff.stack_rebase.realign_align.value_or(64);
+                p.dynamic_size =
+                    eff.stack_rebase.dynamic_size.value_or(128);
+                p.relocate_probability =
+                    eff.stack_rebase.relocate_probability.value_or(60);
+                p.alias_amplify =
+                    eff.stack_rebase.alias_amplify.value_or(40);
+                p.nonentry_shuffle =
+                    eff.stack_rebase.nonentry_shuffle.value_or(false);
+                changed |= passes::stackRebaseFunction(F, p, rng);
             }
 
             // Launder the frame/GEP pointers introduced above and selected

@@ -56,6 +56,7 @@
 #include "morok/passes/SplitBasicBlocks.hpp"
 #include "morok/passes/StackCoalescing.hpp"
 #include "morok/passes/StackDeltaGames.hpp"
+#include "morok/passes/StackRebase.hpp"
 #include "morok/passes/StateOpaquePredicates.hpp"
 #include "morok/passes/StringEncryption.hpp"
 #include "morok/passes/SubThresholdPersistence.hpp"
@@ -5118,6 +5119,152 @@ entry:
         rng));
     CHECK(countGlobals(*M, "morok.stackdelta.seed") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("stackRebaseFunction emits persistent realigned dynamic frame pressure") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+target datalayout = "e-m:e-p:64:64-i64:64-f80:128-n8:16:32:64-S128"
+define i32 @stackrebase(i32 %x, ptr %sink) {
+entry:
+  %local = alloca i32, align 4
+  store i32 %x, ptr %local, align 4
+  %loaded = load i32, ptr %local, align 4
+  %r = add i32 %loaded, 7
+  ret i32 %r
+}
+)ir");
+    Function *F = M->getFunction("stackrebase");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x514c);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::stackRebaseFunction(
+        *F,
+        {/*realign_align=*/64, /*dynamic_size=*/128,
+         /*relocate_probability=*/100, /*alias_amplify=*/100,
+         /*nonentry_shuffle=*/false},
+        rng));
+
+    CHECK(F->hasFnAttribute(Attribute::NoInline));
+    CHECK(F->getFnAttribute("frame-pointer").getValueAsString() == "all");
+
+    bool hasRealignedAlloca = false;
+    bool hasDynamicAlloca = false;
+    bool hasVolatilePtrStore = false;
+    bool hasReadableIntentGlobal = false;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+            hasRealignedAlloca |= AI->isStaticAlloca() &&
+                                  AI->getAlign().value() >= 64u;
+            hasDynamicAlloca |= !AI->isStaticAlloca();
+        }
+        if (auto *SI = dyn_cast<StoreInst>(&I))
+            hasVolatilePtrStore |=
+                SI->isVolatile() && SI->getValueOperand()->getType()->isPointerTy();
+    }
+    for (GlobalVariable &GV : M->globals())
+        hasReadableIntentGlobal |= GV.getName().contains("anchor") ||
+                                   GV.getName().contains("stackrebase");
+
+    CHECK(hasRealignedAlloca);
+    CHECK(hasDynamicAlloca);
+    CHECK(hasVolatilePtrStore);
+    CHECK(countVolatileAccesses(*F) >= 6u);
+    CHECK_FALSE(hasReadableIntentGlobal);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("stackRebaseFunction emits optional non-entry stack shuffle") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+target datalayout = "e-m:e-p:64:64-i64:64-f80:128-n8:16:32:64-S128"
+define i32 @stackrebase_shuffle(i32 %x, i1 %flag) {
+entry:
+  br i1 %flag, label %left, label %right
+left:
+  %l = add i32 %x, 1
+  ret i32 %l
+right:
+  %r = xor i32 %x, 3
+  ret i32 %r
+}
+)ir");
+    Function *F = M->getFunction("stackrebase_shuffle");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x5151);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::stackRebaseFunction(
+        *F,
+        {/*realign_align=*/0, /*dynamic_size=*/0,
+         /*relocate_probability=*/0, /*alias_amplify=*/0,
+         /*nonentry_shuffle=*/true},
+        rng));
+
+    bool hasStackSave = false;
+    bool hasStackRestore = false;
+    bool hasDynamicAlloca = false;
+    for (Instruction &I : instructions(*F)) {
+        if (auto *AI = dyn_cast<AllocaInst>(&I))
+            hasDynamicAlloca |= !AI->isStaticAlloca();
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+            if (Function *Callee = CI->getCalledFunction()) {
+                hasStackSave |= Callee->getName().starts_with("llvm.stacksave");
+                hasStackRestore |=
+                    Callee->getName().starts_with("llvm.stackrestore");
+            }
+        }
+    }
+
+    CHECK(hasStackSave);
+    CHECK(hasStackRestore);
+    CHECK(hasDynamicAlloca);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("stackRebaseFunction skips fragile targets and functions") {
+    LLVMContext ctx;
+    auto Win = parse(ctx, R"ir(
+target triple = "x86_64-pc-windows-msvc"
+define i32 @win_target(i32 %x) {
+entry:
+  %slot = alloca i32, align 4
+  store i32 %x, ptr %slot, align 4
+  ret i32 %x
+}
+)ir");
+    Function *WinF = Win->getFunction("win_target");
+    REQUIRE(WinF);
+
+    auto Tail = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+target datalayout = "e-m:e-p:64:64-i64:64-f80:128-n8:16:32:64-S128"
+declare i32 @tail_sink(i32)
+define i32 @musttail_user(i32 %x) {
+entry:
+  %r = musttail call i32 @tail_sink(i32 %x)
+  ret i32 %r
+}
+)ir");
+    Function *TailF = Tail->getFunction("musttail_user");
+    REQUIRE(TailF);
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x5152);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::StackRebaseParams Params{
+        /*realign_align=*/64, /*dynamic_size=*/128,
+        /*relocate_probability=*/100, /*alias_amplify=*/100,
+        /*nonentry_shuffle=*/true};
+
+    CHECK_FALSE(morok::passes::stackRebaseFunction(*WinF, Params, rng));
+    CHECK_FALSE(morok::passes::stackRebaseFunction(*TailF, Params, rng));
+    CHECK(countVolatileAccesses(*WinF) == 0u);
+    CHECK(countVolatileAccesses(*TailF) == 0u);
+    CHECK_FALSE(verifyModule(*Win, &errs()));
+    CHECK_FALSE(verifyModule(*Tail, &errs()));
 }
 
 TEST_CASE("pointerLaunderFunction launders memory pointer operands") {

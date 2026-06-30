@@ -89,6 +89,13 @@ PassConfig makeLow() {
     c.stack_delta.max_extra_bytes = 0;
     c.stack_delta.touches = 0;
 
+    c.stack_rebase.enabled = false;
+    c.stack_rebase.realign_align = 0;
+    c.stack_rebase.dynamic_size = 0;
+    c.stack_rebase.relocate_probability = 0;
+    c.stack_rebase.alias_amplify = 0;
+    c.stack_rebase.nonentry_shuffle = false;
+
     c.pointer_launder.enabled = false;
     c.pointer_launder.pointer_probability = 0;
     c.pointer_launder.integer_probability = 0;
@@ -352,6 +359,13 @@ PassConfig makeMid() {
     c.stack_delta.max_extra_bytes = 32;
     c.stack_delta.touches = 2;
 
+    c.stack_rebase.enabled = false;
+    c.stack_rebase.realign_align = 0;
+    c.stack_rebase.dynamic_size = 0;
+    c.stack_rebase.relocate_probability = 0;
+    c.stack_rebase.alias_amplify = 0;
+    c.stack_rebase.nonentry_shuffle = false;
+
     c.pointer_launder.enabled = true;
     c.pointer_launder.pointer_probability = 50;
     c.pointer_launder.integer_probability = 25;
@@ -606,6 +620,13 @@ PassConfig makeHigh() {
     c.stack_delta.min_bytes = 17;
     c.stack_delta.max_extra_bytes = 64;
     c.stack_delta.touches = 3;
+
+    c.stack_rebase.enabled = true;
+    c.stack_rebase.realign_align = 64;
+    c.stack_rebase.dynamic_size = 128;
+    c.stack_rebase.relocate_probability = 60;
+    c.stack_rebase.alias_amplify = 40;
+    c.stack_rebase.nonentry_shuffle = false;
 
     c.pointer_launder.enabled = true;
     c.pointer_launder.pointer_probability = 90;
@@ -880,6 +901,13 @@ PassConfig makeMax() {
     c.stack_delta.min_bytes = 17;
     c.stack_delta.max_extra_bytes = 96;
     c.stack_delta.touches = 4;
+
+    c.stack_rebase.enabled = true;
+    c.stack_rebase.realign_align = 128;
+    c.stack_rebase.dynamic_size = 256;
+    c.stack_rebase.relocate_probability = 100;
+    c.stack_rebase.alias_amplify = 75;
+    c.stack_rebase.nonentry_shuffle = true;
 
     c.pointer_launder.enabled = true;
     c.pointer_launder.pointer_probability = 100;

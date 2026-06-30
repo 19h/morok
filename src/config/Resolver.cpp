@@ -72,6 +72,15 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.stack_delta.min_bytes, src.stack_delta.min_bytes);
     mergeOpt(dst.stack_delta.max_extra_bytes, src.stack_delta.max_extra_bytes);
     mergeOpt(dst.stack_delta.touches, src.stack_delta.touches);
+    // Persistent stack-frame rebasing pressure
+    mergeOpt(dst.stack_rebase.enabled, src.stack_rebase.enabled);
+    mergeOpt(dst.stack_rebase.realign_align, src.stack_rebase.realign_align);
+    mergeOpt(dst.stack_rebase.dynamic_size, src.stack_rebase.dynamic_size);
+    mergeOpt(dst.stack_rebase.relocate_probability,
+             src.stack_rebase.relocate_probability);
+    mergeOpt(dst.stack_rebase.alias_amplify, src.stack_rebase.alias_amplify);
+    mergeOpt(dst.stack_rebase.nonentry_shuffle,
+             src.stack_rebase.nonentry_shuffle);
     // Pointer laundering
     mergeOpt(dst.pointer_launder.enabled, src.pointer_launder.enabled);
     mergeOpt(dst.pointer_launder.pointer_probability,

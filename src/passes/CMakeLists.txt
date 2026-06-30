@@ -15,6 +15,7 @@ add_library(morok_passes STATIC
   SplitBasicBlocks.cpp
   StackCoalescing.cpp
   StackDeltaGames.cpp
+  StackRebase.cpp
   PointerLaundering.cpp
   TypePunning.cpp
   PhiTangling.cpp

@@ -188,6 +188,13 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     min_bytes = 21
     max_extra_bytes = 48
     touches = 4
+    [passes.stack_rebase]
+    enabled = true
+    realign_align = 96
+    dynamic_size = 192
+    relocate_probability = 71
+    alias_amplify = 37
+    nonentry_shuffle = true
     [passes.pointer_laundering]
     enabled = true
     pointer_probability = 80
@@ -465,6 +472,12 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.stack_delta.min_bytes == 21u);
     CHECK(r.config.passes.stack_delta.max_extra_bytes == 48u);
     CHECK(r.config.passes.stack_delta.touches == 4u);
+    CHECK(r.config.passes.stack_rebase.enabled == true);
+    CHECK(r.config.passes.stack_rebase.realign_align == 96u);
+    CHECK(r.config.passes.stack_rebase.dynamic_size == 192u);
+    CHECK(r.config.passes.stack_rebase.relocate_probability == 71u);
+    CHECK(r.config.passes.stack_rebase.alias_amplify == 37u);
+    CHECK(r.config.passes.stack_rebase.nonentry_shuffle == true);
     CHECK(r.config.passes.pointer_launder.enabled == true);
     CHECK(r.config.passes.pointer_launder.pointer_probability == 80u);
     CHECK(r.config.passes.pointer_launder.integer_probability == 20u);

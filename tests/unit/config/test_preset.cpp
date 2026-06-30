@@ -65,6 +65,7 @@ TEST_CASE("low preset matches the documented table") {
     CHECK(c.const_enc.feistel == false);
     CHECK(c.stack_coalesce.enabled == false);
     CHECK(c.stack_delta.enabled == false);
+    CHECK(c.stack_rebase.enabled == false);
     CHECK(c.pointer_launder.enabled == false);
     CHECK(c.type_pun.enabled == false);
     CHECK(c.phi_tangle.enabled == false);
@@ -123,6 +124,12 @@ TEST_CASE("mid preset matches the documented table") {
     CHECK(c.stack_delta.min_bytes == 17u);
     CHECK(c.stack_delta.max_extra_bytes == 32u);
     CHECK(c.stack_delta.touches == 2u);
+    CHECK(c.stack_rebase.enabled == false);
+    CHECK(c.stack_rebase.realign_align == 0u);
+    CHECK(c.stack_rebase.dynamic_size == 0u);
+    CHECK(c.stack_rebase.relocate_probability == 0u);
+    CHECK(c.stack_rebase.alias_amplify == 0u);
+    CHECK(c.stack_rebase.nonentry_shuffle == false);
     CHECK(c.pointer_launder.enabled == true);
     CHECK(c.pointer_launder.pointer_probability == 50u);
     CHECK(c.type_pun.enabled == true);
@@ -229,6 +236,12 @@ TEST_CASE("high preset matches the documented table") {
     CHECK(c.stack_delta.min_bytes == 17u);
     CHECK(c.stack_delta.max_extra_bytes == 64u);
     CHECK(c.stack_delta.touches == 3u);
+    CHECK(c.stack_rebase.enabled == true);
+    CHECK(c.stack_rebase.realign_align == 64u);
+    CHECK(c.stack_rebase.dynamic_size == 128u);
+    CHECK(c.stack_rebase.relocate_probability == 60u);
+    CHECK(c.stack_rebase.alias_amplify == 40u);
+    CHECK(c.stack_rebase.nonentry_shuffle == false);
     CHECK(c.pointer_launder.enabled == true);
     CHECK(c.pointer_launder.pointer_probability == 90u);
     CHECK(c.pointer_launder.integer_probability == 45u);
@@ -412,6 +425,12 @@ TEST_CASE("max preset enables every pass at full intensity") {
     CHECK(c.split.enabled == true);
     CHECK(c.stack_coalesce.enabled == true);
     CHECK(c.stack_delta.enabled == true);
+    CHECK(c.stack_rebase.enabled == true);
+    CHECK(c.stack_rebase.realign_align == 128u);
+    CHECK(c.stack_rebase.dynamic_size == 256u);
+    CHECK(c.stack_rebase.relocate_probability == 100u);
+    CHECK(c.stack_rebase.alias_amplify == 75u);
+    CHECK(c.stack_rebase.nonentry_shuffle == true);
     CHECK(c.pointer_launder.enabled == true);
     CHECK(c.type_pun.enabled == true);
     CHECK(c.phi_tangle.enabled == true);
