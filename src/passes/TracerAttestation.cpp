@@ -443,9 +443,6 @@ void emitShareRound(Module &M, Function &Ctor, IRBuilder<> &B,
                                 I * 0x9E3779B97F4A7C15ULL),
                     "morok.tracer.repair.seal");
         }
-        runtime_seal::foldFlag(FoldB, runtime_seal::kAntiDebugChannel, Mismatch,
-                               FoldSalt ^ 0x8A6F0E4D27D5C139ULL,
-                               "morok.tracer.antidbg");
     }
     FoldB.CreateBr(ContBB);
 
@@ -467,7 +464,6 @@ bool tracerAttestationModule(Module &M, const TracerAttestationParams &Params,
 
     if (Params.bind_to_runtime_seal) {
         runtime_seal::getChannel(M, runtime_seal::kTracerChannel, Rng);
-        runtime_seal::getChannel(M, runtime_seal::kAntiDebugChannel, Rng);
     }
 
     Function *ShareHelper = getShareHelper(M, Rng, Params.virtualize_helpers);

@@ -514,6 +514,16 @@ void foldEnforcedFlag(IRBuilderBase &B, GlobalVariable *State, Value *Flag,
     sealFold(B, Flag, Salt ^ 0xA5B0E176D83429CFULL);
 }
 
+void foldCorroboratedGateFlag(IRBuilderBase &B, GlobalVariable *State,
+                              Value *Flag, std::uint64_t Salt,
+                              const Twine &Name) {
+    // Anti-hook probes are noisy across dynamic loaders, hypervisors, and
+    // emulators. Keep individual verdicts in the anti-hook state/gate; the
+    // anti_hook seal is consumed only by emitGateDecision() after independent
+    // evidence has corroborated the event.
+    foldFlag(B, State, Flag, Salt, Name, /*ScoreSoftSignal=*/false);
+}
+
 Value *packedI32Flag(IRBuilderBase &B, Value *Packed, std::uint32_t Mask,
                      const Twine &BitsName, const Twine &Name) {
     auto *ty = cast<IntegerType>(Packed->getType());
@@ -540,6 +550,21 @@ Value *constIp(Module &M, std::uint64_t V) {
 
 Value *constSignedIp(Module &M, std::int64_t V) {
     return ConstantInt::getSigned(intPtrTy(M), V);
+}
+
+Value *validAuxvPhdrPointer(IRBuilderBase &B, Module &M, Value *AtPhdr,
+                            const Twine &Name) {
+    auto *ip = intPtrTy(M);
+    Value *nonNull =
+        B.CreateICmpNE(AtPhdr, ConstantInt::get(ip, 0), Name + ".nonzero");
+    if (ip->getBitWidth() < 64)
+        return nonNull;
+    // When a musl program is launched as `ld-musl.so ./prog`, auxv can expose
+    // an unrelocated/loader-relative AT_PHDR value. Treat low 64-bit pointers
+    // as unavailable so anti-hook probes do not dereference unmapped pages.
+    Value *highHalf = B.CreateICmpUGT(
+        AtPhdr, ConstantInt::get(ip, 0x100000000ULL), Name + ".high");
+    return B.CreateAnd(nonNull, highHalf, Name);
 }
 
 Value *gepI8(IRBuilderBase &B, Module &M, Value *Base, Value *Offset,
@@ -711,7 +736,7 @@ struct GateDecision {
 };
 
 GateDecision emitGateDecision(IRBuilderBase &B, GlobalVariable *State,
-                              GateAccumulator &Gate) {
+                              GateAccumulator &Gate, StringRef SealChannel) {
     auto *i64 = B.getInt64Ty();
     GateDecision decision;
     decision.hardScore =
@@ -756,19 +781,19 @@ GateDecision emitGateDecision(IRBuilderBase &B, GlobalVariable *State,
 
     foldState(B, State, decision.finalScore, 0x2E5B91A73C64D80FULL,
               "morok.gate.score.state");
-    runtime_seal::foldFlag(B, runtime_seal::kAntiDebugChannel,
-                           decision.confirmed, 0x9C4F1D72E6A835B0ULL,
+    runtime_seal::foldFlag(B, SealChannel, decision.confirmed,
+                           0x9C4F1D72E6A835B0ULL,
                            "morok.gate.score.fold");
     Value *softWord =
         B.CreateSelect(decision.softConfirmed, decision.softScore,
                        ConstantInt::get(i64, 0), "morok.gate.soft.word");
-    runtime_seal::foldWord(B, runtime_seal::kAntiDebugChannel, softWord,
-                           0x5F72E319A840C6DBULL, "morok.gate.soft.kdf");
+    runtime_seal::foldWord(B, SealChannel, softWord, 0x5F72E319A840C6DBULL,
+                           "morok.gate.soft.kdf");
     Value *coherenceWord =
         B.CreateSelect(decision.confirmed, cappedPenalty,
                        ConstantInt::get(i64, 0),
                        "morok.gate.coherence.word");
-    runtime_seal::foldWord(B, runtime_seal::kAntiDebugChannel, coherenceWord,
+    runtime_seal::foldWord(B, SealChannel, coherenceWord,
                            0xC1A46E8B32D90F75ULL,
                            "morok.gate.coherence.kdf");
     return decision;
@@ -7640,7 +7665,7 @@ Function *responseActionFunction(Module &M, ir::IRRandom &rng,
 
 Value *emitGateResponseTier(IRBuilder<> &B, GlobalVariable *State,
                             const GateDecision &Decision, Value *Tier7,
-                            const Twine &Name) {
+                            StringRef SealChannel, const Twine &Name) {
     auto *i64 = B.getInt64Ty();
     Value *softTier = B.CreateSelect(
         Decision.softConfirmed, ConstantInt::get(i64, 4),
@@ -7648,7 +7673,7 @@ Value *emitGateResponseTier(IRBuilder<> &B, GlobalVariable *State,
     Value *responseTier = B.CreateSelect(
         Tier7, ConstantInt::get(i64, 7), softTier, Name + ".tier");
     foldState(B, State, responseTier, 0xE31C749A52B806DFULL, Name);
-    runtime_seal::foldWord(B, runtime_seal::kAntiDebugChannel, responseTier,
+    runtime_seal::foldWord(B, SealChannel, responseTier,
                            0x7C2D48E1B59A306FULL, Name + ".kdf");
     return responseTier;
 }
@@ -8035,6 +8060,7 @@ Function *linuxCleanCopyProbe(Module &M, ir::IRRandom &rng, const Triple &TT) {
     Value *mapPtr = PB.CreateIntToPtr(mapAddr, ptr, "morok.clean.map.ptr");
     Value *magic = loadAt(PB, M, i32, mapPtr, 0ULL, "morok.clean.elf.magic");
     Value *elfType = loadAt(PB, M, i16, mapPtr, 16, "morok.clean.elf.type");
+    Value *elfEntry = loadAt(PB, M, i64, mapPtr, 24, "morok.clean.elf.entry");
     Value *isElf64 = PB.CreateICmpEQ(magic, ConstantInt::get(i32, 0x464C457F));
     Value *phOff = loadAt(PB, M, i64, mapPtr, 32, "morok.clean.elf.phoff");
     Value *phEntRaw =
@@ -8046,14 +8072,30 @@ Function *linuxCleanCopyProbe(Module &M, ir::IRRandom &rng, const Triple &TT) {
         M.getOrInsertFunction("getauxval", FunctionType::get(ip, {ip}, false));
     Value *atPhdr = PB.CreateCall(getauxval, {ConstantInt::get(ip, 3)},
                                   "morok.clean.atphdr");
+    Value *atEntry = PB.CreateCall(getauxval, {ConstantInt::get(ip, 9)},
+                                   "morok.clean.atentry");
     Value *phBytes = PB.CreateMul(phEnt, phNum, "morok.clean.elf.phbytes");
     Value *phEnd = PB.CreateAdd(phOff, phBytes, "morok.clean.elf.phend");
     Value *validPh =
         PB.CreateAnd(PB.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
                      PB.CreateICmpULE(phEnd, fileSize));
+    Value *runtimeBase =
+        PB.CreateSub(atPhdr, phOff, "morok.clean.elf.runtime.base");
+    Value *runtimeEntry = PB.CreateSelect(
+        PB.CreateICmpEQ(elfType, ConstantInt::get(i16, 3)),
+        PB.CreateAdd(runtimeBase, elfEntry), elfEntry,
+        "morok.clean.elf.runtime.entry");
+    Value *entryMatches = PB.CreateAnd(
+        PB.CreateICmpNE(atEntry, ConstantInt::get(ip, 0)),
+        PB.CreateICmpEQ(runtimeEntry, atEntry),
+        "morok.clean.elf.entry.match");
     Value *valid = PB.CreateAnd(
-        isElf64, PB.CreateAnd(validPh, PB.CreateICmpNE(
-                                           atPhdr, ConstantInt::get(ip, 0))));
+        isElf64,
+        PB.CreateAnd(
+            validPh,
+            validAuxvPhdrPointer(PB, M, atPhdr, "morok.clean.phdr.ptr")));
+    valid = PB.CreateAnd(valid, entryMatches,
+                         "morok.clean.elf.runtime.match");
     PB.CreateCondBr(valid, phLoopBB, badElfBB);
 
     IRBuilder<> BEB(badElfBB);
@@ -8629,10 +8671,10 @@ Function *linuxGotTargetInRx(Module &M) {
     auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
 
     IRBuilder<> EB(entry);
-    Value *hasSelfPhdr =
-        EB.CreateAnd(EB.CreateICmpNE(atPhdr, ConstantInt::get(ip, 0)),
-                     EB.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
-                     "morok.antihook.got.self.phdr");
+    Value *hasSelfPhdr = EB.CreateAnd(
+        validAuxvPhdrPointer(EB, M, atPhdr, "morok.antihook.got.self.phdr.ptr"),
+        EB.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
+        "morok.antihook.got.self.phdr");
     EB.CreateCondBr(hasSelfPhdr, selfLoopBB, ret0BB);
 
     IRBuilder<> SLB(selfLoopBB);
@@ -8711,11 +8753,11 @@ Function *linuxGotLazyPltTarget(Module &M) {
     auto *ret0BB = BasicBlock::Create(ctx, "ret0", fn);
 
     IRBuilder<> EB(entry);
-    Value *hasSelfPhdr =
-        EB.CreateAnd(EB.CreateICmpNE(atPhdr, ConstantInt::get(ip, 0)),
-                     EB.CreateAnd(EB.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
-                                  EB.CreateICmpUGT(phNum, ConstantInt::get(ip, 0))),
-                     "morok.antihook.got.lazy.phdr");
+    Value *hasSelfPhdr = EB.CreateAnd(
+        validAuxvPhdrPointer(EB, M, atPhdr, "morok.antihook.got.lazy.phdr.ptr"),
+        EB.CreateAnd(EB.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
+                     EB.CreateICmpUGT(phNum, ConstantInt::get(ip, 0))),
+        "morok.antihook.got.lazy.phdr");
     Value *validTarget =
         EB.CreateAnd(EB.CreateICmpUGE(target, ConstantInt::get(ip, 6)),
                      EB.CreateICmpNE(slot, ConstantInt::get(ip, 0)),
@@ -8920,8 +8962,8 @@ Function *linuxGotRecheckProbe(Module &M, Function *Got,
                        "morok.antihook.got.recheck.changed");
     foldState(B, State, B.CreateXor(diff, tag, "morok.antihook.got.recheck.mix"),
               0x6F13D9C4B825A7E1ULL, "morok.antihook.got.recheck");
-    foldEnforcedFlag(B, State, changed, 0xA6C12D8F49E35B70ULL,
-                     "morok.antihook.got.recheck.changed");
+    foldCorroboratedGateFlag(B, State, changed, 0xA6C12D8F49E35B70ULL,
+                              "morok.antihook.got.recheck.changed");
     B.CreateRetVoid();
     return fn;
 }
@@ -9082,7 +9124,7 @@ Function *linuxGotPltProbe(Module &M, const Triple &TT) {
         B.CreateICmpUGT(pageRaw, ConstantInt::get(ip, 0)), pageRaw,
         ConstantInt::get(ip, 4096), "morok.antihook.got.pagesz");
     Value *validPhdr = B.CreateAnd(
-        B.CreateICmpNE(atPhdr, ConstantInt::get(ip, 0)),
+        validAuxvPhdrPointer(B, M, atPhdr, "morok.antihook.got.phdr.ptr"),
         B.CreateAnd(B.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
                     B.CreateICmpUGT(phNum, ConstantInt::get(ip, 0))));
     B.CreateCondBr(validPhdr, phLoopBB, retBB);
@@ -9431,7 +9473,8 @@ Function *linuxAuxvLoaderStateProbe(Module &M, const Triple &TT) {
     Value *atEntry = B.CreateCall(getauxval, {ConstantInt::get(ip, 9)},
                                   "morok.antihook.loader.atentry");
     Value *validPhdr = B.CreateAnd(
-        B.CreateICmpNE(atPhdr, ConstantInt::get(ip, 0)),
+        validAuxvPhdrPointer(B, M, atPhdr,
+                             "morok.antihook.loader.phdr.ptr"),
         B.CreateAnd(B.CreateICmpUGE(phEnt, ConstantInt::get(ip, phEntMin)),
                     B.CreateICmpUGT(phNum, ConstantInt::get(ip, 0))),
         "morok.antihook.loader.phdr.valid");
@@ -11308,10 +11351,10 @@ Function *linuxWxEnforceProbe(Module &M, const Triple &TT) {
     Value *pageSize = B.CreateSelect(
         B.CreateICmpUGT(pageRaw, ConstantInt::get(ip, 0)), pageRaw,
         ConstantInt::get(ip, 4096), "morok.antihook.wxorx.pagesz.v");
-    Value *valid =
-        B.CreateAnd(B.CreateICmpNE(atPhdr, ConstantInt::get(ip, 0)),
-                    B.CreateAnd(B.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
-                                B.CreateICmpUGT(phNum, ConstantInt::get(ip, 0))));
+    Value *valid = B.CreateAnd(
+        validAuxvPhdrPointer(B, M, atPhdr, "morok.antihook.wxorx.phdr.ptr"),
+        B.CreateAnd(B.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
+                    B.CreateICmpUGT(phNum, ConstantInt::get(ip, 0))));
     B.CreateCondBr(valid, baseLoopBB, retBB);
 
     IRBuilder<> BLB(baseLoopBB);
@@ -11709,10 +11752,10 @@ Function *linuxAntiDumpProbe(Module &M, const Triple &TT) {
     Value *pageSize = B.CreateSelect(
         B.CreateICmpUGT(pageRaw, ConstantInt::get(ip, 0)), pageRaw,
         ConstantInt::get(ip, 4096), "morok.antidump.pagesz.v");
-    Value *valid =
-        B.CreateAnd(B.CreateICmpNE(atPhdr, ConstantInt::get(ip, 0)),
-                    B.CreateAnd(B.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
-                                B.CreateICmpUGT(phNum, ConstantInt::get(ip, 0))));
+    Value *valid = B.CreateAnd(
+        validAuxvPhdrPointer(B, M, atPhdr, "morok.antidump.phdr.ptr"),
+        B.CreateAnd(B.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56)),
+                    B.CreateICmpUGT(phNum, ConstantInt::get(ip, 0))));
     B.CreateCondBr(valid, phLoopBB, retBB);
 
     IRBuilder<> PLB(phLoopBB);
@@ -12047,10 +12090,11 @@ Function *linuxStackOriginCheck(Module &M) {
         B.CreateCall(getauxval, {ConstantInt::get(ip, 4)}, "morok.stack.phent");
     Value *phNum =
         B.CreateCall(getauxval, {ConstantInt::get(ip, 5)}, "morok.stack.phnum");
-    Value *valid =
-        B.CreateAnd(B.CreateICmpNE(target, ConstantInt::get(ip, 0)),
-                    B.CreateAnd(B.CreateICmpNE(atPhdr, ConstantInt::get(ip, 0)),
-                                B.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56))));
+    Value *valid = B.CreateAnd(
+        B.CreateICmpNE(target, ConstantInt::get(ip, 0)),
+        B.CreateAnd(validAuxvPhdrPointer(B, M, atPhdr,
+                                         "morok.antihook.stack.phdr.ptr"),
+                    B.CreateICmpUGE(phEnt, ConstantInt::get(ip, 56))));
     B.CreateCondBr(valid, baseLoopBB, ret0BB);
 
     IRBuilder<> LB(baseLoopBB);
@@ -12400,9 +12444,9 @@ bool insertStackOriginChecks(Module &M, Function *Check, GlobalVariable *State,
                          "morok.antihook.stack.origin");
         Value *bad = B.CreateICmpEQ(ok, ConstantInt::get(i32, 0),
                                     "morok.antihook.stack.bad");
-        foldEnforcedFlag(B, State, bad,
-                         rng.next() ^ (0xD6E8FEB86659FD93ULL * site++),
-                         "morok.antihook.stack.bad");
+        foldCorroboratedGateFlag(
+            B, State, bad, rng.next() ^ (0xD6E8FEB86659FD93ULL * site++),
+            "morok.antihook.stack.bad");
         changed = true;
     }
     return changed;
@@ -17065,7 +17109,7 @@ void emitProloguePatternChecks(IRBuilder<> &B, Module &M, const Triple &TT,
     for (Function *target : Targets) {
         Value *hit = x86 ? emitX86ProloguePattern(B, M, target)
                          : emitArm64ProloguePattern(B, M, target);
-        foldEnforcedFlag(
+        foldCorroboratedGateFlag(
             B, State, hit, rng.next() ^ (0x9E3779B97F4A7C15ULL * site++),
             "morok.antihook.prologue");
     }
@@ -17147,7 +17191,7 @@ void emitPosixStubIntegrityChecks(IRBuilder<> &B, Module &M, const Triple &TT,
 
         std::string base = (Twine("morok.antihook.stub.") + label).str();
         Value *hit = emitX86ImportStubPattern(B, M, &F, base);
-        foldEnforcedFlag(
+        foldCorroboratedGateFlag(
             B, State, hit,
             rng.next() ^ salt ^ (0xA24BAED4963EE407ULL * site++),
             base);
@@ -17523,8 +17567,8 @@ Function *antiHookRecheckProbe(Module &M, GlobalVariable *State,
                          "morok.antihook.recheck.stack.module");
         Value *changed = B.CreateICmpEQ(ok, ConstantInt::get(i32, 0),
                                         "morok.antihook.recheck.stack.changed");
-        foldEnforcedFlag(B, State, changed, 0x8E43A7D61C9250BFULL,
-                         "morok.antihook.recheck.stack.changed");
+        foldCorroboratedGateFlag(B, State, changed, 0x8E43A7D61C9250BFULL,
+                                  "morok.antihook.recheck.stack.changed");
     }
     B.CreateRetVoid();
     return fn;
@@ -32173,8 +32217,8 @@ Function *windowsWriteWatchProbe(Module &M, GlobalVariable *State,
               "morok.win.writewatch.granularity.mix");
     foldFlag(QB, State, QB.CreateNot(getOk, "morok.win.writewatch.ntget.weak"),
              0xD64B20F198A7C53EULL, "morok.win.writewatch.ntget.weak");
-    foldEnforcedFlag(QB, State, dirtyAny, 0x59E1A7C42D30B68FULL,
-                     "morok.win.writewatch.dirty");
+    foldCorroboratedGateFlag(QB, State, dirtyAny, 0x59E1A7C42D30B68FULL,
+                              "morok.win.writewatch.dirty");
     QB.CreateCondBr(dirtyAny, scanLoopBB, cleanupBB);
 
     IRBuilder<> SLB(scanLoopBB);
@@ -34417,8 +34461,8 @@ bool trapOracleModule(Module &M, ir::IRRandom &rng) {
     foldState(B, state, hits, 0x91D0F736B52C48EAULL, "morok.trap.final");
     Value *missing = B.CreateICmpULT(hits, ConstantInt::get(i32, expected),
                                      "morok.trap.missing");
-    foldEnforcedFlag(B, state, missing, 0xE2AB41739D08C6F5ULL,
-                     "morok.trap.missing");
+    foldFlag(B, state, missing, 0xE2AB41739D08C6F5ULL,
+             "morok.trap.missing");
     if (useLinuxX86SiginfoTrapHandler(tt)) {
         auto *tfPc = B.CreateLoad(i32, trapTfPcCounter(M),
                                   "morok.trap.tf.pc.final");
@@ -34428,8 +34472,8 @@ bool trapOracleModule(Module &M, ir::IRRandom &rng) {
         Value *tfPcMissing =
             B.CreateICmpEQ(tfPc, ConstantInt::get(i32, 0),
                            "morok.trap.tf.pc.missing");
-        foldEnforcedFlag(B, state, tfPcMissing, 0x95D3E70B24AC681FULL,
-                         "morok.trap.tf.pc.missing");
+        foldFlag(B, state, tfPcMissing, 0x95D3E70B24AC681FULL,
+                 "morok.trap.tf.pc.missing");
         auto *acHits =
             B.CreateLoad(i32, trapAcCounter(M), "morok.trap.ac.final");
         acHits->setVolatile(true);
@@ -34438,8 +34482,8 @@ bool trapOracleModule(Module &M, ir::IRRandom &rng) {
         Value *acMissing =
             B.CreateICmpEQ(acHits, ConstantInt::get(i32, 0),
                            "morok.trap.ac.missing");
-        foldEnforcedFlag(B, state, acMissing, 0x53A9D7C20E6B184FULL,
-                         "morok.trap.ac.missing");
+        foldFlag(B, state, acMissing, 0x53A9D7C20E6B184FULL,
+                 "morok.trap.ac.missing");
     }
     if (useLinuxX86SiginfoTrapHandler(tt)) {
         constexpr int kSigIll = 4;
@@ -34546,7 +34590,7 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
     appendImportVerifierTargets(M, tt, prologueTargets);
 
     Function *ctor = makeCtorShell(M, "morok.antihook");
-    antiDebugSeal(M, rng);
+    runtime_seal::getChannel(M, runtime_seal::kAntiHookChannel, rng);
     GlobalVariable *state = antiHookState(M, rng);
     IRBuilder<> B(&ctor->getEntryBlock());
     GateAccumulator gate = createGateAccumulator(B);
@@ -34578,8 +34622,8 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         addHardGateSignal(B, gate, changed, 3, 0xF3A91C6E245BD807ULL,
                           "morok.gate.got");
         foldState(B, state, diff, 0xF93A8B7C62D514E1ULL, "morok.antihook.got");
-        foldEnforcedFlag(B, state, changed, 0xB17D4E23C9A5806FULL,
-                         "morok.antihook.got.changed");
+        foldCorroboratedGateFlag(B, state, changed, 0xB17D4E23C9A5806FULL,
+                                  "morok.antihook.got.changed");
     }
     if (Function *loader = linuxAuxvLoaderStateProbe(M, tt)) {
         Value *sample =
@@ -34633,8 +34677,9 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                               "morok.gate.static.atbase");
             foldState(B, state, diff, 0x93C2E47B518D6A0FULL,
                       "morok.antihook.static.atbase");
-            foldEnforcedFlag(B, state, changed, 0xAF6721C9D40B853EULL,
-                             "morok.antihook.static.atbase.changed");
+            foldCorroboratedGateFlag(
+                B, state, changed, 0xAF6721C9D40B853EULL,
+                "morok.antihook.static.atbase.changed");
         }
     }
     // Census must observe the original protections before W^X remediation can
@@ -34681,8 +34726,8 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         } else {
             addHardGateSignal(B, gate, changed, 3, 0x2C8B15D9F0476EA3ULL,
                               "morok.gate.wxorx");
-            foldEnforcedFlag(B, state, changed, 0xD8F31C6A4B927E50ULL,
-                             "morok.antihook.wxorx.changed");
+            foldCorroboratedGateFlag(B, state, changed, 0xD8F31C6A4B927E50ULL,
+                                      "morok.antihook.wxorx.changed");
         }
     }
     if (Function *diverge = methodDivergenceProbe(M, tt, rng)) {
@@ -34695,8 +34740,8 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                           "morok.gate.diverge");
         foldState(B, state, diff, 0x2F8D6C1E9A7453B0ULL,
                   "morok.antihook.diverge");
-        foldEnforcedFlag(B, state, changed, 0xC58E90A37B42D16FULL,
-                         "morok.antihook.diverge.changed");
+        foldCorroboratedGateFlag(B, state, changed, 0xC58E90A37B42D16FULL,
+                                  "morok.antihook.diverge.changed");
     }
     if (Function *emu = emulationDivergenceProbe(M, tt)) {
         Value *diff = B.CreateCall(emu, {}, "morok.antihook.emu.diff");
@@ -34706,8 +34751,8 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         addHardGateSignal(B, gate, changed, 3, 0x4A73D8C10E6F29B5ULL,
                           "morok.gate.emu");
         foldState(B, state, diff, 0x7642CDB91E30A58FULL, "morok.antihook.emu");
-        foldEnforcedFlag(B, state, changed, 0x1F0E3D2C4B5A6978ULL,
-                         "morok.antihook.emu.changed");
+        foldCorroboratedGateFlag(B, state, changed, 0x1F0E3D2C4B5A6978ULL,
+                                  "morok.antihook.emu.changed");
     }
     if (Function *fsgs = fsGsBaseGapProbe(M, tt)) {
         Value *diff = B.CreateCall(fsgs, {}, "morok.antihook.fsgs.diff");
@@ -34719,7 +34764,7 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         foldState(B, state, diff, 0x31B6D90A7E4C258FULL,
                   "morok.antihook.fsgs");
         foldFlag(B, state, changed, 0xAE51C7096D38B24FULL,
-                 "morok.antihook.fsgs.changed", /*ScoreSoftSignal=*/true);
+                 "morok.antihook.fsgs.changed");
     }
     if (Function *fpu = fpuSimdDivergenceProbe(M, tt)) {
         Value *diff = B.CreateCall(fpu, {}, "morok.antihook.fpu.diff");
@@ -34729,8 +34774,8 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         addHardGateSignal(B, gate, changed, 3, 0x6E20C4F9A38B51D7ULL,
                           "morok.gate.fpu");
         foldState(B, state, diff, 0xA38F51D76B20C4E9ULL, "morok.antihook.fpu");
-        foldEnforcedFlag(B, state, changed, 0x62D9B40E8F1C357AULL,
-                         "morok.antihook.fpu.changed");
+        foldCorroboratedGateFlag(B, state, changed, 0x62D9B40E8F1C357AULL,
+                                  "morok.antihook.fpu.changed");
     }
     if (Function *sandbox = sandboxHeuristicProbe(M, tt)) {
         Value *score =
@@ -34777,8 +34822,8 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                           "morok.gate.mprotect");
         foldState(B, state, diff, 0x40D79A2C5E18B6F3ULL,
                   "morok.antihook.mprotect");
-        foldEnforcedFlag(B, state, changed, 0xBED176A4309C52F8ULL,
-                         "morok.antihook.mprotect.changed");
+        foldCorroboratedGateFlag(B, state, changed, 0xBED176A4309C52F8ULL,
+                                  "morok.antihook.mprotect.changed");
     }
     if (Function *schro = schrodingerPageProbe(M, state, rng, tt)) {
         Value *diff = B.CreateCall(schro, {}, "morok.antihook.schro.diff");
@@ -34825,8 +34870,8 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
                           "morok.gate.dbi.jit");
         foldState(B, state, diff, 0x1B89E4C76F20DA53ULL,
                   "morok.antihook.dbi");
-        foldEnforcedFlag(B, state, changed, 0xF4A7812C39D60E5BULL,
-                         "morok.antihook.dbi.changed");
+        foldCorroboratedGateFlag(B, state, changed, 0xF4A7812C39D60E5BULL,
+                                  "morok.antihook.dbi.changed");
         foldFlag(B, state, jitChanged, 0x9C41B7E620D83AF5ULL,
                  "morok.antihook.dbi.jit.changed");
     }
@@ -34899,8 +34944,9 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
         } else {
             addHardGateSignal(B, gate, changed, 3, 0xD86F21B49C0A753EULL,
                               "morok.gate.ra.range");
-            foldEnforcedFlag(B, state, changed, 0x3C791E5A6B20D48FULL,
-                             "morok.antihook.ra.range.changed");
+            foldCorroboratedGateFlag(
+                B, state, changed, 0x3C791E5A6B20D48FULL,
+                "morok.antihook.ra.range.changed");
         }
     }
     insertStackOriginChecks(M, stackCheck, state, prologueTargets, rng);
@@ -34930,9 +34976,11 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
 
     if (tt.isOSDarwin()) {
         addGateCoherencePenalties(B, gate);
-        GateDecision decision = emitGateDecision(B, state, gate);
+        GateDecision decision =
+            emitGateDecision(B, state, gate, runtime_seal::kAntiHookChannel);
         Value *responseTier = emitGateResponseTier(
-            B, state, decision, decision.confirmed, "morok.gate.response");
+            B, state, decision, decision.confirmed,
+            runtime_seal::kAntiHookChannel, "morok.gate.response");
         emitGateResponseActionCall(B, M, rng, tt, responseTier);
         B.CreateRetVoid();
         appendToGlobalCtors(M, ctor, 0);
@@ -34941,9 +34989,11 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
     }
     if (!tt.isOSLinux()) {
         addGateCoherencePenalties(B, gate);
-        GateDecision decision = emitGateDecision(B, state, gate);
+        GateDecision decision =
+            emitGateDecision(B, state, gate, runtime_seal::kAntiHookChannel);
         Value *responseTier = emitGateResponseTier(
-            B, state, decision, decision.confirmed, "morok.gate.response");
+            B, state, decision, decision.confirmed,
+            runtime_seal::kAntiHookChannel, "morok.gate.response");
         emitGateResponseActionCall(B, M, rng, tt, responseTier);
         B.CreateRetVoid();
         appendToGlobalCtors(M, ctor, 0);
@@ -34982,13 +35032,15 @@ bool antiHookingModule(Module &M, ir::IRRandom &rng,
     addHardGateSignal(B, gate, hooked, 3, 0xE57A2C91D603B48FULL,
                       "morok.gate.hook.symbol");
     addGateCoherencePenalties(B, gate);
-    GateDecision decision = emitGateDecision(B, state, gate);
+    GateDecision decision =
+        emitGateDecision(B, state, gate, runtime_seal::kAntiHookChannel);
     Value *aggressive = B.CreateAnd(hooked, decision.confirmed,
                                     "morok.gate.response.aggressive");
     foldPoisonFlag(B, aggressive, 0xA4F6C2E91B537D8BULL,
                    "morok.antihook.corroborated");
-    Value *responseTier = emitGateResponseTier(B, state, decision, aggressive,
-                                               "morok.gate.response");
+    Value *responseTier = emitGateResponseTier(
+        B, state, decision, aggressive, runtime_seal::kAntiHookChannel,
+        "morok.gate.response");
     emitGateResponseActionCall(B, M, rng, tt, responseTier);
     B.CreateRetVoid();
     appendToGlobalCtors(M, ctor, 0);

@@ -327,6 +327,18 @@ FunctionCallee getauxvalDecl(Module &M) {
                                  FunctionType::get(IP, {IP}, false));
 }
 
+Value *validAuxvPhdrPointer(IRBuilderBase &B, Module &M, Value *AtPhdr,
+                            const Twine &Name) {
+    auto *IP = M.getDataLayout().getIntPtrType(M.getContext());
+    Value *NonNull =
+        B.CreateICmpNE(AtPhdr, ConstantInt::get(IP, 0), Name + ".nonzero");
+    if (IP->getBitWidth() < 64)
+        return NonNull;
+    Value *HighHalf = B.CreateICmpUGT(
+        AtPhdr, ConstantInt::get(IP, 0x100000000ULL), Name + ".high");
+    return B.CreateAnd(NonNull, HighHalf, Name);
+}
+
 FunctionCallee dlIteratePhdrDecl(Module &M) {
     auto *I32 = Type::getInt32Ty(M.getContext());
     auto *Ptr = PointerType::getUnqual(M.getContext());
@@ -1201,7 +1213,7 @@ Function *linuxHashResolver(Module &M, unsigned Family) {
     Value *PhNum = B.CreateCall(getauxvalDecl(M), {ConstantInt::get(IP, 5)},
                                 "morok.fco.elf.phnum");
     Value *ValidPhdr = B.CreateAnd(
-        B.CreateICmpNE(AtPhdr, ConstantInt::get(IP, 0)),
+        validAuxvPhdrPointer(B, M, AtPhdr, "morok.fco.elf.phdr.ptr"),
         B.CreateAnd(B.CreateICmpUGE(PhEnt, ConstantInt::get(IP, 56)),
                     B.CreateICmpUGT(PhNum, ConstantInt::get(IP, 0))));
     B.CreateCondBr(ValidPhdr, PhLoop, RetNull);
@@ -2261,6 +2273,45 @@ void storeSigaction(IRBuilder<> &B, Module &M, AllocaInst *Action,
         gepI8(B, M, Action, constIp(M, kFlagsOffset), "morok.fco.ex.sa.flags"));
 }
 
+void moveGlobalCtorToFront(Module &M, Function *Ctor) {
+    GlobalVariable *GV = M.getGlobalVariable("llvm.global_ctors");
+    if (!GV || !GV->hasInitializer())
+        return;
+    auto *Arr = dyn_cast<ConstantArray>(GV->getInitializer());
+    if (!Arr)
+        return;
+
+    SmallVector<Constant *, 16> Matches;
+    SmallVector<Constant *, 16> Rest;
+    for (Use &ElemUse : Arr->operands()) {
+        auto *Entry = dyn_cast<Constant>(ElemUse.get());
+        auto *CS = dyn_cast_or_null<ConstantStruct>(Entry);
+        if (CS && CS->getNumOperands() >= 2) {
+            if (auto *Target = dyn_cast<Constant>(CS->getOperand(1))) {
+                if (Target->stripPointerCasts() == Ctor) {
+                    Matches.push_back(Entry);
+                    continue;
+                }
+            }
+        }
+        Rest.push_back(Entry);
+    }
+
+    if (Matches.empty())
+        return;
+    Matches.append(Rest.begin(), Rest.end());
+    GV->setInitializer(ConstantArray::get(cast<ArrayType>(GV->getValueType()),
+                                          Matches));
+}
+
+bool hasGlobalCtors(const Module &M) {
+    const GlobalVariable *GV = M.getGlobalVariable("llvm.global_ctors");
+    if (!GV || !GV->hasInitializer())
+        return false;
+    auto *Arr = dyn_cast<ConstantArray>(GV->getInitializer());
+    return Arr && Arr->getNumOperands() != 0;
+}
+
 ExceptionRuntime ensureExceptionRuntime(Module &M, FunctionCallee Resolver,
                                         bool ManualResolver,
                                         int RtldDefaultVal) {
@@ -2294,6 +2345,10 @@ ExceptionRuntime ensureExceptionRuntime(Module &M, FunctionCallee Resolver,
                                     ConstantPointerNull::get(Ptr)});
     B.CreateRetVoid();
     appendToGlobalCtors(M, Ctor, 0);
+    // Earlier module passes can emit priority-0 startup hooks before FCO runs.
+    // If those hooks contain FCO-rewritten calls, they must not fault before the
+    // FCO SIGSEGV handler is installed.
+    moveGlobalCtorToFront(M, Ctor);
     return Rt;
 }
 
@@ -2766,7 +2821,7 @@ bool functionCallObfuscateModule(Module &M, const FcoParams &params,
         return FunctionCallee(Fn->getFunctionType(), Fn);
     };
     FunctionCallee fallbackResolver = resolverForFamily(0);
-    const bool exceptionCalls = useExceptionCalls(tt);
+    const bool exceptionCalls = useExceptionCalls(tt) && !hasGlobalCtors(M);
     ExceptionRuntime exceptionRt;
     if (exceptionCalls)
         exceptionRt = ensureExceptionRuntime(M, fallbackResolver,

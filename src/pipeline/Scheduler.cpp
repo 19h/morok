@@ -744,13 +744,6 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         changed |= passes::stringEncryptModule(M, sp, rng);
     }
 
-    // Hide library imports behind dlsym after strings/import names have been
-    // cloaked at their call sites.
-    if (InitialModuleGrowthOk && config_.passes.fco.enabled.value_or(false)) {
-        passes::FcoParams fp;
-        changed |= passes::functionCallObfuscateModule(M, fp, rng);
-    }
-
     // C++ virtual dispatch still has recognizable vptr/slot load shapes here.
     // Guard those call sites before VM/per-function transforms obscure them.
     if (InitialModuleGrowthOk &&
@@ -1505,6 +1498,15 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         wp.probability = config_.passes.func_wrap.probability.value_or(50);
         wp.times = config_.passes.func_wrap.times.value_or(1);
         changed |= passes::functionWrapModule(M, wp, rng);
+    }
+
+    // Hide surviving library imports after the CFG/body mutation wave.  FCO
+    // emits resolver caches and, on simple Linux x86_64 modules, deliberate
+    // fault/resume callsites; running it late keeps later obfuscation passes
+    // from cloning or reshaping those callsite protocols.
+    if (InitialModuleGrowthOk && config_.passes.fco.enabled.value_or(false)) {
+        passes::FcoParams fp;
+        changed |= passes::functionCallObfuscateModule(M, fp, rng);
     }
 
     // Final seed-driven diversity layer: reorder the emitted IR layout and add

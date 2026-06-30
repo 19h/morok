@@ -315,6 +315,19 @@ void checkSealEnforcement(Module &M, Function &F) {
     CHECK(countNamedInstructions(F, "morok.seal.fold.anti_debug.next") >= 1u);
 }
 
+void checkAntiHookSealEnforcement(Module &M, Function &F) {
+    CHECK(M.getGlobalVariable("morok.seal.root.anti_hook", true) != nullptr);
+    CHECK(countNamedInstructions(F, "morok.gate.score.fold.trip") >= 1u);
+    CHECK(countNamedInstructions(F, "morok.gate.score.fold.next") >= 1u);
+    CHECK(countNamedInstructions(F, "morok.gate.soft.kdf") >= 1u);
+    CHECK(countNamedInstructions(F, "morok.gate.coherence.kdf") >= 1u);
+    CHECK(countNamedInstructions(F, "morok.gate.response.kdf") >= 1u);
+}
+
+void checkNoAntiDebugSealFold(Function &F) {
+    CHECK(countNamedInstructions(F, "morok.seal.fold.anti_debug") == 0u);
+}
+
 void checkDarwinCsopsHardenedRuntimeSignals(Function &F) {
     Instruction *RuntimeBits =
         findNamedInstruction(F, "morok.antidbg.csops.hr.runtime.bits");
@@ -1062,6 +1075,28 @@ std::vector<unsigned> ctorPrioritiesForTarget(Module &M, Function &TargetFn) {
     return priorities;
 }
 
+std::vector<std::string> ctorNamesInOrder(Module &M) {
+    std::vector<std::string> names;
+    GlobalVariable *ctors = M.getGlobalVariable("llvm.global_ctors");
+    if (!ctors || !ctors->hasInitializer())
+        return names;
+    auto *array = dyn_cast<ConstantArray>(ctors->getInitializer());
+    if (!array)
+        return names;
+
+    for (Use &elem : array->operands()) {
+        auto *entry = dyn_cast<ConstantStruct>(elem.get());
+        if (!entry || entry->getNumOperands() < 2)
+            continue;
+        auto *target = dyn_cast<Constant>(entry->getOperand(1));
+        if (!target)
+            continue;
+        if (auto *F = dyn_cast<Function>(target->stripPointerCasts()))
+            names.push_back(F->getName().str());
+    }
+    return names;
+}
+
 std::size_t countAliases(Module &M) {
     return static_cast<std::size_t>(
         std::distance(M.alias_begin(), M.alias_end()));
@@ -1275,8 +1310,9 @@ void checkFpuSimdProbe(Function &Fpu, Function &Ctor) {
         findNamedInstruction(Ctor, "morok.corroborate.fpu.changed");
     REQUIRE(FpuChanged != nullptr);
     CHECK(countNamedInstructions(Ctor, "morok.gate.fpu.hard") >= 1u);
-    CHECK(valueFeedsNamedInstruction(FpuChanged,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK(valueFeedsNamedInstruction(FpuChanged, "morok.gate.fpu.hard.next"));
+    CHECK_FALSE(
+        valueFeedsNamedInstruction(FpuChanged, "morok.seal.fold.anti_debug"));
 }
 
 void checkSmcCoherencyProbe(Function &Smc) {
@@ -11288,7 +11324,7 @@ entry:
     REQUIRE(Seal != nullptr);
     GlobalVariable *AntiSeal =
         M->getGlobalVariable("morok.seal.root.anti_debug", true);
-    REQUIRE(AntiSeal != nullptr);
+    CHECK(AntiSeal == nullptr);
     Function *Ctor = M->getFunction("morok.tracer.attest");
     Function *Share = M->getFunction("morok.tracer.share");
     REQUIRE(Ctor != nullptr);
@@ -11308,7 +11344,7 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.restore.ptracer") == 2u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.expected") == 2u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.seal.next") == 2u);
-    CHECK(countNamedInstructions(*Ctor, "morok.tracer.antidbg.next") == 2u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.antidbg.next") == 0u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.poke") == 0u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.fail.nonzero") == 2u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.child.fail.nonzero") ==
@@ -11384,7 +11420,7 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.seal.next") == 4u);
     CHECK(countNamedInstructions(*Ctor, "morok.tracer.repair.seal.next") ==
           12u);
-    CHECK(countNamedInstructions(*Ctor, "morok.tracer.antidbg.next") == 4u);
+    CHECK(countNamedInstructions(*Ctor, "morok.tracer.antidbg.next") == 0u);
 
     std::size_t repairDiffs = 0;
     for (Instruction &I : instructions(*Ctor)) {
@@ -11394,7 +11430,8 @@ entry:
         CHECK(valueFeedsNamedInstruction(&I,
                                          "morok.tracer.repair.word.bad"));
         CHECK(valueFeedsNamedInstruction(&I, "morok.tracer.repair.seal"));
-        CHECK(valueFeedsNamedInstruction(&I, "morok.tracer.antidbg.trip"));
+        CHECK_FALSE(valueFeedsNamedInstruction(&I,
+                                               "morok.tracer.antidbg.trip"));
     }
     CHECK(repairDiffs == 12u);
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -16743,6 +16780,7 @@ define i32 @caller() {
         firstFunctionByPrefixAndArity(*M, "morok.fco.resolve.elf.", 2);
     REQUIRE(Resolve);
     CHECK(Resolve->arg_size() == 2);
+    CHECK(countNamedInstructions(*Resolve, "morok.fco.elf.phdr.ptr") >= 1u);
     Function *Scan = firstFunctionByPrefix(*M, "morok.fco.resolve.elf.module.");
     REQUIRE(Scan);
     bool hasIfuncReturn = false;
@@ -17120,6 +17158,41 @@ define i32 @caller() {
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("functionCallObfuscateModule avoids exception path with ctors") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+target triple = "x86_64-unknown-linux-gnu"
+declare i32 @puts(ptr)
+@.s = private constant [3 x i8] c"hi\00"
+@llvm.global_ctors = appending global [1 x { i32, ptr, ptr }] [
+  { i32, ptr, ptr } { i32 0, ptr @pre_ctor, ptr null }
+]
+define internal void @pre_ctor() {
+  %r = call i32 @puts(ptr @.s)
+  ret void
+}
+define i32 @caller() {
+  %r = call i32 @puts(ptr @.s)
+  ret i32 %r
+}
+)ir");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8181);
+    morok::ir::IRRandom rng(engine);
+    CHECK(morok::passes::functionCallObfuscateModule(*M, {/*prob=*/100}, rng));
+
+    CHECK(M->getFunction("morok.fco.ex.install") == nullptr);
+    CHECK(M->getFunction("morok.fco.ex.handler") == nullptr);
+    std::vector<std::string> names = ctorNamesInOrder(*M);
+    REQUIRE(names.size() == 1);
+    CHECK(names.front() == "pre_ctor");
+
+    Function *PreCtor = M->getFunction("pre_ctor");
+    REQUIRE(PreCtor);
+    CHECK(countInlineAsmBodies(*PreCtor, "movq %rax, (%rax)") == 0u);
+    CHECK(countCallsToPrefix(*PreCtor, "morok.fco.resolve.elf.") >= 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE(
     "functionCallObfuscateModule uses Mach-O hash resolver for asm names") {
     LLVMContext ctx;
@@ -17311,7 +17384,7 @@ entry:
             isa<ConstantPointerNull>(CB->getArgOperand(0));
     }
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
-    checkSealEnforcement(*M, *Ctor);
+    checkAntiHookSealEnforcement(*M, *Ctor);
     checkGateScoring(*Ctor);
     GlobalVariable *MacTargets =
         M->getGlobalVariable("morok.antihook.mac.targets", true);
@@ -17388,17 +17461,20 @@ entry:
     Instruction *LinuxStub =
         findNamedInstruction(*Ctor, "morok.antihook.stub.getpid.hit");
     REQUIRE(LinuxStub != nullptr);
-    CHECK(valueFeedsNamedInstruction(LinuxStub,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(LinuxStub,
+                                           "morok.seal.fold.anti_debug"));
     Instruction *LinuxStubFf25 =
         findNamedInstruction(*Ctor, "morok.antihook.stub.getpid.ff25");
     REQUIRE(LinuxStubFf25 != nullptr);
     CHECK(valueFeedsNamedInstruction(LinuxStubFf25,
                                      "morok.antihook.stub.getpid.hit"));
-    CHECK(valueFeedsNamedInstruction(LinuxStubFf25,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(LinuxStubFf25,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Clean, "morok.antihook.mac.mem.mix") >= 1u);
     CHECK(countNamedInstructions(*Clean, "morok.antihook.mac.file.mix") >= 1u);
+    CHECK(countNamedInstructions(*Clean, "morok.clean.elf.entry") >= 1u);
+    CHECK(countNamedInstructions(*Clean, "morok.clean.atentry") >= 1u);
+    CHECK(countNamedInstructions(*Clean, "morok.clean.elf.entry.match") >= 1u);
     CHECK(countNamedInstructions(*Clean, "morok.negative.text.int3") >= 1u);
     CHECK(countNamedInstructions(*Clean, "morok.negative.text.int3.long") >=
           1u);
@@ -17471,8 +17547,8 @@ entry:
     Instruction *PhaseStackChanged = findNamedInstruction(
         *PhaseRecheck, "morok.antihook.recheck.stack.changed");
     REQUIRE(PhaseStackChanged != nullptr);
-    CHECK(valueFeedsNamedInstruction(PhaseStackChanged,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(PhaseStackChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Work, "morok.antihook.got.site.seen") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.recheck.site.seen") >=
           1u);
@@ -17548,8 +17624,8 @@ entry:
     Instruction *DivergeChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.diverge.changed");
     REQUIRE(DivergeChanged != nullptr);
-    CHECK(valueFeedsNamedInstruction(DivergeChanged,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(DivergeChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK_FALSE(hasReadableByteString(*M, "/proc/self/status"));
     CHECK_FALSE(hasReadableByteString(*M, "TracerPid"));
     CHECK_FALSE(hasReadableByteString(*M, "/dev/null"));
@@ -17647,16 +17723,16 @@ entry:
     Instruction *EmuChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.emu.changed");
     REQUIRE(EmuChanged != nullptr);
-    CHECK(valueFeedsNamedInstruction(EmuChanged,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(EmuChanged,
+                                           "morok.seal.fold.anti_debug"));
     Instruction *FsGsChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.fsgs.changed");
     REQUIRE(FsGsChanged != nullptr);
     CHECK_FALSE(valueFeedsNamedInstruction(FsGsChanged,
                                            "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Ctor, "morok.gate.fsgs.soft") >= 1u);
-    CHECK(countNamedInstructions(*Ctor, "morok.antihook.fsgs.changed.score") >=
-          1u);
+    CHECK(countNamedInstructions(*Ctor, "morok.antihook.fsgs.changed.score") ==
+          0u);
     checkFpuSimdProbe(*Fpu, *Ctor);
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
@@ -17954,8 +18030,8 @@ entry:
     Instruction *DbiChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.dbi.changed");
     REQUIRE(DbiChanged != nullptr);
-    CHECK(valueFeedsNamedInstruction(DbiChanged,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(DbiChanged,
+                                           "morok.seal.fold.anti_debug"));
     Instruction *DbiJitChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.dbi.jit.changed");
     REQUIRE(DbiJitChanged != nullptr);
@@ -18158,8 +18234,8 @@ entry:
     Instruction *MprotectChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.mprotect.changed");
     REQUIRE(MprotectChanged != nullptr);
-    CHECK(valueFeedsNamedInstruction(MprotectChanged,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(MprotectChanged,
+                                           "morok.seal.fold.anti_debug"));
     Instruction *RaRangeChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.ra.range.changed");
     REQUIRE(RaRangeChanged != nullptr);
@@ -18214,7 +18290,7 @@ entry:
     CHECK(countNamedInstructions(*Ctor, "morok.negative.modules.extra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
-    checkSealEnforcement(*M, *Work);
+    checkNoAntiDebugSealFold(*Work);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.rwx") >= 1u);
     CHECK(countNamedInstructions(*Maps, "morok.antihook.maps.anonymous.exec") >=
           1u);
@@ -18361,8 +18437,8 @@ entry:
     Instruction *Changed =
         findNamedInstruction(*Ctor, "morok.corroborate.static.atbase.changed");
     REQUIRE(Changed != nullptr);
-    CHECK(valueFeedsNamedInstruction(Changed,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(Changed,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Ctor, "morok.gate.static.atbase.hard") >=
           1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -18536,12 +18612,13 @@ entry:
     Instruction *Changed =
         findNamedInstruction(*Ctor, "morok.corroborate.mprotect.changed");
     REQUIRE(Changed != nullptr);
-    CHECK(valueFeedsNamedInstruction(Changed, "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(Changed,
+                                           "morok.seal.fold.anti_debug"));
     Instruction *DivergeChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.diverge.changed");
     REQUIRE(DivergeChanged != nullptr);
-    CHECK(valueFeedsNamedInstruction(DivergeChanged,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(DivergeChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Ctor, "morok.gate.mprotect.hard") >= 1u);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
@@ -18690,7 +18767,7 @@ entry:
     Function *Work = M->getFunction("work");
     REQUIRE(Work != nullptr);
     CHECK(M->getGlobalVariable("morok.antihook.state", true) != nullptr);
-    checkSealEnforcement(*M, *Ctor);
+    checkAntiHookSealEnforcement(*M, *Ctor);
     checkGateScoring(*Ctor);
     GlobalVariable *DarwinMacTargets =
         M->getGlobalVariable("morok.antihook.mac.targets", true);
@@ -18798,8 +18875,8 @@ entry:
     Instruction *EmuChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.emu.changed");
     REQUIRE(EmuChanged != nullptr);
-    CHECK(valueFeedsNamedInstruction(EmuChanged,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(EmuChanged,
+                                           "morok.seal.fold.anti_debug"));
     checkFpuSimdProbe(*Fpu, *Ctor);
     CHECK(countNamedInstructions(
               *Sandbox, "morok.antihook.sandbox.cpuid.hypervisor") >= 1u);
@@ -18917,7 +18994,7 @@ entry:
                                            "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.ra") >= 1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.stack.bad") >= 1u);
-    checkSealEnforcement(*M, *Work);
+    checkNoAntiDebugSealFold(*Work);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.vm.rwx") >= 1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.vm.rwx.large") >= 1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.vm.private.exec") >= 1u);
@@ -18930,15 +19007,15 @@ entry:
     Instruction *DarwinStub =
         findNamedInstruction(*Ctor, "morok.antihook.stub.getpid.hit");
     REQUIRE(DarwinStub != nullptr);
-    CHECK(valueFeedsNamedInstruction(DarwinStub,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(DarwinStub,
+                                           "morok.seal.fold.anti_debug"));
     Instruction *DarwinStubFf25 =
         findNamedInstruction(*Ctor, "morok.antihook.stub.getpid.ff25");
     REQUIRE(DarwinStubFf25 != nullptr);
     CHECK(valueFeedsNamedInstruction(DarwinStubFf25,
                                      "morok.antihook.stub.getpid.hit"));
-    CHECK(valueFeedsNamedInstruction(DarwinStubFf25,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(DarwinStubFf25,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(M->getFunction("_NSGetExecutablePath") != nullptr);
     CHECK(M->getFunction("_dyld_image_count") != nullptr);
     CHECK(M->getFunction("_dyld_get_image_header") != nullptr);
@@ -19082,7 +19159,7 @@ entry:
     Function *Work = M->getFunction("work");
     REQUIRE(Work != nullptr);
     checkWindowsTlsCallbacks(*M, "antihook", "morok.antihook");
-    checkSealEnforcement(*M, *Ctor);
+    checkAntiHookSealEnforcement(*M, *Ctor);
     checkGateScoring(*Ctor);
     const auto recheckPriorities =
         ctorPrioritiesFor(*M, "morok.antihook.recheck.ctor");
@@ -19095,8 +19172,8 @@ entry:
     Instruction *PhaseStackChanged = findNamedInstruction(
         *PhaseRecheck, "morok.antihook.recheck.stack.changed");
     REQUIRE(PhaseStackChanged != nullptr);
-    CHECK(valueFeedsNamedInstruction(PhaseStackChanged,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(PhaseStackChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(M->getFunction("VirtualQuery") != nullptr);
     CHECK(M->getFunction("VirtualProtect") != nullptr);
     CHECK(M->getFunction("QueryPerformanceCounter") != nullptr);
@@ -19171,8 +19248,8 @@ entry:
     Instruction *EmuChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.emu.changed");
     REQUIRE(EmuChanged != nullptr);
-    CHECK(valueFeedsNamedInstruction(EmuChanged,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(EmuChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(findNamedInstruction(*Ctor, "morok.corroborate.fsgs.changed") ==
           nullptr);
     CHECK(countNamedInstructions(*Ctor, "morok.gate.fsgs.soft") == 0u);
@@ -19183,7 +19260,9 @@ entry:
         findNamedInstruction(*Ctor, "morok.corroborate.ra.range.changed");
     REQUIRE(WinRaRangeChanged != nullptr);
     CHECK(valueFeedsNamedInstruction(WinRaRangeChanged,
-                                     "morok.seal.fold.anti_debug"));
+                                     "morok.gate.ra.range.hard.next"));
+    CHECK_FALSE(valueFeedsNamedInstruction(WinRaRangeChanged,
+                                           "morok.seal.fold.anti_debug"));
     CHECK(countNamedInstructions(*Ctor, "morok.gate.ra.range.hard") >= 1u);
     Instruction *SandboxChanged =
         findNamedInstruction(*Ctor, "morok.corroborate.sandbox.changed");
@@ -19251,8 +19330,8 @@ entry:
     Instruction *WriteWatchDirty =
         findNamedInstruction(*WriteWatch, "morok.win.writewatch.dirty.any");
     REQUIRE(WriteWatchDirty != nullptr);
-    CHECK(valueFeedsNamedInstruction(WriteWatchDirty,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(WriteWatchDirty,
+                                           "morok.seal.fold.anti_debug"));
     Instruction *WriteWatchUnavailable =
         findNamedInstruction(*WriteWatch, "morok.win.writewatch.unavailable");
     REQUIRE(WriteWatchUnavailable != nullptr);
@@ -19286,7 +19365,7 @@ entry:
     CHECK(countNamedInstructions(*Work, "morok.antihook.recheck.site.seen") >=
           1u);
     CHECK(countNamedInstructions(*Work, "morok.antihook.recheck.mid.") >= 1u);
-    checkSealEnforcement(*M, *Work);
+    checkNoAntiDebugSealFold(*Work);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.win.rwx") >= 1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.win.rwx.large") >= 1u);
     CHECK(countNamedInstructions(*Vm, "morok.antihook.win.private") >= 1u);
@@ -19329,7 +19408,7 @@ entry:
     REQUIRE(Stack != nullptr);
     Function *Work = M->getFunction("work");
     REQUIRE(Work != nullptr);
-    checkSealEnforcement(*M, *Ctor);
+    checkAntiHookSealEnforcement(*M, *Ctor);
     checkGateScoring(*Ctor);
     CHECK(countNamedInstructions(*Ctor, "morok.antihook.prologue.arm64.hit") >=
           1u);
@@ -23189,7 +23268,8 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Handler != nullptr);
     CHECK(Handler->arg_size() == 3);
     CHECK(M->getGlobalVariable("morok.trap.state", true) != nullptr);
-    checkSealEnforcement(*M, *Ctor);
+    CHECK(M->getGlobalVariable("morok.seal.root.anti_debug", true) != nullptr);
+    checkNoAntiDebugSealFold(*Ctor);
     CHECK(M->getGlobalVariable("morok.trap.hits", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.trap.tf.pc.hits", true) != nullptr);
     CHECK(M->getGlobalVariable("morok.trap.ac.hits", true) != nullptr);
@@ -23212,13 +23292,13 @@ define i32 @main() { ret i32 0 }
     Instruction *TfPcMissing =
         findNamedInstruction(*Ctor, "morok.trap.tf.pc.missing");
     REQUIRE(TfPcMissing != nullptr);
-    CHECK(valueFeedsNamedInstruction(TfPcMissing,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(TfPcMissing,
+                                           "morok.seal.fold.anti_debug"));
     Instruction *AcMissing =
         findNamedInstruction(*Ctor, "morok.trap.ac.missing");
     REQUIRE(AcMissing != nullptr);
-    CHECK(valueFeedsNamedInstruction(AcMissing,
-                                     "morok.seal.fold.anti_debug"));
+    CHECK_FALSE(valueFeedsNamedInstruction(AcMissing,
+                                           "morok.seal.fold.anti_debug"));
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
@@ -23429,7 +23509,8 @@ define i32 @main() { ret i32 0 }
     REQUIRE(Ctor != nullptr);
     REQUIRE(Handler != nullptr);
     CHECK(Handler->arg_size() == 3);
-    checkSealEnforcement(*M, *Ctor);
+    CHECK(M->getGlobalVariable("morok.seal.root.anti_debug", true) != nullptr);
+    checkNoAntiDebugSealFold(*Ctor);
     CHECK(M->getFunction("sigaction") != nullptr);
     CHECK(M->getFunction("signal") == nullptr);
     CHECK(M->getFunction("raise") != nullptr);
