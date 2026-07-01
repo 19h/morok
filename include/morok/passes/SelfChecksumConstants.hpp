@@ -21,6 +21,7 @@ class Function;
 namespace morok::passes {
 
 enum class SelfChecksumDiffCacheMode {
+    Direct,
     Activation,
     Static,
 };
