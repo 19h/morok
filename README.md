@@ -15,6 +15,9 @@ and test. It raises static and dynamic analysis cost; it is not a trust
 boundary, a license system by itself, or a substitute for platform signing,
 attestation, sandboxing, or server-side policy.
 
+Do not use Morok to hide malware, credential theft, cheating, unauthorized
+third-party bypass, or other activity you are not allowed to perform.
+
 ## Contents
 
 - [Scope](#scope)
@@ -92,49 +95,20 @@ morok::passes     New-PM pass implementations plus testable free functions.
 morok_plugin      Loadable New-PM pass plugin, emitted as libMorok.
 ```
 
-Useful repository and developer paths:
-
-```text
-include/morok/{core,config,ir,runtime,passes,pipeline}/ public headers
-src/{core,config,ir,runtime,passes,pipeline}/           implementations
-tests/{unit,ir,e2e}/                              unit, IR, and e2e gates
-third_party/{doctest,tomlplusplus}/               vendored header-only deps
-cmake/Morok{LLVM,Test,Warnings}.cmake             build policy modules
-docs/algorithms.md                                pass and scheduler reference
-docs/hardness.md                                  primitive hardness notes
-docs/objections.md                                public claim/objection notes
-docs/insurance.md                                 broader protection catalog
-docs/insurance-tasks.md                           implementable protection checklist
-docs/roadmap.md                                   design backlog and reality notes
-cross_build.sh                                    Linux/macOS cross-build helper
-run_tests.sh                                      authoritative local test entrypoint
-tools/morok-audit.py                              release binary audit gate
-```
-
-Optional local paths may exist in a developer tree:
-
-```text
-programs/                                         stress corpus for compile/run sweeps
-crackmes/                                        example protected programs
-issues/                                          local issue triage material
-research/                                        local research notes and technique catalogs
-build*/                                          generated build trees
-```
-
 ## Build Requirements
 
 - CMake 3.28 or newer.
 - Ninja.
 - A C11 and C++23 capable toolchain.
-- LLVM 18 or newer with the New-PM plugin API Morok targets. The current
-  development toolchain uses the customized API-v2 plugin header at
+- LLVM 18 or newer with the New-PM plugin API Morok targets. The current CI and
+  development toolchains use the API-v2 plugin header at
   `<llvm/Plugins/PassPlugin.h>`.
 
 Morok requires the LLVM headers and the `clang`/`opt` binaries used at runtime
 to agree on the same New-PM pass plugin ABI. The build currently checks for
-`<llvm/Plugins/PassPlugin.h>` with `LLVM_PLUGIN_API_VERSION == 2`; upstream
-LLVM installs that expose only `<llvm/Passes/PassPlugin.h>` with API version 1
-are a different plugin ABI and are rejected by
+`<llvm/Plugins/PassPlugin.h>` with `LLVM_PLUGIN_API_VERSION == 2`; older LLVM
+installs that expose only `<llvm/Passes/PassPlugin.h>` with API version 1 are a
+different plugin ABI and are rejected by
 [`cmake/MorokLLVM.cmake`](cmake/MorokLLVM.cmake) instead of failing later with a
 cryptic plugin-load error.
 
@@ -177,7 +151,7 @@ component libraries it uses and explicitly exports `llvmGetPassPluginInfo`.
 Use the top-level script unless you are intentionally narrowing the loop:
 
 ```sh
-./run_tests.sh            # incremental configure/build + entire ctest suite
+./run_tests.sh            # incremental configure/build + configured ctest suite
 ./run_tests.sh --clean    # remove build/ and configure from scratch
 ./run_tests.sh -R passes  # ctest name regex
 ./run_tests.sh -L ir      # label filter; labels include core/config/ir/e2e,
@@ -185,7 +159,9 @@ Use the top-level script unless you are intentionally narrowing the loop:
                           # and core/config/ir/unit/aggregate
 ```
 
-The full gate covers:
+When LLVM validation fails, CMake can still configure only the pure core/config
+tests. Treat that as a partial build, not the full gate for plugin or pipeline
+work. With LLVM available, the full gate covers:
 
 | Layer | Test style | Evidence |
 |---|---|---|
@@ -255,7 +231,7 @@ clang -O2 -fpass-plugin="$PLUGIN" -mllvm -morok prog.c -o prog
 Environment switches recognized by the plugin:
 
 ```text
-MOROK_ENABLE=1                         opt into clang auto-injection without -mllvm -morok
+MOROK_ENABLE=1                         opt into main clang auto-injection without -mllvm -morok
 MOROK_CONFIG=path                      config file fallback when -morok-config is absent
 MOROK_PRESET=high                      preset fallback when no config file is loaded
 MOROK_SEED=1234                        seed fallback when -morok-seed is absent or zero
@@ -283,6 +259,10 @@ For `clang -fpass-plugin`, Morok also registers extension-point callbacks:
 - pipeline-early-simplification: VM candidate preservation for `-mllvm -morok`.
 - optimizer-last: the main Morok scheduler.
 
+Use the explicit `-mllvm -morok` flag for VM-heavy builds. The environment-only
+`MOROK_ENABLE` path currently enables the main optimizer callbacks but does not
+trigger the early VM candidate-preservation callback.
+
 ## Cross Builds and Post-Link Sealing
 
 The helper in [`cross_build.sh`](cross_build.sh) builds a source file through
@@ -293,7 +273,7 @@ Mach-O plugin (`libMorok.dylib`) and the musl cross target:
 
 ```sh
 ./cross_build.sh --source programs/cf_license_crackme.c --out-dir build/cross
-./cross_build.sh --linux-only --source boo.c --out-dir build/cross
+./cross_build.sh --linux-only --source programs/01_hello_world.c --out-dir build/cross
 ./cross_build.sh --macos-arches "arm64 x86_64" --preset max
 ./cross_build.sh --config morok.toml --seed 832040
 ```
@@ -398,10 +378,11 @@ python3 tools/morok-audit.py build/cross --release --require-sealed-manifest \
 ```
 
 The audit verifies self-check, mutual-guard, and caller-keyed-dispatch post-link
-records, then writes a provenance manifest with file hashes, detected binary
-formats, sealed-manifest counts, and any findings. Release findings are hard
-failures. Test fixtures must be allowlisted explicitly with a versioned JSON
-file:
+records, scans sidecar files, debug/private-symbol sections, unsupported binary
+variants, plaintext output labels, and high-value marker strings, then writes a
+provenance manifest with file hashes, detected binary formats, sealed-manifest
+counts, and any findings. Release findings are hard failures. Test fixtures
+must be allowlisted explicitly with a versioned JSON file:
 
 ```json
 {
@@ -502,8 +483,8 @@ Per-function annotation keys are the scheduler tags:
 aliasop, bcf, csm, constenc, decoy, dfi, dispatchless, entfla, extop,
 fla, ifsm, indibran, mba, microstress, mq, mutualguard, nistate, optamp,
 pathexplode, phitangle, ptrlaunder, selfcheck, shamir, split,
-stackcoalesce, stackdelta, stateop, sub, tablearith, threshold, tracekey,
-typepun, uniform, vobf
+stackcoalesce, stackdelta, stackrebase, stateop, sub, tablearith, threshold,
+tracekey, typepun, uniform, vobf
 ```
 
 Prefix any key with `no` to force that pass off for a function, for example
@@ -519,21 +500,29 @@ The whole-pipeline `morok` pass is ordered to preserve semantics and maximize
 composition:
 
 ```text
-VM(user code)
+platform runtime / direct-syscall policy setup
+-> Mirage clone/hub planning
+-> external proof, environment, tracer, and sealed-blob key material
+-> VM priority marking
+-> VM(user code)
 -> fault-paged VM payload delivery
 -> hash-gated VM self-decrypt for remaining eager payloads
 -> anti-hook / anti-class-dump / Windows substrate and Windows probes
 -> anti-debug / timing / scheduler-step / trap / page-fault / cache / microarchitectural probes
 -> decoy strings
 -> string encryption
--> function-call obfuscation
 -> vtable integrity
+-> function fission
 -> per-function structural, scalar, CFG, data-flow, integrity, and literal passes
--> leaf-helper seal binding
+-> guaranteed integrity catch-up
+-> leaf-helper and string-seed seal binding
 -> VM/hardening for generated protection helpers
+-> late VM payload delivery / self-decrypt for generated helper payloads
 -> nanomites
--> adversarial self-tuning / merge
+-> adversarial self-tuning / function merging
+-> function-call obfuscation
 -> caller-keyed dispatch
+-> returnless dispatch
 -> function wrappers
 -> per-build polymorphism
 -> misleading metadata
@@ -560,6 +549,7 @@ de-switch wide gate constants
 -> type punning
 -> stack coalescing
 -> stack delta games
+-> stack rebasing
 -> pointer laundering
 -> DFI
 -> table arithmetic
@@ -578,8 +568,9 @@ de-switch wide gate constants
 -> indirect branch
 ```
 
-The precise maintained order is documented in
-[`docs/algorithms.md`](docs/algorithms.md#scheduler-order-to-preserve-semantics).
+The code in [`src/pipeline/Scheduler.cpp`](src/pipeline/Scheduler.cpp) is the
+source of truth for the maintained order; [`docs/algorithms.md`](docs/algorithms.md)
+expands the rationale for the major ordering constraints.
 
 ## Pass Inventory
 
@@ -609,6 +600,7 @@ binding, protection-helper hardening, and private-linkage cleanup for generated
 | Microcode stress | `morok-microstress` | `microcode_stress` | Emits oversized blockaddress tables and aliased decoy destinations. |
 | Path explosion | `morok-pathexplode` | `path_explosion` | Adds opaque-guarded input-derived decoy loops and volatile symbolic stores. |
 | Coherent decoys | `morok-decoy` | `coherent_decoys` | Adds plausible dead alternate return computations and hidden decoy-tamper state. |
+| Mirage | `morok-mirage` | `mirage` | Counterfeit-computation substrate. Replaces a selected verdict-like function's body with a branchless dispatch hub over a private candidate table of `2` equivalent real clones plus `2` plausible-but-wrong counterfeit algorithms (built-in `license_check`/`signature_verify`/`token_validate`/`feature_flag` templates). On a clean runtime seal state the hub routes to a real clone chosen from a per-invocation epoch — so one dynamic trace never observes the whole population; on a dirty seal state (anti-debug/env-binding/tracer evidence) it routes to a counterfeit, so tampering yields a plausible denial rather than a trap. Real clones are equivalence-by-construction (clone + normal Morok transforms); real clone 1 is VM-prioritized with a divergent native-heavy fallback. Candidates are private-linkage (names never reach the symbol table). Off by default; opt-in via `[passes.mirage]`. Cross-candidate mutual guarding is a phase-2 extension. |
 | Alias opaque predicates | `morok-aliasop` | `alias_opaque_predicates` | Maintains pointer/alias invariants that guard decoy edges. |
 | External opaque predicates | `morok-extop` | `external_opaque_predicates` | Uses IPO-blocked volatile helper guards and scratch decoy arms. |
 | MQ gate | `morok-mq` | `mq_gate` | Plants GF(2) quadratic opaque gates over argument-derived bits. |
@@ -632,6 +624,7 @@ binding, protection-helper hardening, and private-linkage cleanup for generated
 | Vector obfuscation | `morok-vec` | `vector_obfuscation` | Lifts scalar ops/casts/comparisons/selects into SIMD lanes. |
 | Stack coalescing | `morok-stackcoalesce` | `stack_coalescing` | Collapses static allocas into one opaque byte buffer. |
 | Stack delta games | `morok-stackdelta` | `stack_delta_games` | Adds dynamic stack-pointer deltas and overlapping volatile stack touches. |
+| Stack rebase | `morok-stackrebase` | `stack_rebase` | Pressures the backend into realigned/dynamic stack frames, escapes selected frame addresses through volatile sinks, and optionally inserts bounded non-entry VLA churn before pointer laundering. Skips generated code, Windows targets, varargs, EH/personality, sanitizer/hardening-sensitive functions, risky coroutine/SJLJ/localescape/statepoint intrinsics, musttail/inline-asm/operand-bundle calls, and setjmp-like callees. |
 | Pointer laundering | `morok-ptrlaunder` | `pointer_laundering` | Sends pointers/scalars through pointer-int and byte-vector boundaries. |
 | Type punning | `morok-typepun` | `type_punning` | Round-trips scalars through volatile union-buffer reinterpretation chains. |
 | PHI tangling | `morok-phitangle` | `phi_tangling` | Builds redundant scalar PHI webs and cross-edge value copies. |
@@ -647,11 +640,14 @@ binding, protection-helper hardening, and private-linkage cleanup for generated
 | Returnless dispatch | scheduler-only | `returnless_dispatch` | Rewrites tail-position returns (`return f(...)`) into indirect tail branches: the function leaves through a computed `br x16` / `jmp *rax` read from a hidden slot instead of a `ret`, and the callee target is no longer a direct edge. Perfect-forwarding sites use `musttail` (guaranteed no `ret`); others use a `tail` hint. Only genuine tail-position returns qualify — returns of computed values keep a normal ABI return, and escaping/EH/`setjmp`/varargs/`sret`/`byval` sites are skipped. Off by default; opt-in while validated per platform. |
 | Function wrapper | `morok-funcwrap` | `function_wrapper` | Wraps calls after per-function transforms so callers see proxy edges. |
 | VTable integrity | `morok-vtable` | `vtable_integrity` | Guards Itanium C++ virtual dispatches by expected vptr, slot, target, and cookie hash. |
-| Decoy strings | `morok-decoystr` | `decoy_strings` | Distributes retained plaintext honeypot diagnostics and fake logging infrastructure. |
+| Decoy strings | `morok-decoystr` | `decoy_strings` | Distributes retained honeypot diagnostics and fake logging infrastructure. When string encryption also runs, decoy globals are routed through the same encryption path as real strings so static triage cannot bucket them as obvious bait. |
 
-String encryption intentionally excludes generated `morok.decoy.str.*` globals.
-Those decoys must remain visible to cheap triage tools such as `strings`; real
-user strings are encrypted, length-padded where safe, and materialized lazily.
+Generated `morok.decoy.str.*` globals are intentionally eligible for string
+encryption. If only `decoy_strings` runs they remain plaintext bait; in normal
+pipelines where `string_encryption` also runs, they are encrypted, length-padded
+where safe, and materialized like real user strings so cheap triage cannot
+separate decoys by plaintext visibility alone.
+
 Sealed blobs are opt-in: mark a private byte-array global with section
 `.morok.sealed` or a `morok.sealed.` prefix. Supported load/no-capture call
 uses materialize into per-use stack buffers via a per-blob `morok.sealed.open.*`
@@ -740,6 +736,11 @@ foundation helpers instead of hardcoding duplicate offsets or import paths.
 Every per-pass field is optional. Unset fields fall through to the preset,
 policy, or pass default. Percentages use `0..100` unless noted.
 
+Use the section names exactly as listed below. Internal short names such as
+`sub`, `const_enc`, `stack_delta`, `vec`, `csm`, and `anti_dbg` are not TOML
+aliases; `environment_binding_kdf` is the accepted compatibility alias for
+`env_binding_kdf`.
+
 ### Global and Policy
 
 | Scope | Keys |
@@ -773,8 +774,23 @@ unsealed manifest sentinels instead of sealed code-window metadata.
 | `external_opaque_predicates` | `enabled`, `probability`, `max_blocks`, `decoy_stores` |
 | `mq_gate` | `enabled`, `probability`, `vars`, `eqs`, `density`, `max_gates`, `fold_diff` |
 | `nanomites` | `enabled`, `probability`, `max_sites` |
+| `mirage` | `enabled`, `sensitive_only`, `clone_count`, `counterfeit_count`, `max_functions`, `max_instructions`, `counterfeit_domains`, `seal_gated_reality`, `per_invocation_epoch`, `cross_guard`, `force_route` |
 
 `chaos_state_machine.generator` accepts `logistic` or `tfunction`.
+`nested_dispatch` and `warmup` are parsed as reserved knobs but are currently
+ignored by the pass.
+
+`mirage` is off in every preset — opt-in via `[passes.mirage] enabled = true`. It
+transforms only `sensitive`/`mirage`-annotated verdict-like functions (integer/
+`i1` return, scalar integer/pointer args, no vararg/EH/recursion/side effects
+unless explicitly `mirage`-marked). `counterfeit_domains` selects from the
+built-in `license_check`, `signature_verify`, `token_validate`, and
+`feature_flag` templates (empty = all four, chosen per build). `force_route`
+(`auto` | `real` | `fake`) is a build-time diagnostic that pins the hub's route
+at emission — it changes only the generated IR, never the shipped binary, so a
+`fake` build deterministically exercises the counterfeit path for tests without a
+live seal producer. Cross-candidate mutual guarding (`cross_guard`) is a
+documented phase-2 extension and is currently a no-op.
 
 ### Scalar, Data, Stack, and Literal Sections
 
@@ -791,13 +807,14 @@ unsealed manifest sentinels instead of sealed code-window metadata.
 | `vector_obfuscation` | `enabled`, `probability`, `width`, `shuffle`, `lift_comparisons` |
 | `stack_coalescing` | `enabled`, `probability`, `opaque_offsets` |
 | `stack_delta_games` | `enabled`, `probability`, `max_blocks`, `min_bytes`, `max_extra_bytes`, `touches` |
+| `stack_rebase` | `enabled`, `realign_align`, `dynamic_size`, `relocate_probability`, `alias_amplify`, `nonentry_shuffle` |
 | `pointer_laundering` | `enabled`, `pointer_probability`, `integer_probability` |
 | `type_punning` | `enabled`, `probability`, `include_floating`, `max_targets` |
 | `phi_tangling` | `enabled`, `probability`, `layers`, `max_phis` |
 
-`constant_encryption.globalize` routes selected reconstructed carrier values
-through private volatile globals after share folding; `globalize_prob` controls
-that extra layer per rewritten literal.
+`constant_encryption.globalize` and `globalize_prob` are parsed for
+forward-compatibility. The current pass already emits XOR shares as private
+globals read with volatile loads, so these knobs do not change output.
 
 `vector_obfuscation.width` accepts the pass-supported SIMD width values
 `128`, `256`, and `512`.
@@ -817,7 +834,7 @@ that extra layer per rewritten literal.
 | `virtualization` | `enabled`, `probability`, `max_functions`, `max_instructions`, `max_registers` |
 | `fault_paged_payload` | `enabled`, `probability`, `max_payloads`, `max_payload_bytes`, `page_size`, `delivery`, `backend`, `per_page_keys`, `reseal_after_use`, `decoy_pages`, `fallback`, `bind_to_runtime_seal`, `virtualize_helpers` |
 | `hash_gated_self_decrypt` | `enabled`, `probability`, `max_payloads`, `max_payload_bytes`, `context_keying` |
-| `external_secret_binding` | `enabled`, `mode`, `public_key`, `expected_digest`, `identity_policy`, `bind_to_runtime_seal`, `virtualize_helpers` |
+| `external_secret_binding` | `enabled`, `mode`, `public_key`, `expected_digest`, `identity_policy`, `entitlement_gate`, `entitlement_required_mask`, `entitlement_not_before_epoch`, `entitlement_not_after_epoch`, `bind_to_runtime_seal`, `virtualize_helpers` |
 | `env_binding_kdf` | `enabled`, `mode`, `expected_digest`, `identity_policy`, `min_factors`, `bind_to_runtime_seal`, `virtualize_helpers` |
 | `tracer_attestation` | `enabled`, `mode`, `shares`, `renewal`, `bind_to_runtime_seal`, `virtualize_helpers` |
 | `sealed_blob` | `enabled`, `max_blobs`, `max_blob_bytes`, `key_sources`, `delivery`, `zeroize_after_use`, `runtime_keyed_magic`, `magic_bytes` |
@@ -1023,7 +1040,7 @@ self-check data region.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| CMake cannot find `llvm/Plugins/PassPlugin.h` | Host LLVM is upstream or wrong fork/API | Point `LLVM_DIR` at the matching custom LLVM install. |
+| CMake cannot find `llvm/Plugins/PassPlugin.h` | Host LLVM is missing the API-v2 New-PM plugin header | Point `LLVM_DIR` at the same API-v2 LLVM install used by `clang`/`opt`. |
 | Plugin load reports API/version mismatch | `clang`/`opt` and Morok were built against different LLVM plugin ABIs | Rebuild Morok with the same LLVM used by the host driver. |
 | `-mllvm -morok` is unknown on Windows | Windows plugin cl::opts are not parsed by host clang the same way | Use `MOROK_ENABLE=1` plus `MOROK_CONFIG`, `MOROK_PRESET`, and `MOROK_SEED`. |
 | Static Linux binary crashes around import indirection | FCO was left enabled in a static link | Use `cross_build.sh` or force `[passes.function_call_obfuscate].enabled = false` and `[passes.platform_runtime].static_link_expected = true`. |
@@ -1035,14 +1052,10 @@ self-check data region.
 
 - [`docs/algorithms.md`](docs/algorithms.md): algorithm and scheduler reference.
 - [`docs/hardness.md`](docs/hardness.md): hardness-backed primitive specs.
-- [`docs/insurance.md`](docs/insurance.md): broader binary self-protection catalog.
 - [`docs/insurance-tasks.md`](docs/insurance-tasks.md): implementable task list.
 - [`docs/objections.md`](docs/objections.md): limitations and objection handling.
-- [`docs/roadmap.md`](docs/roadmap.md): design backlog and known limits.
 - [`tests/e2e/*.toml`](tests/e2e): tested pipeline configurations.
 - [`tools/morok-audit.py`](tools/morok-audit.py): release binary audit gate.
-- [`crackmes/siloterminal/README.md`](crackmes/siloterminal/README.md):
-  freestanding/static crackme example.
 - [`crackmes/zorya/AUTHORS_NOTE.md`](crackmes/zorya/AUTHORS_NOTE.md):
   sealed verifier example and security model.
 

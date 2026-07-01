@@ -382,6 +382,18 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.nanomites.enabled, src.nanomites.enabled);
     mergeOpt(dst.nanomites.probability, src.nanomites.probability);
     mergeOpt(dst.nanomites.max_sites, src.nanomites.max_sites);
+    // Mirage counterfeit-computation substrate
+    mergeOpt(dst.mirage.enabled, src.mirage.enabled);
+    mergeOpt(dst.mirage.sensitive_only, src.mirage.sensitive_only);
+    mergeOpt(dst.mirage.clone_count, src.mirage.clone_count);
+    mergeOpt(dst.mirage.counterfeit_count, src.mirage.counterfeit_count);
+    mergeOpt(dst.mirage.max_functions, src.mirage.max_functions);
+    mergeOpt(dst.mirage.max_instructions, src.mirage.max_instructions);
+    mergeVec(dst.mirage.counterfeit_domains, src.mirage.counterfeit_domains);
+    mergeOpt(dst.mirage.seal_gated_reality, src.mirage.seal_gated_reality);
+    mergeOpt(dst.mirage.per_invocation_epoch, src.mirage.per_invocation_epoch);
+    mergeOpt(dst.mirage.cross_guard, src.mirage.cross_guard);
+    mergeOpt(dst.mirage.force_route, src.mirage.force_route);
     // StrEnc
     mergeOpt(dst.str_enc.enabled, src.str_enc.enabled);
     mergeOpt(dst.str_enc.probability, src.str_enc.probability);

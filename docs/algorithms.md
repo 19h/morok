@@ -447,6 +447,95 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   flattening/IFSM/dispatcherless routing absorb coherent dead arms as ordinary
   CFG rather than exposing a late BCF signature.
 
+## Mirage — counterfeit-computation substrate — IR structure
+- Attacks two reversing steps Morok does not otherwise target directly:
+  deciding *which* candidate is the real sensitive algorithm, and generalizing
+  from *one* dynamic trace of the protected computation.  For a selected
+  verdict-like function `F` it replaces the body of `F` with a thin branchless
+  dispatch hub and emits a private candidate table of `clone_count` equivalent
+  real clones followed by `counterfeit_count` plausible-but-wrong counterfeits:
+  `F.__mirage.real0..`, `F.__mirage.fake0..`, and `F.__mirage.table`.
+- Eligibility is deliberately narrow (a wrong value must be a valid failure
+  mode): `F` is defined, non-`morok.*`/non-`llvm.*`, not `nomirage`, and — when
+  `sensitive_only` — carries `sensitive` or `mirage`.  Its return is `i1` or an
+  integer ≤ 64 bits; every argument is a scalar integer or address-space-0
+  pointer with no `byval`/`sret`/`inalloca`/`swifterror`/`preallocated`/`nest`
+  attribute; it is not vararg, has no `invoke`/landingpad/EH-pad/`callbr`/resume/
+  `indirectbr` and no personality/`naked`/coroutine, has no address-taken basic
+  block (a `blockaddress`/computed-goto reference from an outside constant would
+  survive against the deleted original after cloning), is not in a direct-call
+  cycle (bounded DFS), is within `max_instructions`, and has no observable side
+  effects (any
+  write to non-stack memory, volatile/atomic op, or non-read-only/throwing call)
+  unless explicitly `mirage`-marked, because counterfeits do not preserve side
+  effects.
+- Real clones are equivalence-by-construction: `CloneFunctionInto` copies `F`
+  before its body is deleted, so each clone is semantically identical, and the
+  clones then flow through the normal semantics-preserving per-function Morok
+  transforms.  Divergent profiles keep a single trace from generalizing — even
+  clones get `sub`/`mba`/`indibran`/`fla`; odd clone 1 is `vm`-prioritized with a
+  divergent native-heavy fallback (`dispatchless`/`phitangle`/`entfla`) so it is
+  strongly and *differently* obfuscated whether or not the virtualizer claims it.
+- Counterfeits are synthesized with IRBuilder, not cloned: a multi-block
+  arg-derived fold loop over a per-build private table, one of four templates
+  (`license_check` hash/MAC fold, `signature_verify` square-and-multiply-shaped
+  fold, `token_validate` field extraction, `feature_flag` bitmask accumulation),
+  returning a wrong-but-plausible value — a rarely-true arg-dependent verdict
+  biased toward denial for `i1`, or a small nonzero status/tier/error code for
+  wider integers.  They emit no strings and no calls, so they create no obvious
+  new landmarks, and all arithmetic is UB-free (masked shifts, no division by
+  zero).  Counterfeits are never VM-lifted (they carry `novm`) so they remain
+  static algorithmic bait.
+- The seal-gated selection lives in a private `morok.mirage.sel.<F>` helper, not
+  in `F` itself.  The per-function obfuscation loop (and the guaranteed integrity
+  waves) skip every `morok.*` name, so the helper's zero-on-clean arithmetic is
+  never rewritten — critically, the integrity-FUSION passes (DFI / self-checksum
+  / mutual-guard) make constants depend on a runtime code-region hash that is
+  only zero on a POST-LINK-SEALED binary, so on an unsealed build they would
+  otherwise flip the seal delta nonzero and misroute a clean run.  `F` stays the
+  public ABI entry and just forwards: `%t = call morok.mirage.sel.F(); call %t(args)`.
+- The selector is a single straight-line, branchless block.  A per-hub volatile
+  epoch global is advanced by an odd step each call and reduced modulo
+  `clone_count` to pick the real clone (per-invocation variation even on clean
+  runs).  A zero-on-clean seal key is derived from the `anti_debug`,
+  `env_binding`, and `tracer` RuntimeSeal channel deltas: an `anyDirty` OR
+  guarantees the KDF seed is nonzero whenever any channel is dirty (so an XOR
+  cancellation can never launder a dirty state to clean), and `emitKdf64` yields
+  `0` iff clean.  The final index is `select dirty, clone_count + (key %
+  counterfeit_count), epoch % clone_count` — a branchless selector, not a
+  conditional branch — loaded from the table by an in-bounds GEP and returned as
+  the candidate pointer, which `F` then calls indirectly with its arguments.  If
+  a channel has no producer it stays clean and contributes zero, so enabling
+  Mirage alone never routes to a counterfeit; a producer folding evidence later
+  makes Mirage route automatically.
+- `counterfeit_count = 0` disables the dirty route entirely (no urem-by-zero is
+  emitted); `seal_gated_reality = false` keeps only epoch-varied real routing;
+  `per_invocation_epoch = false` pins the real clone.  `force_route`
+  (`auto`|`real`|`fake`) is a build-time diagnostic that pins the emitted route
+  for deterministic testing without a live seal producer — it changes only the
+  IR, never a shipped binary.
+- Attribute hygiene: the hub's forwarding calls (and the selector's epoch store)
+  relax `F`'s memory-effect/`readonly`/`willreturn`/`norecurse`/`speculatable`
+  promises (never its ABI return/parameter attributes); the indirect call keeps
+  `nounwind` when `F` had it, and the hub and counterfeits drop any return-value
+  `range` so a counterfeit's out-of-range value stays a concrete plausible result
+  rather than poison.  All candidates, the selector helper, and the epoch/table/
+  per-fake-table globals are private-linkage, so their `__mirage`/`morok.mirage`
+  names are assembler-local and never reach the object symbol table.
+- The virtualizer's callback-safety heuristic keeps every address-taken function
+  native once any unresolved indirect call exists in the module; the hub's own
+  indirect call trips it, so the address-taken real clones fall back to native.
+  This is the intended fallback — the divergent native-heavy profile on clone 1
+  keeps it strongly obfuscated regardless.
+- Cross-candidate mutual guarding (each candidate checksumming its peers so
+  patching one poisons the others) needs new post-link manifests and is a
+  documented phase-2 extension; v1 candidates still receive ordinary integrity
+  passes where eligible.
+- Scheduler placement is first, before VM priority marking and the first VM
+  wave, so real clone 1's `vm` mark is seen by the priority planner and every
+  candidate's non-`morok.*` name lets it flow through the normal transforms.
+  Off in every preset; opt-in via `[passes.mirage]`.
+
 ## Optimizer amplification — IR structure
 - Eligible operations are scalar integer `add/sub/mul/and/or/xor` binary
   operators (including `nuw`/`nsw`/`disjoint`-flagged forms), scalar integer
@@ -1585,6 +1674,6 @@ All integer identities hold in the ring Z/2ⁿ (two's-complement wraparound).
   or generate dense IR.
 
 ## Scheduler order (to preserve semantics)
-Virtualization(user) → FaultPagedPayload → HashSelfDecrypt → AntiHook → AntiClassDump → WindowsPEFoundation → WindowsPebHeapDebug → WindowsDebugObject → WindowsThreadHide → WindowsAntiAttach → WindowsKernelDebugger → WindowsSyscalls → WindowsUnhook → WindowsVehAudit → WindowsProcessMitigations → AntiDebug → TimingOracle → TrapOracle → PageFaultTlbOracle → CacheTimingOracle → MicroarchitecturalCanary → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
+Mirage(clone+hub) → Virtualization(user) → FaultPagedPayload → HashSelfDecrypt → AntiHook → AntiClassDump → WindowsPEFoundation → WindowsPebHeapDebug → WindowsDebugObject → WindowsThreadHide → WindowsAntiAttach → WindowsKernelDebugger → WindowsSyscalls → WindowsUnhook → WindowsVehAudit → WindowsProcessMitigations → AntiDebug → TimingOracle → TrapOracle → PageFaultTlbOracle → CacheTimingOracle → MicroarchitecturalCanary → StringEnc → FCO(fn) → VTableIntegrity → per-fn{ Split, BCF, OptAmp, Sub,
 MBA, AliasOp, ExtOp, CoherentDecoys, NiState/EntFla/CSM(generator)/Flatten, StateOp, IFSM, PhiTangle, TypePun, StackCoalesce, StackDelta, PointerLaunder, DataFlowIntegrity, TableArith, Uniform, Vec, PathExplosion, MqGate, TraceKeying, Dispatcherless, MicrocodeStress, SelfChecksum, MutualGuardGraph, ShamirShare, ConstEnc, IndirectBranch } → ProtectionHelperVM → SensitiveHelperHardening → Nanomites → AdversarialSelfTuning → AdversarialFunctionMerging → FunctionWrapper → PerBuildPolymorphism →
 MisleadingMetadata → FeatureElimination (strip debug/names) → cleanup marker decls.

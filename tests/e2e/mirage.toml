@@ -1,0 +1,28 @@
+# Opt-in Mirage (counterfeit-computation substrate) e2e config.
+#
+# Based on the portable-safe intensity (the `high` preset minus virtualization,
+# mirroring portable.toml) so the clean differential runs correctly on every
+# platform, with the Mirage substrate layered on top.  On a clean run the hub
+# always routes to one of the equivalent real clones — the per-invocation epoch
+# keeps alternating between them across the workload's many calls — so the
+# obfuscated output must match the clean reference exactly.  The counterfeits are
+# emitted as static algorithmic bait but are only reached under a dirty runtime
+# seal state, which does not occur on a clean execution.
+[global]
+preset = "high"
+
+[passes.virtualization]
+enabled = false
+probability = 0
+
+[passes.mirage]
+enabled = true
+sensitive_only = true
+clone_count = 2
+counterfeit_count = 2
+max_functions = 8
+max_instructions = 256
+counterfeit_domains = ["license_check", "signature_verify"]
+seal_gated_reality = true
+per_invocation_epoch = true
+cross_guard = false

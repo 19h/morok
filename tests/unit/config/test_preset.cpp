@@ -54,6 +54,16 @@ TEST_CASE("presets leave constant_encryption globalize opt-in") {
     }
 }
 
+// Mirage is an explicit opt-in protection: no preset may enable it (mirage-plan
+// §12 — the safer first landing is disabled by default until its e2e matrix
+// stabilizes).  Assert it is disabled at every intensity.
+TEST_CASE("presets keep mirage opt-in (disabled everywhere)") {
+    for (Preset p : {Preset::Low, Preset::Mid, Preset::High, Preset::Max}) {
+        const PassConfig c = presetConfig(p);
+        CHECK(c.mirage.enabled.value_or(false) == false);
+    }
+}
+
 TEST_CASE("low preset matches the documented table") {
     const PassConfig c = presetConfig(Preset::Low);
     CHECK(c.bcf.probability == 30u);

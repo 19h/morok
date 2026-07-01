@@ -363,6 +363,32 @@ struct FunctionFissionConfig {
     Opt<std::uint32_t> max_region_blocks;
 };
 
+// Mirage: counterfeit-computation substrate.  A selected verdict-like function
+// is replaced by a thin branchless hub that dispatches, per invocation, to one
+// of several equivalent real clones (clean seal state) or a plausible-but-wrong
+// counterfeit algorithm (dirty seal state).  Attacks the "one real algorithm to
+// find, one trace to generalize" reversing assumption.  Off in every preset;
+// opt-in via `[passes.mirage]`.
+struct MirageConfig {
+    Opt<bool> enabled;
+    Opt<bool> sensitive_only;        ///< only transform sensitive/mirage funcs
+    Opt<std::uint32_t> clone_count;  ///< equivalent real clones (>=1)
+    Opt<std::uint32_t> counterfeit_count; ///< counterfeit algorithms (0 = none)
+    Opt<std::uint32_t> max_functions;     ///< cap of hubs emitted per module
+    Opt<std::uint32_t> max_instructions;  ///< per-function clone-size cap
+    std::vector<std::string> counterfeit_domains; ///< template names to draw from
+    Opt<bool> seal_gated_reality;    ///< route to counterfeits on dirty seal
+    Opt<bool> per_invocation_epoch;  ///< vary real clone per call via epoch
+    Opt<bool> cross_guard;           ///< phase 2 cross-candidate guarding (nyi)
+    // Diagnostic/test-only build knob (never set by presets): force the hub's
+    // route at emission time so an e2e test can deterministically observe the
+    // real vs counterfeit outcome without a live seal producer.  "auto" (unset)
+    // keeps normal seal-gated routing; "real" pins the real-clone path; "fake"
+    // pins the counterfeit path.  It changes the emitted IR only — the shipped
+    // binary carries no runtime switch — so it cannot weaken a normal build.
+    Opt<std::string> force_route;
+};
+
 struct NanomiteConfig {
     Opt<bool> enabled;
     Opt<std::uint32_t> probability;
@@ -489,6 +515,7 @@ struct PassConfig {
     ReturnlessDispatchConfig returnless_dispatch;
     FunctionFissionConfig function_fission;
     NanomiteConfig nanomites;
+    MirageConfig mirage;
     StrEncConfig str_enc;
     ConstEncConfig const_enc;
     VecConfig vec;

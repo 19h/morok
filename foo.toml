@@ -1,8 +1,8 @@
 [global]
 preset = "max"
-verbose = false
-trace = false
-demangle_names = false
+verbose = true
+trace = true
+demangle_names = true
 
 [passes]
 fail_closed_on_unsealed = true
@@ -323,7 +323,7 @@ min_region_blocks = 2
 max_region_blocks = 64
 
 [passes.nanomites]
-enabled = true
+enabled = false
 probability = 100
 max_sites = 128
 

@@ -420,6 +420,20 @@ void parseNanomites(const toml::table &t, NanomiteConfig &c) {
     c.max_sites = readU32(t["max_sites"]);
 }
 
+void parseMirage(const toml::table &t, MirageConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.sensitive_only = readBool(t["sensitive_only"]);
+    c.clone_count = readU32(t["clone_count"]);
+    c.counterfeit_count = readU32(t["counterfeit_count"]);
+    c.max_functions = readU32(t["max_functions"]);
+    c.max_instructions = readU32(t["max_instructions"]);
+    readStrArr(t["counterfeit_domains"], c.counterfeit_domains);
+    c.seal_gated_reality = readBool(t["seal_gated_reality"]);
+    c.per_invocation_epoch = readBool(t["per_invocation_epoch"]);
+    c.cross_guard = readBool(t["cross_guard"]);
+    c.force_route = readString(t["force_route"]);
+}
+
 void parseStrEnc(const toml::table &t, StrEncConfig &c) {
     c.enabled = readBool(t["enabled"]);
     c.probability = readU32(t["probability"]);
@@ -578,6 +592,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseFunctionFission(*t, pc.function_fission);
     if (auto *t = p["nanomites"].as_table())
         parseNanomites(*t, pc.nanomites);
+    if (auto *t = p["mirage"].as_table())
+        parseMirage(*t, pc.mirage);
     if (auto *t = p["string_encryption"].as_table())
         parseStrEnc(*t, pc.str_enc);
     if (auto *t = p["constant_encryption"].as_table())

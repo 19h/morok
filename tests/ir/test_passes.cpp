@@ -38,6 +38,7 @@
 #include "morok/passes/InterproceduralFsm.hpp"
 #include "morok/passes/Mba.hpp"
 #include "morok/passes/MicrocodeStress.hpp"
+#include "morok/passes/Mirage.hpp"
 #include "morok/passes/MisleadingMetadata.hpp"
 #include "morok/passes/MqGate.hpp"
 #include "morok/passes/MutualGuardGraph.hpp"
@@ -24317,4 +24318,353 @@ TEST_CASE("passes leave declarations untouched") {
         morok::ir::IRRandom rng(engine);
         CHECK_FALSE(morok::passes::substituteFunction(F, {100, 1}, rng));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mirage — counterfeit-computation substrate
+// ---------------------------------------------------------------------------
+
+namespace {
+const char *kMirageVerdict = R"ir(
+define i1 @verdict(i64 %k, i64 %s) {
+entry:
+  %h = xor i64 %k, %s
+  %m = mul i64 %h, 2654435761
+  %r = lshr i64 %m, 33
+  %x = xor i64 %m, %r
+  %c = icmp eq i64 %x, 305419896
+  ret i1 %c
+}
+)ir";
+
+std::unique_ptr<Module> mirageRun(LLVMContext &ctx, const char *ir,
+                                  const char *fn,
+                                  morok::passes::MirageParams p, bool &changed) {
+    auto M = parse(ctx, ir);
+    if (Function *F = M->getFunction(fn))
+        morok::ir::addAnnotation(*F, "sensitive");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0x31337);
+    morok::ir::IRRandom rng(engine);
+    changed = morok::passes::mirageModule(*M, p, rng);
+    return M;
+}
+} // namespace
+
+TEST_CASE("mirage emits real clones and counterfeits behind a hub") {
+    LLVMContext ctx;
+    bool changed = false;
+    auto M = mirageRun(ctx, kMirageVerdict, "verdict",
+                       morok::passes::MirageParams{}, changed);
+    CHECK(changed);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+
+    CHECK(M->getFunction("verdict.__mirage.real0") != nullptr);
+    CHECK(M->getFunction("verdict.__mirage.real1") != nullptr);
+    CHECK(M->getFunction("verdict.__mirage.fake0") != nullptr);
+    CHECK(M->getFunction("verdict.__mirage.fake1") != nullptr);
+    CHECK(M->getGlobalVariable("verdict.__mirage.table", /*AllowInternal=*/true) !=
+          nullptr);
+
+    // The original symbol survives as the public ABI entry with its signature.
+    Function *hub = M->getFunction("verdict");
+    REQUIRE(hub != nullptr);
+    CHECK(hub->getReturnType()->isIntegerTy(1));
+    CHECK_FALSE(hub->isDeclaration());
+    // Candidates are private linkage, so their names never reach the symtab.
+    CHECK(M->getFunction("verdict.__mirage.real0")->hasPrivateLinkage());
+    CHECK(M->getFunction("verdict.__mirage.fake0")->hasPrivateLinkage());
+}
+
+TEST_CASE("mirage hub forwards through a branchless morok.* selector") {
+    LLVMContext ctx;
+    bool changed = false;
+    auto M = mirageRun(ctx, kMirageVerdict, "verdict",
+                       morok::passes::MirageParams{}, changed);
+    REQUIRE(changed);
+
+    // The hub is a thin, straight-line wrapper: it calls the selector helper and
+    // then indirect-calls the chosen candidate — no seal arithmetic of its own.
+    Function *hub = M->getFunction("verdict");
+    REQUIRE(hub != nullptr);
+    CHECK(hub->size() == 1u);
+    bool anyBranch = false, indirectCall = false, callsSelector = false;
+    for (Instruction &I : hub->front()) {
+        if (isa<BranchInst>(I))
+            anyBranch = true;
+        if (auto *CB = dyn_cast<CallInst>(&I)) {
+            Function *Callee = CB->getCalledFunction();
+            if (Callee == nullptr)
+                indirectCall = true;
+            else if (Callee->getName().starts_with("morok.mirage.sel."))
+                callsSelector = true;
+        }
+    }
+    CHECK_FALSE(anyBranch);
+    CHECK(callsSelector);
+    CHECK(indirectCall);
+
+    // The seal-gated selection lives in a private `morok.*` helper (skipped by
+    // the per-function obfuscation loop, so its zero-on-clean arithmetic is
+    // never rewritten): branchless, with the select router and the ptr-returning
+    // table load.
+    Function *sel = nullptr;
+    for (Function &Fn : *M)
+        if (Fn.getName().starts_with("morok.mirage.sel.")) {
+            sel = &Fn;
+            break;
+        }
+    REQUIRE(sel != nullptr);
+    CHECK(sel->hasPrivateLinkage());
+    CHECK(sel->getReturnType()->isPointerTy());
+    CHECK(sel->arg_empty());
+    bool hasSelect = false, loadsPtr = false, condBranch = false;
+    for (BasicBlock &BB : *sel)
+        for (Instruction &I : BB) {
+            if (isa<SelectInst>(I))
+                hasSelect = true;
+            if (auto *LI = dyn_cast<LoadInst>(&I))
+                if (LI->getType()->isPointerTy())
+                    loadsPtr = true;
+            if (auto *BR = dyn_cast<BranchInst>(&I))
+                if (BR->isConditional())
+                    condBranch = true;
+        }
+    CHECK(hasSelect);       // branchless routing via `select`
+    CHECK(loadsPtr);        // loads the target from the candidate table
+    CHECK_FALSE(condBranch);
+}
+
+TEST_CASE("mirage stamps divergent candidate annotations") {
+    using morok::ir::hasAnnotation;
+    LLVMContext ctx;
+    bool changed = false;
+    morok::passes::MirageParams p;
+    p.vm_profile_available = true; // real1 gets the VM-priority profile
+    auto M = mirageRun(ctx, kMirageVerdict, "verdict", p, changed);
+    REQUIRE(changed);
+
+    Function *r0 = M->getFunction("verdict.__mirage.real0");
+    Function *r1 = M->getFunction("verdict.__mirage.real1");
+    Function *f0 = M->getFunction("verdict.__mirage.fake0");
+    REQUIRE(r0 != nullptr);
+    REQUIRE(r1 != nullptr);
+    REQUIRE(f0 != nullptr);
+
+    // real0: native-heavy, never VM, never re-mirage.
+    CHECK(hasAnnotation(*r0, "sensitive"));
+    CHECK(hasAnnotation(*r0, "sub"));
+    CHECK(hasAnnotation(*r0, "mba"));
+    CHECK(hasAnnotation(*r0, "nomirage"));
+    CHECK(hasAnnotation(*r0, "novm"));
+    CHECK_FALSE(hasAnnotation(*r0, "vm"));
+
+    // real1: VM-priority.
+    CHECK(hasAnnotation(*r1, "vm"));
+    CHECK(hasAnnotation(*r1, "virtualization"));
+    CHECK(hasAnnotation(*r1, "nomirage"));
+
+    // fakes: native structural bait, never VM, never re-mirage.
+    CHECK(hasAnnotation(*f0, "bcf"));
+    CHECK(hasAnnotation(*f0, "split"));
+    CHECK(hasAnnotation(*f0, "nomirage"));
+    CHECK(hasAnnotation(*f0, "novm"));
+
+    // hub: kept native and never re-processed.
+    Function *hub = M->getFunction("verdict");
+    CHECK(hasAnnotation(*hub, "nomirage"));
+    CHECK(hasAnnotation(*hub, "novm"));
+}
+
+TEST_CASE("mirage real1 stays native when the build has no VM available") {
+    using morok::ir::hasAnnotation;
+    LLVMContext ctx;
+    bool changed = false;
+    morok::passes::MirageParams p;
+    p.vm_profile_available = false; // VM-disabled build
+    auto M = mirageRun(ctx, kMirageVerdict, "verdict", p, changed);
+    REQUIRE(changed);
+    Function *r1 = M->getFunction("verdict.__mirage.real1");
+    REQUIRE(r1 != nullptr);
+    // Fallback profile: no vm annotation, so Mirage cannot force a VM wave on a
+    // VM-disabled (e.g. portable/Linux) build.
+    CHECK_FALSE(hasAnnotation(*r1, "vm"));
+    CHECK(hasAnnotation(*r1, "nomirage"));
+}
+
+TEST_CASE("mirage counterfeit bodies are multi-block and nontrivial") {
+    LLVMContext ctx;
+    bool changed = false;
+    auto M = mirageRun(ctx, kMirageVerdict, "verdict",
+                       morok::passes::MirageParams{}, changed);
+    REQUIRE(changed);
+    Function *f0 = M->getFunction("verdict.__mirage.fake0");
+    REQUIRE(f0 != nullptr);
+    CHECK(f0->size() >= 3u); // entry + loop + verdict
+    unsigned insts = 0;
+    for (BasicBlock &BB : *f0)
+        insts += static_cast<unsigned>(BB.size());
+    CHECK(insts >= 12u);
+    // No new imports/calls in the counterfeit body (no obvious landmarks).
+    for (BasicBlock &BB : *f0)
+        for (Instruction &I : BB)
+            CHECK_FALSE(isa<CallInst>(I));
+    // Counterfeit is genuinely different IR from the real clone.
+    Function *r0 = M->getFunction("verdict.__mirage.real0");
+    REQUIRE(r0 != nullptr);
+    CHECK(f0->size() != r0->size());
+}
+
+TEST_CASE("mirage handles small integer status verdicts with pointer args") {
+    LLVMContext ctx;
+    const char *ir = R"ir(
+define i32 @status(i32 %u, ptr %ctx) {
+entry:
+  %a = mul i32 %u, 7
+  %b = add i32 %a, 3
+  %c = and i32 %b, 15
+  ret i32 %c
+}
+)ir";
+    bool changed = false;
+    auto M = mirageRun(ctx, ir, "status", morok::passes::MirageParams{}, changed);
+    CHECK(changed);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+    Function *f0 = M->getFunction("status.__mirage.fake0");
+    REQUIRE(f0 != nullptr);
+    CHECK(f0->getReturnType()->isIntegerTy(32));
+}
+
+TEST_CASE("mirage skips vararg, EH, and pointer-return functions") {
+    LLVMContext ctx;
+    const char *ir = R"ir(
+declare i32 @__gxx_personality_v0(...)
+define i32 @va(i32 %n, ...) {
+entry:
+  ret i32 %n
+}
+define ptr @ret_ptr(i64 %x) {
+entry:
+  %p = inttoptr i64 %x to ptr
+  ret ptr %p
+}
+define i32 @with_eh(i64 %x) personality ptr @__gxx_personality_v0 {
+entry:
+  ret i32 0
+}
+)ir";
+    auto M = parse(ctx, ir);
+    for (Function &F : *M)
+        if (!F.isDeclaration())
+            morok::ir::addAnnotation(F, "sensitive");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(7);
+    morok::ir::IRRandom rng(engine);
+    const bool changed =
+        morok::passes::mirageModule(*M, morok::passes::MirageParams{}, rng);
+    CHECK_FALSE(changed);
+    for (Function &F : *M)
+        CHECK_FALSE(F.getName().contains("__mirage"));
+}
+
+TEST_CASE("mirage skips recursive and side-effecting functions") {
+    LLVMContext ctx;
+    const char *ir = R"ir(
+@g = internal global i64 0
+define i32 @fact(i32 %n) {
+entry:
+  %c = icmp sle i32 %n, 1
+  br i1 %c, label %base, label %rec
+base:
+  ret i32 1
+rec:
+  %n1 = sub i32 %n, 1
+  %r = call i32 @fact(i32 %n1)
+  %m = mul i32 %n, %r
+  ret i32 %m
+}
+define i32 @writes(i32 %x) {
+entry:
+  %e = zext i32 %x to i64
+  store i64 %e, ptr @g
+  ret i32 %x
+}
+)ir";
+    auto M = parse(ctx, ir);
+    for (Function &F : *M)
+        if (!F.isDeclaration())
+            morok::ir::addAnnotation(F, "sensitive");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(11);
+    morok::ir::IRRandom rng(engine);
+    // Recursion and (non-`mirage`-marked) observable side effects are both
+    // ineligible, so nothing is transformed.
+    const bool changed =
+        morok::passes::mirageModule(*M, morok::passes::MirageParams{}, rng);
+    CHECK_FALSE(changed);
+    for (Function &F : *M)
+        CHECK_FALSE(F.getName().contains("__mirage"));
+}
+
+// Regression: a function with an address-taken basic block (computed-goto jump
+// table via `blockaddress`) must be skipped.  Cloning it would leave the
+// `blockaddress` constants in the module-level jump table pointing at the
+// original F, and deleting F's body to install the hub would dangle them into
+// `inttoptr(1)` placeholders — a verifier-clean miscompile of the clone's
+// `indirectbr`.
+TEST_CASE("mirage skips functions with address-taken blocks (computed goto)") {
+    LLVMContext ctx;
+    const char *ir = R"ir(
+@jtbl = internal constant [2 x ptr] [ptr blockaddress(@dispatch, %a), ptr blockaddress(@dispatch, %b)]
+define i32 @dispatch(i64 %i) {
+entry:
+  %p = getelementptr [2 x ptr], ptr @jtbl, i64 0, i64 %i
+  %t = load ptr, ptr %p
+  indirectbr ptr %t, [label %a, label %b]
+a:
+  ret i32 10
+b:
+  ret i32 20
+}
+)ir";
+    auto M = parse(ctx, ir);
+    morok::ir::addAnnotation(*M->getFunction("dispatch"), "sensitive");
+    auto engine = morok::core::Xoshiro256pp::fromSeed(13);
+    morok::ir::IRRandom rng(engine);
+    const bool changed =
+        morok::passes::mirageModule(*M, morok::passes::MirageParams{}, rng);
+    CHECK_FALSE(changed);
+    for (Function &F : *M)
+        CHECK_FALSE(F.getName().contains("__mirage"));
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("mirage is verifier-clean and re-run leaves candidates alone") {
+    LLVMContext ctx;
+    bool changed = false;
+    auto M = mirageRun(ctx, kMirageVerdict, "verdict",
+                       morok::passes::MirageParams{}, changed);
+    REQUIRE(changed);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+
+    // Second pass: hub + candidates all carry `nomirage`, so nothing new.
+    auto engine = morok::core::Xoshiro256pp::fromSeed(0xABCD);
+    morok::ir::IRRandom rng2(engine);
+    const bool changed2 =
+        morok::passes::mirageModule(*M, morok::passes::MirageParams{}, rng2);
+    CHECK_FALSE(changed2);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("mirage without counterfeits routes only among real clones") {
+    LLVMContext ctx;
+    bool changed = false;
+    morok::passes::MirageParams p;
+    p.counterfeit_count = 0; // no fakes
+    auto M = mirageRun(ctx, kMirageVerdict, "verdict", p, changed);
+    REQUIRE(changed);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+    CHECK(M->getFunction("verdict.__mirage.real0") != nullptr);
+    CHECK(M->getFunction("verdict.__mirage.real1") != nullptr);
+    CHECK(M->getFunction("verdict.__mirage.fake0") == nullptr);
+    // The hub must not contain an unreachable / out-of-range table index: with
+    // no counterfeits there is no dirty route, so no urem-by-zero is emitted.
+    CHECK_FALSE(verifyModule(*M, &errs()));
 }
