@@ -11947,6 +11947,32 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("selfChecksumConstantsFunction can keep direct diff calls") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @selfcheck_direct(i32 %a) {
+entry:
+  %x = xor i32 %a, 305419896
+  %y = add i32 %x, 17
+  ret i32 %y
+}
+)ir");
+    Function *F = M->getFunction("selfcheck_direct");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(18145);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::SelfChecksumParams params{/*probability=*/100,
+                                             /*max_constants=*/8,
+                                             /*region_bytes=*/32};
+    params.diff_cache = morok::passes::SelfChecksumDiffCacheMode::Direct;
+
+    CHECK(morok::passes::selfChecksumConstantsFunction(*F, params, rng));
+
+    CHECK(countNamedInstructions(*F, "morok.sc.diff.cache") == 0u);
+    CHECK(countCallsTo(*F, "morok.sc.diff.selfcheck_direct") >= 2u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 // Regression for #106: fail-closed-on-unsealed binds the post-link code_size
 // sentinel into the seal-dependent passes' live key material, so a never-sealed
 // (or downgrade-reset) binary reconstructs garbage and cannot run instead of

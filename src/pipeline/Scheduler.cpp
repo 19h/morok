@@ -470,6 +470,8 @@ passes::MirageParams mirageParams(const config::MirageConfig &C,
 passes::SelfChecksumDiffCacheMode
 selfChecksumDiffCacheMode(const config::SelfChecksumConfig &C) {
     const std::string Mode = C.diff_cache.value_or("activation");
+    if (Mode == "direct" || Mode == "none")
+        return passes::SelfChecksumDiffCacheMode::Direct;
     if (Mode == "static")
         return passes::SelfChecksumDiffCacheMode::Static;
     return passes::SelfChecksumDiffCacheMode::Activation;

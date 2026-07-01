@@ -22,3 +22,11 @@ preset = "high"
 [passes.virtualization]
 enabled = false
 probability = 0
+
+[passes.self_checksum_constants]
+# Linux arm64's portable runtime differential is not yet activation-cache
+# stable: sampling the integrity diff once at function entry can poison
+# argument constants in 02_fibonacci.c.  Keep the original per-use self-check
+# behavior for this cross-platform gate while Darwin and explicit operator
+# configs can still use the default activation cache or `diff_cache = "static"`.
+diff_cache = "direct"

@@ -88,6 +88,7 @@ struct Runtime {
 
 struct ActivationDiffCache {
     AllocaInst *encoded = nullptr;
+    Function *direct_provider = nullptr;
     std::uint64_t mask = 0;
 };
 
@@ -741,6 +742,7 @@ ActivationDiffCache createActivationDiffCache(Function &F, Function *Provider,
     auto *I64 = B.getInt64Ty();
 
     ActivationDiffCache Cache;
+    Cache.direct_provider = Provider;
     Cache.mask = Rng.next();
     Cache.encoded = B.CreateAlloca(I64, nullptr, "morok.sc.diff.cache");
     Cache.encoded->setAlignment(Align(8));
@@ -757,6 +759,9 @@ ActivationDiffCache createActivationDiffCache(Function &F, Function *Provider,
 
 Value *emitCachedDiff64(Builder &B, const ActivationDiffCache &Cache,
                         StringRef Name) {
+    if (!Cache.encoded)
+        return B.CreateCall(Cache.direct_provider->getFunctionType(),
+                            Cache.direct_provider, {}, Name);
     auto *Load = B.CreateLoad(B.getInt64Ty(), Cache.encoded,
                               "morok.sc.diff.cache.load");
     Load->setVolatile(true);
@@ -782,7 +787,10 @@ Value *emitFusedConstant(Function &F, Instruction &User,
     GlobalVariable *MaskGV = createMask(M, F, Ty, Mask);
 
     Builder B(&User);
-    Value *Diff64 = emitCachedDiff64(B, Cache, "morok.sc.diff.cached");
+    Value *Diff64 =
+        emitCachedDiff64(B, Cache,
+                         Cache.encoded ? "morok.sc.diff.cached"
+                                       : "morok.sc.diff.call");
     Value *Diff = Diff64;
     if (Bits < 64)
         Diff = B.CreateTrunc(Diff64, Ty, "morok.sc.diff.trunc");
@@ -913,8 +921,13 @@ bool selfChecksumConstantsFunction(Function &F,
             *F.getParent(), suffixFor(F), R, Rng.next(), Rng.next());
         DiffProviderCallName = "morok.sc.cache.call";
     }
-    ActivationDiffCache Cache =
-        createActivationDiffCache(F, DiffProvider, DiffProviderCallName, Rng);
+    ActivationDiffCache Cache;
+    if (Params.diff_cache == SelfChecksumDiffCacheMode::Direct) {
+        Cache.direct_provider = DiffProvider;
+    } else {
+        Cache = createActivationDiffCache(F, DiffProvider, DiffProviderCallName,
+                                          Rng);
+    }
     std::map<std::pair<BasicBlock *, BasicBlock *>, BasicBlock *> SplitEdges;
     auto insertionPoint = [&](const Target &T) -> Instruction * {
         if (!T.phi_incoming)
