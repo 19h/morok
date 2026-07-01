@@ -298,6 +298,7 @@ void parseSelfChecksum(const toml::table &t, SelfChecksumConfig &c) {
     c.probability = readU32(t["probability"]);
     c.max_constants = readU32(t["max_constants"]);
     c.region_bytes = readU32(t["region_bytes"]);
+    c.diff_cache = readString(t["diff_cache"]);
 }
 
 void parseDataFlowIntegrity(const toml::table &t, DataFlowIntegrityConfig &c) {
