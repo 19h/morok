@@ -20,6 +20,11 @@ class Function;
 
 namespace morok::passes {
 
+enum class SelfChecksumDiffCacheMode {
+    Activation,
+    Static,
+};
+
 struct SelfChecksumParams {
     std::uint32_t probability = 100;    ///< per eligible constant, 0..100
     std::uint32_t max_constants = 16;   ///< per-function replacement cap
@@ -28,6 +33,8 @@ struct SelfChecksumParams {
     /// a nonzero corruption into the diff so reconstructed constants/returns are
     /// garbage and the never-sealed binary cannot run.  Sealed builds unaffected.
     bool fail_closed_on_unsealed = false;
+    SelfChecksumDiffCacheMode diff_cache =
+        SelfChecksumDiffCacheMode::Activation; ///< helper diff reuse policy
 };
 
 /// Fuse selected scalar constant operands, including PHI incoming values,

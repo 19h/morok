@@ -250,6 +250,7 @@ struct SelfChecksumConfig {
     Opt<std::uint32_t> probability;
     Opt<std::uint32_t> max_constants;
     Opt<std::uint32_t> region_bytes;
+    Opt<std::string> diff_cache;
 };
 
 struct DataFlowIntegrityConfig {

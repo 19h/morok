@@ -86,6 +86,11 @@ struct Runtime {
     std::uint64_t seed = 0;
 };
 
+struct ActivationDiffCache {
+    AllocaInst *encoded = nullptr;
+    std::uint64_t mask = 0;
+};
+
 bool generatedFunction(const Function &F) {
     return F.getName().starts_with("morok.");
 }
@@ -553,8 +558,215 @@ GlobalVariable *createMask(Module &M, Function &F, IntegerType *Ty,
     return GV;
 }
 
-Value *emitFusedConstant(Function &F, Runtime &R, Instruction &User,
-                         Constant *C, ir::IRRandom &Rng) {
+GlobalVariable *createI64CacheGlobal(Module &M, StringRef Name) {
+    auto *I64 = Type::getInt64Ty(M.getContext());
+    auto *GV = new GlobalVariable(M, I64, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(I64, 0), Name);
+    GV->setAlignment(Align(8));
+    return GV;
+}
+
+GlobalVariable *createI8CacheGlobal(Module &M, StringRef Name) {
+    auto *I8 = Type::getInt8Ty(M.getContext());
+    auto *GV = new GlobalVariable(M, I8, /*isConstant=*/false,
+                                  GlobalValue::PrivateLinkage,
+                                  ConstantInt::get(I8, 0), Name);
+    GV->setAlignment(Align(1));
+    return GV;
+}
+
+Value *zextOrTruncI64(Builder &B, Value *V) {
+    auto *I64 = B.getInt64Ty();
+    if (V->getType() == I64)
+        return V;
+    if (V->getType()->isIntegerTy())
+        return B.CreateZExtOrTrunc(V, I64);
+    return B.CreatePtrToInt(V, I64);
+}
+
+Value *mixCacheKey(Builder &B, Value *Key, Value *Word, std::uint64_t Salt,
+                   const Twine &Name) {
+    auto *I64 = B.getInt64Ty();
+    Word = zextOrTruncI64(B, Word);
+    Key = B.CreateXor(Key, Word, Name + ".xor");
+    Key = B.CreateAdd(Key, ConstantInt::get(I64, Salt), Name + ".add");
+    Key = B.CreateXor(Key, B.CreateLShr(Key, ConstantInt::get(I64, 33)),
+                      Name + ".fold33");
+    Key = B.CreateMul(Key, ConstantInt::get(I64, 0xff51afd7ed558ccdULL),
+                      Name + ".mul0");
+    Key = B.CreateXor(Key, B.CreateLShr(Key, ConstantInt::get(I64, 29)),
+                      Name + ".fold29");
+    Key = B.CreateMul(Key, ConstantInt::get(I64, 0xc4ceb9fe1a85ec53ULL),
+                      Name + ".mul1");
+    return B.CreateXor(Key, B.CreateLShr(Key, ConstantInt::get(I64, 32)),
+                       Name + ".fold32");
+}
+
+Value *emitStaticCacheKey(Builder &B, Runtime &R, std::uint64_t Seed,
+                          StringRef Prefix) {
+    auto *I64 = B.getInt64Ty();
+    Value *Key = ConstantInt::get(I64, Seed ^ R.seed ^ 0x9C15D37B4A7C159EULL);
+    if (R.code_size) {
+        auto *CodeSize =
+            B.CreateLoad(B.getInt32Ty(), R.code_size,
+                         Twine(Prefix) + ".code_size");
+        CodeSize->setVolatile(true);
+        CodeSize->setAlignment(Align(4));
+        Key = mixCacheKey(B, Key, CodeSize, Seed ^ 0x61C8864680B583EBULL,
+                          Twine(Prefix) + ".code_size.mix");
+    }
+    if (R.heartbeat_crypto) {
+        auto *Crypto =
+            B.CreateLoad(I64, R.heartbeat_crypto, Twine(Prefix) + ".watchdog");
+        Crypto->setVolatile(true);
+        Crypto->setAtomic(AtomicOrdering::Monotonic);
+        Crypto->setAlignment(Align(8));
+        Key = mixCacheKey(B, Key, Crypto, Seed ^ 0xD6E8FEB86659FD93ULL,
+                          Twine(Prefix) + ".watchdog.mix");
+    }
+    if (R.runtime_seal) {
+        Value *Delta = runtime_seal::emitDelta(
+            B, R.runtime_seal, R.runtime_seal_s0,
+            Twine(Prefix) + ".runtime_seal");
+        Key = mixCacheKey(B, Key, Delta, Seed ^ 0xD1F2C3A497586B0EULL,
+                          Twine(Prefix) + ".runtime_seal.mix");
+    }
+    if (R.external_proof_seal) {
+        Value *Delta = runtime_seal::emitDelta(
+            B, R.external_proof_seal, R.external_proof_s0,
+            Twine(Prefix) + ".external_proof");
+        Key = mixCacheKey(B, Key, Delta, Seed ^ 0xA529B72F1D3C4E8BULL,
+                          Twine(Prefix) + ".external_proof.mix");
+    }
+    if (R.tracer_seal) {
+        Value *Delta = runtime_seal::emitDelta(
+            B, R.tracer_seal, R.tracer_s0, Twine(Prefix) + ".tracer");
+        Key = mixCacheKey(B, Key, Delta, Seed ^ 0xC8735F2D9E164AB1ULL,
+                          Twine(Prefix) + ".tracer.mix");
+    }
+    if (R.anti_analysis_poison) {
+        auto *Poison =
+            B.CreateLoad(I64, R.anti_analysis_poison,
+                         Twine(Prefix) + ".poison");
+        Poison->setVolatile(true);
+        Poison->setAlignment(Align(8));
+        Key = mixCacheKey(B, Key, Poison, Seed ^ 0xBADC0FFEE0DDF00DULL,
+                          Twine(Prefix) + ".poison.mix");
+    }
+    return Key;
+}
+
+Function *createStaticDiffCacheFunction(Module &M, StringRef Suffix, Runtime &R,
+                                        std::uint64_t Mask,
+                                        std::uint64_t KeySeed) {
+    LLVMContext &Ctx = M.getContext();
+    auto *I8 = Type::getInt8Ty(Ctx);
+    auto *I64 = Type::getInt64Ty(Ctx);
+
+    auto *ValueGV = createI64CacheGlobal(
+        M, (Twine("morok.sc.cache.value.") + Suffix).str());
+    auto *KeyGV = createI64CacheGlobal(
+        M, (Twine("morok.sc.cache.key.") + Suffix).str());
+    auto *ReadyGV = createI8CacheGlobal(
+        M, (Twine("morok.sc.cache.ready.") + Suffix).str());
+
+    auto *Fn = Function::Create(FunctionType::get(I64, false),
+                                GlobalValue::InternalLinkage,
+                                (Twine("morok.sc.cache.") + Suffix).str(), &M);
+    addRuntimeAttrs(Fn);
+
+    BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", Fn);
+    BasicBlock *Cached = BasicBlock::Create(Ctx, "cached", Fn);
+    BasicBlock *Fill = BasicBlock::Create(Ctx, "fill", Fn);
+    BasicBlock *Exit = BasicBlock::Create(Ctx, "exit", Fn);
+
+    Builder EB(Entry);
+    Value *CurrentKey = emitStaticCacheKey(EB, R, KeySeed, "morok.sc.cache.key");
+    auto *Ready = EB.CreateLoad(I8, ReadyGV, "morok.sc.cache.ready.load");
+    Ready->setAtomic(AtomicOrdering::Acquire);
+    Ready->setAlignment(Align(1));
+    auto *StoredKey = EB.CreateLoad(I64, KeyGV, "morok.sc.cache.key.load");
+    StoredKey->setAtomic(AtomicOrdering::Monotonic);
+    StoredKey->setAlignment(Align(8));
+    Value *ReadySet =
+        EB.CreateICmpNE(Ready, ConstantInt::get(I8, 0), "morok.sc.cache.ready");
+    Value *KeyMatches =
+        EB.CreateICmpEQ(StoredKey, CurrentKey, "morok.sc.cache.key.ok");
+    Value *UseCached =
+        EB.CreateAnd(ReadySet, KeyMatches, "morok.sc.cache.use");
+    EB.CreateCondBr(UseCached, Cached, Fill);
+
+    Builder CB(Cached);
+    auto *CachedValue =
+        CB.CreateLoad(I64, ValueGV, "morok.sc.cache.value.load");
+    CachedValue->setAtomic(AtomicOrdering::Monotonic);
+    CachedValue->setAlignment(Align(8));
+    CB.CreateBr(Exit);
+
+    Builder FB(Fill);
+    Value *Diff64 = FB.CreateCall(R.diff->getFunctionType(), R.diff, {},
+                                  "morok.sc.cache.diff");
+    Value *Encoded =
+        FB.CreateXor(Diff64, FB.getInt64(Mask), "morok.sc.cache.value.enc");
+    auto *ValueStore = FB.CreateStore(Encoded, ValueGV);
+    ValueStore->setAtomic(AtomicOrdering::Monotonic);
+    ValueStore->setAlignment(Align(8));
+    auto *KeyStore = FB.CreateStore(CurrentKey, KeyGV);
+    KeyStore->setAtomic(AtomicOrdering::Monotonic);
+    KeyStore->setAlignment(Align(8));
+    auto *ReadyStore = FB.CreateStore(ConstantInt::get(I8, 1), ReadyGV);
+    ReadyStore->setAtomic(AtomicOrdering::Release);
+    ReadyStore->setAlignment(Align(1));
+    FB.CreateBr(Exit);
+
+    Builder XB(Exit);
+    PHINode *EncodedDiff = XB.CreatePHI(I64, 2, "morok.sc.cache.value");
+    EncodedDiff->addIncoming(CachedValue, Cached);
+    EncodedDiff->addIncoming(Encoded, Fill);
+    Value *Diff =
+        XB.CreateXor(EncodedDiff, XB.getInt64(Mask), "morok.sc.cache.diff.raw");
+    XB.CreateRet(Diff);
+    return Fn;
+}
+
+ActivationDiffCache createActivationDiffCache(Function &F, Function *Provider,
+                                              StringRef CallName,
+                                              ir::IRRandom &Rng) {
+    BasicBlock &Entry = F.getEntryBlock();
+    auto IP = Entry.getFirstInsertionPt();
+    Instruction *InsertBefore =
+        IP == Entry.end() ? Entry.getTerminator() : &*IP;
+    Builder B(InsertBefore);
+    auto *I64 = B.getInt64Ty();
+
+    ActivationDiffCache Cache;
+    Cache.mask = Rng.next();
+    Cache.encoded = B.CreateAlloca(I64, nullptr, "morok.sc.diff.cache");
+    Cache.encoded->setAlignment(Align(8));
+
+    Value *Diff64 =
+        B.CreateCall(Provider->getFunctionType(), Provider, {}, CallName);
+    Value *Encoded =
+        B.CreateXor(Diff64, B.getInt64(Cache.mask), "morok.sc.diff.cache.enc");
+    auto *Store = B.CreateStore(Encoded, Cache.encoded);
+    Store->setVolatile(true);
+    Store->setAlignment(Align(8));
+    return Cache;
+}
+
+Value *emitCachedDiff64(Builder &B, const ActivationDiffCache &Cache,
+                        StringRef Name) {
+    auto *Load = B.CreateLoad(B.getInt64Ty(), Cache.encoded,
+                              "morok.sc.diff.cache.load");
+    Load->setVolatile(true);
+    Load->setAlignment(Align(8));
+    return B.CreateXor(Load, B.getInt64(Cache.mask), Name);
+}
+
+Value *emitFusedConstant(Function &F, Instruction &User,
+                         Constant *C, const ActivationDiffCache &Cache,
+                         ir::IRRandom &Rng) {
     auto Encoded = encodeConstant(C);
     if (!Encoded)
         return C;
@@ -570,8 +782,7 @@ Value *emitFusedConstant(Function &F, Runtime &R, Instruction &User,
     GlobalVariable *MaskGV = createMask(M, F, Ty, Mask);
 
     Builder B(&User);
-    auto *Diff64 = B.CreateCall(R.diff->getFunctionType(), R.diff, {},
-                                "morok.sc.diff.call");
+    Value *Diff64 = emitCachedDiff64(B, Cache, "morok.sc.diff.cached");
     Value *Diff = Diff64;
     if (Bits < 64)
         Diff = B.CreateTrunc(Diff64, Ty, "morok.sc.diff.trunc");
@@ -593,7 +804,8 @@ Value *emitFusedConstant(Function &F, Runtime &R, Instruction &User,
 // license result), so a code patch corrupts the *returned* value, not only the
 // constants the function uses internally.  On an intact + sealed binary the
 // diff is zero and the return is byte-for-byte unchanged.
-void poisonReturns(Function &F, Runtime &R, const SelfChecksumParams &Params,
+void poisonReturns(Function &F, const SelfChecksumParams &Params,
+                   const ActivationDiffCache &Cache,
                    ir::IRRandom &Rng,
                    const SmallPtrSetImpl<const ReturnInst *> &AlreadyFused) {
     SmallVector<ReturnInst *, 8> Returns;
@@ -639,8 +851,7 @@ void poisonReturns(Function &F, Runtime &R, const SelfChecksumParams &Params,
             continue;
 
         Builder B(RI);
-        auto *Diff64 = B.CreateCall(R.diff->getFunctionType(), R.diff, {},
-                                    "morok.sc.ret.diff");
+        Value *Diff64 = emitCachedDiff64(B, Cache, "morok.sc.ret.diff");
         Value *D = IT->getBitWidth() < 64
                        ? B.CreateTrunc(Diff64, IT, "morok.sc.ret.trunc")
                        : static_cast<Value *>(Diff64);
@@ -668,11 +879,9 @@ bool selfChecksumConstantsFunction(Function &F,
         return false;
     if (directlyRecursive(F))
         return false;
-    // This pass splices plain calls to the diff helper at arbitrary user sites
-    // (including store-value literals).  Calls inside Windows funclet-EH blocks
-    // require a ["funclet"(token)] operand bundle or the verifier rejects them,
-    // so skip funclet-EH functions entirely, matching ArithmeticTables /
-    // DataFlowIntegrity / Virtualization.  A no-op on Itanium (macOS/Linux).
+    // This pass rewrites arbitrary user sites (including store-value literals).
+    // Keep skipping Windows funclet-EH functions so those rewrites do not create
+    // verifier-sensitive IR inside catch/cleanup funclets.
     if (ir::usesFuncletEH(F))
         return false;
 
@@ -697,6 +906,15 @@ bool selfChecksumConstantsFunction(Function &F,
         return false;
 
     Runtime R = createRuntime(F, Params, Rng);
+    Function *DiffProvider = R.diff;
+    StringRef DiffProviderCallName = "morok.sc.diff.call";
+    if (Params.diff_cache == SelfChecksumDiffCacheMode::Static) {
+        DiffProvider = createStaticDiffCacheFunction(
+            *F.getParent(), suffixFor(F), R, Rng.next(), Rng.next());
+        DiffProviderCallName = "morok.sc.cache.call";
+    }
+    ActivationDiffCache Cache =
+        createActivationDiffCache(F, DiffProvider, DiffProviderCallName, Rng);
     std::map<std::pair<BasicBlock *, BasicBlock *>, BasicBlock *> SplitEdges;
     auto insertionPoint = [&](const Target &T) -> Instruction * {
         if (!T.phi_incoming)
@@ -730,7 +948,8 @@ bool selfChecksumConstantsFunction(Function &F,
         Instruction *InsertBefore = insertionPoint(T);
         if (!InsertBefore)
             continue;
-        Value *Repl = emitFusedConstant(F, R, *InsertBefore, T.value, Rng);
+        Value *Repl =
+            emitFusedConstant(F, *InsertBefore, T.value, Cache, Rng);
         if (T.phi_incoming) {
             auto *PN = cast<PHINode>(T.user);
             BasicBlock *Incoming = T.incoming_block;
@@ -748,7 +967,7 @@ bool selfChecksumConstantsFunction(Function &F,
         }
     }
 
-    poisonReturns(F, R, Params, Rng, FusedReturns);
+    poisonReturns(F, Params, Cache, Rng, FusedReturns);
 
     relaxMemoryAttrs(F);
     invalidateCallerEffects(F);
@@ -769,7 +988,8 @@ bool bindLeafHelpersToSeal(Module &M, ir::IRRandom &Rng) {
         for (Instruction &I : instructions(F))
             if (auto *CB = dyn_cast<CallBase>(&I))
                 if (Function *C = CB->getCalledFunction())
-                    if (C->getName().starts_with("morok.sc.diff"))
+                    if (C->getName().starts_with("morok.sc.diff") ||
+                        C->getName().starts_with("morok.sc.cache"))
                         return true;
         return false;
     };

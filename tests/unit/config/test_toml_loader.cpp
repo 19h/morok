@@ -326,6 +326,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     probability = 83
     max_constants = 6
     region_bytes = 48
+    diff_cache = "static"
     [passes.data_flow_integrity]
     enabled = true
     probability = 64
@@ -594,6 +595,7 @@ TEST_CASE("preset is the base and [passes.*] overrides it") {
     CHECK(r.config.passes.self_checksum.probability == 83u);
     CHECK(r.config.passes.self_checksum.max_constants == 6u);
     CHECK(r.config.passes.self_checksum.region_bytes == 48u);
+    CHECK(r.config.passes.self_checksum.diff_cache == "static");
     CHECK(r.config.passes.data_flow_integrity.enabled == true);
     CHECK(r.config.passes.data_flow_integrity.probability == 64u);
     CHECK(r.config.passes.data_flow_integrity.max_tables == 5u);

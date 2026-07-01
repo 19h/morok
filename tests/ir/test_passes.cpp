@@ -11872,6 +11872,80 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE(
+    "selfChecksumConstantsFunction reuses one activation diff for many constants") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+declare i32 @selfcheck_many_sink(i32, i32, i32)
+
+define i32 @selfcheck_many(i32 %a, ptr %p, i1 %flag) {
+entry:
+  %x = xor i32 %a, 305419896
+  %y = add i32 %x, 17
+  store i32 99, ptr %p, align 4
+  %z = call i32 @selfcheck_many_sink(i32 %y, i32 123, i32 456)
+  %sel = select i1 %flag, i32 7, i32 8
+  %w = add i32 %z, %sel
+  ret i32 %w
+}
+)ir");
+    Function *F = M->getFunction("selfcheck_many");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(18142);
+    morok::ir::IRRandom rng(engine);
+
+    CHECK(morok::passes::selfChecksumConstantsFunction(
+        *F, {/*probability=*/100, /*max_constants=*/8, /*region_bytes=*/32},
+        rng));
+
+    Function *Diff = M->getFunction("morok.sc.diff.selfcheck_many");
+    REQUIRE(Diff);
+
+    CHECK(countGlobals(*M, "morok.sc.mask") == 7u);
+    CHECK(countNamedInstructions(*F, "morok.sc.const") >= 7u);
+    CHECK(countCallsTo(*F, "morok.sc.diff.selfcheck_many") == 1u);
+    CHECK(countNamedInstructions(*F, "morok.sc.diff.call") == 1u);
+    CHECK(countNamedInstructions(*F, "morok.sc.diff.cache.load") >= 7u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("selfChecksumConstantsFunction can route through a static diff cache") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define i32 @selfcheck_static(i32 %a, ptr %p) {
+entry:
+  %x = xor i32 %a, 305419896
+  %y = add i32 %x, 17
+  store i32 99, ptr %p, align 4
+  ret i32 %y
+}
+)ir");
+    Function *F = M->getFunction("selfcheck_static");
+    REQUIRE(F);
+    auto engine = morok::core::Xoshiro256pp::fromSeed(18143);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::SelfChecksumParams params{/*probability=*/100,
+                                             /*max_constants=*/8,
+                                             /*region_bytes=*/32};
+    params.diff_cache = morok::passes::SelfChecksumDiffCacheMode::Static;
+
+    CHECK(morok::passes::selfChecksumConstantsFunction(*F, params, rng));
+
+    Function *Diff = M->getFunction("morok.sc.diff.selfcheck_static");
+    Function *Cache = M->getFunction("morok.sc.cache.selfcheck_static");
+    REQUIRE(Diff);
+    REQUIRE(Cache);
+
+    CHECK(countGlobals(*M, "morok.sc.cache.value") == 1u);
+    CHECK(countGlobals(*M, "morok.sc.cache.key") == 1u);
+    CHECK(countGlobals(*M, "morok.sc.cache.ready") == 1u);
+    CHECK(countCallsTo(*F, "morok.sc.diff.selfcheck_static") == 0u);
+    CHECK(countCallsTo(*F, "morok.sc.cache.selfcheck_static") == 1u);
+    CHECK(countCallsTo(*Cache, "morok.sc.diff.selfcheck_static") == 1u);
+    CHECK(countNamedInstructions(*F, "morok.sc.diff.cache.load") >= 3u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 // Regression for #106: fail-closed-on-unsealed binds the post-link code_size
 // sentinel into the seal-dependent passes' live key material, so a never-sealed
 // (or downgrade-reset) binary reconstructs garbage and cannot run instead of

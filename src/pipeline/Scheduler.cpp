@@ -444,6 +444,14 @@ faultPagedPayloadParams(const config::FaultPagedPayloadConfig &C) {
     return P;
 }
 
+passes::SelfChecksumDiffCacheMode
+selfChecksumDiffCacheMode(const config::SelfChecksumConfig &C) {
+    const std::string Mode = C.diff_cache.value_or("activation");
+    if (Mode == "static")
+        return passes::SelfChecksumDiffCacheMode::Static;
+    return passes::SelfChecksumDiffCacheMode::Activation;
+}
+
 bool passEnabledOrImplicitSensitive(config::Opt<bool> Enabled, bool Sensitive) {
     if (Enabled.has_value())
         return *Enabled;
@@ -1200,6 +1208,7 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
                 p.region_bytes = eff.self_checksum.region_bytes.value_or(32);
                 p.fail_closed_on_unsealed =
                     eff.fail_closed_on_unsealed.value_or(false);
+                p.diff_cache = selfChecksumDiffCacheMode(eff.self_checksum);
                 changed |= passes::selfChecksumConstantsFunction(F, p, rng);
             }
 
@@ -1324,6 +1333,7 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
                 p.region_bytes = eff.self_checksum.region_bytes.value_or(32);
                 p.fail_closed_on_unsealed =
                     eff.fail_closed_on_unsealed.value_or(false);
+                p.diff_cache = selfChecksumDiffCacheMode(eff.self_checksum);
                 changed |= passes::selfChecksumConstantsFunction(F, p, rng);
             }
             if (ir::shouldObfuscate(F, "mutualguard",

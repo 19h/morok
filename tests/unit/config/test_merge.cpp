@@ -185,6 +185,7 @@ TEST_CASE("merge handles every pass family") {
     src.self_checksum.probability = 82u;
     src.self_checksum.max_constants = 7u;
     src.self_checksum.region_bytes = 40u;
+    src.self_checksum.diff_cache = "static";
     src.data_flow_integrity.enabled = true;
     src.data_flow_integrity.probability = 69u;
     src.data_flow_integrity.max_tables = 4u;
@@ -410,6 +411,7 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.self_checksum.probability == 82u);
     CHECK(dst.self_checksum.max_constants == 7u);
     CHECK(dst.self_checksum.region_bytes == 40u);
+    CHECK(dst.self_checksum.diff_cache == "static");
     CHECK(dst.data_flow_integrity.enabled == true);
     CHECK(dst.data_flow_integrity.probability == 69u);
     CHECK(dst.data_flow_integrity.max_tables == 4u);

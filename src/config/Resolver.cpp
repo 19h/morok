@@ -263,6 +263,7 @@ void merge(PassConfig &dst, const PassConfig &src) {
     mergeOpt(dst.self_checksum.probability, src.self_checksum.probability);
     mergeOpt(dst.self_checksum.max_constants, src.self_checksum.max_constants);
     mergeOpt(dst.self_checksum.region_bytes, src.self_checksum.region_bytes);
+    mergeOpt(dst.self_checksum.diff_cache, src.self_checksum.diff_cache);
     // Data-flow-entangled integrity
     mergeOpt(dst.data_flow_integrity.enabled, src.data_flow_integrity.enabled);
     mergeOpt(dst.data_flow_integrity.probability,
