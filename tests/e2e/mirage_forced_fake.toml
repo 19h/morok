@@ -1,0 +1,16 @@
+# Diagnostic Mirage config that pins the counterfeit route at emission time
+# (force_route = "fake").  This is a BUILD-TIME test knob: it changes the emitted
+# IR only — the shipped binary carries no runtime switch — so it cannot weaken a
+# normal build.  It lets an e2e test deterministically observe that the
+# counterfeit path is wired and produces a wrong-but-plausible verdict WITHOUT a
+# trap or crash, without depending on a live runtime seal producer.
+#
+# Deliberately lean (Mirage only, no base preset) so the wrong-verdict behavior
+# is isolated from every other transform and the build is fast.
+[passes.mirage]
+enabled = true
+sensitive_only = true
+clone_count = 2
+counterfeit_count = 2
+counterfeit_domains = ["license_check", "signature_verify"]
+force_route = "fake"

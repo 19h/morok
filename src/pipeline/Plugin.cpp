@@ -41,6 +41,7 @@
 #include "morok/passes/InterproceduralFsm.hpp"
 #include "morok/passes/Mba.hpp"
 #include "morok/passes/MicrocodeStress.hpp"
+#include "morok/passes/Mirage.hpp"
 #include "morok/passes/MqGate.hpp"
 #include "morok/passes/MutualGuardGraph.hpp"
 #include "morok/passes/Nanomites.hpp"
@@ -563,6 +564,10 @@ PassPluginLibraryInfo getPluginInfo() {
                     }
                     if (name == "morok-nanomites") {
                         MPM.addPass(passes::NanomitesPass());
+                        return true;
+                    }
+                    if (name == "morok-mirage") {
+                        MPM.addPass(passes::MiragePass());
                         return true;
                     }
                     if (name == "morok-decoystr") {

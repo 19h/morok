@@ -87,6 +87,10 @@ set(_vtable_integrity_config
     "${CMAKE_CURRENT_SOURCE_DIR}/vtable_integrity_dispatch.toml")
 set(_vtable_integrity_workload
     "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/vtable_integrity_dispatch.cpp")
+set(_mirage_config "${CMAKE_CURRENT_SOURCE_DIR}/mirage.toml")
+set(_mirage_fake_config "${CMAKE_CURRENT_SOURCE_DIR}/mirage_forced_fake.toml")
+set(_mirage_fake_driver "${CMAKE_CURRENT_SOURCE_DIR}/mirage_forced_fake.sh")
+set(_mirage_workload "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/mirage_verdict.c")
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
@@ -499,6 +503,41 @@ set_tests_properties("e2e/vtable_integrity_dispatch" PROPERTIES
   LABELS "e2e;security"
   REQUIRED_FILES
     "$<TARGET_FILE:morok_plugin>;${_vtable_integrity_driver};${_vtable_integrity_config};${_vtable_integrity_workload}"
+  TIMEOUT 120)
+
+# Mirage clean differential: on a clean run the seal-gated hub always routes to a
+# real clone, so obfuscated output must match the reference exactly even as the
+# per-invocation epoch alternates between the equivalent clones.  The mirage.toml
+# intensity is portable (high minus virtualization), so this runs on every host.
+add_test(NAME "e2e/mirage_clean_differential"
+  COMMAND bash "${_driver}"
+          "${CMAKE_C_COMPILER}"
+          "$<TARGET_FILE:morok_plugin>"
+          "${_sysroot}"
+          "${_mirage_workload}"
+          "${_mirage_config}"
+          4242)
+set_tests_properties("e2e/mirage_clean_differential" PROPERTIES
+  LABELS "e2e;security"
+  REQUIRED_FILES
+    "$<TARGET_FILE:morok_plugin>;${_driver};${_mirage_config};${_mirage_workload}"
+  TIMEOUT 120)
+
+# Mirage counterfeit route: a force_route="fake" build must run without trapping
+# yet diverge from the real reference, proving the counterfeit algorithms are
+# wired and produce a wrong-but-plausible verdict on a dirty seal state.
+add_test(NAME "e2e/mirage_forced_fake"
+  COMMAND bash "${_mirage_fake_driver}"
+          "${CMAKE_C_COMPILER}"
+          "$<TARGET_FILE:morok_plugin>"
+          "${_sysroot}"
+          "${_mirage_workload}"
+          "${_mirage_fake_config}"
+          4242)
+set_tests_properties("e2e/mirage_forced_fake" PROPERTIES
+  LABELS "e2e;security;adversarial"
+  REQUIRED_FILES
+    "$<TARGET_FILE:morok_plugin>;${_mirage_fake_driver};${_mirage_fake_config};${_mirage_workload}"
   TIMEOUT 120)
 
 add_test(NAME "e2e/timing_false_positive_clean_run"

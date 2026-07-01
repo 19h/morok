@@ -90,6 +90,38 @@ TEST_CASE("nanomites section is parsed") {
     CHECK(r.config.passes.nanomites.max_sites == 7u);
 }
 
+TEST_CASE("mirage section is parsed") {
+    const auto r = loadFromString(R"(
+    [passes.mirage]
+    enabled = true
+    sensitive_only = false
+    clone_count = 3
+    counterfeit_count = 2
+    max_functions = 12
+    max_instructions = 400
+    counterfeit_domains = ["license_check", "signature_verify"]
+    seal_gated_reality = true
+    per_invocation_epoch = false
+    cross_guard = true
+    force_route = "fake"
+  )");
+    REQUIRE(r.ok);
+    const auto &m = r.config.passes.mirage;
+    CHECK(m.enabled == true);
+    CHECK(m.sensitive_only == false);
+    CHECK(m.clone_count == 3u);
+    CHECK(m.counterfeit_count == 2u);
+    CHECK(m.max_functions == 12u);
+    CHECK(m.max_instructions == 400u);
+    REQUIRE(m.counterfeit_domains.size() == 2);
+    CHECK(m.counterfeit_domains[0] == "license_check");
+    CHECK(m.counterfeit_domains[1] == "signature_verify");
+    CHECK(m.seal_gated_reality == true);
+    CHECK(m.per_invocation_epoch == false);
+    CHECK(m.cross_guard == true);
+    CHECK(m.force_route == "fake");
+}
+
 TEST_CASE("a tuning section does not disable a preset-enabled pass") {
     // Regression: a [passes.X] section that only tunes a parameter must NOT
     // reset the pass's other preset-provided fields (notably `enabled`).  The

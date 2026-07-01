@@ -289,6 +289,20 @@ PassConfig makeLow() {
     c.function_fission.min_region_blocks = 2;
     c.function_fission.max_region_blocks = 64;
 
+    // Off in every preset: the counterfeit-computation substrate is explicit
+    // opt-in via [passes.mirage] until its e2e matrix stabilizes (mirage-plan
+    // §12).  Left unset in mid/high/max too, so the value_or(false) default
+    // keeps it disabled everywhere.
+    c.mirage.enabled = false;
+    c.mirage.sensitive_only = true;
+    c.mirage.clone_count = 2;
+    c.mirage.counterfeit_count = 2;
+    c.mirage.max_functions = 8;
+    c.mirage.max_instructions = 256;
+    c.mirage.seal_gated_reality = true;
+    c.mirage.per_invocation_epoch = true;
+    c.mirage.cross_guard = false;
+
     c.vec.enabled = false;
     c.csm.enabled = false;
     c.csm.generator = CsmGenerator::Logistic;

@@ -609,6 +609,7 @@ binding, protection-helper hardening, and private-linkage cleanup for generated
 | Microcode stress | `morok-microstress` | `microcode_stress` | Emits oversized blockaddress tables and aliased decoy destinations. |
 | Path explosion | `morok-pathexplode` | `path_explosion` | Adds opaque-guarded input-derived decoy loops and volatile symbolic stores. |
 | Coherent decoys | `morok-decoy` | `coherent_decoys` | Adds plausible dead alternate return computations and hidden decoy-tamper state. |
+| Mirage | `morok-mirage` | `mirage` | Counterfeit-computation substrate. Replaces a selected verdict-like function's body with a branchless dispatch hub over a private candidate table of `2` equivalent real clones plus `2` plausible-but-wrong counterfeit algorithms (built-in `license_check`/`signature_verify`/`token_validate`/`feature_flag` templates). On a clean runtime seal state the hub routes to a real clone chosen from a per-invocation epoch — so one dynamic trace never observes the whole population; on a dirty seal state (anti-debug/env-binding/tracer evidence) it routes to a counterfeit, so tampering yields a plausible denial rather than a trap. Real clones are equivalence-by-construction (clone + normal Morok transforms); real clone 1 is VM-prioritized with a divergent native-heavy fallback. Candidates are private-linkage (names never reach the symbol table). Off by default; opt-in via `[passes.mirage]`. Cross-candidate mutual guarding is a phase-2 extension. |
 | Alias opaque predicates | `morok-aliasop` | `alias_opaque_predicates` | Maintains pointer/alias invariants that guard decoy edges. |
 | External opaque predicates | `morok-extop` | `external_opaque_predicates` | Uses IPO-blocked volatile helper guards and scratch decoy arms. |
 | MQ gate | `morok-mq` | `mq_gate` | Plants GF(2) quadratic opaque gates over argument-derived bits. |
@@ -773,8 +774,21 @@ unsealed manifest sentinels instead of sealed code-window metadata.
 | `external_opaque_predicates` | `enabled`, `probability`, `max_blocks`, `decoy_stores` |
 | `mq_gate` | `enabled`, `probability`, `vars`, `eqs`, `density`, `max_gates`, `fold_diff` |
 | `nanomites` | `enabled`, `probability`, `max_sites` |
+| `mirage` | `enabled`, `sensitive_only`, `clone_count`, `counterfeit_count`, `max_functions`, `max_instructions`, `counterfeit_domains`, `seal_gated_reality`, `per_invocation_epoch`, `cross_guard`, `force_route` |
 
 `chaos_state_machine.generator` accepts `logistic` or `tfunction`.
+
+`mirage` is off in every preset — opt-in via `[passes.mirage] enabled = true`. It
+transforms only `sensitive`/`mirage`-annotated verdict-like functions (integer/
+`i1` return, scalar integer/pointer args, no vararg/EH/recursion/side effects
+unless explicitly `mirage`-marked). `counterfeit_domains` selects from the
+built-in `license_check`, `signature_verify`, `token_validate`, and
+`feature_flag` templates (empty = all four, chosen per build). `force_route`
+(`auto` | `real` | `fake`) is a build-time diagnostic that pins the hub's route
+at emission — it changes only the generated IR, never the shipped binary, so a
+`fake` build deterministically exercises the counterfeit path for tests without a
+live seal producer. Cross-candidate mutual guarding (`cross_guard`) is a
+documented phase-2 extension and is currently a no-op.
 
 ### Scalar, Data, Stack, and Literal Sections
 
@@ -1035,6 +1049,9 @@ self-check data region.
 
 - [`docs/algorithms.md`](docs/algorithms.md): algorithm and scheduler reference.
 - [`docs/hardness.md`](docs/hardness.md): hardness-backed primitive specs.
+- [`docs/mirage-plan.md`](docs/mirage-plan.md): planned Mirage
+  counterfeit-computation substrate, including research findings and scheduler
+  constraints.
 - [`docs/insurance.md`](docs/insurance.md): broader binary self-protection catalog.
 - [`docs/insurance-tasks.md`](docs/insurance-tasks.md): implementable task list.
 - [`docs/objections.md`](docs/objections.md): limitations and objection handling.

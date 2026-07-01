@@ -37,6 +37,7 @@
 #include "morok/passes/InterproceduralFsm.hpp"
 #include "morok/passes/Mba.hpp"
 #include "morok/passes/MicrocodeStress.hpp"
+#include "morok/passes/Mirage.hpp"
 #include "morok/passes/MisleadingMetadata.hpp"
 #include "morok/passes/MqGate.hpp"
 #include "morok/passes/MutualGuardGraph.hpp"
@@ -444,6 +445,28 @@ faultPagedPayloadParams(const config::FaultPagedPayloadConfig &C) {
     return P;
 }
 
+passes::MirageParams mirageParams(const config::MirageConfig &C,
+                                  bool VmAvailable) {
+    passes::MirageParams P;
+    P.sensitive_only = C.sensitive_only.value_or(true);
+    P.clone_count = C.clone_count.value_or(2);
+    P.counterfeit_count = C.counterfeit_count.value_or(2);
+    P.max_functions = C.max_functions.value_or(8);
+    P.max_instructions = C.max_instructions.value_or(256);
+    P.seal_gated_reality = C.seal_gated_reality.value_or(true);
+    P.per_invocation_epoch = C.per_invocation_epoch.value_or(true);
+    P.cross_guard = C.cross_guard.value_or(false);
+    P.vm_profile_available = VmAvailable;
+    if (!C.counterfeit_domains.empty())
+        P.counterfeit_domains = C.counterfeit_domains;
+    const std::string Route = C.force_route.value_or("auto");
+    if (Route == "real")
+        P.force_route = passes::MirageForceRoute::Real;
+    else if (Route == "fake")
+        P.force_route = passes::MirageForceRoute::Fake;
+    return P;
+}
+
 bool passEnabledOrImplicitSensitive(config::Opt<bool> Enabled, bool Sensitive) {
     if (Enabled.has_value())
         return *Enabled;
@@ -536,6 +559,23 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
     const ModuleSize InitialSize = measureModule(M);
     const bool InitialModuleGrowthOk = moduleGrowthOk(InitialSize);
     bool changed = false;
+
+    // Mirage runs first, before VM priority marking and the first VM wave: it
+    // clones each selected verdict-like function into equivalent reals + wrong-
+    // but-plausible counterfeits behind a seal-gated branchless hub.  Real clone
+    // 1 is stamped `vm`, so the VM priority planner below sees it and the first
+    // wave can lift it; every candidate carries a non-`morok.*` name so it still
+    // flows through the normal per-function transforms.  Gated on the module
+    // growth budget so a huge module does not balloon further.
+    if (InitialModuleGrowthOk &&
+        config_.passes.mirage.enabled.value_or(false)) {
+        const bool VmAvailable =
+            config_.passes.virtualization.enabled.value_or(false);
+        passes::MirageParams p =
+            mirageParams(config_.passes.mirage, VmAvailable);
+        changed |= passes::mirageModule(M, p, rng);
+    }
+
     const UserVmPriorityPlan InitialVmPriority =
         InitialModuleGrowthOk
             ? markUserVmPriorityFunctions(M, config_, moduleName, demangle)
