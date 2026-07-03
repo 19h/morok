@@ -86,3 +86,8 @@ web/target/
 web/dist/
 
 __pycache__
+
+*.ini
+*.id*
+*.til
+*.nam
