@@ -9146,6 +9146,7 @@ TEST_CASE("virtualizeModule uses seed-diverse VM handler layout") {
         std::vector<std::string> handlers;
         std::vector<std::string> handler_multiset;
         std::string bytecode;
+        std::uint64_t stride = 0;
     };
 
     auto render = [](std::uint64_t Seed) {
@@ -9175,6 +9176,21 @@ entry:
                 Out.handlers.push_back(BB.getName().str());
         Out.handler_multiset = Out.handlers;
         std::sort(Out.handler_multiset.begin(), Out.handler_multiset.end());
+        for (Instruction &I : instructions(*Helper)) {
+            if (!I.getName().starts_with("morok.vm.pc.next"))
+                continue;
+            auto *BO = dyn_cast<BinaryOperator>(&I);
+            REQUIRE(BO);
+            auto *Step = dyn_cast<ConstantInt>(BO->getOperand(1));
+            REQUIRE(Step);
+            if (Out.stride == 0)
+                Out.stride = Step->getZExtValue();
+            else
+                CHECK(Out.stride == Step->getZExtValue());
+        }
+        CHECK(Out.stride >= 16u);
+        CHECK(Out.stride <= 32u);
+        CHECK((Out.stride % 4u) == 0u);
 
         GlobalVariable *Bytecode = nullptr;
         for (GlobalVariable &GV : M->globals())
@@ -9196,9 +9212,11 @@ entry:
     CHECK(A.handlers == B.handlers);
     CHECK(A.handler_multiset == B.handler_multiset);
     CHECK(A.bytecode == B.bytecode);
+    CHECK(A.stride == B.stride);
     CHECK(A.handler_multiset != C.handler_multiset);
     CHECK(A.handlers != C.handlers);
     CHECK(A.bytecode != C.bytecode);
+    CHECK(A.stride != C.stride);
 }
 
 TEST_CASE("virtualizeModule keeps generated protection helpers native") {

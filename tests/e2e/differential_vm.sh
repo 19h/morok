@@ -70,6 +70,8 @@ fi
 
 TOPOLOGY=""
 ALT_TOPOLOGY=""
+PAYLOAD_SIZES=""
+ALT_PAYLOAD_SIZES=""
 for FN in "${EXPECTED[@]}"; do
   COUNT="$(grep "^@morok.vm.targets.$FN " "$TMP/obf.ll" | \
       grep -oE 'exec, %[0-9]+' | sort -u | wc -l | tr -d ' ')"
@@ -81,9 +83,19 @@ for FN in "${EXPECTED[@]}"; do
   fi
   TOPOLOGY="$TOPOLOGY:$COUNT"
   ALT_TOPOLOGY="$ALT_TOPOLOGY:$ALT_COUNT"
+  SIZE="$(grep "^@morok.fpp.meta.$FN " "$TMP/obf.ll" | \
+      sed -E 's/.*\[i64 ([0-9]+).*/\1/')"
+  ALT_SIZE="$(grep "^@morok.fpp.meta.$FN " "$TMP/obf-alt.ll" | \
+      sed -E 's/.*\[i64 ([0-9]+).*/\1/')"
+  PAYLOAD_SIZES="$PAYLOAD_SIZES:$SIZE"
+  ALT_PAYLOAD_SIZES="$ALT_PAYLOAD_SIZES:$ALT_SIZE"
 done
 if [ "$TOPOLOGY" = "$ALT_TOPOLOGY" ]; then
   echo "FAIL seeds=$SEED/$ALT_SEED  VM handler topology did not change ($TOPOLOGY)" >&2
+  exit 1
+fi
+if [ "$PAYLOAD_SIZES" = "$ALT_PAYLOAD_SIZES" ]; then
+  echo "FAIL seeds=$SEED/$ALT_SEED  VM record strides did not change ($PAYLOAD_SIZES)" >&2
   exit 1
 fi
 
@@ -93,5 +105,5 @@ if [ "$REF" != "$OBF" ]; then
   echo "FAIL config=$CONFIG seed=$SEED  ref='$REF'  obf='$OBF'" >&2
   exit 1
 fi
-echo "OK   config=$CONFIG seed=$SEED  lifted=$LIFTED topology=$TOPOLOGY/$ALT_TOPOLOGY  output=$REF"
+echo "OK   config=$CONFIG seed=$SEED  lifted=$LIFTED topology=$TOPOLOGY/$ALT_TOPOLOGY payloads=$PAYLOAD_SIZES/$ALT_PAYLOAD_SIZES  output=$REF"
 exit 0

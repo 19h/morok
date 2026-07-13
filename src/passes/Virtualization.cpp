@@ -8,9 +8,9 @@
 // encrypted per-function bytecode stream and an internal interpreter helper.
 // The helper uses threaded computed-goto dispatch (`indirectbr` over a
 // blockaddress table), seed-varying handler subsets/variants, permuted record
-// fields, embedded whole-record integrity tags, and per-byte decryption keyed
-// by the VM PC; the original function becomes a native wrapper that calls into
-// the VM.
+// fields and instruction strides, embedded whole-record integrity tags, and
+// per-byte decryption keyed by the VM PC; the original function becomes a
+// native wrapper that calls into the VM.
 //
 // The lifter handles arbitrary (single- and multi-block) control flow.  Real
 // CFGs are first de-SSA'd with `demoteToStack` (after critical-edge splitting),
@@ -75,7 +75,8 @@ namespace {
 
 using Builder = IRBuilder<NoFolder>;
 
-constexpr std::uint32_t kInstrStride = 16;
+constexpr std::uint32_t kMinInstrStride = 16;
+constexpr std::uint32_t kMaxInstrStride = 32;
 constexpr std::uint64_t kImmPcSalt = 0x9E3779B97F4A7C15ULL;
 constexpr std::uint32_t kVmTargetTableSlots = 256;
 
@@ -177,6 +178,7 @@ struct EncodedProgram {
 };
 
 struct Encoding {
+    std::uint32_t stride = kMinInstrStride;
     std::uint32_t mul = 1;
     std::uint32_t add = 0;
     std::uint8_t xork = 0;
@@ -1354,8 +1356,7 @@ bool Lifter::liftTerminator(Instruction &T) {
             auto Idx = static_cast<std::uint32_t>(P_.code.size());
             if (!emit({VmOp::BrCond, *Eq, 0, 0, 0}))
                 return false;
-            Fixups_.push_back({Idx, Case.getCaseSuccessor(), nullptr,
-                               (Idx + 1) * kInstrStride});
+            Fixups_.push_back({Idx, Case.getCaseSuccessor(), nullptr, Idx + 1});
         }
         auto Idx = static_cast<std::uint32_t>(P_.code.size());
         if (!emit({VmOp::Jmp, 0, 0, 0, 0}))
@@ -1367,7 +1368,7 @@ bool Lifter::liftTerminator(Instruction &T) {
         // Never reached in defined executions; contain it as a self-loop so the
         // dispatcher always has a valid target.
         auto Idx = static_cast<std::uint32_t>(P_.code.size());
-        return emit({VmOp::Jmp, 0, 0, 0, Idx * kInstrStride});
+        return emit({VmOp::Jmp, 0, 0, 0, Idx});
     }
     return false;
 }
@@ -1385,17 +1386,14 @@ bool Lifter::liftBlock(BasicBlock &BB) {
 void Lifter::patchFixups() {
     for (const Fixup &Fx : Fixups_) {
         VmInstr &Inst = P_.code[Fx.op_index];
-        const std::uint64_t Taken =
-            static_cast<std::uint64_t>(BlockStart_[Fx.taken]) * kInstrStride;
+        const std::uint64_t Taken = BlockStart_[Fx.taken];
         if (Inst.op == VmOp::Jmp) {
             Inst.imm = Taken;
             continue;
         }
         const std::uint64_t NotTaken =
-            Fx.not_taken
-                ? static_cast<std::uint64_t>(BlockStart_[Fx.not_taken]) *
-                      kInstrStride
-                : Fx.not_taken_static;
+            Fx.not_taken ? static_cast<std::uint64_t>(BlockStart_[Fx.not_taken])
+                         : Fx.not_taken_static;
         Inst.imm = (Taken & 0xFFFFFFFFULL) | (NotTaken << 32);
     }
 }
@@ -1578,6 +1576,10 @@ std::uint8_t streamKey(std::uint32_t Offset, const Encoding &Enc) {
 
 Encoding makeEncoding(ir::IRRandom &Rng) {
     Encoding Enc;
+    constexpr std::uint32_t kStrideQuantum = 4;
+    constexpr std::uint32_t kStrideChoices =
+        ((kMaxInstrStride - kMinInstrStride) / kStrideQuantum) + 1;
+    Enc.stride = kMinInstrStride + kStrideQuantum * Rng.range(kStrideChoices);
     Enc.mul = static_cast<std::uint32_t>(Rng.next()) | 1u;
     Enc.add = static_cast<std::uint32_t>(Rng.next());
     Enc.xork = static_cast<std::uint8_t>(Rng.next());
@@ -1618,7 +1620,7 @@ std::uint64_t encodedImm(std::uint64_t Imm, std::uint32_t Pc,
 EncodedProgram encodeBytecode(const Program &P, const HandlerLayout &Layout,
                               const Encoding &Enc, ir::IRRandom &Rng) {
     EncodedProgram Encoded;
-    Encoded.bytecode.assign(P.code.size() * kInstrStride, 0);
+    Encoded.bytecode.assign(P.code.size() * Enc.stride, 0);
     for (std::uint32_t I = 0; I < P.code.size(); ++I) {
         const VmInstr &Instr = P.code[I];
         const std::vector<std::uint8_t> &Ids = Layout.ids[opIndex(Instr.op)];
@@ -1628,13 +1630,23 @@ EncodedProgram encodeBytecode(const Program &P, const HandlerLayout &Layout,
             Instr.op == VmOp::Call
                 ? Ids[static_cast<std::size_t>(Instr.imm)]
                 : Ids[Rng.range(static_cast<std::uint32_t>(Ids.size()))];
-        const std::uint32_t Pc = I * kInstrStride;
-        std::array<std::uint8_t, kInstrStride> Plain{};
+        const std::uint32_t Pc = I * Enc.stride;
+        std::vector<std::uint8_t> Plain(Enc.stride, 0);
         Plain[Enc.fields[0]] = Handler;
         Plain[Enc.fields[1]] = Instr.dst ^ Enc.operand_key;
         Plain[Enc.fields[2]] = Instr.lhs ^ Enc.operand_key;
         Plain[Enc.fields[3]] = Instr.rhs ^ Enc.operand_key;
-        const std::uint64_t Imm = encodedImm(Instr.imm, Pc, Enc);
+        std::uint64_t LogicalImm = Instr.imm;
+        if (Instr.op == VmOp::Jmp) {
+            LogicalImm *= Enc.stride;
+        } else if (Instr.op == VmOp::BrCond) {
+            const std::uint64_t Taken =
+                (LogicalImm & 0xFFFFFFFFULL) * Enc.stride;
+            const std::uint64_t NotTaken =
+                ((LogicalImm >> 32) & 0xFFFFFFFFULL) * Enc.stride;
+            LogicalImm = (Taken & 0xFFFFFFFFULL) | (NotTaken << 32);
+        }
+        const std::uint64_t Imm = encodedImm(LogicalImm, Pc, Enc);
         for (unsigned B = 0; B < 8; ++B)
             Plain[Enc.imm_fields[B]] =
                 static_cast<std::uint8_t>((Imm >> (B * 8)) & 0xFFu);
@@ -1653,7 +1665,9 @@ EncodedProgram encodeBytecode(const Program &P, const HandlerLayout &Layout,
         for (unsigned B = 0; B < 4; ++B)
             Plain[12 + B] =
                 static_cast<std::uint8_t>((Guard >> (B * 8)) & 0xFFu);
-        for (unsigned B = 12; B < kInstrStride; ++B)
+        for (unsigned B = kMinInstrStride; B < Enc.stride; ++B)
+            Plain[B] = static_cast<std::uint8_t>(Rng.next());
+        for (unsigned B = 12; B < Enc.stride; ++B)
             Encoded.bytecode[Pc + B] = Plain[B] ^ streamKey(Pc + B, Enc);
     }
     return Encoded;
@@ -1821,7 +1835,7 @@ Value *emitDecodeImm(Builder &B, GlobalVariable *Bytecode, Value *Pc,
 Value *emitComputedRecordGuard(Builder &B, GlobalVariable *Bytecode, Value *Pc,
                                Value *DecodedOp, const Encoding &Enc) {
     auto *I32 = B.getInt32Ty();
-    Value *InstrIndex = B.CreateUDiv(Pc, ConstantInt::get(I32, kInstrStride),
+    Value *InstrIndex = B.CreateUDiv(Pc, ConstantInt::get(I32, Enc.stride),
                                      "morok.vm.guard.instr");
     Value *H =
         B.CreateXor(ConstantInt::get(I32, Enc.record_guard_key),
@@ -1940,10 +1954,11 @@ Value *safeIndex(Builder &B, AllocaInst *PoisonSlot, Value *Idx,
 }
 
 Value *safePc(Builder &B, AllocaInst *PoisonSlot, Value *Pc,
-              std::uint32_t InstrCount, const Twine &Name) {
+              std::uint32_t InstrCount, std::uint32_t InstrStride,
+              const Twine &Name) {
     auto *I32 = B.getInt32Ty();
-    const std::uint32_t ByteSize = InstrCount * kInstrStride;
-    Value *Stride = ConstantInt::get(I32, kInstrStride);
+    const std::uint32_t ByteSize = InstrCount * InstrStride;
+    Value *Stride = ConstantInt::get(I32, InstrStride);
     Value *ByteSizeV = ConstantInt::get(I32, ByteSize);
     Value *Misaligned = B.CreateICmpNE(
         B.CreateURem(Pc, Stride, Twine(Name).concat(".rem")),
@@ -2157,11 +2172,12 @@ Value *emitBinary(Builder &B, VmOp Op, std::uint8_t Variant, Value *L, Value *R,
     return Out;
 }
 
-void advancePc(Builder &B, AllocaInst *PcSlot, BasicBlock *Dispatch) {
+void advancePc(Builder &B, AllocaInst *PcSlot, BasicBlock *Dispatch,
+               std::uint32_t InstrStride) {
     auto *I32 = B.getInt32Ty();
     Value *Pc = B.CreateLoad(I32, PcSlot, "morok.vm.pc.cur");
-    Value *Next = B.CreateAdd(Pc, ConstantInt::get(I32, kInstrStride),
-                              "morok.vm.pc.next");
+    Value *Next =
+        B.CreateAdd(Pc, ConstantInt::get(I32, InstrStride), "morok.vm.pc.next");
     B.CreateStore(Next, PcSlot);
     B.CreateBr(Dispatch);
 }
@@ -2318,7 +2334,8 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
     Builder DB(Dispatch);
     Value *Pc =
         safePc(DB, PoisonSlot, DB.CreateLoad(I32, PcSlot, "morok.vm.pc"),
-               static_cast<std::uint32_t>(P.code.size()), "morok.vm.pc.safe");
+               static_cast<std::uint32_t>(P.code.size()), Enc.stride,
+               "morok.vm.pc.safe");
     Value *DecodedOp = emitDecodeByte(DB, Bytecode, Pc, Enc.fields[0], Enc);
     Value *ComputedGuard =
         emitComputedRecordGuard(DB, Bytecode, Pc, DecodedOp, Enc);
@@ -2391,7 +2408,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
             emitDecodeByte(PB, Bytecode,
                            safePc(PB, PoisonSlot, BadPc,
                                   static_cast<std::uint32_t>(P.code.size()),
-                                  "morok.vm.poison.pc.safe"),
+                                  Enc.stride, "morok.vm.poison.pc.safe"),
                            Enc.fields[0], Enc),
             I64, "morok.vm.poison.opcode");
         emitPoisonReturn(PB, BadOp);
@@ -2400,9 +2417,10 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
     for (std::size_t I = 0; I < Layout.specs.size(); ++I) {
         const HandlerSpec &Spec = Layout.specs[I];
         Builder B(Handlers[I]);
-        Value *CurPc = safePc(
-            B, PoisonSlot, B.CreateLoad(I32, PcSlot, "morok.vm.pc.h"),
-            static_cast<std::uint32_t>(P.code.size()), "morok.vm.pc.h.safe");
+        Value *CurPc =
+            safePc(B, PoisonSlot, B.CreateLoad(I32, PcSlot, "morok.vm.pc.h"),
+                   static_cast<std::uint32_t>(P.code.size()), Enc.stride,
+                   "morok.vm.pc.h.safe");
 
         switch (Spec.op) {
         case VmOp::Const: {
@@ -2411,7 +2429,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
             Value *Imm = emitDecodeImm(B, Bytecode, CurPc, Enc);
             storeReg(B, Regs, RegsTy, Dst,
                      applyPoison(B, PoisonSlot, Imm, "morok.vm.const.poison"));
-            advancePc(B, PcSlot, Dispatch);
+            advancePc(B, PcSlot, Dispatch, Enc.stride);
             continue;
         }
         case VmOp::Ret: {
@@ -2463,7 +2481,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
             storeReg(
                 B, Regs, RegsTy, Dst,
                 B.CreateSelect(TakeTrue, TrueVal, FalseVal, "morok.vm.select"));
-            advancePc(B, PcSlot, Dispatch);
+            advancePc(B, PcSlot, Dispatch, Enc.stride);
             continue;
         }
         case VmOp::Jmp: {
@@ -2472,7 +2490,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                               "morok.vm.jmp.target");
             JmpTarget = safePc(B, PoisonSlot, JmpTarget,
                                static_cast<std::uint32_t>(P.code.size()),
-                               "morok.vm.jmp.safe");
+                               Enc.stride, "morok.vm.jmp.safe");
             if (Spec.variant != 0) {
                 Value *Zero =
                     B.CreateXor(JmpTarget, JmpTarget, "morok.vm.jmp.zero");
@@ -2491,10 +2509,10 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                               I32, "morok.vm.br.nottaken");
             Taken = safePc(B, PoisonSlot, Taken,
                            static_cast<std::uint32_t>(P.code.size()),
-                           "morok.vm.br.taken.safe");
+                           Enc.stride, "morok.vm.br.taken.safe");
             NotTaken = safePc(B, PoisonSlot, NotTaken,
                               static_cast<std::uint32_t>(P.code.size()),
-                              "morok.vm.br.nottaken.safe");
+                              Enc.stride, "morok.vm.br.nottaken.safe");
             Value *Cond = loadReg(B, Regs, RegsTy, CondIdx);
             Value *Take = B.CreateICmpNE(Cond, ConstantInt::get(I64, 0),
                                          "morok.vm.br.cond");
@@ -2526,7 +2544,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                 Res = B.CreateXor(Res, Zero, "morok.vm.sext.keep");
             }
             storeReg(B, Regs, RegsTy, Dst, Res);
-            advancePc(B, PcSlot, Dispatch);
+            advancePc(B, PcSlot, Dispatch, Enc.stride);
             continue;
         }
         case VmOp::Load8:
@@ -2549,7 +2567,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                     emitMemLoad(B, safeAddress(B, Addr, "morok.vm.load.addr"),
                                 Bytes),
                     "morok.vm.load.poison"));
-            advancePc(B, PcSlot, Dispatch);
+            advancePc(B, PcSlot, Dispatch, Enc.stride);
             continue;
         }
         case VmOp::Store8:
@@ -2570,7 +2588,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                 B, safeAddress(B, Addr, "morok.vm.store.addr"),
                 applyPoison(B, PoisonSlot, Val, "morok.vm.store.poison"),
                 Bytes);
-            advancePc(B, PcSlot, Dispatch);
+            advancePc(B, PcSlot, Dispatch, Enc.stride);
             continue;
         }
         case VmOp::PtrConst: {
@@ -2593,7 +2611,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
             }
             storeReg(B, Regs, RegsTy, Dst,
                      B.CreatePtrToInt(Ptr, I64, "morok.vm.ptr.addr"));
-            advancePc(B, PcSlot, Dispatch);
+            advancePc(B, PcSlot, Dispatch, Enc.stride);
             continue;
         }
         case VmOp::Call: {
@@ -2635,7 +2653,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                 storeReg(B, Regs, RegsTy, ConstantInt::get(I32, CS.result_reg),
                          Res);
             }
-            advancePc(B, PcSlot, Dispatch);
+            advancePc(B, PcSlot, Dispatch, Enc.stride);
             continue;
         }
         default:
@@ -2656,7 +2674,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
             emitBinary(B, Spec.op, Spec.variant, L, R, CurPc, PoisonSlot),
             "morok.vm.bin.poison");
         storeReg(B, Regs, RegsTy, Dst, Out);
-        advancePc(B, PcSlot, Dispatch);
+        advancePc(B, PcSlot, Dispatch, Enc.stride);
     }
 
     return Helper;
