@@ -74,6 +74,14 @@ AUDIT_PROVENANCE="${AUDIT_PROVENANCE:-}"
 AUDIT_ALLOWLIST="${AUDIT_ALLOWLIST:-}"
 PYTHON="${PYTHON:-python3}"
 
+# Optional Linux/x86-64 runtime-metadata shadowing.  This is a post-link ELF
+# transform, so it is meaningful only for dynamically linked Linux outputs.
+# The conventional DT_JMPREL records name per-site decoy symbols while a later
+# page-overlapping PT_LOAD supplies the original records to the runtime loader.
+ELF_SHADOW="${ELF_SHADOW:-0}"
+ELF_SHADOW_TOOL="${ELF_SHADOW_TOOL:-$ROOT/tools/morok_elf_shadow.py}"
+ELF_SHADOW_MAX_BYTES="${ELF_SHADOW_MAX_BYTES:-1048576}"
+
 BUILD_LINUX=1
 BUILD_MACOS="$DEFAULT_BUILD_MACOS"
 STRIP_BINARIES=1
@@ -119,6 +127,9 @@ Options:
                          from a previous run (e.g. a static binary left over when
                          switching to --dynamic) cannot fail the bundle audit
   --dynamic              Linux dynamic link (default: static)
+  --elf-shadow           Apply Linux/x86-64 DT_JMPREL page shadowing; requires
+                         --dynamic (default: off)
+  --no-elf-shadow        Disable DT_JMPREL page shadowing
   --extra-cflags FLAGS   Extra compiler flags (e.g. "-no-pie -ffast-math")
   --extra-sources PATHS  Extra source files compiled alongside the main source
                          (space-separated, e.g. "tweetnacl.c")
@@ -275,6 +286,8 @@ while [ "$#" -gt 0 ]; do
     --no-audit) AUDIT_BINARIES=0; shift ;;
     --clean) CLEAN_OUT=1; shift ;;
     --dynamic) LINUX_STATIC=0; shift ;;
+    --elf-shadow) ELF_SHADOW=1; shift ;;
+    --no-elf-shadow) ELF_SHADOW=0; shift ;;
     --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
     --extra-sources) EXTRA_SOURCES="$2"; shift 2 ;;
     --libs) LIBS="$2"; shift 2 ;;
@@ -313,6 +326,19 @@ if [ "$EMIT_PLATFORM_DEFAULTS" -eq 1 ]; then
 fi
 
 [ "$BUILD_LINUX" -eq 1 ] || [ "$BUILD_MACOS" -eq 1 ] || die "nothing to build"
+
+case "$ELF_SHADOW" in
+  0|1) ;;
+  *) die "ELF_SHADOW must be 0 or 1" ;;
+esac
+if [ "$ELF_SHADOW" -eq 1 ]; then
+  [ "$BUILD_LINUX" -eq 1 ] || die "--elf-shadow requires a Linux output"
+  [ "$LINUX_STATIC" -eq 0 ] || die "--elf-shadow requires --dynamic"
+  case "${LINUX_TARGET%%-*}" in
+    x86_64|amd64) ;;
+    *) die "--elf-shadow supports only Linux x86-64 targets" ;;
+  esac
+fi
 
 if [ "$BUILD_MACOS" -eq 1 ] && [ "$HOST_OS" != "Darwin" ]; then
   die "macOS builds require a Darwin host; run with --linux-only or --no-macos on $HOST_OS"
@@ -459,11 +485,12 @@ strip_macos() {
   fi
 }
 
-# Post-link seal MUST run last (after strip), so the sealed code-window hash is
-# taken over the exact bytes that exist at runtime.  On macOS the in-place byte
-# rewrite invalidates the signature, so re-sign afterwards.  Fail closed: a
-# binary with zero sealed manifests has no native-code patch protection and must
-# not be shipped.
+# Post-link seal MUST run after strip, so the sealed code-window hash is taken
+# over the exact native code bytes that exist at runtime.  Linux ELF relocation
+# shadowing runs after this step but changes only loader metadata, not a sealed
+# code window.  On macOS the in-place byte rewrite invalidates the signature, so
+# re-sign afterwards.  Fail closed: a binary with zero sealed manifests has no
+# native-code patch protection and must not be shipped.
 seal_binary() {
   local out="$1"
   [ "$SEAL_BINARIES" -eq 1 ] || return 0
@@ -485,6 +512,28 @@ seal_binary() {
     /usr/bin/codesign --force --sign - "$out" >/dev/null 2>&1 ||
       die "codesign failed after seal: $out"
   fi
+}
+
+shadow_linux_imports() {
+  local out="$1"
+  [ "$ELF_SHADOW" -eq 1 ] || return 0
+  [ "$LINUX_STATIC" -eq 0 ] ||
+    die "--elf-shadow requires --dynamic; static ELF has no DT_JMPREL loader path"
+  [ -f "$ELF_SHADOW_TOOL" ] ||
+    die "ELF shadow tool not found: $ELF_SHADOW_TOOL"
+  need_tool "$PYTHON"
+
+  echo ">> shadowing Linux import relocations in $out"
+  local cmd=("$PYTHON" "$ELF_SHADOW_TOOL" apply "$out"
+             --max-shadow-bytes "$ELF_SHADOW_MAX_BYTES")
+  # A fixed Morok seed makes the post-link decoy selection reproducible too.
+  # Seed zero retains per-artifact derivation from the final binary bytes.
+  if [ "$SEED" != "0" ]; then
+    cmd+=(--seed "$SEED")
+  fi
+  "${cmd[@]}" || die "ELF relocation shadowing failed for $out"
+  "$PYTHON" "$ELF_SHADOW_TOOL" verify "$out" >/dev/null ||
+    die "ELF relocation shadow verification failed for $out"
 }
 
 audit_bundle() {
@@ -532,6 +581,7 @@ build_linux() {
 
   local arch="${LINUX_TARGET%%-*}"
   local static_flag=()
+  local elf_shadow_link=()
   local static_suffix=""
   local morok_cfg=("${MOROK_CONFIG[@]}")
   if [ "$LINUX_STATIC" -eq 1 ]; then
@@ -548,6 +598,11 @@ build_linux() {
     # to parse, the plugin must still apply the intended protections rather than
     # silently produce a bare, unprotected binary.
     morok_cfg=(-mllvm "-morok-config=$static_cfg" -mllvm "-morok-preset=$PRESET")
+  elif [ "$ELF_SHADOW" -eq 1 ]; then
+    # Reserve a conventional, late PT_NOTE header for the post-link shadow
+    # PT_LOAD.  Compact lld/musl links otherwise have no disposable program
+    # header, and growing/relocating the table is not loader-portable.
+    elf_shadow_link=("-Wl,--build-id=sha1")
   fi
 
   local out="$OUT_DIR/$STEM-linux-$arch$static_suffix"
@@ -561,10 +616,11 @@ build_linux() {
   if [ "${#static_flag[@]}" -gt 0 ]; then
     linux_cmd+=("${static_flag[@]}")
   fi
-  linux_cmd+=("${morok_cfg[@]}" "${COMMON[@]}" -o "$out")
+  linux_cmd+=("${morok_cfg[@]}" "${elf_shadow_link[@]}" "${COMMON[@]}" -o "$out")
   "${linux_cmd[@]}"
   strip_linux "$out"
   seal_binary "$out"
+  shadow_linux_imports "$out"
   OUTPUTS+=("$out")
 }
 

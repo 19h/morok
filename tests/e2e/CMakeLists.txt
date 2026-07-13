@@ -91,6 +91,8 @@ set(_mirage_config "${CMAKE_CURRENT_SOURCE_DIR}/mirage.toml")
 set(_mirage_fake_config "${CMAKE_CURRENT_SOURCE_DIR}/mirage_forced_fake.toml")
 set(_mirage_fake_driver "${CMAKE_CURRENT_SOURCE_DIR}/mirage_forced_fake.sh")
 set(_mirage_workload "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/mirage_verdict.c")
+set(_elf_shadow_driver
+    "${CMAKE_CURRENT_SOURCE_DIR}/elf_relocation_shadow_test.py")
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
@@ -173,6 +175,16 @@ add_test(NAME "e2e/workflows_pinned"
 set_tests_properties("e2e/workflows_pinned" PROPERTIES LABELS "e2e")
 
 if(Python3_EXECUTABLE)
+  add_test(NAME "e2e/elf_relocation_shadow"
+    COMMAND "${Python3_EXECUTABLE}" "${_elf_shadow_driver}"
+            "${CMAKE_SOURCE_DIR}")
+  set_tests_properties("e2e/elf_relocation_shadow" PROPERTIES
+    LABELS "e2e;security;linux"
+    REQUIRED_FILES
+      "${CMAKE_SOURCE_DIR}/tools/morok_elf_shadow.py;${_elf_shadow_driver}"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 30)
+
   add_test(NAME "e2e/release_audit"
     COMMAND "${Python3_EXECUTABLE}" "${_release_audit_driver}"
             "${CMAKE_SOURCE_DIR}")

@@ -299,6 +299,8 @@ Common options:
 | `--no-audit` | Skip the final `morok-audit` release gate. |
 | `--clean` | Wipe the output directory before building, after refusing unsafe paths outside the canonical build tree. |
 | `--dynamic` | Build Linux dynamically; the default Linux mode is static. |
+| `--elf-shadow` | For dynamic Linux/x86-64 outputs, apply post-link `DT_JMPREL` runtime-metadata shadowing. |
+| `--no-elf-shadow` | Disable ELF relocation shadowing (the default). |
 | `--extra-cflags FLAGS` | Extra compiler flags. |
 | `--extra-sources PATHS` | Extra source files compiled alongside the main source. |
 | `--libs FLAGS` | Extra link libraries. |
@@ -310,7 +312,8 @@ Recognized environment overrides include `BUILD_DIR`, `OUT_DIR`, `CLANG`,
 `LINUX_CC`, `LINUX_STATIC`, `LINUX_SYSROOT`, `LINUX_STRIP`, `MACOS_ARCHES`,
 `MACOS_MIN`, `MACOS_SDK`, `EXTRA_SOURCES`, `EXTRA_CFLAGS`, `LIBS`,
 `SEAL_BINARIES`, `SEAL_WINDOW`, `SEAL_TOOL`, `AUDIT_BINARIES`, `AUDIT_TOOL`,
-`AUDIT_PROVENANCE`, `AUDIT_ALLOWLIST`, and `PYTHON`.
+`AUDIT_PROVENANCE`, `AUDIT_ALLOWLIST`, `ELF_SHADOW`, `ELF_SHADOW_TOOL`,
+`ELF_SHADOW_MAX_BYTES`, and `PYTHON`.
 
 Important defaults:
 
@@ -391,6 +394,66 @@ must be allowlisted explicitly with a versioned JSON file:
     {"path": "fixtures/*.pem", "checks": ["private-key-sidecar"]}
   ]
 }
+```
+
+### Linux ELF relocation shadowing
+
+Dynamic Linux/x86-64 builds can opt into loader-view divergence after linking,
+stripping, and sealing:
+
+```sh
+./cross_build.sh --linux-only --dynamic --elf-shadow \
+  --source programs/01_hello_world.c
+```
+
+The post-link transform rewrites each conventional
+`R_X86_64_JUMP_SLOT` record to a seed-diverse, function-like decoy dynamic
+symbol. It preserves the original relocation page range at an appended,
+page-aligned file offset and repurposes a later `PT_NULL` or `PT_NOTE` program
+header as a `PT_LOAD`. When enabled through `cross_build.sh`, the link adds a
+standard SHA-1 build-ID note so compact lld/musl layouts also reserve such a
+header without discarding `PT_PHDR`, `PT_DYNAMIC`, `PT_GNU_EH_FRAME`,
+`PT_GNU_STACK`, or `PT_GNU_RELRO`. Linux processes the new load after the
+ordinary segment and maps the preserved page range over the same virtual
+pages. Static tools that
+follow the section/file view associate PLT sites with the decoys; the runtime
+loader follows `DT_JMPREL` in the final mapped image and resolves the original
+symbols.
+
+The producer is fail-closed and bounded. It accepts only little-endian
+Linux/x86-64 `ET_EXEC`/`ET_DYN` files with 4096-byte loader pages,
+`Elf64_Rela` PLT relocations, an
+unambiguous non-overlapping input load map, at least two function-like dynamic
+symbols, and a reusable later `PT_NULL`/`PT_NOTE` header. If neither spare type
+exists, standalone application rejects the binary and instructs the caller to
+relink with `--build-id`. The default shadow cap is 1 MiB. File growth is the
+page-rounded relocation span plus at most 4095 alignment bytes; calls have no
+added steady-state instructions or
+memory allocations. Static binaries, other architectures, pre-overlapped
+layouts, and binaries without a spare safe header are rejected without writing
+the output.
+
+The reserved build-ID `PT_NOTE` entry is consumed by the shadow `PT_LOAD`.
+The note's section and file bytes remain available to static readers, but
+runtime code that enumerates program headers will not discover the build ID as
+a `PT_NOTE`. Pipelines that require runtime build-ID discovery must leave this
+mechanism disabled or provide a separate disposable program-header slot.
+
+This mechanism changes call-site attribution, not the complete imported-symbol
+inventory, and page-rounded `PT_LOAD` overlap remains a loader-aware detection
+signal. It therefore composes with function-call obfuscation but does not
+replace it. The implementation follows the ELF64 program-header alignment
+rules in the [System V gABI](https://refspecs.linuxfoundation.org/elf/gabi4%2B/ch5.pheader.html),
+Linux's page-rounded ordered mapping in
+[`fs/binfmt_elf.c`](https://github.com/torvalds/linux/blob/master/fs/binfmt_elf.c),
+and glibc's documented dynamic-loader model in the
+[GNU C Library manual](https://sourceware.org/glibc/manual/latest/html_node/Dynamic-Linker.html).
+
+Manual application and verification are:
+
+```sh
+python3 tools/morok_elf_shadow.py apply path/to/binary --seed 832040
+python3 tools/morok_elf_shadow.py verify path/to/binary
 ```
 
 ## Configuration Model
