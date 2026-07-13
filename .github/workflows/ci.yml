@@ -85,9 +85,11 @@ jobs:
           sccache --stop-server >/dev/null 2>&1 || true
           dir="${RUNNER_TEMP//\\//}/sccache"
           mkdir -p "$dir"
-          echo "SCCACHE_DIR=$dir" >> "$GITHUB_ENV"
-          echo "SCCACHE_GHA_ENABLED=false" >> "$GITHUB_ENV"
-          echo "SCCACHE_CACHE_SIZE=3G" >> "$GITHUB_ENV"
+          {
+            echo "SCCACHE_DIR=$dir"
+            echo "SCCACHE_GHA_ENABLED=false"
+            echo "SCCACHE_CACHE_SIZE=3G"
+          } >> "$GITHUB_ENV"
 
       - name: Restore sccache cache
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
@@ -127,7 +129,8 @@ jobs:
             # path patches: --gcc-install-dir lets it link libstdc++/libgcc, but
             # it cannot locate the C++ *headers*, so add them explicitly with
             # -isystem (<initializer_list> et al. are otherwise "not found").
-            ver="$(ls /usr/include/c++/ 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)"
+            ver="$(find /usr/include/c++ -mindepth 1 -maxdepth 1 -type d \
+              -exec basename {} \; | grep -E '^[0-9]+$' | sort -n | tail -1)"
             triple="$(gcc -dumpmachine)"
             gccdir="/usr/lib/gcc/${triple}/${ver}"
             cxxinc="--gcc-install-dir=${gccdir} -isystem /usr/include/c++/${ver} -isystem /usr/include/${triple}/c++/${ver} -isystem /usr/include/c++/${ver}/backward"
@@ -136,18 +139,18 @@ jobs:
             # does not, so force-include it.
             cxxinc="${cxxinc} -include initializer_list"
             args+=(
-              -DCMAKE_C_FLAGS="--gcc-install-dir=${gccdir}"
-              -DCMAKE_CXX_FLAGS="${cxxinc}"
+              "-DCMAKE_C_FLAGS=--gcc-install-dir=${gccdir}"
+              "-DCMAKE_CXX_FLAGS=${cxxinc}"
               # CMake orders some Morok static libs after the LLVM libs they
               # depend on; GNU ld is single-pass and leaves those cross-archive
               # references undefined (ld64/lld-link rescan automatically). Wrap
               # the whole link in a group so GNU ld rescans. --end-group is
               # appended to every link via STANDARD_LIBRARIES, so --start-group
               # must open it for every link kind (exe + the plugin MODULE).
-              -DCMAKE_EXE_LINKER_FLAGS=-Wl,--start-group
-              -DCMAKE_MODULE_LINKER_FLAGS=-Wl,--start-group
-              -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--start-group
-              -DCMAKE_CXX_STANDARD_LIBRARIES=-Wl,--end-group
+              "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--start-group"
+              "-DCMAKE_MODULE_LINKER_FLAGS=-Wl,--start-group"
+              "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--start-group"
+              "-DCMAKE_CXX_STANDARD_LIBRARIES=-Wl,--end-group"
             )
           fi
           if [ "$RUNNER_OS" = "Windows" ]; then
@@ -169,7 +172,7 @@ jobs:
             # emits its _mm_* intrinsics as undefined external calls (lld-link
             # error), and the scalar scanner is more than fast enough for the tiny
             # Morok config files.
-            args+=( -DCMAKE_CXX_FLAGS="-Wno-c++11-narrowing -include initializer_list -include ostream -DTOML_ENABLE_SIMD=0 $imsvc" )
+            args+=("-DCMAKE_CXX_FLAGS=-Wno-c++11-narrowing -include initializer_list -include ostream -DTOML_ENABLE_SIMD=0 $imsvc")
           fi
           cmake "${args[@]}"
 

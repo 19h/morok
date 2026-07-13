@@ -17,42 +17,55 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: llvm-trunk-pin
+  cancel-in-progress: false
+
 jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Resolve target LLVM commit
         id: resolve
         shell: bash
+        env:
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          if [ -n "${{ github.event.inputs.ref }}" ]; then
-            new="${{ github.event.inputs.ref }}"
+          if [ -n "$INPUT_REF" ]; then
+            new="$INPUT_REF"
           else
             new="$(git ls-remote https://github.com/llvm/llvm-project.git refs/heads/main | cut -f1)"
           fi
-          if [ -z "$new" ]; then
-            echo "::error::could not resolve LLVM main HEAD"; exit 1
+          if [[ ! "$new" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::LLVM ref must resolve to a full 40-hex commit SHA"
+            exit 1
           fi
           source .github/llvm-trunk.env
-          echo "old=${LLVM_REF}" >> "$GITHUB_OUTPUT"
-          echo "new=${new}" >> "$GITHUB_OUTPUT"
-          if [ "${LLVM_REF}" = "${new}" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
+          {
+            echo "old=${LLVM_REF}"
+            echo "new=${new}"
+            if [ "${LLVM_REF}" = "${new}" ]; then
+              echo "changed=false"
+            else
+              echo "changed=true"
+            fi
+          } >> "$GITHUB_OUTPUT"
           echo "Current: ${LLVM_REF}"
           echo "Latest : ${new}"
 
       - name: Update pin
         if: steps.resolve.outputs.changed == 'true'
         shell: bash
+        env:
+          NEW_REF: ${{ steps.resolve.outputs.new }}
         run: |
           set -euo pipefail
-          sed -i "s/^LLVM_REF=.*/LLVM_REF=${{ steps.resolve.outputs.new }}/" .github/llvm-trunk.env
+          sed -i "s/^LLVM_REF=.*/LLVM_REF=${NEW_REF}/" .github/llvm-trunk.env
 
       - name: Open pull request
         if: steps.resolve.outputs.changed == 'true'

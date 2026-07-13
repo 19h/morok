@@ -38,6 +38,7 @@ compile_one() {
   local log="$4"
   local cc=()
   local std=()
+  local ldlibs=()
 
   case "$src" in
     *.cpp)
@@ -50,6 +51,10 @@ compile_one() {
       ;;
   esac
 
+  # POSIX C math functions live in libm. The MSVC runtime resolves the same
+  # symbols without a separate library and has no libm import library.
+  [ "${RUNNER_OS:-}" = "Windows" ] || ldlibs=(-lm)
+
   if [ "$mode" = "obf" ]; then
     local morok_env=(MOROK_ENABLE=1 MOROK_SEED="$SEED")
     if [ -f "$CONFIG_OR_PRESET" ]; then
@@ -59,10 +64,10 @@ compile_one() {
     fi
     env "${morok_env[@]}" "${cc[@]}" "${SYSROOT[@]}" -O2 "${std[@]}" \
       -fpass-plugin="$PLUGIN" \
-      "$src" -o "$out" >"$log" 2>&1
+      "$src" -o "$out" "${ldlibs[@]}" >"$log" 2>&1
   else
     "${cc[@]}" "${SYSROOT[@]}" -O2 "${std[@]}" \
-      "$src" -o "$out" >"$log" 2>&1
+      "$src" -o "$out" "${ldlibs[@]}" >"$log" 2>&1
   fi
 }
 

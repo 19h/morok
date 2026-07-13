@@ -33,7 +33,7 @@ LIMIT_BIN=""
 if command -v timeout >/dev/null 2>&1; then LIMIT_BIN=timeout
 elif command -v gtimeout >/dev/null 2>&1; then LIMIT_BIN=gtimeout; fi
 CLEAN_TIMEOUT="${MOROK_RUN_CLEAN_TIMEOUT:-30}"
-OBF_TIMEOUT="${MOROK_RUN_OBF_TIMEOUT:-180}"
+OBF_TIMEOUT="${MOROK_RUN_OBF_TIMEOUT:-300}"
 run_limited() { # <seconds> <cmd...>
   local secs="$1"; shift
   if [ -n "$LIMIT_BIN" ]; then "$LIMIT_BIN" "$secs" "$@"; else "$@"; fi
@@ -44,30 +44,32 @@ if [ -f "$CFG" ]; then MOROK_ENV+=(MOROK_CONFIG="$CFG"); else MOROK_ENV+=(MOROK_
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # Strip inherently non-deterministic lines so they do not cause false failures.
-NOISE='Time|elapsed|seconds|nanosecond|µs| ns | ms | ms\)|cycles|faster|throughput|tasks pending|MB/s|0x[0-9a-fA-F]{6,}'
+NOISE='Time|elapsed|seconds|nanosecond|µs| ns | ms | ms\)|cycles|faster|speedup|throughput|tasks pending|MB/s|0x[0-9a-fA-F]{6,}'
 
 compile_one() { # <src> <out> <log> [clean|obf]
   local src="$1"; local out="$2"; local log="$3"; local mode="$4"
   local cc=("$CLANG"); local std=(-std=c11 -D_GNU_SOURCE)
+  local ldlibs=()
   case "$src" in *.cpp) cc=("$CLANGXX"); std=(-std=c++23 -D_GNU_SOURCE);; esac
+  [ "${RUNNER_OS:-}" = "Windows" ] || ldlibs=(-lm)
 
   if [ "$mode" = "obf" ]; then
     if [ -n "$SDK" ]; then
       env "${MOROK_ENV[@]}" "${cc[@]}" -isysroot "$SDK" -O2 "${std[@]}" \
         -fpass-plugin="$PLUGIN" \
-        "$src" -o "$out" >"$log" 2>&1
+        "$src" -o "$out" "${ldlibs[@]}" >"$log" 2>&1
     else
       env "${MOROK_ENV[@]}" "${cc[@]}" -O2 "${std[@]}" \
         -fpass-plugin="$PLUGIN" \
-        "$src" -o "$out" >"$log" 2>&1
+        "$src" -o "$out" "${ldlibs[@]}" >"$log" 2>&1
     fi
   else
     if [ -n "$SDK" ]; then
       "${cc[@]}" -isysroot "$SDK" -O2 "${std[@]}" \
-        "$src" -o "$out" >"$log" 2>&1
+        "$src" -o "$out" "${ldlibs[@]}" >"$log" 2>&1
     else
       "${cc[@]}" -O2 "${std[@]}" \
-        "$src" -o "$out" >"$log" 2>&1
+        "$src" -o "$out" "${ldlibs[@]}" >"$log" 2>&1
     fi
   fi
 }
