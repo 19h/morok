@@ -9147,6 +9147,7 @@ TEST_CASE("virtualizeModule uses seed-diverse VM handler layout") {
         std::vector<std::string> handler_multiset;
         std::string bytecode;
         std::uint64_t stride = 0;
+        int stream_variant = -1;
     };
 
     auto render = [](std::uint64_t Seed) {
@@ -9177,6 +9178,16 @@ entry:
         Out.handler_multiset = Out.handlers;
         std::sort(Out.handler_multiset.begin(), Out.handler_multiset.end());
         for (Instruction &I : instructions(*Helper)) {
+            for (int Variant = 0; Variant < 4; ++Variant) {
+                const std::string Prefix =
+                    "morok.vm.key.v" + std::to_string(Variant) + ".";
+                if (!I.getName().starts_with(Prefix))
+                    continue;
+                if (Out.stream_variant == -1)
+                    Out.stream_variant = Variant;
+                else
+                    CHECK(Out.stream_variant == Variant);
+            }
             if (!I.getName().starts_with("morok.vm.pc.next"))
                 continue;
             auto *BO = dyn_cast<BinaryOperator>(&I);
@@ -9191,6 +9202,7 @@ entry:
         CHECK(Out.stride >= 16u);
         CHECK(Out.stride <= 32u);
         CHECK((Out.stride % 4u) == 0u);
+        REQUIRE(Out.stream_variant >= 0);
 
         GlobalVariable *Bytecode = nullptr;
         for (GlobalVariable &GV : M->globals())
@@ -9213,10 +9225,17 @@ entry:
     CHECK(A.handler_multiset == B.handler_multiset);
     CHECK(A.bytecode == B.bytecode);
     CHECK(A.stride == B.stride);
+    CHECK(A.stream_variant == B.stream_variant);
     CHECK(A.handler_multiset != C.handler_multiset);
     CHECK(A.handlers != C.handlers);
     CHECK(A.bytecode != C.bytecode);
     CHECK(A.stride != C.stride);
+    CHECK(A.stream_variant != C.stream_variant);
+
+    unsigned MixerMask = 0;
+    for (std::uint64_t Seed = 15101; Seed < 15165 && MixerMask != 0xFu; ++Seed)
+        MixerMask |= 1u << render(Seed).stream_variant;
+    CHECK(MixerMask == 0xFu);
 }
 
 TEST_CASE("virtualizeModule keeps generated protection helpers native") {

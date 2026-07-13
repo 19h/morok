@@ -697,7 +697,8 @@ is deliberately no separate per-PC opcode table: such a table is a statically
 decodable shadow copy of the handler sequence. Opcode/register fields and the
 eight immediate bytes are independently permuted per function; instruction
 stride varies from 16 to 32 bytes with encrypted padding and rescaled branch
-targets; real handlers are scattered across the 256-entry target space; and
+targets; byte decoding selects one of four arithmetic mixer families per
+function; real handlers are scattered across the 256-entry target space; and
 each VM emits only its used ISA subset plus a bounded seed-varying decoy subset.
 Fault-paged payload delivery is
 preferred for configured VM payloads and leaves already protected bytecode

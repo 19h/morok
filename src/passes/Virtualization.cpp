@@ -9,8 +9,8 @@
 // The helper uses threaded computed-goto dispatch (`indirectbr` over a
 // blockaddress table), seed-varying handler subsets/variants, permuted record
 // fields and instruction strides, embedded whole-record integrity tags, and
-// per-byte decryption keyed by the VM PC; the original function becomes a
-// native wrapper that calls into the VM.
+// per-byte decryption selected from several mixer families and keyed by the VM
+// PC; the original function becomes a native wrapper that calls into the VM.
 //
 // The lifter handles arbitrary (single- and multi-block) control flow.  Real
 // CFGs are first de-SSA'd with `demoteToStack` (after critical-edge splitting),
@@ -179,6 +179,7 @@ struct EncodedProgram {
 
 struct Encoding {
     std::uint32_t stride = kMinInstrStride;
+    std::uint8_t stream_variant = 0;
     std::uint32_t mul = 1;
     std::uint32_t add = 0;
     std::uint8_t xork = 0;
@@ -1569,8 +1570,31 @@ std::optional<HandlerLayout> makeLayout(ir::IRRandom &Rng, const Program &P) {
 
 std::uint8_t streamKey(std::uint32_t Offset, const Encoding &Enc) {
     std::uint32_t X = Offset * Enc.mul + Enc.add;
-    X ^= X >> 7;
-    X ^= X >> 15;
+    switch (Enc.stream_variant) {
+    case 0:
+        X ^= X >> 7;
+        X ^= X >> 15;
+        break;
+    case 1: {
+        const std::uint32_t Rot = (X << 11) | (X >> 21);
+        X ^= Rot;
+        X *= 0x85EBCA6Bu;
+        X ^= X >> 13;
+        break;
+    }
+    case 2:
+        X ^= X >> 16;
+        X *= 0x7FEB352Du;
+        X ^= X >> 15;
+        X *= 0x846CA68Bu;
+        X ^= X >> 16;
+        break;
+    default:
+        X ^= X << 13;
+        X ^= X >> 17;
+        X ^= X << 5;
+        break;
+    }
     return static_cast<std::uint8_t>(X) ^ Enc.xork;
 }
 
@@ -1580,6 +1604,7 @@ Encoding makeEncoding(ir::IRRandom &Rng) {
     constexpr std::uint32_t kStrideChoices =
         ((kMaxInstrStride - kMinInstrStride) / kStrideQuantum) + 1;
     Enc.stride = kMinInstrStride + kStrideQuantum * Rng.range(kStrideChoices);
+    Enc.stream_variant = static_cast<std::uint8_t>(Rng.range(4));
     Enc.mul = static_cast<std::uint32_t>(Rng.next()) | 1u;
     Enc.add = static_cast<std::uint32_t>(Rng.next());
     Enc.xork = static_cast<std::uint8_t>(Rng.next());
@@ -1743,6 +1768,7 @@ Value *emitStreamKey(Builder &B, Value *Offset, const Encoding &Enc) {
         const std::uint64_t Domain =
             (static_cast<std::uint64_t>(Enc.mul) << 32) ^
             (static_cast<std::uint64_t>(Enc.add) << 16) ^
+            (static_cast<std::uint64_t>(Enc.stream_variant) << 8) ^
             static_cast<std::uint64_t>(Enc.xork) ^ DomainTag;
         Value *K64 = runtime_seal::emitKdf64(B, D, Domain, KdfName);
         Value *D32 = B.CreateXor(
@@ -1766,10 +1792,46 @@ Value *emitStreamKey(Builder &B, Value *Offset, const Encoding &Enc) {
     foldSealChannel(runtime_seal::kTracerChannel, 0xD4E7B93A8F15C26DULL,
                     "morok.vm.tracer.seal", "morok.vm.tracer.seal.kdf",
                     "morok.vm.tracer.seal.fold", "morok.vm.key.tracer");
-    X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 7)),
-                    "morok.vm.key.fold7");
-    X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 15)),
-                    "morok.vm.key.fold15");
+    switch (Enc.stream_variant) {
+    case 0:
+        X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 7)),
+                        "morok.vm.key.v0.fold7");
+        X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 15)),
+                        "morok.vm.key.v0.fold15");
+        break;
+    case 1: {
+        Value *Rot = B.CreateOr(
+            B.CreateShl(X, ConstantInt::get(I32, 11), "morok.vm.key.v1.shl"),
+            B.CreateLShr(X, ConstantInt::get(I32, 21), "morok.vm.key.v1.shr"),
+            "morok.vm.key.v1.rot");
+        X = B.CreateXor(X, Rot, "morok.vm.key.v1.xor");
+        X = B.CreateMul(X, ConstantInt::get(I32, 0x85EBCA6Bu),
+                        "morok.vm.key.v1.mul");
+        X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 13)),
+                        "morok.vm.key.v1.fold13");
+        break;
+    }
+    case 2:
+        X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 16)),
+                        "morok.vm.key.v2.fold16a");
+        X = B.CreateMul(X, ConstantInt::get(I32, 0x7FEB352Du),
+                        "morok.vm.key.v2.mul0");
+        X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 15)),
+                        "morok.vm.key.v2.fold15");
+        X = B.CreateMul(X, ConstantInt::get(I32, 0x846CA68Bu),
+                        "morok.vm.key.v2.mul1");
+        X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 16)),
+                        "morok.vm.key.v2.fold16b");
+        break;
+    default:
+        X = B.CreateXor(X, B.CreateShl(X, ConstantInt::get(I32, 13)),
+                        "morok.vm.key.v3.fold13");
+        X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 17)),
+                        "morok.vm.key.v3.fold17");
+        X = B.CreateXor(X, B.CreateShl(X, ConstantInt::get(I32, 5)),
+                        "morok.vm.key.v3.fold5");
+        break;
+    }
     Value *K = B.CreateTrunc(X, I8, "morok.vm.key.trunc");
     return B.CreateXor(K, ConstantInt::get(I8, Enc.xork), "morok.vm.key");
 }
