@@ -194,6 +194,20 @@ jobs:
         shell: bash
         run: sccache --show-stats || true
 
+      # Fast, clearly-labeled tripwire for the LLVM-IR pass unit tests: every
+      # obfuscation pass has a dedicated suite asserting it emits well-formed IR,
+      # actually fires, honors its no-op/cap/probability gates, and preserves the
+      # documented per-pass invariants.  These are milliseconds to run, so we run
+      # the whole `ir` label here first — an IR regression fails this step
+      # distinctly, before the slower differential/programs sweep below (which
+      # also re-runs them as part of the authoritative full gate).  The suites are
+      # target-neutral, so this runs identically on every platform in the matrix.
+      - name: Run IR unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -L ir --output-on-failure --timeout 300
+
       - name: Run tests
         shell: bash
         run: |
