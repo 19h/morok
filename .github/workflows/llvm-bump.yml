@@ -14,6 +14,7 @@ on:
         required: false
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -86,3 +87,14 @@ jobs:
           labels: |
             dependencies
             llvm
+
+      # A pull request created with GITHUB_TOKEN does not emit another workflow
+      # run. Explicit workflow_dispatch is the supported recursion exception, so
+      # dispatch CI on the PR branch after create-pull-request updates it.
+      - name: Run CI for updated pin
+        if: steps.resolve.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP_BRANCH: chore/bump-llvm-trunk
+        run: gh workflow run ci.yml --ref "$BUMP_BRANCH"
