@@ -80,6 +80,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
@@ -2993,6 +2994,38 @@ entry:
     CHECK(countGlobals(*M, "morok.vm.bytecode.decoy_math") == 0u);
     CHECK(countGlobals(*M, "morok.vm.bytecode.novm_sensitive_math") == 0u);
     CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
+TEST_CASE("MorokPass reports explicitly required VM coverage failures") {
+    LLVMContext ctx;
+    bool SawError = false;
+    ctx.setDiagnosticHandlerCallBack(
+        [](const DiagnosticInfo *DI, void *Opaque) {
+            if (DI && DI->getSeverity() == DS_Error)
+                *static_cast<bool *>(Opaque) = true;
+        },
+        &SawError);
+    auto M = parse(ctx, R"ir(
+define float @required_float(float %x) {
+entry:
+  %y = fadd float %x, 1.0
+  ret float %y
+}
+)ir");
+
+    morok::config::Config cfg;
+    cfg.seed = 716;
+    morok::config::Policy required;
+    required.func_regex = "^required_float$";
+    required.overrides.virtualization.enabled = true;
+    cfg.policies.push_back(std::move(required));
+
+    ModuleAnalysisManager AM;
+    morok::pipeline::MorokPass(std::move(cfg)).run(*M, AM);
+
+    CHECK(SawError);
+    CHECK(M->getFunction("morok.vm.required_float.exec") == nullptr);
+    CHECK(countGlobals(*M, "morok.vm.bytecode.required_float") == 0u);
 }
 
 TEST_CASE("MorokPass keeps anti-debug and checksum helpers native") {
@@ -9002,9 +9035,14 @@ entry:
     std::size_t switches = 0;
     std::size_t addHandlers = 0;
     std::size_t xorHandlers = 0;
+    std::size_t realHandlers = 0;
     bool hasBytecodeDecrypt = false;
     bool hasPoisonHandler = false;
     for (BasicBlock &BB : *Helper) {
+        realHandlers += BB.getName().starts_with("morok.vm.h.") &&
+                                BB.getName() != "morok.vm.h.poison"
+                            ? 1u
+                            : 0u;
         addHandlers += BB.getName().starts_with("morok.vm.h.add") ? 1u : 0u;
         xorHandlers += BB.getName().starts_with("morok.vm.h.xor") ? 1u : 0u;
         hasPoisonHandler |= BB.getName() == "morok.vm.h.poison";
@@ -9016,8 +9054,9 @@ entry:
     }
     CHECK(indirects == 1u);
     CHECK(switches == 0u);
-    CHECK(addHandlers >= 2u);
-    CHECK(xorHandlers >= 2u);
+    CHECK(addHandlers >= 1u);
+    CHECK(xorHandlers >= 1u);
+    CHECK(realHandlers < 24u);
     CHECK(hasBytecodeDecrypt);
     CHECK(hasPoisonHandler);
     CHECK(countNamedInstructions(*Helper, "morok.vm.pc.safe.bad") >= 1u);
@@ -9105,6 +9144,7 @@ entry:
 TEST_CASE("virtualizeModule uses seed-diverse VM handler layout") {
     struct Snapshot {
         std::vector<std::string> handlers;
+        std::vector<std::string> handler_multiset;
         std::string bytecode;
     };
 
@@ -9133,6 +9173,8 @@ entry:
         for (BasicBlock &BB : *Helper)
             if (BB.getName().starts_with("morok.vm.h."))
                 Out.handlers.push_back(BB.getName().str());
+        Out.handler_multiset = Out.handlers;
+        std::sort(Out.handler_multiset.begin(), Out.handler_multiset.end());
 
         GlobalVariable *Bytecode = nullptr;
         for (GlobalVariable &GV : M->globals())
@@ -9152,10 +9194,11 @@ entry:
     Snapshot C = render(15102);
 
     CHECK(A.handlers == B.handlers);
+    CHECK(A.handler_multiset == B.handler_multiset);
     CHECK(A.bytecode == B.bytecode);
-    const bool SeedDiverse =
-        A.handlers != C.handlers || A.bytecode != C.bytecode;
-    CHECK(SeedDiverse);
+    CHECK(A.handler_multiset != C.handler_multiset);
+    CHECK(A.handlers != C.handlers);
+    CHECK(A.bytecode != C.bytecode);
 }
 
 TEST_CASE("virtualizeModule keeps generated protection helpers native") {
@@ -9909,6 +9952,50 @@ entry:
     CHECK_FALSE(verifyModule(*M, &errs()));
 }
 
+TEST_CASE("virtualizeModule honors explicit VM priority on called hot loops") {
+    LLVMContext ctx;
+    auto M = parse(ctx, R"ir(
+define internal i32 @hot_loop(i32 %n) {
+entry:
+  br label %head
+head:
+  %i = phi i32 [ 0, %entry ], [ %i2, %body ]
+  %acc = phi i32 [ 0, %entry ], [ %acc2, %body ]
+  %cond = icmp slt i32 %i, %n
+  br i1 %cond, label %body, label %done
+body:
+  %acc2 = add i32 %acc, %i
+  %i2 = add i32 %i, 1
+  br label %head
+done:
+  ret i32 %acc
+}
+
+define i32 @caller(i32 %n) {
+entry:
+  %a = call i32 @hot_loop(i32 %n)
+  ret i32 %a
+}
+)ir");
+    Function *Hot = M->getFunction("hot_loop");
+    REQUIRE(Hot);
+    morok::ir::addAnnotation(*Hot, "morok.vm.priority");
+
+    auto engine = morok::core::Xoshiro256pp::fromSeed(8104);
+    morok::ir::IRRandom rng(engine);
+    morok::passes::VirtualizationParams P;
+    P.probability = 100;
+    P.max_functions = 1;
+    P.max_instructions = 128;
+    P.max_registers = 96;
+    P.prioritize_marked_user_functions = true;
+
+    CHECK(morok::passes::virtualizeModule(*M, P, rng));
+    CHECK(M->getFunction("morok.vm.hot_loop.exec") != nullptr);
+    CHECK(countGlobals(*M, "morok.vm.bytecode.hot_loop") == 1u);
+    CHECK_FALSE(verifyModule(*M, &errs()));
+}
+
 TEST_CASE("virtualizeModule lifts memory access, alloca, and getelementptr") {
     LLVMContext ctx;
     auto M = parse(ctx, R"ir(
@@ -9997,21 +10084,21 @@ entry:
     REQUIRE(Helper);
     CHECK(Helper->getReturnType()->isVoidTy());
     CHECK(countGlobals(*M, "morok.vm.bytecode") == 1u);
-    CHECK(countGlobals(*M, "morok.vm.opguard") == 1u);
+    CHECK(countGlobals(*M, "morok.vm.opguard") == 0u);
     CHECK(M->getGlobalVariable("morok.seal.root.anti_debug", true) != nullptr);
-    bool hasOpcodeGuard = false;
-    bool recordsOpcodePoison = false;
+    bool hasRecordGuard = false;
+    bool recordsGuardPoison = false;
     bool foldsVoidPoison = false;
     for (Instruction &I : instructions(*Helper)) {
-        hasOpcodeGuard |= I.getName().starts_with("morok.vm.op.expected") ||
-                          I.getName().starts_with("morok.vm.op.bad");
-        recordsOpcodePoison |= I.getName().starts_with("morok.vm.op.guard");
+        hasRecordGuard |= I.getName().starts_with("morok.vm.guard.tag") ||
+                          I.getName().starts_with("morok.vm.record.bad");
+        recordsGuardPoison |= I.getName().starts_with("morok.vm.record.guard");
         foldsVoidPoison |=
             I.getName().starts_with("morok.vm.void.poison.seal") ||
             I.getName().starts_with("morok.vm.ret.void.poison.seal");
     }
-    CHECK(hasOpcodeGuard);
-    CHECK(recordsOpcodePoison);
+    CHECK(hasRecordGuard);
+    CHECK(recordsGuardPoison);
     CHECK(foldsVoidPoison);
     CHECK_FALSE(verifyModule(*M, &errs()));
 }

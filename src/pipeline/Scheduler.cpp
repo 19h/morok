@@ -304,6 +304,7 @@ struct UserVmPriorityPlan {
     std::uint32_t max_functions = 0;
     std::uint32_t max_instructions = 0;
     std::uint32_t max_registers = 0;
+    std::vector<std::string> required_targets;
 };
 
 UserVmPriorityPlan
@@ -323,9 +324,9 @@ markUserVmPriorityFunctions(Module &M, const config::Config &Config,
 
         const bool PolicyTargetsVm = virtualizationConfigDiffers(
             Eff.virtualization, Config.passes.virtualization);
-        const bool SourceTargetsVm = isUserSensitiveFunction(F) ||
-                                     ir::hasAnnotation(F, "vm") ||
-                                     ir::hasAnnotation(F, "virtualization");
+        const bool ExplicitVm = ir::hasAnnotation(F, "vm") ||
+                                ir::hasAnnotation(F, "virtualization");
+        const bool SourceTargetsVm = isUserSensitiveFunction(F) || ExplicitVm;
         if (!PolicyTargetsVm && !SourceTargetsVm)
             continue;
 
@@ -337,6 +338,11 @@ markUserVmPriorityFunctions(Module &M, const config::Config &Config,
             continue;
 
         ir::addAnnotation(F, "morok.vm.priority");
+        // An explicit source annotation or function-specific policy is a hard
+        // coverage request.  Keep sensitive-only priority best-effort, but do
+        // not let an operator-selected VM target silently remain native.
+        if (ExplicitVm || PolicyTargetsVm)
+            Plan.required_targets.push_back(F.getName().str());
         Plan.has_target = true;
         ++Plan.target_count;
         Plan.probability = std::max(Plan.probability, TargetProbability);
@@ -707,6 +713,13 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
         // stack frames and trap.  Indirect/import/vararg calls remain excluded.
         p.allow_internal_user_calls = true;
         changed |= passes::virtualizeModule(M, p, rng);
+        for (const std::string &Name : InitialVmPriority.required_targets) {
+            const std::string HelperName = "morok.vm." + Name + ".exec";
+            if (!M.getFunction(HelperName))
+                M.getContext().emitError(
+                    Twine("Morok: explicitly required VM target '") + Name +
+                    "' was not liftable; refusing silent native fallback");
+        }
     }
 
     if (InitialModuleGrowthOk &&

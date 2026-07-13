@@ -7,9 +7,10 @@
 // An IR-level bytecode virtualizer.  Eligible functions are lifted into an
 // encrypted per-function bytecode stream and an internal interpreter helper.
 // The helper uses threaded computed-goto dispatch (`indirectbr` over a
-// blockaddress table), duplicated arithmetic handlers, and per-byte decryption
-// keyed by the VM PC; the original function becomes a native wrapper that calls
-// into the VM.
+// blockaddress table), seed-varying handler subsets/variants, permuted record
+// fields, embedded whole-record integrity tags, and per-byte decryption keyed
+// by the VM PC; the original function becomes a native wrapper that calls into
+// the VM.
 //
 // The lifter handles arbitrary (single- and multi-block) control flow.  Real
 // CFGs are first de-SSA'd with `demoteToStack` (after critical-edge splitting),
@@ -173,7 +174,6 @@ struct Program {
 
 struct EncodedProgram {
     std::vector<std::uint8_t> bytecode;
-    std::vector<std::uint8_t> opcode_guard;
 };
 
 struct Encoding {
@@ -182,6 +182,13 @@ struct Encoding {
     std::uint8_t xork = 0;
     std::uint8_t operand_key = 0;
     std::uint64_t imm_key = 0;
+    std::uint32_t record_guard_key = 0;
+    // Physical byte locations of the semantic {opcode,dst,lhs,rhs} fields and
+    // of the eight little-endian immediate bytes.  These are independently
+    // permuted per function, so a cross-build decoder cannot assume that byte
+    // zero is the opcode or that the immediate is laid out contiguously.
+    std::array<std::uint8_t, 4> fields{{0, 1, 2, 3}};
+    std::array<std::uint8_t, 8> imm_fields{{4, 5, 6, 7, 8, 9, 10, 11}};
 };
 
 struct HandlerSpec {
@@ -192,6 +199,8 @@ struct HandlerSpec {
 
 struct HandlerLayout {
     std::vector<HandlerSpec> specs;
+    std::vector<std::uint8_t> slots;
+    std::uint8_t poison_slot = 0;
     std::array<std::vector<std::uint8_t>, static_cast<std::size_t>(VmOp::Count)>
         ids;
 };
@@ -662,7 +671,11 @@ bool isEligible(Function &F, const VirtualizationParams &Params) {
         return false;
     if (!classifySignature(F))
         return false;
-    if (!generatedFunction(F) && loopLikelyHot(F))
+    // Explicitly selected trust-boundary functions must not silently fall back
+    // to native code merely because they contain a loop.  The priority marker
+    // is added only for a source annotation or a function-specific policy; the
+    // ordinary global VM wave still avoids unselected hot loops.
+    if (!generatedFunction(F) && loopLikelyHot(F) && !markedUserVmPriority(F))
         return false;
     if (F.size() > kMaxLiftBlocks)
         return false;
@@ -1451,10 +1464,9 @@ void shuffleSpecs(std::vector<HandlerSpec> &Specs, ir::IRRandom &Rng) {
     }
 }
 
-std::optional<HandlerLayout> makeLayout(ir::IRRandom &Rng,
-                                        std::uint32_t NumCalls) {
+std::optional<HandlerLayout> makeLayout(ir::IRRandom &Rng, const Program &P) {
     HandlerLayout Layout;
-    Layout.specs = {
+    const std::vector<HandlerSpec> Catalog = {
         {VmOp::Const, 0, "const"},      {VmOp::Ret, 0, "ret"},
         {VmOp::Add, 0, "add.a"},        {VmOp::Add, 1, "add.b"},
         {VmOp::Sub, 0, "sub.a"},        {VmOp::Sub, 1, "sub.b"},
@@ -1483,20 +1495,77 @@ std::optional<HandlerLayout> makeLayout(ir::IRRandom &Rng,
         {VmOp::Store16, 0, "store16"},  {VmOp::Store32, 0, "store32"},
         {VmOp::Store64, 0, "store64"},  {VmOp::PtrConst, 0, "ptrconst"},
     };
+
+    std::array<bool, static_cast<std::size_t>(VmOp::Count)> Used{};
+    for (const VmInstr &I : P.code)
+        Used[opIndex(I.op)] = true;
+
+    std::array<std::vector<HandlerSpec>, static_cast<std::size_t>(VmOp::Count)>
+        ByOp;
+    for (const HandlerSpec &Spec : Catalog)
+        ByOp[opIndex(Spec.op)].push_back(Spec);
+
+    // Materialize only the ISA actually required by this program.  For an op
+    // with multiple implementations, choose one mandatory implementation and
+    // probabilistically retain the alternatives.  This changes handler count
+    // and native structure across seeds rather than merely permuting IDs.
+    for (std::size_t O = 0; O < Used.size(); ++O) {
+        if (!Used[O] || O == opIndex(VmOp::Call))
+            continue;
+        const std::vector<HandlerSpec> &Variants = ByOp[O];
+        if (Variants.empty())
+            return std::nullopt;
+        const std::size_t Mandatory =
+            Rng.range(static_cast<std::uint32_t>(Variants.size()));
+        Layout.specs.push_back(Variants[Mandatory]);
+        for (std::size_t V = 0; V < Variants.size(); ++V)
+            if (V != Mandatory && Rng.chance(55))
+                Layout.specs.push_back(Variants[V]);
+    }
+
+    // Add a bounded, seed-varying subset of unused handlers as plausible
+    // decoys.  Unlike the old complete fixed ISA, an analyst cannot classify
+    // one instance and assume that every build exposes the same handler set.
+    std::vector<std::size_t> Unused;
+    for (std::size_t O = 0; O < Used.size(); ++O)
+        if (!Used[O] && O != opIndex(VmOp::Call) && !ByOp[O].empty())
+            Unused.push_back(O);
+    for (std::size_t I = Unused.size(); I > 1; --I) {
+        const std::size_t J = Rng.range(static_cast<std::uint32_t>(I));
+        std::swap(Unused[I - 1], Unused[J]);
+    }
+    const std::size_t Decoys =
+        std::min<std::size_t>(Unused.size(), 3u + Rng.range(6));
+    for (std::size_t I = 0; I < Decoys; ++I) {
+        const std::vector<HandlerSpec> &Variants = ByOp[Unused[I]];
+        Layout.specs.push_back(
+            Variants[Rng.range(static_cast<std::uint32_t>(Variants.size()))]);
+    }
+
     shuffleSpecs(Layout.specs, Rng);
     // Each call site gets its own handler, appended in order AFTER the shuffle
     // so the call-index -> handler-id mapping is stable (encoder and builder
     // must agree).  variant carries the call index.
-    for (std::uint32_t I = 0; I < NumCalls; ++I)
+    for (std::uint32_t I = 0; I < P.calls.size(); ++I)
         Layout.specs.push_back({VmOp::Call, static_cast<std::uint8_t>(I),
                                 std::string("call.") + std::to_string(I)});
-    // Reserve one table slot for the poison handler so opcode-guard failures
-    // can dispatch there even when the decoded byte is otherwise in range.
+    // Scatter real handlers across the complete byte ID space and reserve an
+    // unrelated slot for record-guard failures.  The old dense [0,H) prefix
+    // exposed the exact real-handler count and made the dispatch map trivial to
+    // recognize across builds.
     if (Layout.specs.size() >= kVmTargetTableSlots)
         return std::nullopt;
+    std::array<std::uint8_t, kVmTargetTableSlots> Slots{};
+    for (std::uint32_t I = 0; I < kVmTargetTableSlots; ++I)
+        Slots[I] = static_cast<std::uint8_t>(I);
+    for (std::size_t I = Slots.size(); I > 1; --I) {
+        const std::size_t J = Rng.range(static_cast<std::uint32_t>(I));
+        std::swap(Slots[I - 1], Slots[J]);
+    }
+    Layout.slots.assign(Slots.begin(), Slots.begin() + Layout.specs.size());
+    Layout.poison_slot = Slots[Layout.specs.size()];
     for (std::uint32_t I = 0; I < Layout.specs.size(); ++I)
-        Layout.ids[opIndex(Layout.specs[I].op)].push_back(
-            static_cast<std::uint8_t>(I));
+        Layout.ids[opIndex(Layout.specs[I].op)].push_back(Layout.slots[I]);
     return Layout;
 }
 
@@ -1514,39 +1583,31 @@ Encoding makeEncoding(ir::IRRandom &Rng) {
     Enc.xork = static_cast<std::uint8_t>(Rng.next());
     Enc.operand_key = static_cast<std::uint8_t>(Rng.next());
     Enc.imm_key = Rng.next();
+    Enc.record_guard_key = static_cast<std::uint32_t>(Rng.next());
+    for (std::size_t I = Enc.fields.size(); I > 1; --I) {
+        const std::size_t J = Rng.range(static_cast<std::uint32_t>(I));
+        std::swap(Enc.fields[I - 1], Enc.fields[J]);
+    }
+    for (std::size_t I = Enc.imm_fields.size(); I > 1; --I) {
+        const std::size_t J = Rng.range(static_cast<std::uint32_t>(I));
+        std::swap(Enc.imm_fields[I - 1], Enc.imm_fields[J]);
+    }
     return Enc;
 }
 
-std::uint8_t opcodeGuardKey(std::uint32_t InstrIndex, const Encoding &Enc) {
-    std::uint32_t X =
-        InstrIndex * (Enc.mul ^ 0x85EBCA6Bu) + (Enc.add ^ 0xC2B2AE35u);
-    X ^= static_cast<std::uint32_t>(Enc.xork) * 0x9E3779B1u;
-    X ^= X >> 13;
-    X *= 0x27D4EB2Du;
-    X ^= X >> 15;
-    return static_cast<std::uint8_t>(X);
-}
-
-Value *emitOpcodeGuardKey(Builder &B, Value *InstrIndex,
-                          const Encoding &Enc) {
-    auto *I32 = B.getInt32Ty();
-    Value *X = B.CreateMul(
-        InstrIndex, ConstantInt::get(I32, Enc.mul ^ 0x85EBCA6Bu),
-        "morok.vm.opguard.key.mul");
-    X = B.CreateAdd(X, ConstantInt::get(I32, Enc.add ^ 0xC2B2AE35u),
-                    "morok.vm.opguard.key.add");
-    X = B.CreateXor(
-        X,
-        ConstantInt::get(I32, static_cast<std::uint32_t>(Enc.xork) *
-                                  0x9E3779B1u),
-        "morok.vm.opguard.key.salt");
-    X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 13)),
-                    "morok.vm.opguard.key.fold13");
-    X = B.CreateMul(X, ConstantInt::get(I32, 0x27D4EB2Du),
-                    "morok.vm.opguard.key.mix");
-    X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 15)),
-                    "morok.vm.opguard.key.fold15");
-    return B.CreateTrunc(X, B.getInt8Ty(), "morok.vm.opguard.key");
+std::uint32_t recordGuard(ArrayRef<std::uint8_t> Cipher, std::uint8_t DecodedOp,
+                          std::uint32_t InstrIndex, const Encoding &Enc) {
+    std::uint32_t H = Enc.record_guard_key ^ (InstrIndex * 0x9E3779B1u) ^
+                      Enc.add ^
+                      (static_cast<std::uint32_t>(DecodedOp) * 0xA24BAED5u);
+    for (unsigned I = 0; I < 12; ++I) {
+        H ^= static_cast<std::uint32_t>(Cipher[I]) + 0x7F4A7C15u +
+             static_cast<std::uint32_t>(I) * 0x85EBCA6Bu;
+        H = (H << 7) | (H >> 25);
+        H *= 0x27D4EB2Du;
+        H ^= H >> 15;
+    }
+    return H;
 }
 
 std::uint64_t encodedImm(std::uint64_t Imm, std::uint32_t Pc,
@@ -1558,7 +1619,6 @@ EncodedProgram encodeBytecode(const Program &P, const HandlerLayout &Layout,
                               const Encoding &Enc, ir::IRRandom &Rng) {
     EncodedProgram Encoded;
     Encoded.bytecode.assign(P.code.size() * kInstrStride, 0);
-    Encoded.opcode_guard.reserve(P.code.size());
     for (std::uint32_t I = 0; I < P.code.size(); ++I) {
         const VmInstr &Instr = P.code[I];
         const std::vector<std::uint8_t> &Ids = Layout.ids[opIndex(Instr.op)];
@@ -1570,18 +1630,31 @@ EncodedProgram encodeBytecode(const Program &P, const HandlerLayout &Layout,
                 : Ids[Rng.range(static_cast<std::uint32_t>(Ids.size()))];
         const std::uint32_t Pc = I * kInstrStride;
         std::array<std::uint8_t, kInstrStride> Plain{};
-        Plain[0] = Handler;
-        Plain[1] = Instr.dst ^ Enc.operand_key;
-        Plain[2] = Instr.lhs ^ Enc.operand_key;
-        Plain[3] = Instr.rhs ^ Enc.operand_key;
+        Plain[Enc.fields[0]] = Handler;
+        Plain[Enc.fields[1]] = Instr.dst ^ Enc.operand_key;
+        Plain[Enc.fields[2]] = Instr.lhs ^ Enc.operand_key;
+        Plain[Enc.fields[3]] = Instr.rhs ^ Enc.operand_key;
         const std::uint64_t Imm = encodedImm(Instr.imm, Pc, Enc);
         for (unsigned B = 0; B < 8; ++B)
-            Plain[4 + B] = static_cast<std::uint8_t>((Imm >> (B * 8)) & 0xFFu);
-        for (unsigned B = 12; B < kInstrStride; ++B)
-            Plain[B] = static_cast<std::uint8_t>(Rng.next());
-        for (unsigned B = 0; B < kInstrStride; ++B)
+            Plain[Enc.imm_fields[B]] =
+                static_cast<std::uint8_t>((Imm >> (B * 8)) & 0xFFu);
+        // Encrypt the semantic record first, then authenticate its twelve inner
+        // ciphertext bytes together with the decoded handler.  Runtime checking
+        // therefore needs only raw volatile loads plus the already-decoded
+        // opcode, rather than twelve extra full keystream/KDF evaluations.
+        for (unsigned B = 0; B < 12; ++B)
             Encoded.bytecode[Pc + B] = Plain[B] ^ streamKey(Pc + B, Enc);
-        Encoded.opcode_guard.push_back(Handler ^ opcodeGuardKey(I, Enc));
+        const ArrayRef<std::uint8_t> CipherRecord(Encoded.bytecode.data() + Pc,
+                                                  12);
+        // The old separate opcode-guard table was a reversible shadow copy of
+        // every handler ID; embedding a 32-bit record tag removes that oracle
+        // while retaining wrong-key/tamper diffusion.
+        const std::uint32_t Guard = recordGuard(CipherRecord, Handler, I, Enc);
+        for (unsigned B = 0; B < 4; ++B)
+            Plain[12 + B] =
+                static_cast<std::uint8_t>((Guard >> (B * 8)) & 0xFFu);
+        for (unsigned B = 12; B < kInstrStride; ++B)
+            Encoded.bytecode[Pc + B] = Plain[B] ^ streamKey(Pc + B, Enc);
     }
     return Encoded;
 }
@@ -1597,21 +1670,6 @@ GlobalVariable *createBytecode(Module &M, ArrayRef<std::uint8_t> Bytes,
     auto *GV = new GlobalVariable(M, ArrTy, /*isConstant=*/true,
                                   GlobalValue::PrivateLinkage, Init, Name);
     GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-    GV->setAlignment(Align(1));
-    return GV;
-}
-
-GlobalVariable *createOpcodeGuardTable(Module &M,
-                                       ArrayRef<std::uint8_t> Guarded,
-                                       StringRef SourceName) {
-    LLVMContext &Ctx = M.getContext();
-    auto *I8 = Type::getInt8Ty(Ctx);
-    auto *ArrTy = ArrayType::get(I8, Guarded.size());
-    auto *Init = ConstantDataArray::get(Ctx, Guarded);
-    auto *GV = new GlobalVariable(
-        M, ArrTy, /*isConstant=*/true, GlobalValue::PrivateLinkage, Init,
-        std::string("morok.vm.opguard.") + SourceName.str());
-    GV->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
     GV->setAlignment(Align(1));
     return GV;
 }
@@ -1702,8 +1760,8 @@ Value *emitStreamKey(Builder &B, Value *Offset, const Encoding &Enc) {
     return B.CreateXor(K, ConstantInt::get(I8, Enc.xork), "morok.vm.key");
 }
 
-Value *emitDecodeByte(Builder &B, GlobalVariable *Bytecode, Value *Pc,
-                      std::uint32_t Field, const Encoding &Enc) {
+Value *emitLoadByte(Builder &B, GlobalVariable *Bytecode, Value *Pc,
+                    std::uint32_t Field, const Twine &Name) {
     auto *I32 = B.getInt32Ty();
     auto *I8 = B.getInt8Ty();
     auto *ArrTy = cast<ArrayType>(Bytecode->getValueType());
@@ -1714,13 +1772,23 @@ Value *emitDecodeByte(Builder &B, GlobalVariable *Bytecode, Value *Pc,
     auto *EncByte = B.CreateLoad(I8, Ptr, "morok.vm.bc.enc");
     EncByte->setVolatile(true);
     EncByte->setAlignment(Align(1));
+    EncByte->setName(Name);
+    return EncByte;
+}
+
+Value *emitDecodeByte(Builder &B, GlobalVariable *Bytecode, Value *Pc,
+                      std::uint32_t Field, const Encoding &Enc) {
+    Value *EncByte = emitLoadByte(B, Bytecode, Pc, Field, "morok.vm.bc.enc");
+    Value *Offset = B.CreateAdd(Pc, ConstantInt::get(B.getInt32Ty(), Field),
+                                "morok.vm.bc.key.off");
     return B.CreateXor(EncByte, emitStreamKey(B, Offset, Enc),
                        "morok.vm.bc.dec");
 }
 
 Value *emitDecodeReg(Builder &B, GlobalVariable *Bytecode, Value *Pc,
                      std::uint32_t Field, const Encoding &Enc) {
-    Value *Raw = emitDecodeByte(B, Bytecode, Pc, Field, Enc);
+    assert(Field < Enc.fields.size() && "invalid semantic VM field");
+    Value *Raw = emitDecodeByte(B, Bytecode, Pc, Enc.fields[Field], Enc);
     Value *Reg =
         B.CreateXor(Raw, ConstantInt::get(B.getInt8Ty(), Enc.operand_key),
                     "morok.vm.reg.enc");
@@ -1735,7 +1803,7 @@ Value *emitDecodeImm(Builder &B, GlobalVariable *Bytecode, Value *Pc,
     auto *I64 = B.getInt64Ty();
     Value *Acc = ConstantInt::get(I64, 0);
     for (unsigned I = 0; I < 8; ++I) {
-        Value *Byte = emitDecodeByte(B, Bytecode, Pc, 4 + I, Enc);
+        Value *Byte = emitDecodeByte(B, Bytecode, Pc, Enc.imm_fields[I], Enc);
         Value *Wide = B.CreateZExt(Byte, I64, "morok.vm.imm.byte");
         if (I != 0)
             Wide = B.CreateShl(Wide, ConstantInt::get(I64, I * 8),
@@ -1748,6 +1816,61 @@ Value *emitDecodeImm(Builder &B, GlobalVariable *Bytecode, Value *Pc,
     Value *Salt = B.CreateMul(PcWide, ConstantInt::get(I64, kImmPcSalt),
                               "morok.vm.imm.salt");
     return B.CreateXor(Acc, Salt, "morok.vm.imm.dec");
+}
+
+Value *emitComputedRecordGuard(Builder &B, GlobalVariable *Bytecode, Value *Pc,
+                               Value *DecodedOp, const Encoding &Enc) {
+    auto *I32 = B.getInt32Ty();
+    Value *InstrIndex = B.CreateUDiv(Pc, ConstantInt::get(I32, kInstrStride),
+                                     "morok.vm.guard.instr");
+    Value *H =
+        B.CreateXor(ConstantInt::get(I32, Enc.record_guard_key),
+                    B.CreateMul(InstrIndex, ConstantInt::get(I32, 0x9E3779B1u),
+                                "morok.vm.guard.pc.mul"),
+                    "morok.vm.guard.pc");
+    H = B.CreateXor(H, ConstantInt::get(I32, Enc.add), "morok.vm.guard.seed");
+    H = B.CreateXor(
+        H,
+        B.CreateMul(B.CreateZExt(DecodedOp, I32, "morok.vm.guard.op"),
+                    ConstantInt::get(I32, 0xA24BAED5u),
+                    "morok.vm.guard.op.mul"),
+        "morok.vm.guard.op.mix");
+    for (unsigned I = 0; I < 12; ++I) {
+        Value *Byte =
+            emitLoadByte(B, Bytecode, Pc, I, "morok.vm.guard.cipher.byte");
+        Value *Term =
+            B.CreateAdd(B.CreateZExt(Byte, I32, "morok.vm.guard.byte"),
+                        ConstantInt::get(I32, 0x7F4A7C15u + I * 0x85EBCA6Bu),
+                        "morok.vm.guard.term");
+        H = B.CreateXor(H, Term, "morok.vm.guard.mix");
+        H = B.CreateOr(
+            B.CreateShl(H, ConstantInt::get(I32, 7), "morok.vm.guard.rol.shl"),
+            B.CreateLShr(H, ConstantInt::get(I32, 25),
+                         "morok.vm.guard.rol.shr"),
+            "morok.vm.guard.rol");
+        H = B.CreateMul(H, ConstantInt::get(I32, 0x27D4EB2Du),
+                        "morok.vm.guard.mul");
+        H = B.CreateXor(H,
+                        B.CreateLShr(H, ConstantInt::get(I32, 15),
+                                     "morok.vm.guard.fold.shr"),
+                        "morok.vm.guard.fold");
+    }
+    return H;
+}
+
+Value *emitStoredRecordGuard(Builder &B, GlobalVariable *Bytecode, Value *Pc,
+                             const Encoding &Enc) {
+    auto *I32 = B.getInt32Ty();
+    Value *Acc = ConstantInt::get(I32, 0);
+    for (unsigned I = 0; I < 4; ++I) {
+        Value *Byte = emitDecodeByte(B, Bytecode, Pc, 12 + I, Enc);
+        Value *Wide = B.CreateZExt(Byte, I32, "morok.vm.guard.tag.byte");
+        if (I != 0)
+            Wide = B.CreateShl(Wide, ConstantInt::get(I32, I * 8),
+                               "morok.vm.guard.tag.shift");
+        Acc = B.CreateOr(Acc, Wide, "morok.vm.guard.tag");
+    }
+    return Acc;
 }
 
 Value *loadPoison(Builder &B, AllocaInst *PoisonSlot, const Twine &Name) {
@@ -2050,40 +2173,22 @@ void setPc(Builder &B, AllocaInst *PcSlot, Value *NewPc, BasicBlock *Dispatch) {
 
 GlobalVariable *createTargetTable(Module &M, Function *Helper,
                                   ArrayRef<BasicBlock *> Blocks,
+                                  ArrayRef<std::uint8_t> Slots,
                                   BasicBlock *PoisonBlock,
                                   StringRef SourceName) {
     LLVMContext &Ctx = M.getContext();
     auto *PtrTy = PointerType::getUnqual(Ctx);
     auto *ArrTy = ArrayType::get(PtrTy, kVmTargetTableSlots);
-    SmallVector<Constant *, kVmTargetTableSlots> Entries;
-    Entries.reserve(kVmTargetTableSlots);
     Constant *Poison = BlockAddress::get(Helper, PoisonBlock);
-    for (std::uint32_t I = 0; I < kVmTargetTableSlots; ++I) {
-        if (I < Blocks.size())
-            Entries.push_back(BlockAddress::get(Helper, Blocks[I]));
-        else
-            Entries.push_back(Poison);
-    }
+    SmallVector<Constant *, kVmTargetTableSlots> Entries(kVmTargetTableSlots,
+                                                         Poison);
+    assert(Blocks.size() == Slots.size() && "handler/slot count mismatch");
+    for (std::size_t I = 0; I < Blocks.size(); ++I)
+        Entries[Slots[I]] = BlockAddress::get(Helper, Blocks[I]);
     return new GlobalVariable(
         M, ArrTy, /*isConstant=*/true, GlobalValue::PrivateLinkage,
         ConstantArray::get(ArrTy, Entries),
         std::string("morok.vm.targets.") + SourceName.str());
-}
-
-Value *emitExpectedOpcode(Builder &B, GlobalVariable *OpcodeGuard, Value *Pc,
-                          const Encoding &Enc) {
-    auto *I32 = B.getInt32Ty();
-    auto *ArrTy = cast<ArrayType>(OpcodeGuard->getValueType());
-    Value *Instr = B.CreateUDiv(Pc, ConstantInt::get(I32, kInstrStride),
-                                "morok.vm.opguard.instr");
-    Value *Ptr = B.CreateInBoundsGEP(
-        ArrTy, OpcodeGuard, {ConstantInt::get(I32, 0), Instr},
-        "morok.vm.opguard.ptr");
-    auto *Guarded = B.CreateLoad(B.getInt8Ty(), Ptr, "morok.vm.opguard.load");
-    Guarded->setVolatile(true);
-    Guarded->setAlignment(Align(1));
-    return B.CreateXor(Guarded, emitOpcodeGuardKey(B, Instr, Enc),
-                       "morok.vm.op.expected");
 }
 
 GlobalVariable *createPointerTable(Module &M, ArrayRef<Constant *> Pointers,
@@ -2129,7 +2234,6 @@ void emitMemStore(Builder &B, Value *Addr, Value *Val, unsigned Bytes) {
 }
 
 Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
-                      GlobalVariable *OpcodeGuard,
                       const HandlerLayout &Layout, const Encoding &Enc) {
     Function *Src = P.source;
     SmallVector<Type *, 8> Params;
@@ -2145,7 +2249,6 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
     addHelperAttrs(Helper);
 
     LLVMContext &Ctx = M.getContext();
-    auto *I8 = Type::getInt8Ty(Ctx);
     auto *I32 = Type::getInt32Ty(Ctx);
     auto *I64 = Type::getInt64Ty(Ctx);
     auto *PtrTy = PointerType::getUnqual(Ctx);
@@ -2162,8 +2265,8 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
     BasicBlock *PoisonHandler =
         BasicBlock::Create(Ctx, "morok.vm.h.poison", Helper);
 
-    GlobalVariable *Targets =
-        createTargetTable(M, Helper, Handlers, PoisonHandler, Src->getName());
+    GlobalVariable *Targets = createTargetTable(
+        M, Helper, Handlers, Layout.slots, PoisonHandler, Src->getName());
     GlobalVariable *PointerTable = createPointerTable(
         M, ArrayRef<Constant *>(P.pointer_constants), Src->getName());
 
@@ -2216,18 +2319,19 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
     Value *Pc =
         safePc(DB, PoisonSlot, DB.CreateLoad(I32, PcSlot, "morok.vm.pc"),
                static_cast<std::uint32_t>(P.code.size()), "morok.vm.pc.safe");
-    Value *DecodedOp = emitDecodeByte(DB, Bytecode, Pc, 0, Enc);
-    Value *ExpectedOp = emitExpectedOpcode(DB, OpcodeGuard, Pc, Enc);
-    Value *OpDelta = DB.CreateXor(DecodedOp, ExpectedOp, "morok.vm.op.delta");
-    Value *OpBad = DB.CreateICmpNE(OpDelta, ConstantInt::get(I8, 0),
-                                   "morok.vm.op.bad");
-    recordPoisonFlag(DB, PoisonSlot, OpBad, OpDelta,
-                     0x91B7584D6A5F23C1ULL, "morok.vm.op.guard");
+    Value *DecodedOp = emitDecodeByte(DB, Bytecode, Pc, Enc.fields[0], Enc);
+    Value *ComputedGuard =
+        emitComputedRecordGuard(DB, Bytecode, Pc, DecodedOp, Enc);
+    Value *StoredGuard = emitStoredRecordGuard(DB, Bytecode, Pc, Enc);
+    Value *GuardDelta =
+        DB.CreateXor(ComputedGuard, StoredGuard, "morok.vm.record.delta");
+    Value *OpBad = DB.CreateICmpNE(GuardDelta, ConstantInt::get(I32, 0),
+                                   "morok.vm.record.bad");
+    recordPoisonFlag(DB, PoisonSlot, OpBad, GuardDelta, 0x91B7584D6A5F23C1ULL,
+                     "morok.vm.record.guard");
     Value *Op = DB.CreateSelect(
-        OpBad,
-        ConstantInt::get(I32, static_cast<std::uint32_t>(Handlers.size())),
-        DB.CreateZExt(DecodedOp, I32, "morok.vm.op.decoded"),
-        "morok.vm.op");
+        OpBad, ConstantInt::get(I32, Layout.poison_slot),
+        DB.CreateZExt(DecodedOp, I32, "morok.vm.op.decoded"), "morok.vm.op");
     auto *TargetsTy = cast<ArrayType>(Targets->getValueType());
     Value *Slot =
         DB.CreateInBoundsGEP(TargetsTy, Targets, {ConstantInt::get(I32, 0), Op},
@@ -2288,7 +2392,7 @@ Function *buildHelper(Module &M, const Program &P, GlobalVariable *Bytecode,
                            safePc(PB, PoisonSlot, BadPc,
                                   static_cast<std::uint32_t>(P.code.size()),
                                   "morok.vm.poison.pc.safe"),
-                           0, Enc),
+                           Enc.fields[0], Enc),
             I64, "morok.vm.poison.opcode");
         emitPoisonReturn(PB, BadOp);
     }
@@ -2593,17 +2697,14 @@ void rewriteAsWrapper(Function &F, Function *Helper) {
 }
 
 bool materializeProgram(Module &M, Program &P, ir::IRRandom &Rng) {
-    std::optional<HandlerLayout> Layout =
-        makeLayout(Rng, static_cast<std::uint32_t>(P.calls.size()));
+    std::optional<HandlerLayout> Layout = makeLayout(Rng, P);
     if (!Layout)
         return false;
     Encoding Enc = makeEncoding(Rng);
     EncodedProgram Encoded = encodeBytecode(P, *Layout, Enc, Rng);
     GlobalVariable *Bytecode =
         createBytecode(M, Encoded.bytecode, P.source->getName());
-    GlobalVariable *OpcodeGuard =
-        createOpcodeGuardTable(M, Encoded.opcode_guard, P.source->getName());
-    Function *Helper = buildHelper(M, P, Bytecode, OpcodeGuard, *Layout, Enc);
+    Function *Helper = buildHelper(M, P, Bytecode, *Layout, Enc);
     rewriteAsWrapper(*P.source, Helper);
     invalidateCallerEffects(*P.source);
     return true;

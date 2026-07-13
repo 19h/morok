@@ -1,6 +1,6 @@
-# Virtualization-focused e2e config: only the bytecode VM and its hash-gated
-# self-decrypt layer, isolated from the rest of the pipeline so the differential
-# gate exercises (and regresses) the lifter specifically.
+# Virtualization-focused e2e config: the bytecode VM plus page-local encrypted
+# delivery, isolated from the rest of the pipeline so the differential gate
+# exercises the lifter without creating a full-payload plaintext window.
 #
 # Apple-only by construction: the VM's indirectbr/blockaddress dispatch still
 # crashes the x86 backend on some inputs (see tests/e2e/portable.toml and the
@@ -17,8 +17,16 @@ max_functions = 16
 max_instructions = 4096
 max_registers = 200
 
-[passes.hash_gated_self_decrypt]
+[passes.fault_paged_payload]
 enabled = true
 probability = 100
 max_payloads = 16
 max_payload_bytes = 65536
+page_size = 64
+backend = "lazy_accessor"
+per_page_keys = true
+reseal_after_use = true
+decoy_pages = 2
+fallback = false
+bind_to_runtime_seal = true
+virtualize_helpers = false

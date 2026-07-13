@@ -3,16 +3,19 @@
 // VM differential workload: call-free leaf functions that the bytecode
 // virtualizer can lift end to end — counted loops, memory loads/stores through
 // pointer arguments, getelementptr indexing, a switch, and multi-way branches.
-// Each is `noinline` so it survives the inliner and is still a distinct,
-// VM-eligible function when the Morok pass runs at OptimizerLast.  `main`
-// exercises them with fixed inputs and prints a deterministic transcript, so a
-// clean build and a VM-obfuscated build must produce byte-identical output.
+// Each is `noinline` and explicitly annotated `vm`, so it survives the inliner,
+// receives priority, and cannot silently fall back to native code under the
+// called-hot-loop heuristic. `main` exercises them with fixed inputs and prints
+// a deterministic transcript, so a clean build and a VM-obfuscated build must
+// produce byte-identical output.
 
 #include <stdint.h>
 #include <stdio.h>
 
+#define VM_TARGET __attribute__((noinline, annotate("vm")))
+
 // Loop + getelementptr + load + wrapping integer arithmetic.
-__attribute__((noinline)) int sum_weighted(const int *a, int n) {
+VM_TARGET int sum_weighted(const int *a, int n) {
     int s = 0;
     for (int i = 0; i < n; i++)
         s += a[i] * (i + 1);
@@ -21,7 +24,7 @@ __attribute__((noinline)) int sum_weighted(const int *a, int n) {
 
 // Loop + i8 load + 64-bit multiply/xor (FNV-1a style); exercises narrow loads
 // and wide arithmetic in one function.
-__attribute__((noinline)) uint64_t fnv1a(const unsigned char *p, int n) {
+VM_TARGET uint64_t fnv1a(const unsigned char *p, int n) {
     uint64_t h = 1469598103934665603ULL;
     for (int i = 0; i < n; i++) {
         h ^= (uint64_t)p[i];
@@ -31,7 +34,7 @@ __attribute__((noinline)) uint64_t fnv1a(const unsigned char *p, int n) {
 }
 
 // Switch lowered to a comparison/branch cascade in bytecode.
-__attribute__((noinline)) int route(int v) {
+VM_TARGET int route(int v) {
     switch (v & 7) {
     case 0:
         return 100;
@@ -49,8 +52,8 @@ __attribute__((noinline)) int route(int v) {
 
 // Multi-way branches + store through a pointer arena; counts in-range elements
 // and records the running parity into the caller's buffer.
-__attribute__((noinline)) int range_count(const int *a, int n, int lo, int hi,
-                                           int *parity_out) {
+VM_TARGET int range_count(const int *a, int n, int lo, int hi,
+                          int *parity_out) {
     int count = 0;
     int parity = 0;
     for (int i = 0; i < n; i++) {

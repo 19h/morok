@@ -673,6 +673,14 @@ does not require a plaintext sentinel to survive in `.rodata`.
 | Data-flow integrity | `morok-dfi` | `data_flow_integrity` | Decodes narrow op tables from runtime integrity hashes and decoy hidden state. |
 | Execution-trace keying | `morok-tracekey` | `execution_trace_keying` | Carries a rolling trace accumulator and delayed tamper samples through data/control state. |
 
+Functions selected explicitly with `annotate("vm")`,
+`annotate("virtualization")`, or a function-specific virtualization policy are
+hard coverage requirements. They receive priority over ordinary candidates,
+may bypass the default called-hot-loop performance heuristic, and emit a
+compilation error if their optimized IR is not liftable; Morok does not silently
+leave an explicitly selected target native. Global probabilistic VM selection
+remains best-effort and continues to avoid unselected hot loops.
+
 For `external_secret_binding`, `expected_digest` is the expected 64-bit final
 proof accumulator accepted by `morok.proof.finish`. If it is omitted or invalid,
 the pass uses a per-build random expected value so arbitrary proof presence fails
@@ -681,9 +689,15 @@ closed instead of keeping the clean seal state.
 VM dispatch is total over all 256 decoded handler IDs. Invalid decoded opcodes,
 registers, pointer-table indexes, branch targets, and unsafe div/rem operands
 are folded into a local poison accumulator and canonicalized to in-bounds state
-instead of trapping or indexing out of range. A guarded per-PC opcode check also
-poisons valid-but-wrong handler IDs, so a wrong key cannot cleanly land on
-another real handler. Fault-paged payload delivery is
+instead of trapping or indexing out of range. Each encrypted instruction embeds
+a 32-bit tag binding its twelve inner-ciphertext bytes to the decoded handler;
+the runtime recomputes the tag before dispatch and poisons any tampered or
+valid-but-wrong record. There
+is deliberately no separate per-PC opcode table: such a table is a statically
+decodable shadow copy of the handler sequence. Opcode/register fields and the
+eight immediate bytes are independently permuted per function, real handlers
+are scattered across the 256-entry target space, and each VM emits only its
+used ISA subset plus a bounded seed-varying decoy subset. Fault-paged payload delivery is
 preferred for configured VM payloads and leaves already protected bytecode
 mutable, so hash-gated self-decrypt only wraps remaining eager payloads. It does
 not allocate a full-payload plaintext scratch buffer; the accessor decrypts the
