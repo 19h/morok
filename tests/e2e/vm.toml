@@ -17,6 +17,13 @@ max_functions = 16
 max_instructions = 4096
 max_registers = 200
 
+[passes.string_encryption]
+enabled = true
+probability = 100
+
+[passes.function_call_obfuscate]
+enabled = true
+
 [passes.fault_paged_payload]
 enabled = true
 probability = 100

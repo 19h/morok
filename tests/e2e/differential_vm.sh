@@ -3,10 +3,11 @@
 #
 # Virtualization differential gate.  Like differential.sh, but in addition to
 # requiring identical clean-vs-obfuscated output it asserts exact coverage of
-# every explicitly targeted workload function, absence of the old reversible
-# opcode-shadow table, a non-complete handler ISA, and cross-seed topology
-# diversity.  A regression that silently leaves only one target protected can
-# no longer pass merely because one `morok.vm.bytecode.*` global exists.
+# every explicitly targeted workload function, protected wrapper strings and
+# imports, absence of the old reversible opcode-shadow table, a non-complete
+# handler ISA, and cross-seed topology diversity.  A regression that silently
+# leaves only one target protected can no longer pass merely because one
+# `morok.vm.bytecode.*` global exists.
 #
 # Usage: differential_vm.sh <clang> <plugin> <sdk> <source> <config.toml> [seed]
 set -euo pipefail
@@ -40,6 +41,17 @@ ALT_SEED=$((SEED + 1))
 env MOROK_ENABLE=1 MOROK_CONFIG="$CONFIG" MOROK_SEED="$ALT_SEED" \
     "$CLANG" "${SYSROOT[@]}" "${VM_CFLAGS[@]}" \
     -fpass-plugin="$PLUGIN" -S -emit-llvm "$SRC" -o "$TMP/obf-alt.ll"
+
+for NEEDLE in 'sum=%d' 'fnv=%llu' 'route=%d' 'rc=%d parity=%d'; do
+  if LC_ALL=C grep -aFq "$NEEDLE" "$TMP/obf"; then
+    echo "FAIL config=$CONFIG seed=$SEED  plaintext format string '$NEEDLE' remains" >&2
+    exit 1
+  fi
+done
+if nm -u "$TMP/obf" | grep -Eq '(^|[[:space:]])_?printf$'; then
+  echo "FAIL config=$CONFIG seed=$SEED  direct printf import remains" >&2
+  exit 1
+fi
 
 LIFTED="$(grep -c '^@morok\.vm\.bytecode\.' "$TMP/obf.ll" || true)"
 EXPECTED=(sum_weighted fnv1a route range_count)
