@@ -3,10 +3,11 @@
 """Post-link ELF relocation shadowing for Linux ELF64 executables.
 
 The conventional DT_JMPREL records are rewritten to name decoy dynamic
-symbols.  A later, page-overlapping PT_LOAD maps an unmodified copy of the
+symbols and, for multi-entry tables, to target a derangement of the real GOT
+slots.  A later, page-overlapping PT_LOAD maps an unmodified copy of the
 relocation page(s) at process start, so the Linux dynamic linker consumes the
-original symbol indices.  Code, PLT stubs, GOT slots, and runtime behaviour are
-unchanged.
+original symbol indices and offsets.  Code, PLT stubs, GOT slots, and runtime
+behaviour are unchanged.
 
 This is intentionally a narrow producer, not a general ELF editor.  It rejects
 inputs whose loader image cannot be established unambiguously instead of
@@ -124,10 +125,15 @@ class Relocation:
 @dataclass(frozen=True)
 class RelocationView:
     relocation_index: int
+    static_r_offset: int
     static_symbol_index: int
     static_symbol: str
+    runtime_r_offset: int
     runtime_symbol_index: int
     runtime_symbol: str
+    static_target_relocation_index: int
+    static_target_runtime_symbol_index: int
+    static_target_runtime_symbol: str
 
 
 @dataclass(frozen=True)
@@ -469,7 +475,8 @@ def decoy_for_relocation(
     relocation: Relocation,
     candidates: list[DynamicSymbol],
     seed_material: bytes,
-    actual_name: str,
+    forbidden_indices: set[int],
+    forbidden_names: set[str],
     excluded: set[int] | None = None,
 ) -> DynamicSymbol:
     if excluded is None:
@@ -477,8 +484,8 @@ def decoy_for_relocation(
     usable = [
         candidate
         for candidate in candidates
-        if candidate.index != relocation.symbol_index
-        and candidate.name != actual_name
+        if candidate.index not in forbidden_indices
+        and candidate.name not in forbidden_names
         and candidate.index not in excluded
     ]
     if not usable:
@@ -498,10 +505,48 @@ def decoy_for_relocation(
     )
 
 
-def _read_runtime_relocation(elf: Elf64, relocation: Relocation) -> tuple[int, int]:
+def deranged_r_offsets(
+    relocations: list[Relocation], seed_material: bytes
+) -> list[int]:
+    """Return a deterministic single-cycle permutation of relocation targets."""
+    offsets = [relocation.r_offset for relocation in relocations]
+    if len(set(offsets)) != len(offsets):
+        raise ShadowError("R_X86_64_JUMP_SLOT r_offset values must be unique")
+    if len(offsets) < 2:
+        return offsets
+
+    order = list(range(len(offsets)))
+    # Sattolo's algorithm produces one cycle and therefore no fixed points.
+    # SHA-256 supplies a reproducible per-artifact choice without global PRNG
+    # state or a cross-callsite shuffle fingerprint.
+    for index in range(len(order) - 1, 0, -1):
+        domain = (
+            seed_material
+            + b"r-offset-cycle"
+            + index.to_bytes(8, "little")
+            + relocations[index].r_offset.to_bytes(8, "little")
+        )
+        swap_index = int.from_bytes(hashlib.sha256(domain).digest()[:8], "little")
+        swap_index %= index
+        order[index], order[swap_index] = order[swap_index], order[index]
+
+    result = [offsets[index] for index in order]
+    if any(result[index] == offsets[index] for index in range(len(offsets))):
+        raise ShadowError("internal r_offset derangement produced a fixed point")
+    return result
+
+
+def _read_runtime_relocation(elf: Elf64, relocation: Relocation) -> Relocation:
     off = elf.runtime_file_offset(relocation.vaddr, ELF64_RELA_SIZE)
-    _r_offset, r_info, _r_addend = struct.unpack_from("<QQq", elf.data, off)
-    return r_info >> 32, r_info & 0xFFFFFFFF
+    r_offset, r_info, r_addend = struct.unpack_from("<QQq", elf.data, off)
+    return Relocation(
+        relocation.index,
+        relocation.vaddr,
+        off,
+        r_offset,
+        r_info,
+        r_addend,
+    )
 
 
 def verify_bytes(data: bytes | bytearray, page_size: int = DEFAULT_PAGE_SIZE) -> ShadowReport:
@@ -531,37 +576,88 @@ def verify_bytes(data: bytes | bytearray, page_size: int = DEFAULT_PAGE_SIZE) ->
     if shadow.index <= original.index:
         raise ShadowError("overlapping shadow PT_LOAD is not ordered after its source")
 
-    views: list[RelocationView] = []
+    static_jump_slots: list[Relocation] = []
+    runtime_jump_slots: list[Relocation] = []
     for relocation in relocations:
-        if relocation.relocation_type != R_X86_64_JUMP_SLOT:
-            continue
-        static_index = relocation.symbol_index
-        runtime_index, runtime_type = _read_runtime_relocation(elf, relocation)
-        if runtime_type != R_X86_64_JUMP_SLOT:
+        runtime = _read_runtime_relocation(elf, relocation)
+        if runtime.relocation_type != relocation.relocation_type:
             raise ShadowError(
-                f"runtime relocation {relocation.index} changed relocation type"
+                f"relocation {relocation.index} has static/runtime type divergence"
             )
+        if runtime.r_addend != relocation.r_addend:
+            raise ShadowError(
+                f"runtime relocation {relocation.index} changed relocation addend"
+            )
+        if runtime.relocation_type == R_X86_64_JUMP_SLOT:
+            static_jump_slots.append(relocation)
+            runtime_jump_slots.append(runtime)
+        elif (
+            runtime.r_offset != relocation.r_offset
+            or runtime.symbol_index != relocation.symbol_index
+        ):
+            raise ShadowError(
+                f"non-JUMP_SLOT relocation {relocation.index} unexpectedly diverges"
+            )
+
+    if not static_jump_slots:
+        raise ShadowError("no divergent R_X86_64_JUMP_SLOT relocations found")
+
+    static_offsets = [relocation.r_offset for relocation in static_jump_slots]
+    runtime_offsets = [relocation.r_offset for relocation in runtime_jump_slots]
+    if len(set(runtime_offsets)) != len(runtime_offsets):
+        raise ShadowError("runtime R_X86_64_JUMP_SLOT r_offset values are not unique")
+    if len(static_jump_slots) > 1:
+        if sorted(static_offsets) != sorted(runtime_offsets):
+            raise ShadowError("static r_offset values are not a runtime-slot permutation")
+        if any(
+            static.r_offset == runtime.r_offset
+            for static, runtime in zip(static_jump_slots, runtime_jump_slots)
+        ):
+            raise ShadowError("static r_offset permutation contains a fixed point")
+    elif static_offsets != runtime_offsets:
+        raise ShadowError("single relocation has an unsupported r_offset change")
+
+    runtime_by_offset = {
+        relocation.r_offset: relocation for relocation in runtime_jump_slots
+    }
+    views: list[RelocationView] = []
+    for relocation, runtime in zip(static_jump_slots, runtime_jump_slots):
+        static_index = relocation.symbol_index
+        runtime_index = runtime.symbol_index
+        target = runtime_by_offset[relocation.r_offset]
+        target_index = target.symbol_index
         if static_index == runtime_index:
             raise ShadowError(
                 f"relocation {relocation.index} has no static/runtime symbol divergence"
             )
-        if static_index >= len(symbols) or runtime_index >= len(symbols):
+        if (
+            static_index >= len(symbols)
+            or runtime_index >= len(symbols)
+            or target_index >= len(symbols)
+        ):
             raise ShadowError("relocation symbol index is outside DT_SYMTAB")
         if symbols[static_index].name == symbols[runtime_index].name:
             raise ShadowError(
                 f"relocation {relocation.index} has no static/runtime name divergence"
             )
+        if symbols[static_index].name == symbols[target_index].name:
+            raise ShadowError(
+                f"relocation {relocation.index} exposes the target slot's runtime name"
+            )
         views.append(
             RelocationView(
                 relocation.index,
+                relocation.r_offset,
                 static_index,
                 symbols[static_index].name,
+                runtime.r_offset,
                 runtime_index,
                 symbols[runtime_index].name,
+                target.index,
+                target_index,
+                symbols[target_index].name,
             )
         )
-    if not views:
-        raise ShadowError("no divergent R_X86_64_JUMP_SLOT relocations found")
 
     shadow_start = align_down(shadow.p_vaddr, page_size)
     shadow_bytes = align_up(
@@ -711,29 +807,51 @@ def apply_bytes(
         if shadow_start <= zero_addr < shadow_end:
             shadow[zero_addr - shadow_start :] = b"\0" * (shadow_end - zero_addr)
 
+    static_offsets = deranged_r_offsets(jump_slots, seed_material)
+    actual_by_offset = {relocation.r_offset: relocation for relocation in jump_slots}
     decoy_views: list[RelocationView] = []
     used_decoys: set[int] = set()
-    for relocation in jump_slots:
+    for relocation, static_offset in zip(jump_slots, static_offsets):
         actual = symbols[relocation.symbol_index]
+        target = actual_by_offset[static_offset]
+        target_actual = symbols[target.symbol_index]
+        forbidden_indices = {actual.index, target_actual.index}
+        forbidden_names = {actual.name, target_actual.name}
         try:
             decoy = decoy_for_relocation(
-                relocation, candidates, seed_material, actual.name, used_decoys
+                relocation,
+                candidates,
+                seed_material,
+                forbidden_indices,
+                forbidden_names,
+                used_decoys,
             )
         except ShadowError:
             used_decoys.clear()
             decoy = decoy_for_relocation(
-                relocation, candidates, seed_material, actual.name, used_decoys
+                relocation,
+                candidates,
+                seed_material,
+                forbidden_indices,
+                forbidden_names,
+                used_decoys,
             )
         used_decoys.add(decoy.index)
         decoy_info = (decoy.index << 32) | relocation.relocation_type
+        struct.pack_into("<Q", elf.data, relocation.file_offset, static_offset)
         struct.pack_into("<Q", elf.data, relocation.file_offset + 8, decoy_info)
         decoy_views.append(
             RelocationView(
                 relocation.index,
+                static_offset,
                 decoy.index,
                 decoy.name,
+                relocation.r_offset,
                 actual.index,
                 actual.name,
+                target.index,
+                target_actual.index,
+                target_actual.name,
             )
         )
 
@@ -741,17 +859,10 @@ def apply_bytes(
     elf.data.extend(shadow)
     output = bytes(elf.data)
     verified = verify_bytes(output, page_size)
-    expected = [
-        (v.relocation_index, v.static_symbol_index, v.runtime_symbol_index)
-        for v in decoy_views
-    ]
-    observed = [
-        (v.relocation_index, v.static_symbol_index, v.runtime_symbol_index)
-        for v in verified.relocations
-    ]
-    if expected != observed:
+    if decoy_views != verified.relocations:
         raise ShadowError(
-            f"internal post-transform verification mismatch: expected {expected}, observed {observed}"
+            "internal post-transform verification mismatch: "
+            f"expected {decoy_views}, observed {verified.relocations}"
         )
     report = ShadowReport(
         input_size=original_size,
@@ -797,6 +908,7 @@ def print_report(report: ShadowReport, as_json: bool) -> None:
     print(
         "elf-shadow: "
         f"relocations={len(report.relocations)} "
+        f"offsets={sum(v.static_r_offset != v.runtime_r_offset for v in report.relocations)} "
         f"phdr={report.program_header_index} "
         f"runtime=0x{report.shadow_vaddr:x}+0x{report.shadow_bytes:x} "
         f"file=0x{report.shadow_file_offset:x} "

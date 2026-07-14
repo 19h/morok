@@ -299,7 +299,7 @@ Common options:
 | `--no-audit` | Skip the final `morok-audit` release gate. |
 | `--clean` | Wipe the output directory before building, after refusing unsafe paths outside the canonical build tree. |
 | `--dynamic` | Build Linux dynamically; the default Linux mode is static. |
-| `--elf-shadow` | For dynamic Linux/x86-64 outputs, apply post-link `DT_JMPREL` runtime-metadata shadowing. |
+| `--elf-shadow` | For dynamic Linux/x86-64 outputs, apply post-link `DT_JMPREL` symbol/offset shadowing. |
 | `--no-elf-shadow` | Disable ELF relocation shadowing (the default). |
 | `--extra-cflags FLAGS` | Extra compiler flags. |
 | `--extra-sources PATHS` | Extra source files compiled alongside the main source. |
@@ -406,19 +406,28 @@ stripping, and sealing:
   --source programs/01_hello_world.c
 ```
 
-The post-link transform rewrites each conventional
-`R_X86_64_JUMP_SLOT` record to a seed-diverse, function-like decoy dynamic
-symbol. It preserves the original relocation page range at an appended,
-page-aligned file offset and repurposes a later `PT_NULL` or `PT_NOTE` program
-header as a `PT_LOAD`. When enabled through `cross_build.sh`, the link adds a
-standard SHA-1 build-ID note so compact lld/musl layouts also reserve such a
-header without discarding `PT_PHDR`, `PT_DYNAMIC`, `PT_GNU_EH_FRAME`,
-`PT_GNU_STACK`, or `PT_GNU_RELRO`. Linux processes the new load after the
-ordinary segment and maps the preserved page range over the same virtual
-pages. Static tools that
-follow the section/file view associate PLT sites with the decoys; the runtime
-loader follows `DT_JMPREL` in the final mapped image and resolves the original
-symbols.
+The post-link transform poisons both independent fields that static tools use
+to attribute PLT calls. Each conventional `R_X86_64_JUMP_SLOT` record names a
+seed-diverse, function-like decoy dynamic symbol. When at least two PLT
+relocations exist, their conventional `r_offset` values are also placed in a
+seeded single-cycle derangement: every record appears to populate another
+callsite's GOT slot, with no fixed points. Decoy selection excludes both the
+record's real ordinal symbol and the real symbol belonging to its apparent GOT
+target. Consequently, analyzers that associate calls by relocation ordinal and
+analyzers that associate them by GOT destination both receive false names. A
+single-entry table retains symbol deception because it has no nontrivial
+`r_offset` permutation.
+
+The transform preserves the complete original relocation pages at an
+appended, page-aligned file offset and repurposes a later `PT_NULL` or `PT_NOTE`
+program header as a `PT_LOAD`. When enabled through `cross_build.sh`, the link
+adds a standard SHA-1 build-ID note so compact lld/musl layouts also reserve
+such a header without discarding `PT_PHDR`, `PT_DYNAMIC`,
+`PT_GNU_EH_FRAME`, `PT_GNU_STACK`, or `PT_GNU_RELRO`. Linux processes the new
+load after the ordinary segment and maps the preserved page range over the
+same virtual pages. The runtime loader therefore consumes the original
+`r_info`, `r_offset`, and addend values. Lazy and eager binding, full RELRO,
+and normal one-time GOT caching remain unchanged.
 
 The producer is fail-closed and bounded. It accepts only little-endian
 Linux/x86-64 `ET_EXEC`/`ET_DYN` files with 4096-byte loader pages,
@@ -441,8 +450,12 @@ mechanism disabled or provide a separate disposable program-header slot.
 
 This mechanism changes call-site attribution, not the complete imported-symbol
 inventory, and page-rounded `PT_LOAD` overlap remains a loader-aware detection
-signal. It therefore composes with function-call obfuscation but does not
-replace it. The implementation follows the ELF64 program-header alignment
+signal. The conventional offset permutation is recoverable as a permutation
+once the original loader image is reconstructed; it increases disagreement
+between segment-precise analysis models but does not conceal the overlapping
+mapping itself. The mechanism therefore composes with function-call
+obfuscation but does not replace it. The implementation follows the ELF64
+program-header alignment
 rules in the [System V gABI](https://refspecs.linuxfoundation.org/elf/gabi4%2B/ch5.pheader.html),
 Linux's page-rounded ordered mapping in
 [`fs/binfmt_elf.c`](https://github.com/torvalds/linux/blob/master/fs/binfmt_elf.c),

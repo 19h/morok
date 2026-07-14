@@ -76,8 +76,9 @@ PYTHON="${PYTHON:-python3}"
 
 # Optional Linux/x86-64 runtime-metadata shadowing.  This is a post-link ELF
 # transform, so it is meaningful only for dynamically linked Linux outputs.
-# The conventional DT_JMPREL records name per-site decoy symbols while a later
-# page-overlapping PT_LOAD supplies the original records to the runtime loader.
+# The conventional DT_JMPREL records name per-site decoy symbols and target a
+# derangement of GOT slots, while a later page-overlapping PT_LOAD supplies the
+# complete original records to the runtime loader.
 ELF_SHADOW="${ELF_SHADOW:-0}"
 ELF_SHADOW_TOOL="${ELF_SHADOW_TOOL:-$ROOT/tools/morok_elf_shadow.py}"
 ELF_SHADOW_MAX_BYTES="${ELF_SHADOW_MAX_BYTES:-1048576}"
@@ -127,7 +128,8 @@ Options:
                          from a previous run (e.g. a static binary left over when
                          switching to --dynamic) cannot fail the bundle audit
   --dynamic              Linux dynamic link (default: static)
-  --elf-shadow           Apply Linux/x86-64 DT_JMPREL page shadowing; requires
+  --elf-shadow           Apply Linux/x86-64 DT_JMPREL symbol/offset shadowing;
+                         requires
                          --dynamic (default: off)
   --no-elf-shadow        Disable DT_JMPREL page shadowing
   --extra-cflags FLAGS   Extra compiler flags (e.g. "-no-pie -ffast-math")

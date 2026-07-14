@@ -9,6 +9,7 @@ import importlib.util
 import os
 import platform
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -54,7 +55,13 @@ def find_compiler() -> str | None:
 
 
 def run(command: list[str], **kwargs) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+    return subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **kwargs,
+    )
 
 
 def main(argv: list[str]) -> int:
@@ -63,6 +70,30 @@ def main(argv: list[str]) -> int:
         return 2
     root = Path(argv[0]).resolve()
     tool = load_tool(root)
+
+    synthetic = [
+        tool.Relocation(
+            index,
+            0x1000 + index * tool.ELF64_RELA_SIZE,
+            0x200 + index * tool.ELF64_RELA_SIZE,
+            0x4000 + index * 8,
+            (index + 1) << 32 | tool.R_X86_64_JUMP_SLOT,
+            0,
+        )
+        for index in range(7)
+    ]
+    offset_variants = set()
+    original_offsets = tuple(relocation.r_offset for relocation in synthetic)
+    for seed_byte in range(16):
+        offsets = tuple(tool.deranged_r_offsets(synthetic, bytes([seed_byte]) * 32))
+        assert set(offsets) == set(original_offsets)
+        assert all(left != right for left, right in zip(offsets, original_offsets))
+        offset_variants.add(offsets)
+    assert len(offset_variants) >= 4, "r_offset derangement lacks seed diversity"
+    assert tool.deranged_r_offsets(synthetic[:1], b"single") == [
+        synthetic[0].r_offset
+    ]
+
     compiler = find_compiler()
     if compiler is None:
         print("SKIP: no Linux x86-64 C compiler available")
@@ -102,6 +133,17 @@ def main(argv: list[str]) -> int:
             view.static_symbol != view.runtime_symbol
             for view in first_report.relocations
         )
+        assert all(
+            view.static_r_offset != view.runtime_r_offset
+            for view in first_report.relocations
+        )
+        assert {
+            view.static_r_offset for view in first_report.relocations
+        } == {view.runtime_r_offset for view in first_report.relocations}
+        assert all(
+            view.static_symbol != view.static_target_runtime_symbol
+            for view in first_report.relocations
+        )
         assert first_report.shadow_bytes <= tool.DEFAULT_MAX_SHADOW_BYTES
         assert first_report.output_size - first_report.input_size < (
             first_report.shadow_bytes + first_report.page_size
@@ -111,6 +153,43 @@ def main(argv: list[str]) -> int:
         assert verified.relocations == first_report.relocations
         assert verified.shadow_vaddr == first_report.shadow_vaddr
         assert verified.shadow_file_offset == first_report.shadow_file_offset
+
+        conventional = tool.Elf64(first)
+        conventional_relocations = conventional.jmprel_relocations(
+            conventional.dynamic_tags()
+        )
+        first_jump_slot = next(
+            relocation
+            for relocation in conventional_relocations
+            if relocation.relocation_type == tool.R_X86_64_JUMP_SLOT
+        )
+        tampered = bytearray(first)
+        struct.pack_into(
+            "<Q",
+            tampered,
+            first_jump_slot.file_offset,
+            first_report.relocations[0].runtime_r_offset,
+        )
+        try:
+            tool.verify_bytes(tampered)
+        except tool.ShadowError as exc:
+            assert "r_offset" in str(exc)
+        else:
+            raise AssertionError("r_offset fixed point was not rejected")
+
+        tampered = bytearray(first)
+        struct.pack_into(
+            "<Q",
+            tampered,
+            first_jump_slot.file_offset + 8,
+            (first_jump_slot.symbol_index << 32) | 1,
+        )
+        try:
+            tool.verify_bytes(tampered)
+        except tool.ShadowError as exc:
+            assert "type divergence" in str(exc)
+        else:
+            raise AssertionError("relocation type divergence was not rejected")
 
         transformed = work / "fixture-shadowed"
         tool.atomic_write(transformed, first, original_mode)
