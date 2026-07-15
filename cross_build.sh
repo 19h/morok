@@ -618,7 +618,14 @@ build_linux() {
   if [ "${#static_flag[@]}" -gt 0 ]; then
     linux_cmd+=("${static_flag[@]}")
   fi
-  linux_cmd+=("${morok_cfg[@]}" "${elf_shadow_link[@]}" "${COMMON[@]}" -o "$out")
+  linux_cmd+=("${morok_cfg[@]}")
+  # Bash 3.2 (the system shell on macOS runners) treats an empty-array
+  # expansion as an unbound variable under `set -u`.  Keep the optional ELF
+  # linker flags behind the same explicit cardinality guard used above.
+  if [ "${#elf_shadow_link[@]}" -gt 0 ]; then
+    linux_cmd+=("${elf_shadow_link[@]}")
+  fi
+  linux_cmd+=("${COMMON[@]}" -o "$out")
   "${linux_cmd[@]}"
   strip_linux "$out"
   seal_binary "$out"
