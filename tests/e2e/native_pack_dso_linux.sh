@@ -19,6 +19,11 @@ IFUNC_SOURCE="$ROOT/tests/e2e/fixtures/native_pack_ifunc.S"
 LOADER="$ROOT/runtime/native_pack_loader.c"
 META="$ROOT/runtime/native_pack_meta.S"
 SCRIPT="$ROOT/runtime/native_pack.ld"
+TARGET="$($CC -dumpmachine)"
+ARCH_FLAGS=()
+case "$TARGET" in
+  aarch64-*|arm64-*) ARCH_FLAGS=(-mno-outline-atomics) ;;
+esac
 
 "$CC" -O2 "$DRIVER_SOURCE" -ldl -pthread -o "$TMP/driver"
 
@@ -28,12 +33,17 @@ build_pair() {
   local keydir="$TMP/key-$suffix"
   "$PACKER" prepare "$keydir" --seed "$((31337 + suffix))" >/dev/null
   local common=(-I"$keydir" -ffreestanding -fno-builtin -fPIC -fno-stack-protector
-    -fno-unwind-tables -fno-asynchronous-unwind-tables -fvisibility=hidden -O2)
+    -fno-unwind-tables -fno-asynchronous-unwind-tables -fvisibility=hidden -O2
+    "${ARCH_FLAGS[@]}")
   "$CC" "${common[@]}" -std=c11 -c "$LOADER" -o "$TMP/loader-$suffix.o"
   "$CC" "${common[@]}" -c "$META" -o "$TMP/meta-$suffix.o"
   local loader_undefined
   loader_undefined="$("$NM" -u "$TMP/loader-$suffix.o" | awk '{print $NF}')"
-  [ "$loader_undefined" = "__morok_npack_meta" ]
+  if [ "$loader_undefined" != "__morok_npack_meta" ]; then
+    echo "native-pack loader has unexpected undefined symbols:" >&2
+    "$NM" -u "$TMP/loader-$suffix.o" >&2
+    exit 1
+  fi
   "$CC" -O2 -shared -fPIC $define "$SOURCE" -Wl,--build-id=sha1 \
     -o "$TMP/clean-$suffix.so"
   "$CC" -O2 -shared -fPIC $define "$SOURCE" \
@@ -63,7 +73,7 @@ build_pair 2 "-DNATIVE_PACK_CTOR=1"
 "$PACKER" prepare "$TMP/key-ifunc" --seed 31340 >/dev/null
 IFUNC_COMMON=(-I"$TMP/key-ifunc" -ffreestanding -fno-builtin -fPIC
   -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables
-  -fvisibility=hidden -O2)
+  -fvisibility=hidden -O2 "${ARCH_FLAGS[@]}")
 "$CC" "${IFUNC_COMMON[@]}" -std=c11 -c "$LOADER" -o "$TMP/loader-ifunc.o"
 "$CC" "${IFUNC_COMMON[@]}" -c "$META" -o "$TMP/meta-ifunc.o"
 "$CC" -fPIC -c "$IFUNC_SOURCE" -o "$TMP/ifunc-symbol.o"

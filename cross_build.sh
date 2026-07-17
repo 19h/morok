@@ -687,6 +687,12 @@ build_linux() {
       -fPIC
       -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables
       -fvisibility=hidden -O2)
+    # A freestanding AArch64 loader cannot depend on compiler-rt's optional
+    # __aarch64_* outline-atomic helpers: those helpers may not be linked into
+    # the protected artifact and would also create a pre-open import edge.
+    case "$LINUX_TARGET" in
+      aarch64-*|arm64-*) loader_common+=(-mno-outline-atomics) ;;
+    esac
     "$CLANG" "${loader_common[@]}" -std=c11 -c "$NATIVE_PACK_LOADER" \
       -o "$loader_obj" || {
         rm -rf "$native_pack_dir"
