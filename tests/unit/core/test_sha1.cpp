@@ -5,6 +5,7 @@
 #include "morok/core/Sha1.hpp"
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 using namespace morok::core;

@@ -78,10 +78,17 @@ function(morok_add_layer subdir)
   endif()
 endfunction()
 
-# LLVM-independent layers (always built).
+# LLVM-independent layers.
 morok_add_layer(src/core)
 morok_add_layer(src/config)
-morok_add_layer(src/packer)
+
+# The host finalizer reads and rewrites Linux ELF64 images.  It is useful from
+# Linux and macOS cross-build hosts, but is not part of the Windows toolchain;
+# excluding it there also keeps the Windows plugin build independent of Unix
+# host-tool implementation details.
+if(NOT WIN32)
+  morok_add_layer(src/packer)
+endif()
 
 # LLVM-dependent layers (require a usable LLVM with the New-PM plugin API).
 if(MOROK_BUILD_PLUGIN OR MOROK_BUILD_TESTS)
