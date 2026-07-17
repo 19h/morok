@@ -9,6 +9,7 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import os
 import platform
 import shutil
 import struct
@@ -141,12 +142,16 @@ class Auditor:
         *,
         release: bool,
         require_sealed_manifest: bool,
+        require_native_pack: bool,
+        native_pack_tool: Path | None,
         allowlist: Allowlist,
         provenance_path: Path | None,
     ):
         self.root = root.resolve()
         self.release = release
         self.require_sealed_manifest = require_sealed_manifest
+        self.require_native_pack = require_native_pack
+        self.native_pack_tool = native_pack_tool.resolve() if native_pack_tool else None
         self.allowlist = allowlist
         self.provenance_path = provenance_path.resolve() if provenance_path else None
         self.findings: list[Finding] = []
@@ -530,6 +535,43 @@ class Auditor:
                     sealed += 1
 
         self.is_macho_signature_valid(path, binary)
+        if self.require_native_pack:
+            if binary.kind != "elf":
+                self.emit_finding(
+                    "missing-native-pack",
+                    path,
+                    "native-code packing is supported only for Linux ELF64 artifacts",
+                )
+            elif (
+                self.native_pack_tool is None
+                or not self.native_pack_tool.is_file()
+                or not os.access(self.native_pack_tool, os.X_OK)
+            ):
+                self.emit_finding(
+                    "native-pack-verifier-unavailable",
+                    path,
+                    "native-pack finalizer/verifier executable is unavailable",
+                )
+            else:
+                try:
+                    result = subprocess.run(
+                        [str(self.native_pack_tool), "verify", str(path)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=30,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    self.emit_finding(
+                        "native-pack-verifier-unavailable", path, str(exc)
+                    )
+                    result = None
+                if result is not None and result.returncode != 0:
+                    self.emit_finding(
+                        "missing-native-pack",
+                        path,
+                        result.stderr.strip() or "native-pack verification failed",
+                    )
         self.binaries.append(
             BinaryReport(self.rel(path), binary.kind, binary.arch, total, sealed)
         )
@@ -555,7 +597,7 @@ class Auditor:
                 self.audit_content_markers(path, data)
             self.audit_binary(path)
 
-        if self.require_sealed_manifest and not self.binaries:
+        if (self.require_sealed_manifest or self.require_native_pack) and not self.binaries:
             self.emit_finding(
                 "missing-release-binary",
                 ".",
@@ -581,6 +623,7 @@ class Auditor:
             "root": str(self.root),
             "release": self.release,
             "require_sealed_manifest": self.require_sealed_manifest,
+            "require_native_pack": self.require_native_pack,
             "files": self.files,
             "binaries": [asdict(b) for b in self.binaries],
             "findings": [asdict(f) for f in self.findings],
@@ -599,6 +642,16 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="require every recognized release binary to contain at least one sealed manifest",
     )
+    parser.add_argument(
+        "--require-native-pack",
+        action="store_true",
+        help="require every recognized release binary to pass native-pack verification",
+    )
+    parser.add_argument(
+        "--native-pack-tool",
+        type=Path,
+        help="path to the morok-native-pack finalizer/verifier",
+    )
     parser.add_argument("--allowlist", type=Path, help="versioned JSON allowlist")
     parser.add_argument("--provenance", type=Path, help="write JSON provenance manifest")
     args = parser.parse_args(argv)
@@ -608,6 +661,8 @@ def main(argv: list[str]) -> int:
         args.path,
         release=args.release,
         require_sealed_manifest=args.require_sealed_manifest,
+        require_native_pack=args.require_native_pack,
+        native_pack_tool=args.native_pack_tool,
         allowlist=allowlist,
         provenance_path=args.provenance,
     )

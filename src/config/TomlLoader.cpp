@@ -246,6 +246,14 @@ void parseFaultPagedPayload(const toml::table &t,
     c.virtualize_helpers = readBool(t["virtualize_helpers"]);
 }
 
+void parseNativeCodePack(const toml::table &t, NativeCodePackConfig &c) {
+    c.enabled = readBool(t["enabled"]);
+    c.probability = readU32(t["probability"]);
+    c.max_functions = readU32(t["max_functions"]);
+    c.min_instructions = readU32(t["min_instructions"]);
+    c.protect_generated = readBool(t["protect_generated"]);
+}
+
 void parseExternalSecretBinding(const toml::table &t,
                                 ExternalSecretBindingConfig &c) {
     c.enabled = readBool(t["enabled"]);
@@ -550,6 +558,8 @@ void parsePasses(const toml::table &p, PassConfig &pc) {
         parseHashSelfDecrypt(*t, pc.hash_self_decrypt);
     if (auto *t = p["fault_paged_payload"].as_table())
         parseFaultPagedPayload(*t, pc.fault_paged_payload);
+    if (auto *t = p["native_code_pack"].as_table())
+        parseNativeCodePack(*t, pc.native_code_pack);
     if (auto *t = p["external_secret_binding"].as_table())
         parseExternalSecretBinding(*t, pc.external_secret_binding);
     if (auto *t = p["env_binding_kdf"].as_table())

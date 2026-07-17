@@ -22,6 +22,8 @@ morok_add_unit_test(morok_core_tests
     test_shamir_gf256.cpp
     test_knuth_hash.cpp
     test_entropy.cpp
+    test_chacha20_poly1305.cpp
+    test_sha1.cpp
   LINK
     morok::core
   LABELS core unit)

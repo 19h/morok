@@ -46,6 +46,7 @@ add_library(morok_passes STATIC
   UniformPrimitiveLowering.cpp
   Virtualization.cpp
   HashGatedSelfDecrypt.cpp
+  NativeCodePack.cpp
   SealedBlob.cpp
   FaultPagedPayload.cpp
   SelfChecksumConstants.cpp

@@ -469,6 +469,39 @@ else()
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64)$")
+  add_test(NAME "e2e/native_pack_linux"
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/native_pack_linux.sh"
+            "${CMAKE_C_COMPILER}"
+            "$<TARGET_FILE:morok_plugin>"
+            "$<TARGET_FILE:morok-native-pack>"
+            "${PROJECT_SOURCE_DIR}"
+            "${CMAKE_STRIP}"
+            "${CMAKE_NM}")
+  set_tests_properties("e2e/native_pack_linux" PROPERTIES
+    LABELS "e2e;security;linux;native-pack"
+    REQUIRED_FILES
+      "$<TARGET_FILE:morok_plugin>;$<TARGET_FILE:morok-native-pack>;${CMAKE_CURRENT_SOURCE_DIR}/native_pack.toml"
+    TIMEOUT 180)
+
+  add_test(NAME "e2e/native_pack_dso_linux"
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/native_pack_dso_linux.sh"
+            "${CMAKE_C_COMPILER}"
+            "$<TARGET_FILE:morok_plugin>"
+            "$<TARGET_FILE:morok-native-pack>"
+            "${PROJECT_SOURCE_DIR}"
+            "${CMAKE_STRIP}"
+            "${CMAKE_NM}")
+  set_tests_properties("e2e/native_pack_dso_linux" PROPERTIES
+    LABELS "e2e;security;linux;native-pack"
+    REQUIRED_FILES
+      "$<TARGET_FILE:morok_plugin>;$<TARGET_FILE:morok-native-pack>;${CMAKE_CURRENT_SOURCE_DIR}/native_pack.toml"
+    TIMEOUT 180)
+else()
+  message(STATUS "Linux ELF64 native-pack e2e tests skipped on this host.")
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
    CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
   add_test(NAME "e2e/fco_exception_threads"
     COMMAND bash "${_fco_exception_driver}"

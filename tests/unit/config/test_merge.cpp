@@ -163,6 +163,11 @@ TEST_CASE("merge handles every pass family") {
     src.fault_paged_payload.fallback = true;
     src.fault_paged_payload.bind_to_runtime_seal = true;
     src.fault_paged_payload.virtualize_helpers = false;
+    src.native_code_pack.enabled = true;
+    src.native_code_pack.probability = 88u;
+    src.native_code_pack.max_functions = 17u;
+    src.native_code_pack.min_instructions = 9u;
+    src.native_code_pack.protect_generated = true;
     src.external_secret_binding.enabled = true;
     src.external_secret_binding.mode = "feed_api";
     src.external_secret_binding.public_key = "pub-rot-a";
@@ -398,6 +403,11 @@ TEST_CASE("merge handles every pass family") {
     CHECK(dst.fault_paged_payload.fallback == true);
     CHECK(dst.fault_paged_payload.bind_to_runtime_seal == true);
     CHECK(dst.fault_paged_payload.virtualize_helpers == false);
+    CHECK(dst.native_code_pack.enabled == true);
+    CHECK(dst.native_code_pack.probability == 88u);
+    CHECK(dst.native_code_pack.max_functions == 17u);
+    CHECK(dst.native_code_pack.min_instructions == 9u);
+    CHECK(dst.native_code_pack.protect_generated == true);
     CHECK(dst.external_secret_binding.enabled == true);
     CHECK(dst.external_secret_binding.mode == "feed_api");
     CHECK(dst.external_secret_binding.public_key == "pub-rot-a");

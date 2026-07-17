@@ -202,6 +202,16 @@ void merge(PassConfig &dst, const PassConfig &src) {
              src.fault_paged_payload.bind_to_runtime_seal);
     mergeOpt(dst.fault_paged_payload.virtualize_helpers,
              src.fault_paged_payload.virtualize_helpers);
+
+    mergeOpt(dst.native_code_pack.enabled, src.native_code_pack.enabled);
+    mergeOpt(dst.native_code_pack.probability,
+             src.native_code_pack.probability);
+    mergeOpt(dst.native_code_pack.max_functions,
+             src.native_code_pack.max_functions);
+    mergeOpt(dst.native_code_pack.min_instructions,
+             src.native_code_pack.min_instructions);
+    mergeOpt(dst.native_code_pack.protect_generated,
+             src.native_code_pack.protect_generated);
     // External proof/license binding
     mergeOpt(dst.external_secret_binding.enabled,
              src.external_secret_binding.enabled);

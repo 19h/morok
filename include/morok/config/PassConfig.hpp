@@ -201,6 +201,19 @@ struct FaultPagedPayloadConfig {
     Opt<bool> virtualize_helpers;
 };
 
+// Linux ELF64 native-code packing.  The IR pass only establishes the ABI
+// boundary: selected implementations move into a dedicated executable input
+// section and their original symbols become plaintext lazy-entry stubs.  A
+// loader object plus the post-link finalizer are required to produce a runnable
+// artifact.
+struct NativeCodePackConfig {
+    Opt<bool> enabled;
+    Opt<std::uint32_t> probability;
+    Opt<std::uint32_t> max_functions;
+    Opt<std::uint32_t> min_instructions;
+    Opt<bool> protect_generated;
+};
+
 struct ExternalSecretBindingConfig {
     Opt<bool> enabled;
     Opt<std::string> mode;
@@ -495,6 +508,7 @@ struct PassConfig {
     VirtualizationConfig virtualization;
     HashSelfDecryptConfig hash_self_decrypt;
     FaultPagedPayloadConfig fault_paged_payload;
+    NativeCodePackConfig native_code_pack;
     ExternalSecretBindingConfig external_secret_binding;
     EnvBindingKdfConfig env_binding_kdf;
     TracerAttestationConfig tracer_attestation;

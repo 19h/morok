@@ -6,6 +6,7 @@
 #
 #     morok_core      pure C++23 algorithms — zero LLVM, zero I/O
 #     morok_config    preset/policy/TOML configuration — zero LLVM
+#     morok_packer    host-side ELF64 pack finalization — zero LLVM
 #     morok_ir        LLVM-IR helper utilities (links LLVM)
 #     morok_passes    the obfuscation passes (links LLVM + the above)
 #     morok_plugin    the loadable New-PM pass plugin (libMorok)
@@ -80,6 +81,7 @@ endfunction()
 # LLVM-independent layers (always built).
 morok_add_layer(src/core)
 morok_add_layer(src/config)
+morok_add_layer(src/packer)
 
 # LLVM-dependent layers (require a usable LLVM with the New-PM plugin API).
 if(MOROK_BUILD_PLUGIN OR MOROK_BUILD_TESTS)

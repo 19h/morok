@@ -209,6 +209,56 @@ def main(argv: list[str]) -> int:
         assert payload["binaries"][0]["sealed_manifests"] == 1
         assert payload["findings"] == []
 
+        verifier = tmp / "native-pack-verifier.py"
+        verifier.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            "ok = len(sys.argv) == 3 and sys.argv[1] == 'verify' "
+            "and pathlib.Path(sys.argv[2]).name == 'packed'\n"
+            "raise SystemExit(0 if ok else 1)\n"
+        )
+        verifier.chmod(0o700)
+        native_good = tmp / "native-good"
+        native_good.mkdir()
+        write_synthetic_elf(native_good / "packed", sealed=True)
+        provenance = native_good / "morok-audit.json"
+        result = run(
+            tool,
+            native_good,
+            "--require-native-pack",
+            "--native-pack-tool",
+            str(verifier),
+            "--provenance",
+            str(provenance),
+        )
+        require_ok(result)
+        payload = json.loads(provenance.read_text())
+        assert payload["require_native_pack"] is True
+
+        native_missing = tmp / "native-missing"
+        native_missing.mkdir()
+        write_synthetic_elf(native_missing / "plain", sealed=True)
+        require_fail(
+            run(
+                tool,
+                native_missing,
+                "--require-native-pack",
+                "--native-pack-tool",
+                str(verifier),
+            ),
+            "missing-native-pack",
+        )
+        require_fail(
+            run(
+                tool,
+                native_good,
+                "--require-native-pack",
+                "--native-pack-tool",
+                str(tmp / "absent-verifier"),
+            ),
+            "native-pack-verifier-unavailable",
+        )
+
         ckd_good = tmp / "ckd-good"
         ckd_good.mkdir()
         write_synthetic_ckd_elf(ckd_good / "app", sealed=True)

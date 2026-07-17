@@ -49,6 +49,7 @@ morok_add_unit_test(morok_ir_tests
     test_mirage.cpp
     test_mq_gate.cpp
     test_mutual_guard_graph.cpp
+    test_native_code_pack.cpp
     test_nanomites.cpp
     test_non_invertible_state.cpp
     test_optimizer_amplification.cpp

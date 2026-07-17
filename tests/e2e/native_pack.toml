@@ -1,0 +1,13 @@
+[global]
+seed = 31337
+
+[passes.string_encryption]
+enabled = true
+probability = 100
+
+[passes.native_code_pack]
+enabled = true
+probability = 100
+max_functions = 8
+min_instructions = 2
+protect_generated = false

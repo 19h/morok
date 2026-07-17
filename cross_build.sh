@@ -83,6 +83,23 @@ ELF_SHADOW="${ELF_SHADOW:-0}"
 ELF_SHADOW_TOOL="${ELF_SHADOW_TOOL:-$ROOT/tools/morok_elf_shadow.py}"
 ELF_SHADOW_MAX_BYTES="${ELF_SHADOW_MAX_BYTES:-1048576}"
 
+# Optional Linux ELF64 native-code packing.  This is explicitly outside the
+# ordinary presets: enabling it changes the link/finalization contract and
+# therefore requires this build-pipeline switch in addition to the IR pass.
+NATIVE_PACK="${NATIVE_PACK:-0}"
+NATIVE_PACK_TOOL="${NATIVE_PACK_TOOL:-$BUILD_DIR/src/packer/morok-native-pack}"
+NATIVE_PACK_LOADER="${NATIVE_PACK_LOADER:-$ROOT/runtime/native_pack_loader.c}"
+NATIVE_PACK_META="${NATIVE_PACK_META:-$ROOT/runtime/native_pack_meta.S}"
+NATIVE_PACK_SCRIPT="${NATIVE_PACK_SCRIPT:-$ROOT/runtime/native_pack.ld}"
+NATIVE_PACK_TEMP=""
+
+cleanup_native_pack_temp() {
+  if [ -n "$NATIVE_PACK_TEMP" ] && [ -d "$NATIVE_PACK_TEMP" ]; then
+    rm -rf "$NATIVE_PACK_TEMP"
+  fi
+}
+trap cleanup_native_pack_temp EXIT
+
 BUILD_LINUX=1
 BUILD_MACOS="$DEFAULT_BUILD_MACOS"
 STRIP_BINARIES=1
@@ -132,6 +149,10 @@ Options:
                          requires
                          --dynamic (default: off)
   --no-elf-shadow        Disable DT_JMPREL page shadowing
+  --native-pack          Lazily encrypt selected native functions in the Linux
+                         ELF64 output; implies --linux-only and is incompatible
+                         with --elf-shadow
+  --no-native-pack       Disable native-code packing (default)
   --extra-cflags FLAGS   Extra compiler flags (e.g. "-no-pie -ffast-math")
   --extra-sources PATHS  Extra source files compiled alongside the main source
                          (space-separated, e.g. "tweetnacl.c")
@@ -290,6 +311,8 @@ while [ "$#" -gt 0 ]; do
     --dynamic) LINUX_STATIC=0; shift ;;
     --elf-shadow) ELF_SHADOW=1; shift ;;
     --no-elf-shadow) ELF_SHADOW=0; shift ;;
+    --native-pack) NATIVE_PACK=1; BUILD_LINUX=1; BUILD_MACOS=0; shift ;;
+    --no-native-pack) NATIVE_PACK=0; shift ;;
     --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
     --extra-sources) EXTRA_SOURCES="$2"; shift 2 ;;
     --libs) LIBS="$2"; shift 2 ;;
@@ -342,6 +365,22 @@ if [ "$ELF_SHADOW" -eq 1 ]; then
   esac
 fi
 
+case "$NATIVE_PACK" in
+  0|1) ;;
+  *) die "NATIVE_PACK must be 0 or 1" ;;
+esac
+if [ "$NATIVE_PACK" -eq 1 ]; then
+  need_tool "$CLANG"
+  [ "$BUILD_LINUX" -eq 1 ] || die "--native-pack requires a Linux output"
+  [ "$BUILD_MACOS" -eq 0 ] || die "--native-pack does not support macOS"
+  [ "$ELF_SHADOW" -eq 0 ] ||
+    die "--native-pack and --elf-shadow require unimplemented PHDR coordination"
+  case "${LINUX_TARGET%%-*}" in
+    x86_64|amd64|aarch64|arm64) ;;
+    *) die "--native-pack supports Linux ELF64 x86-64/AArch64 only" ;;
+  esac
+fi
+
 if [ "$BUILD_MACOS" -eq 1 ] && [ "$HOST_OS" != "Darwin" ]; then
   die "macOS builds require a Darwin host; run with --linux-only or --no-macos on $HOST_OS"
 fi
@@ -350,6 +389,10 @@ BUILD_DIR="$(root_path "$BUILD_DIR")"
 SRC="$(root_path "$SRC")"
 OUT_DIR="$(root_path "$OUT_DIR")"
 PLUGIN="$(root_path "$PLUGIN")"
+NATIVE_PACK_TOOL="$(root_path "$NATIVE_PACK_TOOL")"
+NATIVE_PACK_LOADER="$(root_path "$NATIVE_PACK_LOADER")"
+NATIVE_PACK_META="$(root_path "$NATIVE_PACK_META")"
+NATIVE_PACK_SCRIPT="$(root_path "$NATIVE_PACK_SCRIPT")"
 
 if [ "$CHECK_CLEAN_DIR" -eq 1 ]; then
   [ "$CLEAN_OUT" -eq 1 ] || die "--check-clean-dir requires --clean"
@@ -365,6 +408,17 @@ if [ ! -f "$PLUGIN" ] && [ -f "$BUILD_DIR/CMakeCache.txt" ]; then
   cmake --build "$BUILD_DIR" --target morok_plugin
 fi
 [ -f "$PLUGIN" ] || die "Morok plugin not found: $PLUGIN"
+if [ "$NATIVE_PACK" -eq 1 ]; then
+  if [ ! -x "$NATIVE_PACK_TOOL" ] && [ -f "$BUILD_DIR/CMakeCache.txt" ]; then
+    echo ">> building missing native-pack finalizer"
+    cmake --build "$BUILD_DIR" --target morok-native-pack
+  fi
+  [ -x "$NATIVE_PACK_TOOL" ] ||
+    die "native-pack finalizer not found: $NATIVE_PACK_TOOL"
+  [ -f "$NATIVE_PACK_LOADER" ] || die "native-pack loader not found"
+  [ -f "$NATIVE_PACK_META" ] || die "native-pack metadata source not found"
+  [ -f "$NATIVE_PACK_SCRIPT" ] || die "native-pack linker script not found"
+fi
 
 case "$SRC" in
   *.cc|*.cpp|*.cxx|*.C)
@@ -553,6 +607,9 @@ audit_bundle() {
   echo ">> auditing release bundle $OUT_DIR"
   local audit_cmd=("$PYTHON" "$AUDIT_TOOL" "$OUT_DIR" --release
                    --require-sealed-manifest --provenance "$provenance")
+  if [ "$NATIVE_PACK" -eq 1 ]; then
+    audit_cmd+=(--require-native-pack --native-pack-tool "$NATIVE_PACK_TOOL")
+  fi
   if [ "${#allowlist[@]}" -gt 0 ]; then
     audit_cmd+=("${allowlist[@]}")
   fi
@@ -586,6 +643,9 @@ build_linux() {
   local elf_shadow_link=()
   local static_suffix=""
   local morok_cfg=("${MOROK_CONFIG[@]}")
+  local native_pack_dir=""
+  local native_pack_objects=()
+  local native_pack_link=()
   if [ "$LINUX_STATIC" -eq 1 ]; then
     static_flag=(-static)
     static_suffix="-static"
@@ -607,6 +667,39 @@ build_linux() {
     elf_shadow_link=("-Wl,--build-id=sha1")
   fi
 
+  if [ "$NATIVE_PACK" -eq 1 ]; then
+    morok_cfg+=(-mllvm -morok-native-pack)
+    native_pack_dir="$(mktemp -d "$OUT_DIR/.morok-native-pack.XXXXXX")" ||
+      die "could not create native-pack temporary directory"
+    NATIVE_PACK_TEMP="$native_pack_dir"
+    "$NATIVE_PACK_TOOL" prepare "$native_pack_dir" --seed "$SEED" || {
+      rm -rf "$native_pack_dir"
+      die "native-pack key preparation failed"
+    }
+    local loader_obj="$native_pack_dir/loader.o"
+    local meta_obj="$native_pack_dir/meta.o"
+    local loader_common=("--target=$LINUX_TARGET")
+    if [ "${#sysroot_arg[@]}" -gt 0 ]; then
+      loader_common+=("${sysroot_arg[@]}")
+    fi
+    loader_common+=("-B$tool_bin" "-B$gcc_lib_dir" "-B$crt_dir"
+      "-I$native_pack_dir" -ffreestanding -fno-builtin
+      -fPIC
+      -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables
+      -fvisibility=hidden -O2)
+    "$CLANG" "${loader_common[@]}" -std=c11 -c "$NATIVE_PACK_LOADER" \
+      -o "$loader_obj" || {
+        rm -rf "$native_pack_dir"
+        die "native-pack loader compilation failed"
+      }
+    "$CLANG" "${loader_common[@]}" -c "$NATIVE_PACK_META" -o "$meta_obj" || {
+      rm -rf "$native_pack_dir"
+      die "native-pack metadata compilation failed"
+    }
+    native_pack_objects=("$loader_obj" "$meta_obj")
+    native_pack_link=("-Wl,-T,$NATIVE_PACK_SCRIPT" -Wl,--build-id=sha1)
+  fi
+
   local out="$OUT_DIR/$STEM-linux-$arch$static_suffix"
   echo ">> linux $LINUX_TARGET -> $out"
   local linux_cmd=("$COMPILER" "--target=$LINUX_TARGET")
@@ -625,10 +718,29 @@ build_linux() {
   if [ "${#elf_shadow_link[@]}" -gt 0 ]; then
     linux_cmd+=("${elf_shadow_link[@]}")
   fi
+  if [ "${#native_pack_link[@]}" -gt 0 ]; then
+    linux_cmd+=("${native_pack_link[@]}")
+  fi
   linux_cmd+=("${COMMON[@]}" -o "$out")
+  if [ "${#native_pack_objects[@]}" -gt 0 ]; then
+    linux_cmd+=("${native_pack_objects[@]}")
+  fi
   "${linux_cmd[@]}"
   strip_linux "$out"
   seal_binary "$out"
+  if [ "$NATIVE_PACK" -eq 1 ]; then
+    "$NATIVE_PACK_TOOL" finalize "$out" \
+      --key "$native_pack_dir/morok_native_pack.key" --consume-key || {
+        rm -rf "$native_pack_dir"
+        die "native-pack finalization failed for $out"
+      }
+    "$NATIVE_PACK_TOOL" verify "$out" || {
+      rm -rf "$native_pack_dir"
+      die "native-pack verification failed for $out"
+    }
+    rm -rf "$native_pack_dir"
+    NATIVE_PACK_TEMP=""
+  fi
   shadow_linux_imports "$out"
   OUTPUTS+=("$out")
 }

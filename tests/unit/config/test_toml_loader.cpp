@@ -90,6 +90,24 @@ TEST_CASE("nanomites section is parsed") {
     CHECK(r.config.passes.nanomites.max_sites == 7u);
 }
 
+TEST_CASE("native code pack section is parsed") {
+    const auto r = loadFromString(R"(
+    [passes.native_code_pack]
+    enabled = true
+    probability = 73
+    max_functions = 19
+    min_instructions = 11
+    protect_generated = true
+  )");
+    REQUIRE(r.ok);
+    const auto &p = r.config.passes.native_code_pack;
+    CHECK(p.enabled == true);
+    CHECK(p.probability == 73u);
+    CHECK(p.max_functions == 19u);
+    CHECK(p.min_instructions == 11u);
+    CHECK(p.protect_generated == true);
+}
+
 TEST_CASE("mirage section is parsed") {
     const auto r = loadFromString(R"(
     [passes.mirage]

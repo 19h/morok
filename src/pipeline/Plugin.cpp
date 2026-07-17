@@ -45,6 +45,7 @@
 #include "morok/passes/MqGate.hpp"
 #include "morok/passes/MutualGuardGraph.hpp"
 #include "morok/passes/Nanomites.hpp"
+#include "morok/passes/NativeCodePack.hpp"
 #include "morok/passes/NonInvertibleState.hpp"
 #include "morok/passes/OptimizerAmplification.hpp"
 #include "morok/passes/PathExplosion.hpp"
@@ -124,6 +125,10 @@ cl::opt<bool> MorokFailClosedOnUnsealed(
     "morok-fail-closed-on-unsealed", cl::init(false),
     cl::desc("Corrupt seal-dependent key material when the post-link code_size "
              "slot is unsealed, so an unsealed binary fails closed."));
+cl::opt<bool> MorokNativePack(
+    "morok-native-pack", cl::init(false), cl::NotHidden,
+    cl::desc("Move eligible Linux ELF64 functions behind native-pack lazy "
+             "entry stubs; requires the loader object and post-link finalizer."));
 // Release/distribution signing assertion for macOS entitlement probes.  This is
 // deliberately not implied by presets: max/high are used for local differential
 // runs where get-task-allow may legitimately be true.
@@ -197,6 +202,9 @@ morok::config::Config loadConfig() {
     if (MorokFailClosedOnUnsealed ||
         std::getenv("MOROK_FAIL_CLOSED_ON_UNSEALED") != nullptr)
         cfg.passes.fail_closed_on_unsealed = true;
+
+    if (MorokNativePack || std::getenv("MOROK_NATIVE_PACK") != nullptr)
+        cfg.passes.native_code_pack.enabled = true;
 
     if (MorokDistributionSigned ||
         std::getenv("MOROK_DISTRIBUTION_SIGNED") != nullptr)
@@ -464,6 +472,10 @@ PassPluginLibraryInfo getPluginInfo() {
                     }
                     if (name == "morok-fpp") {
                         MPM.addPass(passes::FaultPagedPayloadPass());
+                        return true;
+                    }
+                    if (name == "morok-nativepack") {
+                        MPM.addPass(passes::NativeCodePackPass());
                         return true;
                     }
                     if (name == "morok-proofbind") {

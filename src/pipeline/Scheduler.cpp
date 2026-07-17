@@ -42,6 +42,7 @@
 #include "morok/passes/MqGate.hpp"
 #include "morok/passes/MutualGuardGraph.hpp"
 #include "morok/passes/Nanomites.hpp"
+#include "morok/passes/NativeCodePack.hpp"
 #include "morok/passes/NonInvertibleState.hpp"
 #include "morok/passes/OptimizerAmplification.hpp"
 #include "morok/passes/PathExplosion.hpp"
@@ -1594,6 +1595,24 @@ PreservedAnalyses MorokPass::run(Module &M, ModuleAnalysisManager &) {
 
     if (InitialModuleGrowthOk)
         changed |= passes::misleadingMetadataModule(M, rng);
+
+    // Native-code packing is the terminal IR boundary.  All prior transforms
+    // must finish before implementations move into the protected output
+    // section; otherwise a later module pass could inline ciphertext-bound
+    // bodies back into plaintext or create direct edges that bypass the lazy
+    // entry stubs.  Encryption itself is deliberately post-link.
+    if (config_.passes.native_code_pack.enabled.value_or(false)) {
+        passes::NativeCodePackParams p;
+        p.probability =
+            config_.passes.native_code_pack.probability.value_or(100);
+        p.max_functions =
+            config_.passes.native_code_pack.max_functions.value_or(32);
+        p.min_instructions =
+            config_.passes.native_code_pack.min_instructions.value_or(1);
+        p.protect_generated =
+            config_.passes.native_code_pack.protect_generated.value_or(false);
+        changed |= passes::nativeCodePackModule(M, p, rng);
+    }
 
     // Final symbol hygiene: every generated `morok.*` helper still carries its
     // descriptive internal-linkage name (`morok.gf8mul`, `morok.strdec`, …),

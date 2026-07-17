@@ -92,7 +92,12 @@ morok::runtime    Shared runtime IR emitters for platform primitives such as
 
 morok::passes     New-PM pass implementations plus testable free functions.
 
+morok::packer     LLVM-independent ELF64 validation, authenticated post-link
+                  finalization, and finalized-artifact verification.
+
 morok_plugin      Loadable New-PM pass plugin, emitted as libMorok.
+
+morok-native-pack Host executable used by the Linux native-pack build stage.
 ```
 
 ## Build Requirements
@@ -237,6 +242,7 @@ MOROK_PRESET=high                      preset fallback when no config file is lo
 MOROK_SEED=1234                        seed fallback when -morok-seed is absent or zero
 MOROK_CKD_SEAL_REQUIRED=1              require a post-link CKD seal instead of startup self-seal fallback
 MOROK_FAIL_CLOSED_ON_UNSEALED=1        poison seal-dependent paths if retained manifests are still unsealed
+MOROK_NATIVE_PACK=1                    enable the Linux ELF64 native-pack IR boundary
 MOROK_DISTRIBUTION_SIGNED=1            treat macOS get-task-allow findings as release-signing failures
 ```
 
@@ -301,6 +307,8 @@ Common options:
 | `--dynamic` | Build Linux dynamically; the default Linux mode is static. |
 | `--elf-shadow` | For dynamic Linux/x86-64 outputs, apply post-link `DT_JMPREL` symbol/offset shadowing. |
 | `--no-elf-shadow` | Disable ELF relocation shadowing (the default). |
+| `--native-pack` | Build a Linux ELF64 output with lazy authenticated native-code packing; implies `--linux-only`. |
+| `--no-native-pack` | Disable native-code packing (the default). |
 | `--extra-cflags FLAGS` | Extra compiler flags. |
 | `--extra-sources PATHS` | Extra source files compiled alongside the main source. |
 | `--libs FLAGS` | Extra link libraries. |
@@ -313,7 +321,8 @@ Recognized environment overrides include `BUILD_DIR`, `OUT_DIR`, `CLANG`,
 `MACOS_MIN`, `MACOS_SDK`, `EXTRA_SOURCES`, `EXTRA_CFLAGS`, `LIBS`,
 `SEAL_BINARIES`, `SEAL_WINDOW`, `SEAL_TOOL`, `AUDIT_BINARIES`, `AUDIT_TOOL`,
 `AUDIT_PROVENANCE`, `AUDIT_ALLOWLIST`, `ELF_SHADOW`, `ELF_SHADOW_TOOL`,
-`ELF_SHADOW_MAX_BYTES`, and `PYTHON`.
+`ELF_SHADOW_MAX_BYTES`, `NATIVE_PACK`, `NATIVE_PACK_TOOL`,
+`NATIVE_PACK_LOADER`, `NATIVE_PACK_META`, `NATIVE_PACK_SCRIPT`, and `PYTHON`.
 
 Important defaults:
 
@@ -395,6 +404,78 @@ must be allowlisted explicitly with a versioned JSON file:
   ]
 }
 ```
+
+### Linux ELF64 native-code packing
+
+Native packing is an explicit build-pipeline mode for Linux x86-64 and AArch64
+`ET_EXEC`/`ET_DYN` artifacts. It is not enabled by a preset because it changes
+the link contract:
+
+```toml
+[passes.string_encryption]
+enabled = true
+probability = 100
+
+[passes.native_code_pack]
+enabled = true
+probability = 100
+max_functions = 32
+min_instructions = 1
+protect_generated = false
+```
+
+```sh
+./cross_build.sh --native-pack --linux-target x86_64-linux-gnu \
+  --source programs/01_hello_world.c --config morok.toml
+```
+
+The terminal IR pass moves each selected implementation into a protected input
+section and leaves an ABI-equivalent entry stub at the original symbol. The
+stub invokes one hidden freestanding loader on first protected entry, checks a
+per-stub seed-diverse equation, and tail-transfers into the implementation only
+after the protected region is ready. This is lazy; no ELF constructor performs
+decryption. A private-futex state machine serializes concurrent first entry and
+caches the opened region for later calls.
+
+`cross_build.sh` injects exactly one loader/metadata object, links a 64 KiB
+isolated executable region, strips and seals first, then runs
+`morok-native-pack finalize`. The finalizer resolves self-relative ELF virtual
+addresses, audits relocations and early-execution constructs, encrypts the final
+page-padded machine bytes with [RFC 8439
+ChaCha20-Poly1305](https://www.rfc-editor.org/rfc/rfc8439.html), scrubs descriptive
+section names, and recomputes the 20-byte GNU build ID over the finalized file.
+At runtime the loader authenticates ciphertext before making the isolated pages
+`RW`, decrypts, performs AArch64 instruction-cache maintenance when required,
+and restores `RX`; it never requests `RWX`.
+
+The producer rejects rather than guesses when it encounters GNU IFUNC,
+`R_*_IRELATIVE`, `DT_TEXTREL`, a dynamic relocation into ciphertext, a
+`DT_INIT` address inside ciphertext, non-isolated bounds, unsupported ELF
+variants, multiple/missing manifests, or a missing SHA-1-sized GNU build ID.
+All runtime addresses are self-relative, so PIE and shared objects remain
+ASLR-correct. The key sidecar is mode `0600`, is consumed after successful
+finalization, and is rejected by the release audit if it enters the output
+bundle.
+
+Verification is available independently of the key:
+
+```sh
+build/src/packer/morok-native-pack verify path/to/artifact
+python3 tools/morok-audit.py path/to/bundle --release \
+  --require-native-pack \
+  --native-pack-tool build/src/packer/morok-native-pack
+```
+
+The authenticated region detects corruption and makes file-only disassembly of
+selected bodies operate on ciphertext. It is a static-analysis and code-at-rest
+hardening layer, not a runtime confidentiality boundary: both key shares and
+the plaintext necessarily become available within the executing process. A
+local observer capable of instrumenting the loader or reading process memory
+can recover the opened bytes. Encryption/decryption is `Theta(N)` time for
+`N` protected bytes and `Theta(1)` auxiliary space; the current linker group
+privately dirties approximately `ceil(N/P)` pages for runtime page size `P`.
+Use function selection and `max_functions` to bound startup work and private
+dirty memory.
 
 ### Linux ELF relocation shadowing
 
@@ -558,13 +639,18 @@ Per-function annotation keys are the scheduler tags:
 ```text
 aliasop, bcf, csm, constenc, decoy, dfi, dispatchless, entfla, extop,
 fla, ifsm, indibran, mba, microstress, mq, mutualguard, nistate, optamp,
-pathexplode, phitangle, ptrlaunder, selfcheck, shamir, split,
+nativepack, pathexplode, phitangle, ptrlaunder, selfcheck, shamir, split,
 stackcoalesce, stackdelta, stackrebase, stateop, sub, tablearith, threshold,
 tracekey, typepun, uniform, vobf
 ```
 
 Prefix any key with `no` to force that pass off for a function, for example
 `nomba`, `nobcf`, or `noconstenc`.
+
+`nativepack` forces a function into the Linux ELF64 protected group even below
+the configured instruction threshold; `nonativepack` excludes it. Constructors,
+destructors, unsupported ABI shapes, and block-address functions remain
+excluded even when ordinary probability selection would choose them.
 
 `sensitive` is special: when BCF, MBA, or external opaque predicates are unset
 or enabled, the scheduler raises their density on that function. Explicit
@@ -602,6 +688,7 @@ platform runtime / direct-syscall policy setup
 -> function wrappers
 -> per-build polymorphism
 -> misleading metadata
+-> native-code pack ABI boundary
 -> generated-symbol privacy cleanup
 ```
 
@@ -741,6 +828,7 @@ does not require a plaintext sentinel to survive in `.rodata`.
 | Virtualization | `morok-vm` | `virtualization` | Lifts eligible integer/pointer computation kernels to encrypted threaded bytecode VMs, including multi-block, memory, cast, compare, division, selected intrinsics, and direct internal helper calls when safe. |
 | Fault-paged payload delivery | `morok-fpp` | `fault_paged_payload` | Encrypts VM bytecode per page and replaces direct bytecode loads with a lazy accessor that decrypts one page-local cache at a time, re-clears page state on switches, and binds anomalous access to the `fault_paged_payload` runtime seal channel. |
 | Hash-gated self-decrypt | `morok-selfdecrypt` | `hash_gated_self_decrypt` | Lazily decrypts VM bytecode from runtime hashes/context and re-encrypts on helper exit. |
+| Native-code packing | `morok-nativepack` | `native_code_pack` | Terminal Linux ELF64 boundary pass. Moves selected final IR implementations behind lazy plaintext entry stubs; `cross_build.sh --native-pack` supplies the freestanding loader, isolated linker region, post-link ChaCha20-Poly1305 finalizer, and build-ID/audit verification. Off in every preset. |
 | External proof binding | `morok-proofbind` | `external_secret_binding` | Materializes a proof feed/finish API and folds the proof digest difference into the `external_proof` runtime seal channel, so only the expected proof keeps the clean key state. |
 | Environment binding KDF | `morok-envbind` | `env_binding_kdf` | Collects enrolled host identity material, folds mismatches into the `env_binding` runtime seal channel, and feeds string, sealed-blob, and VM key schedules. |
 | Tracer attestation | `morok-tracer` | `tracer_attestation` | Uses a Linux/x86_64 buddy tracer to inject runtime-only share words into the parent and folds only delivery mismatch deltas into the `tracer` and anti-debug runtime seal channels. |
@@ -927,6 +1015,7 @@ globals read with volatile loads, so these knobs do not change output.
 | `virtualization` | `enabled`, `probability`, `max_functions`, `max_instructions`, `max_registers` |
 | `fault_paged_payload` | `enabled`, `probability`, `max_payloads`, `max_payload_bytes`, `page_size`, `delivery`, `backend`, `per_page_keys`, `reseal_after_use`, `decoy_pages`, `fallback`, `bind_to_runtime_seal`, `virtualize_helpers` |
 | `hash_gated_self_decrypt` | `enabled`, `probability`, `max_payloads`, `max_payload_bytes`, `context_keying` |
+| `native_code_pack` | `enabled`, `probability`, `max_functions`, `min_instructions`, `protect_generated` |
 | `external_secret_binding` | `enabled`, `mode`, `public_key`, `expected_digest`, `identity_policy`, `entitlement_gate`, `entitlement_required_mask`, `entitlement_not_before_epoch`, `entitlement_not_after_epoch`, `bind_to_runtime_seal`, `virtualize_helpers` |
 | `env_binding_kdf` | `enabled`, `mode`, `expected_digest`, `identity_policy`, `min_factors`, `bind_to_runtime_seal`, `virtualize_helpers` |
 | `tracer_attestation` | `enabled`, `mode`, `shares`, `renewal`, `bind_to_runtime_seal`, `virtualize_helpers` |
@@ -989,10 +1078,11 @@ than adding a standalone `-passes` entry.
   post-link patch tests when Python is available.
 - Linux x86_64: supported for core/config/IR and portable e2e gates. Static
   cross-builds disable FCO automatically unless an explicit config chooses
-  otherwise.
-- Linux arm64 and other non-Apple hosts: use the portable e2e configuration for
-  high-intensity runtime tests until the VM/trap/anti-analysis runtime paths are
-  fully ported.
+  otherwise. Native packing supports ELF64 static, PIE, and shared-object
+  outputs.
+- Linux arm64: native packing supports ELF64 static, PIE, and shared-object
+  outputs. Other high-intensity runtime paths use the portable e2e
+  configuration until their runtime backends are fully ported.
 - Windows x86_64: Windows-specific passes emit PE/PEB/TEB/export/syscall/VEH
   helpers into Windows-targeted IR. Behavioral e2e plugin loading is skipped on
   Windows hosts; coverage comes from core/config/IR tests and targeted object
@@ -1138,6 +1228,8 @@ self-check data region.
 | `-mllvm -morok` is unknown on Windows | Windows plugin cl::opts are not parsed by host clang the same way | Use `MOROK_ENABLE=1` plus `MOROK_CONFIG`, `MOROK_PRESET`, and `MOROK_SEED`. |
 | Static Linux binary crashes around import indirection | FCO was left enabled in a static link | Use `cross_build.sh` or force `[passes.function_call_obfuscate].enabled = false` and `[passes.platform_runtime].static_link_expected = true`. |
 | Self-checksum does not detect a native patch | Post-link manifests were not sealed | Seal after final link/strip and run `tools/morok-audit.py --release --require-sealed-manifest`. |
+| Native-pack finalization reports no protected range | No eligible function survived the configured probability/threshold | Lower `min_instructions`, increase `probability`/`max_functions`, or annotate required functions with `nativepack`. |
+| Native-pack finalization rejects IFUNC/IRELATIVE/text relocation | The artifact contains code that can execute or be rewritten before lazy opening | Leave that construct outside the protected build or remove it; the finalizer intentionally fails closed. |
 | E2E max fails off Apple | Some max-level runtime/backend paths are still Apple-first | Use `tests/e2e/portable.toml` and consult the comments in that file. |
 | A huge input stops getting later transforms | Scheduler growth budgets are firing | Narrow with policy/annotations or increase the specific pass budget after adding tests. |
 
