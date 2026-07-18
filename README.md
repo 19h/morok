@@ -303,7 +303,7 @@ Common options:
 | `--no-linux`, `--no-macos` | Skip one platform family. |
 | `--no-strip` | Leave produced binaries unstripped. |
 | `--no-audit` | Skip the final `morok-audit` release gate. |
-| `--clean` | Wipe the output directory before building, after refusing unsafe paths outside the canonical build tree. |
+| `--clean` | Wipe the output directory before building, after refusing unsafe paths outside the canonical build tree. This is optional for audit isolation. |
 | `--dynamic` | Build Linux dynamically; the default Linux mode is static. |
 | `--elf-shadow` | For dynamic Linux/x86-64 outputs, apply post-link `DT_JMPREL` symbol/offset shadowing. |
 | `--no-elf-shadow` | Disable ELF relocation shadowing (the default). |
@@ -360,10 +360,12 @@ byte ranges are only known after linking and stripping. `cross_build.sh` seals
 automatically after strip and fails closed if no manifests are present. The
 post-link sealer uses the requested `--window` as the native-code hash coverage
 limit; the self-check random-data `region_bytes` setting does not cap code
-coverage. It then runs `tools/morok-audit.py` over the final output directory to
-reject unsealed manifests, placeholder manifest state, private-key sidecars,
-embedded development paths, plaintext high-value release markers, and plaintext
-magic/sentinel markers before anything is shipped.
+coverage. It then runs `tools/morok-audit.py` with one `--include` selector per
+artifact produced by the current invocation. This retains the output directory
+as the provenance root without treating unrelated files in an existing
+`--out-dir` as release outputs. The selected artifacts are checked for unsealed
+manifests, placeholder manifest state, embedded development paths, plaintext
+high-value release markers, and plaintext magic/sentinel markers.
 
 When macOS sealing is enabled, `cross_build.sh` also passes the strict seal
 flags (`-morok-ckd-seal-required` and
@@ -395,6 +397,11 @@ variants, plaintext output labels, and high-value marker strings, then writes a
 provenance manifest with file hashes, detected binary formats, sealed-manifest
 counts, and any findings. Release findings are hard failures. Test fixtures
 must be allowlisted explicitly with a versioned JSON file:
+
+Without `--include`, a manual directory audit remains recursive. Repeat
+`--include path/to/artifact` to constrain an audit to named files beneath the
+audit root; missing files, directories, symlink escapes, and paths outside the
+root fail with `invalid-audit-include`.
 
 ```json
 {

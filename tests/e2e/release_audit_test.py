@@ -209,6 +209,37 @@ def main(argv: list[str]) -> int:
         assert payload["binaries"][0]["sealed_manifests"] == 1
         assert payload["findings"] == []
 
+        scoped = tmp / "scoped"
+        scoped.mkdir()
+        included = scoped / "app"
+        write_synthetic_elf(included, sealed=True)
+        write_synthetic_elf(scoped / "unrelated-unsealed", sealed=False)
+        (scoped / "unrelated.key").write_text("fixture key material\n")
+        provenance = scoped / "morok-audit.json"
+        result = run(
+            tool,
+            scoped,
+            "--require-sealed-manifest",
+            "--include",
+            str(included),
+            "--provenance",
+            str(provenance),
+        )
+        require_ok(result)
+        payload = json.loads(provenance.read_text())
+        assert payload["includes"] == ["app"]
+        assert [entry["path"] for entry in payload["files"]] == ["app"]
+        assert [entry["path"] for entry in payload["binaries"]] == ["app"]
+
+        require_fail(
+            run(tool, scoped, "--include", str(tmp / "outside")),
+            "invalid-audit-include",
+        )
+        require_fail(
+            run(tool, scoped, "--include", str(scoped / "missing")),
+            "invalid-audit-include",
+        )
+
         verifier = tmp / "native-pack-verifier.py"
         verifier.write_text(
             "#!/usr/bin/env python3\n"

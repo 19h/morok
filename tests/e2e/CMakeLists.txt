@@ -160,6 +160,14 @@ add_test(NAME "e2e/cross_build_empty_sysroot"
 set_tests_properties("e2e/cross_build_empty_sysroot" PROPERTIES
   LABELS "e2e")
 
+# Build-tooling regression: --out-dir may identify an existing directory; its
+# unrelated contents must not be interpreted as artifacts from this invocation.
+add_test(NAME "e2e/cross_build_audit_scope"
+  COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/cross_build_audit_scope.sh"
+          "${CMAKE_SOURCE_DIR}/cross_build.sh")
+set_tests_properties("e2e/cross_build_audit_scope" PROPERTIES
+  LABELS "e2e;security")
+
 # Build-tooling regression (issue #116): --clean must be constrained to a
 # canonical build-dir descendant and refuse destructive OUT_DIR values.
 add_test(NAME "e2e/cross_build_clean"

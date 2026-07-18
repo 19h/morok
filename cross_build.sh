@@ -141,9 +141,7 @@ Options:
   --no-macos             Skip macOS
   --no-strip             Do not strip produced binaries
   --no-audit             Skip the final morok-audit release gate
-  --clean                Wipe the output dir before building, so stale artifacts
-                         from a previous run (e.g. a static binary left over when
-                         switching to --dynamic) cannot fail the bundle audit
+  --clean                Wipe a safely constrained output dir before building
   --dynamic              Linux dynamic link (default: static)
   --elf-shadow           Apply Linux/x86-64 DT_JMPREL symbol/offset shadowing;
                          requires
@@ -435,12 +433,10 @@ if [ -n "$C_STD" ]; then
 fi
 need_tool "$COMPILER"
 
-# Stale artifacts from a previous run persist in OUT_DIR (this script only
-# mkdir -p's it), and the release audit scans the whole directory — so a binary
-# left over from a different flag set (e.g. a static build before --dynamic) can
-# fail the bundle.  --clean wipes OUT_DIR first, but only after resolving it to
-# a strict descendant of BUILD_DIR so '.', '..', symlink escapes, $HOME, and
-# arbitrary absolute paths never reach rm -rf.
+# --clean removes stale outputs when requested, but only after resolving OUT_DIR
+# to a strict descendant of BUILD_DIR so '.', '..', symlink escapes, $HOME, and
+# arbitrary absolute paths never reach rm -rf.  The release audit below scopes
+# itself to OUTPUTS, so OUT_DIR may also be a larger existing directory.
 if [ "$CLEAN_OUT" -eq 1 ]; then
   validate_clean_out_dir
   echo ">> cleaning $OUT_DIR"
@@ -607,6 +603,10 @@ audit_bundle() {
   echo ">> auditing release bundle $OUT_DIR"
   local audit_cmd=("$PYTHON" "$AUDIT_TOOL" "$OUT_DIR" --release
                    --require-sealed-manifest --provenance "$provenance")
+  local out
+  for out in "${OUTPUTS[@]}"; do
+    audit_cmd+=(--include "$out")
+  done
   if [ "$NATIVE_PACK" -eq 1 ]; then
     audit_cmd+=(--require-native-pack --native-pack-tool "$NATIVE_PACK_TOOL")
   fi

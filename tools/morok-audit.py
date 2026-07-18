@@ -146,6 +146,7 @@ class Auditor:
         native_pack_tool: Path | None,
         allowlist: Allowlist,
         provenance_path: Path | None,
+        include_paths: list[Path],
     ):
         self.root = root.resolve()
         self.release = release
@@ -154,6 +155,7 @@ class Auditor:
         self.native_pack_tool = native_pack_tool.resolve() if native_pack_tool else None
         self.allowlist = allowlist
         self.provenance_path = provenance_path.resolve() if provenance_path else None
+        self.include_paths = [path.resolve() for path in include_paths]
         self.findings: list[Finding] = []
         self.allowed_findings: list[Finding] = []
         self.files: list[dict[str, object]] = []
@@ -174,6 +176,37 @@ class Auditor:
         self.findings.append(finding)
 
     def paths(self) -> list[Path]:
+        if self.include_paths:
+            out: list[Path] = []
+            seen: set[Path] = set()
+            for path in self.include_paths:
+                try:
+                    path.relative_to(self.root)
+                except ValueError:
+                    self.emit_finding(
+                        "invalid-audit-include",
+                        path,
+                        f"included path resolves outside audit root {self.root}",
+                    )
+                    continue
+                if not path.is_file():
+                    self.emit_finding(
+                        "invalid-audit-include",
+                        path,
+                        "included path does not exist or is not a file",
+                    )
+                    continue
+                if self.provenance_path and path == self.provenance_path:
+                    self.emit_finding(
+                        "invalid-audit-include",
+                        path,
+                        "provenance output cannot be an audited input",
+                    )
+                    continue
+                if path not in seen:
+                    seen.add(path)
+                    out.append(path)
+            return sorted(out)
         if self.root.is_file():
             return [self.root]
         out: list[Path] = []
@@ -624,6 +657,7 @@ class Auditor:
             "release": self.release,
             "require_sealed_manifest": self.require_sealed_manifest,
             "require_native_pack": self.require_native_pack,
+            "includes": [self.rel(path) for path in self.include_paths],
             "files": self.files,
             "binaries": [asdict(b) for b in self.binaries],
             "findings": [asdict(f) for f in self.findings],
@@ -654,6 +688,13 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--allowlist", type=Path, help="versioned JSON allowlist")
     parser.add_argument("--provenance", type=Path, help="write JSON provenance manifest")
+    parser.add_argument(
+        "--include",
+        action="append",
+        type=Path,
+        default=[],
+        help="audit only this file beneath PATH; repeatable",
+    )
     args = parser.parse_args(argv)
 
     allowlist = Allowlist(args.allowlist)
@@ -665,6 +706,7 @@ def main(argv: list[str]) -> int:
         native_pack_tool=args.native_pack_tool,
         allowlist=allowlist,
         provenance_path=args.provenance,
+        include_paths=args.include,
     )
     return auditor.run()
 
