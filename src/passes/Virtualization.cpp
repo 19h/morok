@@ -598,8 +598,8 @@ std::optional<RetKind> classifySignature(const Function &F) {
 }
 
 bool supportedTerminator(const Instruction &T) {
-    return isa<ReturnInst>(T) || isa<BranchInst>(T) || isa<SwitchInst>(T) ||
-           isa<UnreachableInst>(T);
+    return isa<ReturnInst>(T) || isa<UncondBrInst, CondBrInst>(T) ||
+           isa<SwitchInst>(T) || isa<UnreachableInst>(T);
 }
 
 bool sizedNonScalable(const DataLayout &DL, Type *T) {
@@ -1323,14 +1323,14 @@ bool Lifter::liftTerminator(Instruction &T) {
             return false;
         return emit({VmOp::Ret, 0, *R, 0, 0});
     }
-    if (auto *BI = dyn_cast<BranchInst>(&T)) {
-        if (BI->isUnconditional()) {
-            auto Idx = static_cast<std::uint32_t>(P_.code.size());
-            if (!emit({VmOp::Jmp, 0, 0, 0, 0}))
-                return false;
-            Fixups_.push_back({Idx, BI->getSuccessor(0), nullptr, 0});
-            return true;
-        }
+    if (auto *BI = dyn_cast<UncondBrInst>(&T)) {
+        auto Idx = static_cast<std::uint32_t>(P_.code.size());
+        if (!emit({VmOp::Jmp, 0, 0, 0, 0}))
+            return false;
+        Fixups_.push_back({Idx, BI->getSuccessor(0), nullptr, 0});
+        return true;
+    }
+    if (auto *BI = dyn_cast<CondBrInst>(&T)) {
         auto Cond = materialize(BI->getCondition());
         if (!Cond)
             return false;

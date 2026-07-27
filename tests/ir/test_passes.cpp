@@ -234,8 +234,8 @@ bool namedInstructionPrecedes(Function &F, StringRef firstPrefix,
 bool namedConditionBranchesTo(Function &F, StringRef conditionPrefix,
                               StringRef trueSuccessorPrefix) {
     for (BasicBlock &BB : F) {
-        auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
-        if (!BI || !BI->isConditional())
+        auto *BI = dyn_cast<CondBrInst>(BB.getTerminator());
+        if (!BI)
             continue;
         Value *Cond = BI->getCondition();
         if (Cond->hasName() && Cond->getName().starts_with(conditionPrefix) &&
@@ -986,9 +986,9 @@ void checkWindowsTlsCallbacks(Module &M, StringRef Stem, StringRef CtorName,
         CHECK(Cb->getCallingConv() == ExpectedConv);
         CHECK(countNamedInstructions(*Cb, Prefix + ".reason.process_attach") ==
               1u);
-        auto *EntryBr = dyn_cast<BranchInst>(Cb->getEntryBlock().getTerminator());
+        auto *EntryBr =
+            dyn_cast<CondBrInst>(Cb->getEntryBlock().getTerminator());
         REQUIRE(EntryBr != nullptr);
-        REQUIRE(EntryBr->isConditional());
         REQUIRE(EntryBr->getCondition() != nullptr);
         CHECK(EntryBr->getCondition()->getName().starts_with(
             Prefix + ".reason.process_attach"));
@@ -1433,7 +1433,7 @@ TEST_CASE("RuntimeSeal gates weighted detector score with corroboration") {
 
     std::size_t Branches = 0;
     for (Instruction &I : instructions(*Probe))
-        Branches += isa<BranchInst>(&I) ? 1u : 0u;
+        Branches += isa<UncondBrInst, CondBrInst>(&I) ? 1u : 0u;
     CHECK(Branches == 0u);
     CHECK_FALSE(verifyModule(M, &errs()));
 }
@@ -4441,9 +4441,8 @@ right:
     CHECK(morok::passes::constantEncryptFunction(
         *F, {/*prob=*/100, /*k=*/3, /*iterations=*/1}, rng));
 
-    auto *BI = dyn_cast<BranchInst>(F->getEntryBlock().getTerminator());
+    auto *BI = dyn_cast<CondBrInst>(F->getEntryBlock().getTerminator());
     REQUIRE(BI);
-    REQUIRE(BI->isConditional());
     CHECK_FALSE(isa<ConstantInt>(BI->getCondition()));
     CHECK(countGlobals(*M, "morok.share") == 3u);
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -4560,7 +4559,8 @@ entry:
     REQUIRE(Gf8Mul);
     bool gf8MulHasBranch = false;
     for (BasicBlock &BB : *Gf8Mul)
-        gf8MulHasBranch |= isa<BranchInst>(BB.getTerminator());
+        gf8MulHasBranch |=
+            isa<UncondBrInst, CondBrInst>(BB.getTerminator());
     CHECK_FALSE(gf8MulHasBranch);
     CHECK(countGlobals(*M, "morok.shamir.share") == 12u);
     CHECK(countGlobals(*M, "morok.shamir.cell") == 12u);
@@ -4897,9 +4897,8 @@ right:
                                               /*max_secrets=*/1},
                                              rng));
 
-    auto *BI = dyn_cast<BranchInst>(F->getEntryBlock().getTerminator());
+    auto *BI = dyn_cast<CondBrInst>(F->getEntryBlock().getTerminator());
     REQUIRE(BI);
-    REQUIRE(BI->isConditional());
     CHECK_FALSE(isa<ConstantInt>(BI->getCondition()));
     CHECK(countGlobals(*M, "morok.shamir.share") == 2u);
     CHECK(countGlobals(*M, "morok.shamir.cell") == 2u);
@@ -6756,13 +6755,11 @@ merge:
             if (auto *CI = dyn_cast<CallInst>(&I))
                 if (CI->getCalledFunction() == Context)
                     ++contextCalls;
-            if (auto *BI = dyn_cast<BranchInst>(&I))
-                if (BI->isConditional())
-                    for (unsigned Succ = 0; Succ != BI->getNumSuccessors();
-                         ++Succ)
-                        branchesToDecoy |=
-                            BI->getSuccessor(Succ)->getName().starts_with(
-                                "morok.extop.decoy");
+            if (auto *BI = dyn_cast<CondBrInst>(&I))
+                for (unsigned Succ = 0; Succ != BI->getNumSuccessors(); ++Succ)
+                    branchesToDecoy |=
+                        BI->getSuccessor(Succ)->getName().starts_with(
+                            "morok.extop.decoy");
             if (isDecoy)
                 if (auto *SI = dyn_cast<StoreInst>(&I))
                     decoyHasVolatileStore |= SI->isVolatile();
@@ -8760,7 +8757,7 @@ right:
     bool hasIndexSelect = false;
     bool hasTargetLoad = false;
     for (Instruction &I : instructions(*F)) {
-        branches += isa<BranchInst>(&I) ? 1u : 0u;
+        branches += isa<UncondBrInst, CondBrInst>(&I) ? 1u : 0u;
         indirects += isa<IndirectBrInst>(&I) ? 1u : 0u;
         if (auto *SI = dyn_cast<SelectInst>(&I))
             hasIndexSelect |= SI->getName().starts_with("morok.uniform.index");
@@ -9872,7 +9869,7 @@ right:
     std::size_t wrapperBranches = 0;
     for (Instruction &I : instructions(*F)) {
         wrapperCalls += isa<CallInst>(&I) ? 1u : 0u;
-        wrapperBranches += isa<BranchInst>(&I) ? 1u : 0u;
+        wrapperBranches += isa<UncondBrInst, CondBrInst>(&I) ? 1u : 0u;
     }
     CHECK(wrapperCalls == 1u);
     CHECK(wrapperBranches == 0u);
@@ -10763,60 +10760,61 @@ entry:
         bool blockHasGate = false;
         for (Instruction &I : BB)
             blockHasGate |= I.getName().starts_with("morok.sdb.gate");
-        if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator())) {
+        if (Instruction *BI = BB.getTerminator();
+            isa<UncondBrInst, CondBrInst>(BI)) {
             if (BB.getName() == "entry")
                 ensureEntryBranchesToAcquire =
-                    BI->isUnconditional() &&
+                    isa<UncondBrInst>(BI) &&
                     BI->getSuccessor(0)->getName() == "acquire";
             if (BB.getName() == "entry")
                 activePayloadTripsFail =
-                    BI->isConditional() &&
+                    isa<CondBrInst>(BI) &&
                     ((BI->getSuccessor(0)->getName() == "fail" &&
                       BI->getSuccessor(1)->getName() == "hash") ||
                      (BI->getSuccessor(0)->getName() == "hash" &&
                       BI->getSuccessor(1)->getName() == "fail"));
             if (BB.getName() == "maybe.retain")
                 reentryWaitsOrRetains =
-                    BI->isConditional() &&
+                    isa<CondBrInst>(BI) &&
                     ((BI->getSuccessor(0)->getName() == "wait" &&
                       BI->getSuccessor(1)->getName() == "retain") ||
                      (BI->getSuccessor(0)->getName() == "retain" &&
                       BI->getSuccessor(1)->getName() == "wait"));
             if (BB.getName() == "retain")
                 readyRetainCanExit =
-                    BI->isConditional() &&
+                    isa<CondBrInst>(BI) &&
                     ((BI->getSuccessor(0)->getName() == "exit" &&
                       BI->getSuccessor(1)->getName() == "acquire") ||
                      (BI->getSuccessor(0)->getName() == "acquire" &&
                       BI->getSuccessor(1)->getName() == "exit"));
             if (blockHasGate)
                 gateFallsIntoDecrypt =
-                    BI->isUnconditional() &&
+                    isa<UncondBrInst>(BI) &&
                     BI->getSuccessor(0)->getName() == "decrypt";
             if (BB.getName() == "decrypt")
                 decryptBranchesToDecide =
-                    BI->isConditional() &&
+                    isa<CondBrInst>(BI) &&
                     BI->getSuccessor(0)->getName() == "decide";
             if (BB.getName() == "decide")
                 hasPostDecryptGateDecision =
-                    BI->isConditional() &&
+                    isa<CondBrInst>(BI) &&
                     ((BI->getSuccessor(0)->getName() == "ready" &&
                       BI->getSuccessor(1)->getName() == "fail") ||
                      (BI->getSuccessor(0)->getName() == "fail" &&
                       BI->getSuccessor(1)->getName() == "ready"));
             if (BB.getName() == "fail")
                 failBranchesToPoison =
-                    BI->isUnconditional() &&
+                    isa<UncondBrInst>(BI) &&
                     BI->getSuccessor(0)->getName() == "fail.poison";
             if (BB.getName() == "fail.poison")
                 failPoisonLoops =
-                    BI->isConditional() &&
+                    isa<CondBrInst>(BI) &&
                     ((BI->getSuccessor(0)->getName() == "fail.publish" &&
                       BI->getSuccessor(1)->getName() == "fail.poison") ||
                      (BI->getSuccessor(0)->getName() == "fail.poison" &&
                       BI->getSuccessor(1)->getName() == "fail.publish"));
             if (BB.getName() == "fail.publish")
-                failPoisonPublishes = BI->isUnconditional() &&
+                failPoisonPublishes = isa<UncondBrInst>(BI) &&
                                       BI->getSuccessor(0)->getName() == "exit";
         }
     }
@@ -10880,21 +10878,19 @@ entry:
         }
     }
     for (BasicBlock &BB : *Seal) {
-        if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator())) {
+        if (auto *BI = dyn_cast<CondBrInst>(BB.getTerminator())) {
             if (BB.getName() == "release")
                 sealReleaseRetries =
-                    BI->isConditional() &&
-                    ((BI->getSuccessor(0)->getName() == "release.done" &&
-                      BI->getSuccessor(1)->getName() == "acquire") ||
-                     (BI->getSuccessor(0)->getName() == "acquire" &&
-                      BI->getSuccessor(1)->getName() == "release.done"));
+                    (BI->getSuccessor(0)->getName() == "release.done" &&
+                     BI->getSuccessor(1)->getName() == "acquire") ||
+                    (BI->getSuccessor(0)->getName() == "acquire" &&
+                     BI->getSuccessor(1)->getName() == "release.done");
             if (BB.getName() == "release.done")
                 sealLastReleaseSeals =
-                    BI->isConditional() &&
-                    ((BI->getSuccessor(0)->getName() == "seal" &&
-                      BI->getSuccessor(1)->getName() == "exit") ||
-                     (BI->getSuccessor(0)->getName() == "exit" &&
-                      BI->getSuccessor(1)->getName() == "seal"));
+                    (BI->getSuccessor(0)->getName() == "seal" &&
+                     BI->getSuccessor(1)->getName() == "exit") ||
+                    (BI->getSuccessor(0)->getName() == "exit" &&
+                     BI->getSuccessor(1)->getName() == "seal");
         }
     }
     CHECK(helperCallsEnsure);
@@ -12614,9 +12610,8 @@ right:
         *F, {/*probability=*/100, /*max_constants=*/1, /*region_bytes=*/32},
         rng));
 
-    auto *BI = dyn_cast<BranchInst>(F->getEntryBlock().getTerminator());
+    auto *BI = dyn_cast<CondBrInst>(F->getEntryBlock().getTerminator());
     REQUIRE(BI);
-    REQUIRE(BI->isConditional());
     CHECK_FALSE(isa<ConstantInt>(BI->getCondition()));
     CHECK(BI->getCondition()->getName().starts_with("morok.sc.const"));
     CHECK(BI->getSuccessor(0)->getName() == "left");
@@ -13595,13 +13590,11 @@ no:
                         "morok.trace.latent"))
                     ++latentAtomicRmws;
             }
-            if (auto *BI = dyn_cast<BranchInst>(&I)) {
-                if (BI->isConditional() &&
-                    BI->getCondition()->getName().starts_with(
+            if (auto *BI = dyn_cast<CondBrInst>(&I)) {
+                if (BI->getCondition()->getName().starts_with(
                         "morok.trace.delay.branch.cond"))
                     ++delayedBranchKeys;
-                if (BI->isConditional() &&
-                    BI->getCondition()->getName().starts_with(
+                if (BI->getCondition()->getName().starts_with(
                         "morok.trace.branch.cond"))
                     ++bodyBranchPoisons;
             }
@@ -17323,17 +17316,16 @@ lpad:
     bool fallbackBehindMiss = false;
     bool fallbackBehindDlsymNullCheck = false;
     for (BasicBlock *Pred : predecessors(Fallback->getParent())) {
-        if (auto *BI = dyn_cast<BranchInst>(Pred->getTerminator())) {
+        if (auto *BI = dyn_cast<CondBrInst>(Pred->getTerminator())) {
             fallbackBehindDlsymNullCheck |=
-                BI->isConditional() &&
                 BI->getCondition()->getName().starts_with(
                     "morok.fco.dlsym.available");
         }
         for (BasicBlock *GrandPred : predecessors(Pred)) {
-            if (auto *BI = dyn_cast<BranchInst>(GrandPred->getTerminator())) {
-                fallbackBehindMiss |= BI->isConditional() &&
-                                      BI->getCondition()->getName().starts_with(
-                                          "morok.fco.hash.miss");
+            if (auto *BI =
+                    dyn_cast<CondBrInst>(GrandPred->getTerminator())) {
+                fallbackBehindMiss |= BI->getCondition()->getName().starts_with(
+                    "morok.fco.hash.miss");
             }
         }
     }
@@ -21982,9 +21974,8 @@ define i32 @main() { ret i32 0 }
     }
     CHECK(scanBoundedToCurrentStub);
     REQUIRE(scanBody != nullptr);
-    auto *scanBodyBr = dyn_cast<BranchInst>(scanBody->getTerminator());
+    auto *scanBodyBr = dyn_cast<CondBrInst>(scanBody->getTerminator());
     REQUIRE(scanBodyBr != nullptr);
-    CHECK(scanBodyBr->isConditional());
     CHECK((scanBodyBr->getSuccessor(0)->getName() == "ret" ||
            scanBodyBr->getSuccessor(1)->getName() == "ret"));
     CHECK(countNamedInstructions(*Veh, "morok.win.veh.code") >= 1u);
@@ -22261,9 +22252,8 @@ define i32 @main() { ret i32 0 }
         if (BB.getName() == "close.prev")
             ClosePrev = &BB;
     REQUIRE(ClosePrev != nullptr);
-    auto *ClosePrevBr = dyn_cast<BranchInst>(ClosePrev->getTerminator());
+    auto *ClosePrevBr = dyn_cast<CondBrInst>(ClosePrev->getTerminator());
     REQUIRE(ClosePrevBr != nullptr);
-    REQUIRE(ClosePrevBr->isConditional());
     CHECK(ClosePrevBr->getCondition()->getName().starts_with(
         "morok.win.thide.close.prev.needed"));
     CHECK_FALSE(verifyModule(*M, &errs()));
@@ -23302,8 +23292,8 @@ define i32 @main() { ret i32 0 }
                     // plain rdtsc (not the rdtscp substring)
                     hasRdtsc |= s.contains("rdtsc\n") || s.contains("rdtsc ");
                 }
-        if (auto *BI = dyn_cast<BranchInst>(&I))
-            hasCondBranch |= BI->isConditional();
+        if (isa<CondBrInst>(&I))
+            hasCondBranch = true;
     }
     CHECK(hasCpuid);      // feature test
     CHECK(hasRdtscp);     // fast path (guarded)
@@ -24209,8 +24199,7 @@ else:
     std::size_t conditionalBranches = 0;
     std::size_t indirectBranches = 0;
     for (Instruction &I : instructions(Pick)) {
-        if (auto *BI = dyn_cast<BranchInst>(&I))
-            conditionalBranches += BI->isConditional() ? 1u : 0u;
+        conditionalBranches += isa<CondBrInst>(&I) ? 1u : 0u;
         indirectBranches += isa<IndirectBrInst>(&I) ? 1u : 0u;
     }
     CHECK(conditionalBranches == 0u);
@@ -24280,8 +24269,7 @@ else:
     std::size_t handlerConditionalBranches = 0;
     std::size_t pickIndirectBranches = 0;
     for (Instruction &I : instructions(Handler))
-        if (auto *BI = dyn_cast<BranchInst>(&I))
-            handlerConditionalBranches += BI->isConditional() ? 1u : 0u;
+        handlerConditionalBranches += isa<CondBrInst>(&I) ? 1u : 0u;
     for (Instruction &I : instructions(Pick))
         pickIndirectBranches += isa<IndirectBrInst>(&I) ? 1u : 0u;
 
@@ -24539,7 +24527,7 @@ TEST_CASE("mirage hub forwards through a branchless morok.* selector") {
     CHECK(hub->size() == 1u);
     bool anyBranch = false, indirectCall = false, callsSelector = false;
     for (Instruction &I : hub->front()) {
-        if (isa<BranchInst>(I))
+        if (isa<UncondBrInst, CondBrInst>(I))
             anyBranch = true;
         if (auto *CB = dyn_cast<CallInst>(&I)) {
             Function *Callee = CB->getCalledFunction();
@@ -24575,9 +24563,8 @@ TEST_CASE("mirage hub forwards through a branchless morok.* selector") {
             if (auto *LI = dyn_cast<LoadInst>(&I))
                 if (LI->getType()->isPointerTy())
                     loadsPtr = true;
-            if (auto *BR = dyn_cast<BranchInst>(&I))
-                if (BR->isConditional())
-                    condBranch = true;
+            if (isa<CondBrInst>(&I))
+                condBranch = true;
         }
     CHECK(hasSelect);       // branchless routing via `select`
     CHECK(loadsPtr);        // loads the target from the candidate table

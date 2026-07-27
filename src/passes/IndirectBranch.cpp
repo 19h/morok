@@ -54,9 +54,7 @@ bool addUniqueSuccessor(SmallVectorImpl<BasicBlock *> &successors,
 
 bool collectEligibleSuccessors(Instruction *term,
                                SmallVectorImpl<BasicBlock *> &successors) {
-    if (auto *br = dyn_cast<BranchInst>(term)) {
-        if (!br->isConditional())
-            return false;
+    if (auto *br = dyn_cast<CondBrInst>(term)) {
         for (BasicBlock *succ : llvm::successors(br))
             if (!addUniqueSuccessor(successors, succ))
                 return false;
@@ -92,7 +90,7 @@ slotIds(ArrayRef<BasicBlock *> tableOrder) {
     return ids;
 }
 
-Value *branchIndex(IRBuilder<> &B, BranchInst *br,
+Value *branchIndex(IRBuilder<> &B, CondBrInst *br,
                    const DenseMap<BasicBlock *, std::uint64_t> &ids) {
     auto *i64 = Type::getInt64Ty(B.getContext());
     return B.CreateSelect(
@@ -154,7 +152,7 @@ bool indirectBranchFunction(Function &F, const IndirParams &params,
 
         IRBuilder<> B(target.term);
         Value *idx = nullptr;
-        if (auto *br = dyn_cast<BranchInst>(target.term))
+        if (auto *br = dyn_cast<CondBrInst>(target.term))
             idx = branchIndex(B, br, ids);
         else
             idx = switchIndex(B, cast<SwitchInst>(target.term), ids);

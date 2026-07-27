@@ -228,9 +228,8 @@ TEST_CASE("nanomitesModule replaces the conditional branch with a trap dispatch"
     Function *gate = M->getFunction("gate");
     REQUIRE(gate != nullptr);
     BasicBlock &entry = gate->getEntryBlock();
-    auto *term = dyn_cast<BranchInst>(entry.getTerminator());
+    auto *term = dyn_cast<UncondBrInst>(entry.getTerminator());
     REQUIRE(term != nullptr);
-    CHECK_FALSE(term->isConditional());
 
     // The encrypted PC->target table is an array-of-struct global.
     GlobalVariable *table =

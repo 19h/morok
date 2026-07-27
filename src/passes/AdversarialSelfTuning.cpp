@@ -171,8 +171,12 @@ void scoreInstruction(const Instruction &I, AdversarialScore &S) {
         scoreGep(*GEP, S);
         return;
     }
-    if (const auto *BI = dyn_cast<BranchInst>(&I)) {
-        S.cfg_recovery += BI->isConditional() ? 18 : 4;
+    if (isa<CondBrInst>(&I)) {
+        S.cfg_recovery += 18;
+        return;
+    }
+    if (isa<UncondBrInst>(&I)) {
+        S.cfg_recovery += 4;
         return;
     }
 

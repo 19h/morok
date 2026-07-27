@@ -321,9 +321,7 @@ bool eligibleFunction(Function &F) {
            !functionAddressEscapes(F) && !calledFromNaturalLoop(F);
 }
 
-bool eligibleBranchShape(BranchInst &BI) {
-    if (!BI.isConditional())
-        return false;
+bool eligibleBranchShape(CondBrInst &BI) {
     BasicBlock *head = BI.getParent();
     BasicBlock *trueTarget = BI.getSuccessor(0);
     BasicBlock *falseTarget = BI.getSuccessor(1);
@@ -341,7 +339,7 @@ DenseMap<const BasicBlock *, unsigned> blockOrder(const Function &F) {
     return order;
 }
 
-bool forwardBranch(BranchInst &BI,
+bool forwardBranch(CondBrInst &BI,
                    const DenseMap<const BasicBlock *, unsigned> &Order) {
     if (!eligibleBranchShape(BI))
         return false;
@@ -361,11 +359,11 @@ bool armTerminates(BasicBlock *BB) {
     return isa<ReturnInst>(Term) || isa<UnreachableInst>(Term);
 }
 
-bool isDecisionBranch(BranchInst &BI) {
+bool isDecisionBranch(CondBrInst &BI) {
     return armTerminates(BI.getSuccessor(0)) || armTerminates(BI.getSuccessor(1));
 }
 
-void shuffleBranches(std::vector<BranchInst *> &Branches, ir::IRRandom &Rng) {
+void shuffleBranches(std::vector<CondBrInst *> &Branches, ir::IRRandom &Rng) {
     for (std::size_t i = Branches.size(); i > 1; --i) {
         const std::size_t j = Rng.range(static_cast<std::uint32_t>(i));
         std::swap(Branches[i - 1], Branches[j]);
@@ -396,7 +394,7 @@ void relaxFunctionAttrs(Function &F) {
     F.removeFnAttr(Attribute::Speculatable);
 }
 
-bool lowerBranch(BranchInst &BI, Site &S, GlobalVariable *Decision,
+bool lowerBranch(CondBrInst &BI, Site &S, GlobalVariable *Decision,
                  GlobalVariable *Token, GlobalVariable *Target,
                  const NanomiteLayout &Layout, Module &M) {
     Function &F = *BI.getFunction();
@@ -745,7 +743,7 @@ bool nanomitesModule(Module &M, const NanomiteParams &Params,
     if (intPtrTy(M)->getBitWidth() != 64 || !nanomiteLayout(tt, layout))
         return false;
 
-    std::vector<BranchInst *> candidates;
+    std::vector<CondBrInst *> candidates;
     for (Function &F : M) {
         if (!eligibleFunction(F))
             continue;
@@ -754,7 +752,7 @@ bool nanomitesModule(Module &M, const NanomiteParams &Params,
         for (BasicBlock &BB : F) {
             if (loopBlocks.contains(&BB))
                 continue;
-            if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator())) {
+            if (auto *BI = dyn_cast<CondBrInst>(BB.getTerminator())) {
                 if (!eligibleBranchShape(*BI))
                     continue;
                 // Admit forward branches (as before) AND decision branches whose
@@ -777,7 +775,7 @@ bool nanomitesModule(Module &M, const NanomiteParams &Params,
     // patches — while keeping the randomized order within each tier so the choice
     // still varies per build.  stable_partition preserves the post-shuffle order.
     std::stable_partition(candidates.begin(), candidates.end(),
-                          [](BranchInst *BI) { return isDecisionBranch(*BI); });
+                          [](CondBrInst *BI) { return isDecisionBranch(*BI); });
     GlobalVariable *decision = decisionGlobal(M);
     GlobalVariable *token = tokenGlobal(M);
     GlobalVariable *target = targetGlobal(M);
@@ -785,7 +783,7 @@ bool nanomitesModule(Module &M, const NanomiteParams &Params,
     sites.reserve(std::min<std::size_t>(Params.max_sites, candidates.size()));
     DenseMap<Function *, std::uint32_t> sitesPerFunction;
 
-    for (BranchInst *BI : candidates) {
+    for (CondBrInst *BI : candidates) {
         if (sites.size() >= Params.max_sites)
             break;
         Function *F = BI->getFunction();

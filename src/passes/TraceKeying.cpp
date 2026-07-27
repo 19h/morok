@@ -82,7 +82,8 @@ Instruction *traceSplitPoint(BasicBlock &BB) {
 }
 
 bool directTerminator(const Instruction *Term) {
-    return isa_and_nonnull<BranchInst>(Term) || isa_and_nonnull<SwitchInst>(Term);
+    return isa_and_nonnull<UncondBrInst, CondBrInst>(Term) ||
+           isa_and_nonnull<SwitchInst>(Term);
 }
 
 bool eligibleBlock(BasicBlock &BB, BasicBlock &Entry) {
@@ -232,9 +233,8 @@ Value *valueTraceTag(IRBuilder<NoFolder> &B, Instruction &Term, Value *EdgeTag,
                      ir::IRRandom &Rng) {
     Value *Tag = EdgeTag;
 
-    if (auto *BI = dyn_cast<BranchInst>(&Term)) {
-        if (BI->isConditional())
-            Tag = mixRuntimeValue(B, Tag, BI->getCondition(), Rng);
+    if (auto *BI = dyn_cast<CondBrInst>(&Term)) {
+        Tag = mixRuntimeValue(B, Tag, BI->getCondition(), Rng);
     } else if (auto *SI = dyn_cast<SwitchInst>(&Term)) {
         Tag = mixRuntimeValue(B, Tag, SI->getCondition(), Rng);
     }
@@ -295,9 +295,7 @@ void poisonTerminator(BasicBlock *Body, Value *Diff) {
         return;
     }
 
-    if (auto *BI = dyn_cast<BranchInst>(Term)) {
-        if (!BI->isConditional())
-            return;
+    if (auto *BI = dyn_cast<CondBrInst>(Term)) {
         Value *Bad = asConditionKey(B, Diff);
         Value *Cond =
             B.CreateXor(BI->getCondition(), Bad, "morok.trace.branch.cond");
@@ -414,9 +412,9 @@ Value *tagForSuccessor(IRBuilder<NoFolder> &B, BasicBlock *Succ,
 Value *selectedEdgeTag(IRBuilder<NoFolder> &B, Instruction &Term,
                        const DenseMap<BasicBlock *, std::uint64_t> &KeyOf,
                        ir::IRRandom &Rng) {
-    if (auto *BI = dyn_cast<BranchInst>(&Term)) {
-        if (BI->isUnconditional())
-            return tagForSuccessor(B, BI->getSuccessor(0), KeyOf, Rng);
+    if (auto *BI = dyn_cast<UncondBrInst>(&Term))
+        return tagForSuccessor(B, BI->getSuccessor(0), KeyOf, Rng);
+    if (auto *BI = dyn_cast<CondBrInst>(&Term)) {
         return B.CreateSelect(
             BI->getCondition(),
             tagForSuccessor(B, BI->getSuccessor(0), KeyOf, Rng),
@@ -501,8 +499,10 @@ bool supportsDelayedProbe(Instruction &Term) {
         return IT && IT->getBitWidth() <= 64;
     }
 
-    if (auto *BI = dyn_cast<BranchInst>(&Term))
-        return BI->isConditional();
+    if (isa<CondBrInst>(&Term))
+        return true;
+    if (isa<UncondBrInst>(&Term))
+        return false;
 
     if (auto *SI = dyn_cast<SwitchInst>(&Term)) {
         auto *IT = dyn_cast<IntegerType>(SI->getCondition()->getType());
@@ -587,9 +587,7 @@ bool insertDelayedProbe(Instruction &Term, GlobalVariable *Latent,
         return true;
     }
 
-    if (auto *BI = dyn_cast<BranchInst>(&Term)) {
-        if (!BI->isConditional())
-            return false;
+    if (auto *BI = dyn_cast<CondBrInst>(&Term)) {
         Value *Cond = B.CreateXor(BI->getCondition(), Probe.fire,
                                   "morok.trace.delay.branch.cond");
         BI->setCondition(Cond);

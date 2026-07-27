@@ -78,8 +78,8 @@ bool validSuccessor(const BasicBlock *Succ, const BasicBlock *Entry) {
 
 std::vector<BasicBlock *> terminatorSuccessors(Instruction &Term) {
     std::vector<BasicBlock *> Succs;
-    if (auto *Br = dyn_cast<BranchInst>(&Term)) {
-        for (BasicBlock *Succ : llvm::successors(Br))
+    if (isa<UncondBrInst, CondBrInst>(&Term)) {
+        for (BasicBlock *Succ : llvm::successors(&Term))
             addUnique(Succs, Succ);
     } else if (auto *Sw = dyn_cast<SwitchInst>(&Term)) {
         addUnique(Succs, Sw->getDefaultDest());
@@ -90,9 +90,8 @@ std::vector<BasicBlock *> terminatorSuccessors(Instruction &Term) {
 }
 
 bool eligibleTerminator(Instruction &Term, BasicBlock *Entry) {
-    if (auto *Br = dyn_cast<BranchInst>(&Term)) {
-        if (Br->getNumSuccessors() == 0)
-            return false;
+    if (isa<UncondBrInst, CondBrInst>(&Term)) {
+        // Both direct branch forms have at least one successor.
     } else if (auto *Sw = dyn_cast<SwitchInst>(&Term)) {
         if (Sw->getNumSuccessors() == 0)
             return false;
@@ -195,9 +194,8 @@ std::vector<Value *> collectTerms(Instruction &Term, std::uint32_t MaxTerms) {
         return Terms;
     SmallPtrSet<Value *, 32> Seen;
 
-    if (auto *Br = dyn_cast<BranchInst>(&Term)) {
-        if (Br->isConditional())
-            addTerm(Br->getCondition(), Seen, Terms, Limit);
+    if (auto *Br = dyn_cast<CondBrInst>(&Term)) {
+        addTerm(Br->getCondition(), Seen, Terms, Limit);
     } else if (auto *Sw = dyn_cast<SwitchInst>(&Term)) {
         addTerm(Sw->getCondition(), Seen, Terms, Limit);
     }
@@ -226,9 +224,9 @@ selectedIndex(IRBuilder<NoFolder> &B, Instruction &Term,
               const std::unordered_map<BasicBlock *, std::uint32_t> &ID) {
     auto *I32 = B.getInt32Ty();
 
-    if (auto *Br = dyn_cast<BranchInst>(&Term)) {
-        if (Br->isUnconditional())
-            return ConstantInt::get(I32, ID.at(Br->getSuccessor(0)));
+    if (auto *Br = dyn_cast<UncondBrInst>(&Term))
+        return ConstantInt::get(I32, ID.at(Br->getSuccessor(0)));
+    if (auto *Br = dyn_cast<CondBrInst>(&Term)) {
         return B.CreateSelect(Br->getCondition(),
                               ConstantInt::get(I32, ID.at(Br->getSuccessor(0))),
                               ConstantInt::get(I32, ID.at(Br->getSuccessor(1))),

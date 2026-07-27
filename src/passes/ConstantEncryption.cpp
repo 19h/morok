@@ -98,9 +98,7 @@ Constant *eligibleStoreValue(StoreInst &SI) {
     return C;
 }
 
-ConstantInt *eligibleBranchCondition(BranchInst &BI) {
-    if (!BI.isConditional())
-        return nullptr;
+ConstantInt *eligibleBranchCondition(CondBrInst &BI) {
     auto *C = dyn_cast<ConstantInt>(BI.getCondition());
     if (!C || !eligibleWidth(C->getType()->getIntegerBitWidth()))
         return nullptr;
@@ -122,7 +120,7 @@ bool eligiblePhiIncoming(PHINode &PN, unsigned Incoming) {
     Instruction *Term = Pred ? Pred->getTerminator() : nullptr;
     if (!Term || Term->getNumSuccessors() == 0)
         return false;
-    return Term->getNumSuccessors() == 1 || isa<BranchInst>(Term) ||
+    return Term->getNumSuccessors() == 1 || isa<CondBrInst>(Term) ||
            isa<SwitchInst>(Term);
 }
 
@@ -491,7 +489,7 @@ bool constantEncryptFunction(Function &F, const ConstEncParams &params,
                 } else if (auto *SI = dyn_cast<StoreInst>(&inst)) {
                     if (auto *C = eligibleStoreValue(*SI))
                         targets.push_back({&inst, 0, C});
-                } else if (auto *BI = dyn_cast<BranchInst>(&inst)) {
+                } else if (auto *BI = dyn_cast<CondBrInst>(&inst)) {
                     if (auto *C = eligibleBranchCondition(*BI))
                         targets.push_back({&inst, 0, C});
                 } else if (auto *SW = dyn_cast<SwitchInst>(&inst)) {

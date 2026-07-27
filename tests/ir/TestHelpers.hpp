@@ -249,8 +249,8 @@ inline bool namedConditionBranchesTo(llvm::Function &F,
                                      llvm::StringRef conditionPrefix,
                                      llvm::StringRef trueSuccessorPrefix) {
     for (llvm::BasicBlock &BB : F) {
-        auto *BI = llvm::dyn_cast<llvm::BranchInst>(BB.getTerminator());
-        if (!BI || !BI->isConditional())
+        auto *BI = llvm::dyn_cast<llvm::CondBrInst>(BB.getTerminator());
+        if (!BI)
             continue;
         llvm::Value *Cond = BI->getCondition();
         if (Cond->hasName() && Cond->getName().starts_with(conditionPrefix) &&

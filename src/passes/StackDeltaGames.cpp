@@ -263,7 +263,7 @@ bool stackDeltaGamesFunction(Function &F, const StackDeltaParams &params,
         Instruction *HeadTerm = Head->getTerminator();
         emitStackDelta(Head, *SplitPt, Seed, params, rng);
         HeadTerm->eraseFromParent();
-        BranchInst::Create(Body, Head);
+        UncondBrInst::Create(Body, Head);
         Changed = true;
         ++Count;
     }

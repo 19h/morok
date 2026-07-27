@@ -56,8 +56,8 @@ void addUnique(std::vector<BasicBlock *> &Blocks, BasicBlock *BB) {
 
 std::vector<BasicBlock *> successorsOf(Instruction &Term) {
     std::vector<BasicBlock *> Succs;
-    if (auto *Br = dyn_cast<BranchInst>(&Term)) {
-        for (BasicBlock *Succ : llvm::successors(Br))
+    if (isa<UncondBrInst, CondBrInst>(&Term)) {
+        for (BasicBlock *Succ : llvm::successors(&Term))
             addUnique(Succs, Succ);
     } else if (auto *Sw = dyn_cast<SwitchInst>(&Term)) {
         addUnique(Succs, Sw->getDefaultDest());
@@ -68,7 +68,7 @@ std::vector<BasicBlock *> successorsOf(Instruction &Term) {
 }
 
 bool eligibleTerminator(Instruction &Term, BasicBlock *Entry) {
-    if (!isa<BranchInst>(&Term) && !isa<SwitchInst>(&Term))
+    if (!isa<UncondBrInst, CondBrInst>(&Term) && !isa<SwitchInst>(&Term))
         return false;
     BasicBlock *Parent = Term.getParent();
     if (!Parent || Parent->isEHPad() || Parent->isLandingPad() ||
@@ -104,9 +104,9 @@ selectedIndex(Builder &B, Instruction &Term,
               const std::unordered_map<BasicBlock *, std::uint32_t> &ID) {
     auto *I32 = B.getInt32Ty();
 
-    if (auto *Br = dyn_cast<BranchInst>(&Term)) {
-        if (Br->isUnconditional())
-            return ConstantInt::get(I32, ID.at(Br->getSuccessor(0)));
+    if (auto *Br = dyn_cast<UncondBrInst>(&Term))
+        return ConstantInt::get(I32, ID.at(Br->getSuccessor(0)));
+    if (auto *Br = dyn_cast<CondBrInst>(&Term)) {
         return B.CreateSelect(Br->getCondition(),
                               ConstantInt::get(I32, ID.at(Br->getSuccessor(0))),
                               ConstantInt::get(I32, ID.at(Br->getSuccessor(1))),

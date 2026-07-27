@@ -330,9 +330,8 @@ TEST_CASE("shamirShareFunction rewrites constant branch conditions with truncati
 
     // The entry terminator is now a runtime condition, not a folded constant.
     auto *term = F->getEntryBlock().getTerminator();
-    auto *br = dyn_cast<BranchInst>(term);
+    auto *br = dyn_cast<CondBrInst>(term);
     REQUIRE(br);
-    REQUIRE(br->isConditional());
     CHECK_FALSE(isa<ConstantInt>(br->getCondition()));
 
     CHECK_FALSE(verifyModule(*M));

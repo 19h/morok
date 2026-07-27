@@ -93,9 +93,7 @@ bool inputDerived(Value *V, unsigned Depth, SmallPtrSetImpl<Value *> &Seen) {
     return false;
 }
 
-bool eligibleBranch(BranchInst &BI) {
-    if (!BI.isConditional())
-        return false;
+bool eligibleBranch(CondBrInst &BI) {
     BasicBlock *BB = BI.getParent();
     if (!BB || BB->isEHPad() || BB->isLandingPad() || generatedBlock(*BB))
         return false;
@@ -103,7 +101,7 @@ bool eligibleBranch(BranchInst &BI) {
     return inputDerived(BI.getCondition(), 8, Seen);
 }
 
-void shuffleBranches(std::vector<BranchInst *> &Branches, ir::IRRandom &Rng) {
+void shuffleBranches(std::vector<CondBrInst *> &Branches, ir::IRRandom &Rng) {
     for (std::size_t I = Branches.size(); I > 1; --I) {
         const std::size_t J = Rng.range(static_cast<std::uint32_t>(I));
         std::swap(Branches[I - 1], Branches[J]);
@@ -286,7 +284,7 @@ void relaxMemoryAttrs(Function &F) {
     F.removeFnAttr(Attribute::WillReturn);
 }
 
-bool transformBranch(BranchInst &BI, const MqGateParams &Params,
+bool transformBranch(CondBrInst &BI, const MqGateParams &Params,
                      ir::IRRandom &Rng) {
     Function &F = *BI.getFunction();
     Module &M = *F.getParent();
@@ -348,9 +346,9 @@ bool mqGateFunction(Function &F, const MqGateParams &Params,
         Params.max_gates == 0 || !withinMqBudget(F))
         return false;
 
-    std::vector<BranchInst *> Candidates;
+    std::vector<CondBrInst *> Candidates;
     for (BasicBlock &BB : F)
-        if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator()))
+        if (auto *BI = dyn_cast<CondBrInst>(BB.getTerminator()))
             if (eligibleBranch(*BI))
                 Candidates.push_back(BI);
     if (Candidates.empty())
@@ -359,7 +357,7 @@ bool mqGateFunction(Function &F, const MqGateParams &Params,
     shuffleBranches(Candidates, Rng);
     bool Changed = false;
     std::uint32_t Count = 0;
-    for (BranchInst *BI : Candidates) {
+    for (CondBrInst *BI : Candidates) {
         if (Count >= Params.max_gates)
             break;
         if (!Rng.chance(Params.probability))

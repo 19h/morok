@@ -80,9 +80,7 @@ Constant *eligibleStoreValue(StoreInst &SI) {
     return C;
 }
 
-ConstantInt *eligibleBranchCondition(BranchInst &BI) {
-    if (!BI.isConditional())
-        return nullptr;
+ConstantInt *eligibleBranchCondition(CondBrInst &BI) {
     auto *C = dyn_cast<ConstantInt>(BI.getCondition());
     if (!C || !eligibleWidth(C->getType()->getIntegerBitWidth()))
         return nullptr;
@@ -104,7 +102,7 @@ bool eligiblePhiIncoming(PHINode &PN, unsigned Incoming) {
     Instruction *Term = Pred ? Pred->getTerminator() : nullptr;
     if (!Term || Term->getNumSuccessors() == 0)
         return false;
-    return Term->getNumSuccessors() == 1 || isa<BranchInst>(Term) ||
+    return Term->getNumSuccessors() == 1 || isa<CondBrInst>(Term) ||
            isa<SwitchInst>(Term);
 }
 
@@ -349,7 +347,7 @@ bool shamirShareFunction(Function &F, const ShamirShareParams &Params,
             } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
                 if (auto *C = eligibleStoreValue(*SI))
                     Targets.push_back({&I, 0, C});
-            } else if (auto *BI = dyn_cast<BranchInst>(&I)) {
+            } else if (auto *BI = dyn_cast<CondBrInst>(&I)) {
                 if (auto *C = eligibleBranchCondition(*BI))
                     Targets.push_back({&I, 0, C});
             } else if (auto *SW = dyn_cast<SwitchInst>(&I)) {

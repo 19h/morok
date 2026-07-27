@@ -122,8 +122,8 @@ bool flattenControlFlow(Function &F, IRRandom &rng,
     SwitchInst *sw = dispB.CreateSwitch(stateLoad, defaultBB,
                                         static_cast<unsigned>(blocks.size()));
 
-    BranchInst::Create(dispatch, backEdge);
-    BranchInst::Create(backEdge, defaultBB);
+    UncondBrInst::Create(dispatch, backEdge);
+    UncondBrInst::Create(backEdge, defaultBB);
 
     for (BasicBlock *bb : blocks) {
         bb->moveBefore(backEdge);
@@ -135,14 +135,12 @@ bool flattenControlFlow(Function &F, IRRandom &rng,
         IRBuilder<> b(term);
         SuccessorIds succ;
 
-        if (auto *br = dyn_cast<BranchInst>(term)) {
-            if (br->isUnconditional()) {
-                succ.defaultId = idOf[br->getSuccessor(0)];
-            } else {
-                succ.arms.push_back(
-                    {br->getCondition(), idOf[br->getSuccessor(0)]});
-                succ.defaultId = idOf[br->getSuccessor(1)];
-            }
+        if (auto *uncondBr = dyn_cast<UncondBrInst>(term)) {
+            succ.defaultId = idOf[uncondBr->getSuccessor(0)];
+        } else if (auto *condBr = dyn_cast<CondBrInst>(term)) {
+            succ.arms.push_back(
+                {condBr->getCondition(), idOf[condBr->getSuccessor(0)]});
+            succ.defaultId = idOf[condBr->getSuccessor(1)];
         } else if (auto *swTerm = dyn_cast<SwitchInst>(term)) {
             // Route every case through the dispatcher (no direct edges), so the
             // state stays consistent — essential for state-dependent
