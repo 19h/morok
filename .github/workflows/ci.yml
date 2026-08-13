@@ -64,7 +64,7 @@ jobs:
 
       - name: Install CMake + Ninja
         if: runner.os != 'Linux'
-        uses: lukka/get-cmake@f5b8fbb4d77cec1acc5a5f9f0df4beffaf5d98d9 # latest, pinned 2026-06-19
+        uses: lukka/get-cmake@fffaaafeea488556c2c12dad60690008bc1caacb # latest, pinned 2026-06-19
 
       - name: Set up MSVC environment (Windows)
         if: runner.os == 'Windows'
