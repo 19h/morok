@@ -558,6 +558,22 @@ set_tests_properties("e2e/vtable_integrity_dispatch" PROPERTIES
     "$<TARGET_FILE:morok_plugin>;${_vtable_integrity_driver};${_vtable_integrity_config};${_vtable_integrity_workload}"
   TIMEOUT 120)
 
+# Native ABI regression: a carrier must not overwrite LLVM's stack-frame base
+# while spilled arguments are being reloaded for the dispatched call.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64|x86_64|amd64|AMD64)$")
+  add_test(NAME "e2e/caller_keyed_stack_base"
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/caller_keyed_stack_base.sh"
+            "${CMAKE_C_COMPILER}"
+            "$<TARGET_FILE:morok_plugin>"
+            "${_sysroot}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/caller_keyed_stack_base.c")
+  set_tests_properties("e2e/caller_keyed_stack_base" PROPERTIES
+    LABELS "e2e;abi"
+    REQUIRED_FILES
+      "$<TARGET_FILE:morok_plugin>;${CMAKE_CURRENT_SOURCE_DIR}/fixtures/caller_keyed_stack_base.c"
+    TIMEOUT 120)
+endif()
+
 # Mirage clean differential: on a clean run the seal-gated hub always routes to a
 # real clone, so obfuscated output must match the reference exactly even as the
 # per-invocation epoch alternates between the equivalent clones.  The mirage.toml

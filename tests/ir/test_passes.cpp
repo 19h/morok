@@ -14456,12 +14456,12 @@ entry:
     CHECK(countCallsTo(*Caller, "inc") == 0u);
     CHECK(countCallsTo(*Caller, "mix") == 0u);
     CHECK(countCallsThroughOperand(*Caller, Dispatch) == 2u);
-    CHECK(countInlineAsmConstraints(*Caller, "={x19}") == 4u);
-    CHECK(countInlineAsmConstraints(*Caller, "{x19}") == 6u);
-    CHECK(countInlineAsmConstraints(*Caller, "~{x19}") == 0u);
+    CHECK(countInlineAsmConstraints(*Caller, "={x20}") == 4u);
+    CHECK(countInlineAsmConstraints(*Caller, "{x20}") == 6u);
+    CHECK(countInlineAsmConstraints(*Caller, "~{x20}") == 0u);
     CHECK(countNamedInstructions(*Caller, "morok.ckd.carrier.saved") == 2u);
     CHECK(countNamedInstructions(*Caller, "morok.ckd.carrier.restored") == 2u);
-    CHECK(countInlineAsmBodies(*Caller, "mov $0, x19") == 2u);
+    CHECK(countInlineAsmBodies(*Caller, "mov $0, x20") == 2u);
     CHECK(countGlobals(*M, "morok.ckd.enc") == 2u);
     CHECK(countGlobals(*M, "morok.ckd.cache") == 2u);
     CHECK(countGlobals(*M, "morok.ckd.code.size") == 2u);

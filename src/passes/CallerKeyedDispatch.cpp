@@ -109,11 +109,13 @@ std::optional<Arch> archOf(const Triple &TT) {
 // so the carried jump target survives the dispatcher call's argument setup.  CKD
 // saves/restores the chosen physical register around each dispatched call; the
 // target callee preserves the temporary branch target, not the caller's original
-// register contents.  The legacy register (x19 / r14) is first so
-// `carriers == 1` keeps the original dispatcher identity.
+// register contents. LLVM reserves x19 as AArch64's frame base pointer for
+// dynamic stack frames; overwriting it can redirect argument/spill reloads into
+// the target's code bytes before the call. Keep it out of the carrier pool.
+// The first register (x20 / r14) uses the default dispatcher identity.
 std::vector<std::string> carrierPool(Arch A) {
     if (A == Arch::AArch64)
-        return {"x19", "x20", "x21", "x22", "x23",
+        return {"x20", "x21", "x22", "x23",
                 "x24", "x25", "x26", "x27", "x28"};
     return {"r14", "r12", "r13", "r15"};
 }
@@ -168,7 +170,7 @@ bool eligible(CallInst &CI) {
         return false;
     if (Callee->getName().starts_with("morok."))
         return false;
-    // The carrier register pool (x19-x28 / r12-r15) must stay callee-saved and
+    // The carrier register pool (x20-x28 / r12-r15) must stay callee-saved and
     // never used for argument passing under the call's convention, or the
     // dispatcher call's argument setup would overwrite the loaded jump target
     // and the naked `br`/`jmp` would land on an argument value.  C and fastcc
@@ -735,8 +737,7 @@ bool callerKeyedDispatchModule(Module &M,
         S.code_size = makeCodeSizeSlot(M);
         S.seal_state = makeSealStateSlot(M, S.seal_unsealed);
         // Rotate the carrier register per site.  `carriers == 1` consumes no RNG
-        // and resolves to the legacy `morok.ckd.dispatch` (x19 / r14), so the
-        // single-carrier path stays byte-identical to the original.
+        // and resolves to the default `morok.ckd.dispatch` (x20 / r14).
         const std::uint32_t Ci = NCarriers <= 1 ? 0u : rng.range(NCarriers);
         S.carrier = Pool[Ci];
         S.dispatcher = ensureDispatcher(M, dispatcherName(Pool[Ci], Ci == 0),

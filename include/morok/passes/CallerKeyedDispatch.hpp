@@ -25,7 +25,7 @@ struct CallerKeyedDispatchParams {
     std::uint32_t max_calls = 4096;  ///< transformed direct call-site cap
     std::uint32_t region_bytes = 16; ///< live code bytes hashed per site
     /// Number of distinct callee-saved carrier registers to rotate the indirect
-    /// dispatch through (1 = the single legacy `morok.ckd.dispatch` / `br x19`).
+    /// dispatch through (1 = the default `morok.ckd.dispatch` / `br x20`).
     /// Higher values spread sites across per-register dispatchers
     /// (`morok.ckd.dispatch.x21`, ...) so the final indirect branch differs per
     /// site and the call ABI looks bespoke.  Clamped to the per-arch pool.
