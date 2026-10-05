@@ -38,7 +38,7 @@ bool dispatcherlessRoutingFunction(llvm::Function &F,
 
 /// New-PM wrapper for standalone use (`-passes=morok-dispatchless`).
 class DispatcherlessRoutingPass
-    : public llvm::PassInfoMixin<DispatcherlessRoutingPass> {
+    : public llvm::RequiredPassInfoMixin<DispatcherlessRoutingPass> {
 public:
     explicit DispatcherlessRoutingPass(DispatcherlessRoutingParams params = {},
                                        std::uint64_t seed = 0x1337)
@@ -46,7 +46,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     DispatcherlessRoutingParams params_;

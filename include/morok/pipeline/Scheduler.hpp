@@ -19,13 +19,12 @@
 namespace morok::pipeline {
 
 /// Module pass that applies the whole Morok obfuscation pipeline.
-class MorokPass : public llvm::PassInfoMixin<MorokPass> {
+class MorokPass : public llvm::RequiredPassInfoMixin<MorokPass> {
 public:
     explicit MorokPass(config::Config config) : config_(std::move(config)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     config::Config config_;

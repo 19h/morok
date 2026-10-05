@@ -37,7 +37,7 @@ bool nativeCodePackModule(llvm::Module &M,
                           const NativeCodePackParams &params,
                           morok::ir::IRRandom &rng);
 
-class NativeCodePackPass : public llvm::PassInfoMixin<NativeCodePackPass> {
+class NativeCodePackPass : public llvm::RequiredPassInfoMixin<NativeCodePackPass> {
 public:
     explicit NativeCodePackPass(NativeCodePackParams params = {},
                                 std::uint64_t seed = 0x4E5041434BULL)
@@ -46,7 +46,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     NativeCodePackParams params_;

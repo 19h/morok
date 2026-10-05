@@ -71,4 +71,4 @@ cmake --build "$BUILD" -j "$JOBS"
 
 echo ">> running full test suite (ctest -j $JOBS)"
 set -x
-ctest --test-dir "$BUILD" -j "$JOBS" --output-on-failure "${CTEST_ARGS[@]}"
+ctest --test-dir "$BUILD" -j "$JOBS" --no-tests=error --output-on-failure "${CTEST_ARGS[@]}"

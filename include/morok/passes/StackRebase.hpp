@@ -36,7 +36,7 @@ bool stackRebaseFunction(llvm::Function &F, const StackRebaseParams &params,
                          morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-stackrebase`).
-class StackRebasePass : public llvm::PassInfoMixin<StackRebasePass> {
+class StackRebasePass : public llvm::RequiredPassInfoMixin<StackRebasePass> {
 public:
     explicit StackRebasePass(StackRebaseParams params = {},
                              std::uint64_t seed = 0x1337)
@@ -44,7 +44,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     StackRebaseParams params_;

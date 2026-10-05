@@ -51,7 +51,7 @@ bool chaosStateMachineFunction(llvm::Function &F, morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-csm`).
 class ChaosStateMachinePass
-    : public llvm::PassInfoMixin<ChaosStateMachinePass> {
+    : public llvm::RequiredPassInfoMixin<ChaosStateMachinePass> {
 public:
     explicit ChaosStateMachinePass(CsmParams params = {},
                                    std::uint64_t seed = 0x1337)
@@ -59,7 +59,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     CsmParams params_;

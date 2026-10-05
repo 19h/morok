@@ -4,7 +4,7 @@
 //
 // morok/pipeline/Plugin.cpp — New-PM pass-plugin entry point.
 //
-// Targets this environment's plugin API v2 (<llvm/Plugins/PassPlugin.h>).
+// Uses the build LLVM's plugin API v2/v3 (<llvm/Plugins/PassPlugin.h>).
 // Registers:
 //   • the module pipeline name "morok"            (full scheduler)
 //   • standalone module/function pipeline names for individual passes
@@ -214,7 +214,7 @@ morok::config::Config loadConfig() {
 }
 
 class EarlyOptimizerAmplificationPass
-    : public PassInfoMixin<EarlyOptimizerAmplificationPass> {
+    : public RequiredPassInfoMixin<EarlyOptimizerAmplificationPass> {
 public:
     explicit EarlyOptimizerAmplificationPass(morok::config::Config config)
         : config_(std::move(config)),
@@ -266,8 +266,6 @@ public:
                    : PreservedAnalyses::all();
     }
 
-    static bool isRequired() { return true; }
-
 private:
     morok::config::Config config_;
     morok::core::Xoshiro256pp engine_;
@@ -289,7 +287,7 @@ private:
 // and it is gated on virtualization being enabled, so non-VM builds (and the
 // VM-disabled x86/portable configurations) are completely unaffected.
 class VmCandidatePreserverPass
-    : public PassInfoMixin<VmCandidatePreserverPass> {
+    : public RequiredPassInfoMixin<VmCandidatePreserverPass> {
 public:
     explicit VmCandidatePreserverPass(morok::config::Config config)
         : config_(std::move(config)) {}
@@ -306,8 +304,6 @@ public:
             }
         return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
-
-    static bool isRequired() { return true; }
 
 private:
     static bool vmScalarType(Type *T) {

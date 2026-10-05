@@ -57,7 +57,7 @@ bool returnlessDispatchModule(llvm::Module &M, const ReturnlessParams &params,
 
 /// New-PM wrapper for standalone use (`-passes=morok-returnless`).
 class ReturnlessDispatchPass
-    : public llvm::PassInfoMixin<ReturnlessDispatchPass> {
+    : public llvm::RequiredPassInfoMixin<ReturnlessDispatchPass> {
 public:
     explicit ReturnlessDispatchPass(ReturnlessParams params = {},
                                     std::uint64_t seed = 0x1337)
@@ -65,7 +65,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     ReturnlessParams params_;

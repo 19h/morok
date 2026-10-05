@@ -41,7 +41,7 @@ bool dataFlowIntegrityFunction(llvm::Function &F,
 
 /// New-PM wrapper for standalone use (`-passes=morok-dfi`).
 class DataFlowIntegrityPass
-    : public llvm::PassInfoMixin<DataFlowIntegrityPass> {
+    : public llvm::RequiredPassInfoMixin<DataFlowIntegrityPass> {
 public:
     explicit DataFlowIntegrityPass(DataFlowIntegrityParams params = {},
                                    std::uint64_t seed = 0x1337)
@@ -49,7 +49,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     DataFlowIntegrityParams params_;

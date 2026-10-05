@@ -37,7 +37,7 @@ bool pathExplosionFunction(llvm::Function &F, const PathExplosionParams &params,
                            morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-pathexplode`).
-class PathExplosionPass : public llvm::PassInfoMixin<PathExplosionPass> {
+class PathExplosionPass : public llvm::RequiredPassInfoMixin<PathExplosionPass> {
 public:
     explicit PathExplosionPass(PathExplosionParams params = {},
                                std::uint64_t seed = 0x1337)
@@ -45,7 +45,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     PathExplosionParams params_;

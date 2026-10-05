@@ -2,11 +2,9 @@
 # MorokLLVM.cmake
 #
 # Locates LLVM and validates that it exposes the New-PM plugin API this project
-# targets.  This environment ships a *customised* LLVM where the plugin header
-# was moved to <llvm/Plugins/PassPlugin.h> and the API version is 2 (upstream
-# uses <llvm/Passes/PassPlugin.h>, version 1).  We fail loudly if the header /
-# version we depend on is not present, rather than producing a plugin that the
-# host `opt`/`clang` will reject at load time with a cryptic version error.
+# targets. Upstream trunk exposes <llvm/Plugins/PassPlugin.h> with API version
+# 2 or 3. The plugin advertises the version from the headers it compiles against;
+# its host `opt`/`clang` must come from the same LLVM build.
 #
 # Produces:
 #   Morok_LLVM_FOUND          BOOL — set when everything validated
@@ -35,24 +33,27 @@ if(LLVM_VERSION_MAJOR VERSION_LESS 18)
 endif()
 
 # --- Validate the New-PM plugin API we compile against ----------------------
+# Do not reuse a header from a previously configured LLVM_DIR.
+unset(MOROK_PASSPLUGIN_HEADER CACHE)
 find_file(MOROK_PASSPLUGIN_HEADER
   NAMES llvm/Plugins/PassPlugin.h
   PATHS ${LLVM_INCLUDE_DIRS}
-  NO_DEFAULT_PATH)
+  NO_DEFAULT_PATH
+  NO_CACHE)
 
 if(NOT MOROK_PASSPLUGIN_HEADER)
   message(WARNING
     "MorokLLVM: <llvm/Plugins/PassPlugin.h> not found under ${LLVM_INCLUDE_DIRS}.\n"
-    "This build targets a forked LLVM that moved the plugin header there.")
+    "This build requires the upstream trunk plugin header.")
   return()
 endif()
 
 file(STRINGS "${MOROK_PASSPLUGIN_HEADER}" _api_line
   REGEX "define[ \t]+LLVM_PLUGIN_API_VERSION")
 string(REGEX MATCH "[0-9]+" MOROK_PLUGIN_API_VERSION "${_api_line}")
-if(NOT MOROK_PLUGIN_API_VERSION STREQUAL "2")
+if(NOT MOROK_PLUGIN_API_VERSION MATCHES "^(2|3)$")
   message(WARNING
-    "MorokLLVM: expected LLVM_PLUGIN_API_VERSION 2, got '${MOROK_PLUGIN_API_VERSION}'.")
+    "MorokLLVM: expected LLVM_PLUGIN_API_VERSION 2 or 3, got '${MOROK_PLUGIN_API_VERSION}'.")
   return()
 endif()
 

@@ -35,7 +35,7 @@ bool hashGatedSelfDecryptModule(llvm::Module &M,
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-selfdecrypt`).
 class HashGatedSelfDecryptPass
-    : public llvm::PassInfoMixin<HashGatedSelfDecryptPass> {
+    : public llvm::RequiredPassInfoMixin<HashGatedSelfDecryptPass> {
 public:
     explicit HashGatedSelfDecryptPass(HashGatedSelfDecryptParams params = {},
                                       std::uint64_t seed = 0x1337)
@@ -43,7 +43,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     HashGatedSelfDecryptParams params_;

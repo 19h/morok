@@ -42,7 +42,7 @@ TEST_CASE("materializeAnnotations copies annotations to metadata") {
         *M, AnnoStr->getType(), true, GlobalValue::PrivateLinkage, AnnoStr,
         ".str");
 
-    auto *Int8PtrTy = PointerType::getUnqual(Type::getInt8Ty(ctx));
+    auto *Int8PtrTy = PointerType::getUnqual(ctx);
     auto *CastExpr = ConstantExpr::getBitCast(AnnoGV, Int8PtrTy);
     auto *FnCast = ConstantExpr::getBitCast(F, Int8PtrTy);
 

@@ -37,7 +37,7 @@ bool typePunFunction(llvm::Function &F, const TypePunParams &params,
                      morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-typepun`).
-class TypePunningPass : public llvm::PassInfoMixin<TypePunningPass> {
+class TypePunningPass : public llvm::RequiredPassInfoMixin<TypePunningPass> {
 public:
     explicit TypePunningPass(TypePunParams params = {},
                              std::uint64_t seed = 0x1337)
@@ -45,7 +45,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     TypePunParams params_;

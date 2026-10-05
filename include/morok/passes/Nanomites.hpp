@@ -30,13 +30,12 @@ struct NanomiteParams {
 bool nanomitesModule(llvm::Module &M, const NanomiteParams &Params,
                      morok::ir::IRRandom &Rng);
 
-class NanomitesPass : public llvm::PassInfoMixin<NanomitesPass> {
+class NanomitesPass : public llvm::RequiredPassInfoMixin<NanomitesPass> {
 public:
     explicit NanomitesPass(std::uint64_t seed = 0x4E414E4Fu)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;

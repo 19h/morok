@@ -47,7 +47,7 @@ bool bogusControlFlowFunction(llvm::Function &F, const BcfParams &params,
                               morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-bcf`).
-class BogusControlFlowPass : public llvm::PassInfoMixin<BogusControlFlowPass> {
+class BogusControlFlowPass : public llvm::RequiredPassInfoMixin<BogusControlFlowPass> {
 public:
     explicit BogusControlFlowPass(BcfParams params = {},
                                   std::uint64_t seed = 0x1337)
@@ -55,7 +55,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     BcfParams params_;

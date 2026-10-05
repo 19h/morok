@@ -20,10 +20,9 @@ namespace morok::passes {
 bool vtableIntegrityModule(llvm::Module &M);
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-vtable`).
-class VTableIntegrityPass : public llvm::PassInfoMixin<VTableIntegrityPass> {
+class VTableIntegrityPass : public llvm::RequiredPassInfoMixin<VTableIntegrityPass> {
 public:
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 };
 
 } // namespace morok::passes

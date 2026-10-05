@@ -38,7 +38,7 @@ bool nonInvertibleStateFunction(llvm::Function &F,
 
 /// New-PM wrapper for standalone use (`-passes=morok-nistate`).
 class NonInvertibleStatePass
-    : public llvm::PassInfoMixin<NonInvertibleStatePass> {
+    : public llvm::RequiredPassInfoMixin<NonInvertibleStatePass> {
 public:
     explicit NonInvertibleStatePass(NonInvertibleStateParams params = {},
                                     std::uint64_t seed = 0x1337)
@@ -46,7 +46,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     NonInvertibleStateParams params_;

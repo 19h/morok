@@ -40,7 +40,7 @@ bool uniformPrimitiveLowerFunction(llvm::Function &F,
 
 /// New-PM wrapper for standalone use (`-passes=morok-uniform`).
 class UniformPrimitiveLoweringPass
-    : public llvm::PassInfoMixin<UniformPrimitiveLoweringPass> {
+    : public llvm::RequiredPassInfoMixin<UniformPrimitiveLoweringPass> {
 public:
     explicit UniformPrimitiveLoweringPass(UniformLowerParams params = {},
                                           std::uint64_t seed = 0x1337)
@@ -48,7 +48,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     UniformLowerParams params_;

@@ -41,7 +41,7 @@ bool envBindingKdfModule(llvm::Module &M, const EnvBindingKdfParams &params,
                          morok::ir::IRRandom &rng);
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-envbind`).
-class EnvBindingKdfPass : public llvm::PassInfoMixin<EnvBindingKdfPass> {
+class EnvBindingKdfPass : public llvm::RequiredPassInfoMixin<EnvBindingKdfPass> {
 public:
     explicit EnvBindingKdfPass(EnvBindingKdfParams params = {},
                                std::uint64_t seed = 0xE1B17D1EULL)
@@ -50,7 +50,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     EnvBindingKdfParams params_;

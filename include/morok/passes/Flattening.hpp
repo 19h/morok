@@ -32,14 +32,13 @@ namespace morok::passes {
 bool flattenFunction(llvm::Function &F, morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-flatten`).
-class FlatteningPass : public llvm::PassInfoMixin<FlatteningPass> {
+class FlatteningPass : public llvm::RequiredPassInfoMixin<FlatteningPass> {
 public:
     explicit FlatteningPass(std::uint64_t seed = 0x1337)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;

@@ -38,7 +38,7 @@ bool stackDeltaGamesFunction(llvm::Function &F,
                              morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-stackdelta`).
-class StackDeltaGamesPass : public llvm::PassInfoMixin<StackDeltaGamesPass> {
+class StackDeltaGamesPass : public llvm::RequiredPassInfoMixin<StackDeltaGamesPass> {
 public:
     explicit StackDeltaGamesPass(StackDeltaParams params = {},
                                  std::uint64_t seed = 0x1337)
@@ -46,7 +46,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     StackDeltaParams params_;

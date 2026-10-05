@@ -40,7 +40,7 @@ bool functionWrapModule(llvm::Module &M, const FuncWrapParams &params,
                         morok::ir::IRRandom &rng);
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-funcwrap`).
-class FunctionWrapperPass : public llvm::PassInfoMixin<FunctionWrapperPass> {
+class FunctionWrapperPass : public llvm::RequiredPassInfoMixin<FunctionWrapperPass> {
 public:
     explicit FunctionWrapperPass(FuncWrapParams params = {},
                                  std::uint64_t seed = 0x1337)
@@ -48,7 +48,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     FuncWrapParams params_;

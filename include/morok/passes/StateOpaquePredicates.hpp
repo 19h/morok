@@ -40,7 +40,7 @@ bool stateOpaquePredicatesFunction(llvm::Function &F,
 
 /// New-PM wrapper for standalone use (`-passes=morok-stateop`).
 class StateOpaquePredicatesPass
-    : public llvm::PassInfoMixin<StateOpaquePredicatesPass> {
+    : public llvm::RequiredPassInfoMixin<StateOpaquePredicatesPass> {
 public:
     explicit StateOpaquePredicatesPass(StateOpParams params = {},
                                        std::uint64_t seed = 0x1337)
@@ -48,7 +48,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     StateOpParams params_;

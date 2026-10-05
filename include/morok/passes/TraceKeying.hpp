@@ -30,7 +30,7 @@ bool traceKeyFunction(llvm::Function &F, const TraceKeyParams &params,
                       morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-tracekey`).
-class TraceKeyingPass : public llvm::PassInfoMixin<TraceKeyingPass> {
+class TraceKeyingPass : public llvm::RequiredPassInfoMixin<TraceKeyingPass> {
 public:
     explicit TraceKeyingPass(TraceKeyParams params = {},
                              std::uint64_t seed = 0x1337)
@@ -38,7 +38,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     TraceKeyParams params_;

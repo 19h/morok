@@ -57,7 +57,7 @@ bool bindLeafHelpersToSeal(llvm::Module &M, morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-selfcheck`).
 class SelfChecksumConstantsPass
-    : public llvm::PassInfoMixin<SelfChecksumConstantsPass> {
+    : public llvm::RequiredPassInfoMixin<SelfChecksumConstantsPass> {
 public:
     explicit SelfChecksumConstantsPass(SelfChecksumParams params = {},
                                        std::uint64_t seed = 0x1337)
@@ -65,7 +65,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     SelfChecksumParams params_;

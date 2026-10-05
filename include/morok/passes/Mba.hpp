@@ -36,14 +36,13 @@ bool mbaFunction(llvm::Function &F, const MbaParams &params,
                  morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-mba`).
-class MbaPass : public llvm::PassInfoMixin<MbaPass> {
+class MbaPass : public llvm::RequiredPassInfoMixin<MbaPass> {
 public:
     explicit MbaPass(MbaParams params = {}, std::uint64_t seed = 0x1337)
         : params_(params), engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     MbaParams params_;

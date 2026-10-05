@@ -38,7 +38,7 @@ bool mutualGuardGraphFunction(llvm::Function &F,
                               morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-mutualguard`).
-class MutualGuardGraphPass : public llvm::PassInfoMixin<MutualGuardGraphPass> {
+class MutualGuardGraphPass : public llvm::RequiredPassInfoMixin<MutualGuardGraphPass> {
 public:
     explicit MutualGuardGraphPass(MutualGuardGraphParams params = {},
                                   std::uint64_t seed = 0x1337)
@@ -46,7 +46,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     MutualGuardGraphParams params_;

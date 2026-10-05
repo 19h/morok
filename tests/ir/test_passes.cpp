@@ -948,7 +948,7 @@ void checkWindowsTlsCallbacks(Module &M, StringRef Stem, StringRef CtorName,
     GlobalVariable *Once = M.getGlobalVariable(Prefix + ".once", true);
     REQUIRE(Once != nullptr);
     CHECK(Once->getValueType()->isIntegerTy(32));
-    CHECK(Once->getAlignment() == 4u);
+    CHECK(Once->getAlign() == MaybeAlign(4));
     GlobalVariable *CompilerUsed = M.getGlobalVariable("llvm.compiler.used");
     REQUIRE(CompilerUsed != nullptr);
     REQUIRE(CompilerUsed->hasInitializer());

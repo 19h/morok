@@ -55,7 +55,7 @@ bool bindStringSeedToSeal(llvm::Module &M, morok::ir::IRRandom &rng);
 bool inlineConstantFormatCalls(llvm::Module &M);
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-strenc`).
-class StringEncryptionPass : public llvm::PassInfoMixin<StringEncryptionPass> {
+class StringEncryptionPass : public llvm::RequiredPassInfoMixin<StringEncryptionPass> {
 public:
     explicit StringEncryptionPass(StrEncParams params = {},
                                   std::uint64_t seed = 0x1337)
@@ -63,7 +63,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     StrEncParams params_;

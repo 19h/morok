@@ -40,7 +40,7 @@ bool vectorObfuscateFunction(llvm::Function &F, const VecParams &params,
 
 /// New-PM wrapper for standalone use (`-passes=morok-vec`).
 class VectorObfuscationPass
-    : public llvm::PassInfoMixin<VectorObfuscationPass> {
+    : public llvm::RequiredPassInfoMixin<VectorObfuscationPass> {
 public:
     explicit VectorObfuscationPass(VecParams params = {},
                                    std::uint64_t seed = 0x1337)
@@ -48,7 +48,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     VecParams params_;

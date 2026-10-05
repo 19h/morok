@@ -46,7 +46,7 @@ bool faultPagedPayloadModule(llvm::Module &M,
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-fpp`).
 class FaultPagedPayloadPass
-    : public llvm::PassInfoMixin<FaultPagedPayloadPass> {
+    : public llvm::RequiredPassInfoMixin<FaultPagedPayloadPass> {
 public:
     explicit FaultPagedPayloadPass(FaultPagedPayloadParams params = {},
                                    std::uint64_t seed = 0xF00D5EEDu)
@@ -55,7 +55,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     FaultPagedPayloadParams params_;

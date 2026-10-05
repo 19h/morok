@@ -85,13 +85,12 @@ bool mirageModule(llvm::Module &M, const MirageParams &params,
                   morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-mirage`).
-class MiragePass : public llvm::PassInfoMixin<MiragePass> {
+class MiragePass : public llvm::RequiredPassInfoMixin<MiragePass> {
 public:
     explicit MiragePass(MirageParams params = {}, std::uint64_t seed = 0x1337)
         : params_(params), engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     MirageParams params_;

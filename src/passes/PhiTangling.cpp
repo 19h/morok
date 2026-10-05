@@ -119,7 +119,7 @@ Value *edgeCopy(PHINode &PN, unsigned incoming, IntegerType *CarrierTy,
 
 PHINode *cloneDirectPhi(PHINode &PN) {
     auto *Copy = PHINode::Create(PN.getType(), PN.getNumIncomingValues(),
-                                 "morok.phi.direct", &PN);
+                                 "morok.phi.direct", PN.getIterator());
     for (unsigned i = 0; i < PN.getNumIncomingValues(); ++i)
         Copy->addIncoming(PN.getIncomingValue(i), PN.getIncomingBlock(i));
     return Copy;
@@ -128,7 +128,7 @@ PHINode *cloneDirectPhi(PHINode &PN) {
 PHINode *cloneEdgePhi(PHINode &PN, IntegerType *CarrierTy, ir::IRRandom &rng,
                       std::vector<Instruction *> &generated) {
     auto *Copy = PHINode::Create(PN.getType(), PN.getNumIncomingValues(),
-                                 "morok.phi.edge", &PN);
+                                 "morok.phi.edge", PN.getIterator());
     // A predecessor can appear at more than one incoming index (callbr/asm-goto
     // with duplicate targets, or `br` with both arms to one block).  Every
     // entry for the same block must carry an identical value, so compute the

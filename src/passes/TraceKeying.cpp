@@ -374,7 +374,7 @@ GuardedBlock splitWithGuard(BasicBlock *BB, AllocaInst *State,
     auto *I64 = Type::getInt64Ty(Ctx);
     Instruction *SplitPt = traceSplitPoint(*BB);
     auto *Expected =
-        PHINode::Create(I64, 0, "morok.trace.expected", SplitPt);
+        PHINode::Create(I64, 0, "morok.trace.expected", SplitPt->getIterator());
     BasicBlock *Body = SplitBlock(BB, SplitPt);
     Body->setName("morok.trace.body");
 

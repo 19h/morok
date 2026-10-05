@@ -39,7 +39,7 @@ bool splitBlocksFunction(llvm::Function &F, const SplitParams &params,
                          morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-split`).
-class SplitBasicBlocksPass : public llvm::PassInfoMixin<SplitBasicBlocksPass> {
+class SplitBasicBlocksPass : public llvm::RequiredPassInfoMixin<SplitBasicBlocksPass> {
 public:
     explicit SplitBasicBlocksPass(SplitParams params = {},
                                   std::uint64_t seed = 0x1337)
@@ -47,7 +47,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     SplitParams params_;

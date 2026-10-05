@@ -37,7 +37,7 @@ bool optimizerAmplifyFunction(llvm::Function &F, const OptAmpParams &params,
 
 /// New-PM wrapper for standalone use (`-passes=morok-optamp`).
 class OptimizerAmplificationPass
-    : public llvm::PassInfoMixin<OptimizerAmplificationPass> {
+    : public llvm::RequiredPassInfoMixin<OptimizerAmplificationPass> {
 public:
     explicit OptimizerAmplificationPass(OptAmpParams params = {},
                                         std::uint64_t seed = 0x1337)
@@ -45,7 +45,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     OptAmpParams params_;

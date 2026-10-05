@@ -182,248 +182,228 @@ bool cacheTimingOracleModule(llvm::Module &M, morok::ir::IRRandom &rng);
 bool microarchitecturalCanaryModule(llvm::Module &M,
                                     morok::ir::IRRandom &rng);
 
-class AntiDebuggingPass : public llvm::PassInfoMixin<AntiDebuggingPass> {
+class AntiDebuggingPass : public llvm::RequiredPassInfoMixin<AntiDebuggingPass> {
 public:
     explicit AntiDebuggingPass(std::uint64_t seed = 0xA17D3B9u)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
-class AntiHookingPass : public llvm::PassInfoMixin<AntiHookingPass> {
+class AntiHookingPass : public llvm::RequiredPassInfoMixin<AntiHookingPass> {
 public:
     explicit AntiHookingPass(std::uint64_t seed = 0x1337)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
-class AntiClassDumpPass : public llvm::PassInfoMixin<AntiClassDumpPass> {
+class AntiClassDumpPass : public llvm::RequiredPassInfoMixin<AntiClassDumpPass> {
 public:
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 };
 
 class WindowsPEFoundationPass
-    : public llvm::PassInfoMixin<WindowsPEFoundationPass> {
+    : public llvm::RequiredPassInfoMixin<WindowsPEFoundationPass> {
 public:
     explicit WindowsPEFoundationPass(std::uint64_t seed = 0x51D0BEEF)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
 class WindowsPebHeapDebugPass
-    : public llvm::PassInfoMixin<WindowsPebHeapDebugPass> {
+    : public llvm::RequiredPassInfoMixin<WindowsPebHeapDebugPass> {
 public:
     explicit WindowsPebHeapDebugPass(std::uint64_t seed = 0x5EA1B0A7u)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
 class WindowsDebugObjectPass
-    : public llvm::PassInfoMixin<WindowsDebugObjectPass> {
+    : public llvm::RequiredPassInfoMixin<WindowsDebugObjectPass> {
 public:
     explicit WindowsDebugObjectPass(std::uint64_t seed = 0xD3B60B1Eu)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
 class WindowsThreadHidePass
-    : public llvm::PassInfoMixin<WindowsThreadHidePass> {
+    : public llvm::RequiredPassInfoMixin<WindowsThreadHidePass> {
 public:
     explicit WindowsThreadHidePass(std::uint64_t seed = 0x71D1E11Du)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
 class WindowsAntiAttachPass
-    : public llvm::PassInfoMixin<WindowsAntiAttachPass> {
+    : public llvm::RequiredPassInfoMixin<WindowsAntiAttachPass> {
 public:
     explicit WindowsAntiAttachPass(std::uint64_t seed = 0xA77A11CEu)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
 class WindowsKernelDebuggerPass
-    : public llvm::PassInfoMixin<WindowsKernelDebuggerPass> {
+    : public llvm::RequiredPassInfoMixin<WindowsKernelDebuggerPass> {
 public:
     explicit WindowsKernelDebuggerPass(std::uint64_t seed = 0x1EADBEEFu)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
-class WindowsSyscallsPass : public llvm::PassInfoMixin<WindowsSyscallsPass> {
+class WindowsSyscallsPass : public llvm::RequiredPassInfoMixin<WindowsSyscallsPass> {
 public:
     explicit WindowsSyscallsPass(std::uint64_t seed = 0x5C411C5u)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
 class WindowsProcessModulesPass
-    : public llvm::PassInfoMixin<WindowsProcessModulesPass> {
+    : public llvm::RequiredPassInfoMixin<WindowsProcessModulesPass> {
 public:
     explicit WindowsProcessModulesPass(std::uint64_t seed = 0xC011EC75u)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
-class WindowsUnhookPass : public llvm::PassInfoMixin<WindowsUnhookPass> {
+class WindowsUnhookPass : public llvm::RequiredPassInfoMixin<WindowsUnhookPass> {
 public:
     explicit WindowsUnhookPass(std::uint64_t seed = 0xC1EAD11Du)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
 class WindowsVehAuditPass
-    : public llvm::PassInfoMixin<WindowsVehAuditPass> {
+    : public llvm::RequiredPassInfoMixin<WindowsVehAuditPass> {
 public:
     explicit WindowsVehAuditPass(std::uint64_t seed = 0x5EA11D17u)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
 class WindowsProcessMitigationsPass
-    : public llvm::PassInfoMixin<WindowsProcessMitigationsPass> {
+    : public llvm::RequiredPassInfoMixin<WindowsProcessMitigationsPass> {
 public:
     explicit WindowsProcessMitigationsPass(std::uint64_t seed = 0xAC6C161Du)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
-class TimingOraclePass : public llvm::PassInfoMixin<TimingOraclePass> {
+class TimingOraclePass : public llvm::RequiredPassInfoMixin<TimingOraclePass> {
 public:
     explicit TimingOraclePass(std::uint64_t seed = 0x710C10C5u)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
 class SchedulerStepOraclePass
-    : public llvm::PassInfoMixin<SchedulerStepOraclePass> {
+    : public llvm::RequiredPassInfoMixin<SchedulerStepOraclePass> {
 public:
     explicit SchedulerStepOraclePass(std::uint64_t seed = 0x57E0A11Cu)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
-class TrapOraclePass : public llvm::PassInfoMixin<TrapOraclePass> {
+class TrapOraclePass : public llvm::RequiredPassInfoMixin<TrapOraclePass> {
 public:
     explicit TrapOraclePass(std::uint64_t seed = 0x7A9A7A9Au)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
 class PageFaultTlbOraclePass
-    : public llvm::PassInfoMixin<PageFaultTlbOraclePass> {
+    : public llvm::RequiredPassInfoMixin<PageFaultTlbOraclePass> {
 public:
     explicit PageFaultTlbOraclePass(std::uint64_t seed = 0x9A6EF17Du)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
 class CacheTimingOraclePass
-    : public llvm::PassInfoMixin<CacheTimingOraclePass> {
+    : public llvm::RequiredPassInfoMixin<CacheTimingOraclePass> {
 public:
     explicit CacheTimingOraclePass(std::uint64_t seed = 0xCACE710Cu)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;
 };
 
 class MicroarchitecturalCanaryPass
-    : public llvm::PassInfoMixin<MicroarchitecturalCanaryPass> {
+    : public llvm::RequiredPassInfoMixin<MicroarchitecturalCanaryPass> {
 public:
     explicit MicroarchitecturalCanaryPass(std::uint64_t seed = 0xC411A9E5u)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;

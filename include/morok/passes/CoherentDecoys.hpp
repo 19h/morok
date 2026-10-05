@@ -37,7 +37,7 @@ bool coherentDecoysFunction(llvm::Function &F,
                             morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-decoy`).
-class CoherentDecoysPass : public llvm::PassInfoMixin<CoherentDecoysPass> {
+class CoherentDecoysPass : public llvm::RequiredPassInfoMixin<CoherentDecoysPass> {
 public:
     explicit CoherentDecoysPass(CoherentDecoyParams params = {},
                                 std::uint64_t seed = 0x1337)
@@ -45,7 +45,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     CoherentDecoyParams params_;

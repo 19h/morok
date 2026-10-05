@@ -36,7 +36,7 @@ bool phiTangleFunction(llvm::Function &F, const PhiTangleParams &params,
                        morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-phitangle`).
-class PhiTanglingPass : public llvm::PassInfoMixin<PhiTanglingPass> {
+class PhiTanglingPass : public llvm::RequiredPassInfoMixin<PhiTanglingPass> {
 public:
     explicit PhiTanglingPass(PhiTangleParams params = {},
                              std::uint64_t seed = 0x1337)
@@ -44,7 +44,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     PhiTangleParams params_;

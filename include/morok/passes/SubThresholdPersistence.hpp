@@ -38,7 +38,7 @@ bool subThresholdPersistFunction(llvm::Function &F,
 
 /// New-PM wrapper for standalone use (`-passes=morok-threshold`).
 class SubThresholdPersistencePass
-    : public llvm::PassInfoMixin<SubThresholdPersistencePass> {
+    : public llvm::RequiredPassInfoMixin<SubThresholdPersistencePass> {
 public:
     explicit SubThresholdPersistencePass(SubThresholdParams params = {},
                                          std::uint64_t seed = 0x1337)
@@ -46,7 +46,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     SubThresholdParams params_;

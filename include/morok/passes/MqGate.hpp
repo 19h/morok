@@ -35,14 +35,13 @@ bool mqGateFunction(llvm::Function &F, const MqGateParams &params,
                     morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-mq`).
-class MqGatePass : public llvm::PassInfoMixin<MqGatePass> {
+class MqGatePass : public llvm::RequiredPassInfoMixin<MqGatePass> {
 public:
     explicit MqGatePass(MqGateParams params = {}, std::uint64_t seed = 0x1337)
         : params_(params), engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     MqGateParams params_;

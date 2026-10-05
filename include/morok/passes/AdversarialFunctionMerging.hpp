@@ -38,7 +38,7 @@ bool adversarialFunctionMergingModule(llvm::Module &M,
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-afm`).
 class AdversarialFunctionMergingPass
-    : public llvm::PassInfoMixin<AdversarialFunctionMergingPass> {
+    : public llvm::RequiredPassInfoMixin<AdversarialFunctionMergingPass> {
 public:
     explicit AdversarialFunctionMergingPass(AdversarialMergeParams params = {},
                                             std::uint64_t seed = 0x1337)
@@ -46,7 +46,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     AdversarialMergeParams params_;

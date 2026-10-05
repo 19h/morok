@@ -47,7 +47,7 @@ bool adversarialSelfTuneModule(llvm::Module &M,
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-selftune`).
 class AdversarialSelfTuningPass
-    : public llvm::PassInfoMixin<AdversarialSelfTuningPass> {
+    : public llvm::RequiredPassInfoMixin<AdversarialSelfTuningPass> {
 public:
     explicit AdversarialSelfTuningPass(AdversarialTuningParams params = {},
                                        std::uint64_t seed = 0x1337)
@@ -55,7 +55,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     AdversarialTuningParams params_;

@@ -32,14 +32,13 @@ namespace morok::passes {
 bool decoyStringsModule(llvm::Module &M, morok::ir::IRRandom &rng);
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-decoystr`).
-class DecoyStringsPass : public llvm::PassInfoMixin<DecoyStringsPass> {
+class DecoyStringsPass : public llvm::RequiredPassInfoMixin<DecoyStringsPass> {
 public:
     explicit DecoyStringsPass(std::uint64_t seed = 0xDE001337u)
         : engine_(core::Xoshiro256pp::fromSeed(seed)) {}
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &);
-    static bool isRequired() { return true; }
 
 private:
     core::Xoshiro256pp engine_;

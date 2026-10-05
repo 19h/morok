@@ -46,7 +46,7 @@ bool externalSecretBindingModule(llvm::Module &M,
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-proofbind`).
 class ExternalSecretBindingPass
-    : public llvm::PassInfoMixin<ExternalSecretBindingPass> {
+    : public llvm::RequiredPassInfoMixin<ExternalSecretBindingPass> {
 public:
     explicit ExternalSecretBindingPass(ExternalSecretBindingParams params = {},
                                        std::uint64_t seed = 0x1337)
@@ -55,7 +55,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     ExternalSecretBindingParams params_;

@@ -41,7 +41,7 @@ bool sealedBlobModule(llvm::Module &M, const SealedBlobParams &params,
                       morok::ir::IRRandom &rng);
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-sealedblob`).
-class SealedBlobPass : public llvm::PassInfoMixin<SealedBlobPass> {
+class SealedBlobPass : public llvm::RequiredPassInfoMixin<SealedBlobPass> {
 public:
     explicit SealedBlobPass(SealedBlobParams params = {},
                             std::uint64_t seed = 0x1337)
@@ -50,7 +50,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     SealedBlobParams params_;

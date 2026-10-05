@@ -35,7 +35,7 @@ bool perBuildPolymorphismModule(llvm::Module &M,
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-polymorph`).
 class PerBuildPolymorphismPass
-    : public llvm::PassInfoMixin<PerBuildPolymorphismPass> {
+    : public llvm::RequiredPassInfoMixin<PerBuildPolymorphismPass> {
 public:
     explicit PerBuildPolymorphismPass(PerBuildPolymorphismParams params = {},
                                       std::uint64_t seed = 0x1337)
@@ -43,7 +43,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     PerBuildPolymorphismParams params_;

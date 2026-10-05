@@ -118,6 +118,8 @@ jobs:
           args=(
             -S . -B build -G Ninja
             -DCMAKE_BUILD_TYPE=RelWithDebInfo
+            -DMOROK_BUILD_PLUGIN=ON
+            -DMOROK_BUILD_TESTS=ON
             -DCMAKE_C_COMPILER="${{ steps.llvm.outputs.clang }}"
             -DCMAKE_CXX_COMPILER="${{ steps.llvm.outputs.clangxx }}"
             -DLLVM_DIR="${{ steps.llvm.outputs.llvm-dir }}"
@@ -181,7 +183,9 @@ jobs:
         env:
           CMAKE_C_COMPILER_LAUNCHER: sccache
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
-        run: cmake --build build --parallel
+        run: |
+          cmake --build build --target morok_plugin morok_ir_tests --parallel
+          cmake --build build --parallel
 
       # Explicit save after all compilation so the object cache is uploaded even
       # if the tests below fail.
@@ -209,7 +213,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ctest --test-dir build -L ir --output-on-failure --timeout 300
+          ctest --test-dir build -L ir --no-tests=error --output-on-failure --timeout 300
 
       - name: Run tests
         shell: bash

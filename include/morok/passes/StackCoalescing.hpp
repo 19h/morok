@@ -36,7 +36,7 @@ bool stackCoalesceFunction(llvm::Function &F, const StackCoalesceParams &params,
                            morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-stackcoalesce`).
-class StackCoalescingPass : public llvm::PassInfoMixin<StackCoalescingPass> {
+class StackCoalescingPass : public llvm::RequiredPassInfoMixin<StackCoalescingPass> {
 public:
     explicit StackCoalescingPass(StackCoalesceParams params = {},
                                  std::uint64_t seed = 0x1337)
@@ -44,7 +44,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     StackCoalesceParams params_;

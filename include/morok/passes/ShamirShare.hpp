@@ -34,7 +34,7 @@ bool shamirShareFunction(llvm::Function &F, const ShamirShareParams &params,
                          morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-shamir`).
-class ShamirSharePass : public llvm::PassInfoMixin<ShamirSharePass> {
+class ShamirSharePass : public llvm::RequiredPassInfoMixin<ShamirSharePass> {
 public:
     explicit ShamirSharePass(ShamirShareParams params = {},
                              std::uint64_t seed = 0x1337)
@@ -42,7 +42,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     ShamirShareParams params_;

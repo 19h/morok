@@ -50,7 +50,7 @@ bool functionFissionModule(llvm::Module &M,
                            morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-fission`).
-class FunctionFissionPass : public llvm::PassInfoMixin<FunctionFissionPass> {
+class FunctionFissionPass : public llvm::RequiredPassInfoMixin<FunctionFissionPass> {
 public:
     explicit FunctionFissionPass(FunctionFissionParams params = {},
                                  std::uint64_t seed = 0x1337)
@@ -58,7 +58,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     FunctionFissionParams params_;

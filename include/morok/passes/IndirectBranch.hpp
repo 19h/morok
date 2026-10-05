@@ -40,7 +40,7 @@ bool indirectBranchFunction(llvm::Function &F, const IndirParams &params,
                             morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-indbr`).
-class IndirectBranchPass : public llvm::PassInfoMixin<IndirectBranchPass> {
+class IndirectBranchPass : public llvm::RequiredPassInfoMixin<IndirectBranchPass> {
 public:
     explicit IndirectBranchPass(IndirParams params = {},
                                 std::uint64_t seed = 0x1337)
@@ -48,7 +48,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     IndirParams params_;

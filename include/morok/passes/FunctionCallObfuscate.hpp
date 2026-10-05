@@ -38,7 +38,7 @@ bool functionCallObfuscateModule(llvm::Module &M, const FcoParams &params,
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-fco`).
 class FunctionCallObfuscatePass
-    : public llvm::PassInfoMixin<FunctionCallObfuscatePass> {
+    : public llvm::RequiredPassInfoMixin<FunctionCallObfuscatePass> {
 public:
     explicit FunctionCallObfuscatePass(FcoParams params = {},
                                        std::uint64_t seed = 0x1337)
@@ -46,7 +46,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     FcoParams params_;

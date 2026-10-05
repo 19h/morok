@@ -106,12 +106,12 @@ morok-native-pack Host executable used by the Linux native-pack build stage.
 - Ninja.
 - A C11 and C++23 capable toolchain.
 - LLVM 18 or newer with the New-PM plugin API Morok targets. The current CI and
-  development toolchains use the API-v2 plugin header at
+  development toolchains use the API-v2/v3 plugin header at
   `<llvm/Plugins/PassPlugin.h>`.
 
 Morok requires the LLVM headers and the `clang`/`opt` binaries used at runtime
 to agree on the same New-PM pass plugin ABI. The build currently checks for
-`<llvm/Plugins/PassPlugin.h>` with `LLVM_PLUGIN_API_VERSION == 2`; older LLVM
+`<llvm/Plugins/PassPlugin.h>` with `LLVM_PLUGIN_API_VERSION` 2 or 3; older LLVM
 installs that expose only `<llvm/Passes/PassPlugin.h>` with API version 1 are a
 different plugin ABI and are rejected by
 [`cmake/MorokLLVM.cmake`](cmake/MorokLLVM.cmake) instead of failing later with a
@@ -134,7 +134,7 @@ Useful CMake options:
 
 ```text
 MOROK_BUILD_TESTS=ON       build tests
-MOROK_BUILD_PLUGIN=ON      build libMorok
+MOROK_BUILD_PLUGIN=ON      build libMorok; fail configuration if LLVM is unusable
 MOROK_WERROR=OFF           treat warnings as errors when ON
 MOROK_SANITIZE=OFF         ASan/UBSan for pure layers/tests when ON
 ```
@@ -1230,7 +1230,7 @@ self-check data region.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| CMake cannot find `llvm/Plugins/PassPlugin.h` | Host LLVM is missing the API-v2 New-PM plugin header | Point `LLVM_DIR` at the same API-v2 LLVM install used by `clang`/`opt`. |
+| CMake cannot find `llvm/Plugins/PassPlugin.h` | Host LLVM is missing the API-v2/v3 New-PM plugin header | Point `LLVM_DIR` at the same API-v2/v3 LLVM install used by `clang`/`opt`. |
 | Plugin load reports API/version mismatch | `clang`/`opt` and Morok were built against different LLVM plugin ABIs | Rebuild Morok with the same LLVM used by the host driver. |
 | `-mllvm -morok` is unknown on Windows | Windows plugin cl::opts are not parsed by host clang the same way | Use `MOROK_ENABLE=1` plus `MOROK_CONFIG`, `MOROK_PRESET`, and `MOROK_SEED`. |
 | Static Linux binary crashes around import indirection | FCO was left enabled in a static link | Use `cross_build.sh` or force `[passes.function_call_obfuscate].enabled = false` and `[passes.platform_runtime].static_link_expected = true`. |

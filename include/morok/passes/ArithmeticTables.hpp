@@ -38,7 +38,7 @@ bool tableArithmeticFunction(llvm::Function &F, const TableArithParams &params,
                              morok::ir::IRRandom &rng);
 
 /// New-PM wrapper for standalone use (`-passes=morok-tablearith`).
-class ArithmeticTablesPass : public llvm::PassInfoMixin<ArithmeticTablesPass> {
+class ArithmeticTablesPass : public llvm::RequiredPassInfoMixin<ArithmeticTablesPass> {
 public:
     explicit ArithmeticTablesPass(TableArithParams params = {},
                                   std::uint64_t seed = 0x1337)
@@ -46,7 +46,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     TableArithParams params_;

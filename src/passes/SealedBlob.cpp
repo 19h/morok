@@ -237,7 +237,7 @@ Value *materialize(Value *V, Instruction *Before, GlobalVariable *GV,
         return V;
 
     Instruction *I = CE->getAsInstruction();
-    I->insertBefore(Before);
+    I->insertBefore(Before->getIterator());
     for (unsigned OpNo = 0; OpNo != I->getNumOperands(); ++OpNo) {
         Value *Op = I->getOperand(OpNo);
         if (containsBlob(Op, GV))

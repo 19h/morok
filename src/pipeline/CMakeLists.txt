@@ -4,7 +4,7 @@
 # On Unix the plugin is a MODULE that does NOT link LLVM: the host process
 # (opt / clang) provides the LLVM symbols at dlopen time, so we allow undefined
 # symbols (Mach-O resolves them by default; Linux clang/opt are built with
-# --export-dynamic).  Targets plugin API v2 via <llvm/Plugins/PassPlugin.h>.
+# --export-dynamic). Uses plugin API v2/v3 via <llvm/Plugins/PassPlugin.h>.
 #
 # On Windows there is no load-time undefined-symbol resolution (PE/COFF has no
 # -Wl,-undefined,dynamic_lookup / --allow-shlib-undefined), and the single

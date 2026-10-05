@@ -43,7 +43,7 @@ bool externalOpaquePredicatesFunction(llvm::Function &F,
 
 /// New-PM wrapper for standalone use (`-passes=morok-extop`).
 class ExternalOpaquePredicatesPass
-    : public llvm::PassInfoMixin<ExternalOpaquePredicatesPass> {
+    : public llvm::RequiredPassInfoMixin<ExternalOpaquePredicatesPass> {
 public:
     explicit ExternalOpaquePredicatesPass(ExternalOpaqueParams params = {},
                                           std::uint64_t seed = 0x1337)
@@ -51,7 +51,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     ExternalOpaqueParams params_;

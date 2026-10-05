@@ -99,6 +99,12 @@ if(MOROK_BUILD_PLUGIN OR MOROK_BUILD_TESTS)
     morok_add_layer(src/passes)
     morok_add_layer(src/pipeline)
   else()
+    if(MOROK_BUILD_PLUGIN)
+      message(FATAL_ERROR
+        "MOROK_BUILD_PLUGIN=ON requires a usable LLVM trunk installation.\n"
+        "Point LLVM_DIR at the LLVM build used by clang/opt, or explicitly set\n"
+        "MOROK_BUILD_PLUGIN=OFF to build only the available layers.")
+    endif()
     message(WARNING
       "LLVM not usable for plugin/IR layers — building pure layers only.")
   endif()

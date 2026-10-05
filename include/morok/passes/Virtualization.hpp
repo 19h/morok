@@ -56,7 +56,7 @@ bool virtualizationWillLift(llvm::Function &F,
                             const VirtualizationParams &params);
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-vm`).
-class VirtualizationPass : public llvm::PassInfoMixin<VirtualizationPass> {
+class VirtualizationPass : public llvm::RequiredPassInfoMixin<VirtualizationPass> {
 public:
     explicit VirtualizationPass(VirtualizationParams params = {},
                                 std::uint64_t seed = 0x1337)
@@ -64,7 +64,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     VirtualizationParams params_;

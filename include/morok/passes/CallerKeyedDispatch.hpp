@@ -51,7 +51,7 @@ bool callerKeyedDispatchModule(llvm::Module &M,
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-ckd`).
 class CallerKeyedDispatchPass
-    : public llvm::PassInfoMixin<CallerKeyedDispatchPass> {
+    : public llvm::RequiredPassInfoMixin<CallerKeyedDispatchPass> {
 public:
     explicit CallerKeyedDispatchPass(CallerKeyedDispatchParams params = {},
                                      std::uint64_t seed = 0x1337)
@@ -59,7 +59,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     CallerKeyedDispatchParams params_;

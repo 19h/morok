@@ -40,7 +40,7 @@ bool tracerAttestationModule(llvm::Module &M,
 
 /// New-PM module-pass wrapper for standalone use (`-passes=morok-tracer`).
 class TracerAttestationPass
-    : public llvm::PassInfoMixin<TracerAttestationPass> {
+    : public llvm::RequiredPassInfoMixin<TracerAttestationPass> {
 public:
     explicit TracerAttestationPass(TracerAttestationParams params = {},
                                    std::uint64_t seed = 0x7AACEu)
@@ -49,7 +49,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Module &M,
                                 llvm::ModuleAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     TracerAttestationParams params_;

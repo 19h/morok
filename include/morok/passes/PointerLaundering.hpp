@@ -39,7 +39,7 @@ bool pointerLaunderFunction(llvm::Function &F,
 
 /// New-PM wrapper for standalone use (`-passes=morok-ptrlaunder`).
 class PointerLaunderingPass
-    : public llvm::PassInfoMixin<PointerLaunderingPass> {
+    : public llvm::RequiredPassInfoMixin<PointerLaunderingPass> {
 public:
     explicit PointerLaunderingPass(PointerLaunderParams params = {},
                                    std::uint64_t seed = 0x1337)
@@ -47,7 +47,6 @@ public:
 
     llvm::PreservedAnalyses run(llvm::Function &F,
                                 llvm::FunctionAnalysisManager &AM);
-    static bool isRequired() { return true; }
 
 private:
     PointerLaunderParams params_;
