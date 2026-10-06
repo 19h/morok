@@ -51,6 +51,9 @@ Value *emitMba(BinaryOperator *bo, const MbaParams &params, ir::IRRandom &rng) {
     const unsigned width = ty->getBitWidth();
 
     auto two = [&](Value *v) {
+        // 2*v is zero modulo 2; shifting i1 by one would produce poison.
+        if (width == 1)
+            return static_cast<Value *>(ConstantInt::get(ty, 0));
         return B.CreateShl(v, ConstantInt::get(ty, 1));
     };
 

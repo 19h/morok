@@ -66,11 +66,10 @@ long raw_syscall2(long num, long arg1, long arg2) {
 __attribute__((noinline))
 long raw_syscall3(long num, long arg1, long arg2, long arg3) {
     long ret;
-    register long r10 __asm__("r10") = arg3;
     __asm__ volatile(
         "syscall"
         : "=a"(ret)
-        : "a"(num), "D"(arg1), "S"(arg2), "r"(r10)
+        : "a"(num), "D"(arg1), "S"(arg2), "d"(arg3)
         : "rcx", "r11", "memory"
     );
     return ret;

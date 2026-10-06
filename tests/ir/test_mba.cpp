@@ -8,12 +8,15 @@
 #include "morok/ir/IRRandom.hpp"
 #include "morok/passes/Mba.hpp"
 
+#include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <initializer_list>
 #include <string>
 
 using namespace llvm;
@@ -278,4 +281,58 @@ TEST_CASE("mbaFunction clamps the layer count to at least one") {
         rng));
     CHECK(countBinops(*F) > before);
     CHECK_FALSE(verifyModule(*M));
+}
+
+TEST_CASE("mbaFunction preserves every Boolean input without poison") {
+    for (const std::string opcode : {"add", "sub", "xor", "and", "or", "mul"}) {
+        for (unsigned layers = 1; layers <= 3; ++layers) {
+            for (bool heuristic : {false, true}) {
+                for (unsigned a = 0; a < 2; ++a) {
+                    for (unsigned b = 0; b < 2; ++b) {
+                        CAPTURE(opcode);
+                        CAPTURE(layers);
+                        CAPTURE(heuristic);
+                        CAPTURE(a);
+                        CAPTURE(b);
+                        LLVMContext ctx;
+                        const std::string ir =
+                            "define i1 @boolean(i1 %a, i1 %b) {\n"
+                            "entry:\n  %r = " + opcode +
+                            " i1 %a, %b\n  ret i1 %r\n}\n";
+                        auto M = parse(ctx, ir.c_str());
+                        Function *F = M->getFunction("boolean");
+                        REQUIRE(F);
+                        auto engine = morok::core::Xoshiro256pp::fromSeed(0xBEEF);
+                        morok::ir::IRRandom rng(engine);
+                        REQUIRE(morok::passes::mbaFunction(
+                            *F, {.probability = 100, .layers = layers,
+                                 .heuristic = heuristic}, rng));
+                        CHECK_FALSE(verifyModule(*M));
+                        F->getArg(0)->replaceAllUsesWith(
+                            ConstantInt::get(Type::getInt1Ty(ctx), a));
+                        F->getArg(1)->replaceAllUsesWith(
+                            ConstantInt::get(Type::getInt1Ty(ctx), b));
+                        for (Instruction &I : instructions(*F)) {
+                            if (isa<ReturnInst>(I))
+                                continue;
+                            Constant *folded =
+                                ConstantFoldInstruction(&I, M->getDataLayout());
+                            REQUIRE(folded);
+                            REQUIRE(isa<ConstantInt>(folded));
+                            I.replaceAllUsesWith(folded);
+                        }
+                        auto *result = dyn_cast<ConstantInt>(
+                            cast<ReturnInst>(F->back().getTerminator())->getReturnValue());
+                        REQUIRE(result);
+                        unsigned expected = a ^ b;
+                        if (opcode == "and" || opcode == "mul")
+                            expected = a & b;
+                        else if (opcode == "or")
+                            expected = a | b;
+                        CHECK(result->getZExtValue() == expected);
+                    }
+                }
+            }
+        }
+    }
 }
